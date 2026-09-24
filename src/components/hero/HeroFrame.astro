@@ -7,8 +7,11 @@
  * label:   mono header, the shape being animated (e.g. "opposite ends")
  * caption: one line under the stage naming the invariant the motion shows
  *
- * Under prefers-reduced-motion the global rule disables animation, so a hero's
- * un-animated styles must show the mechanism's final, meaningful state.
+ * Playback controls (play/pause, speed, scrubber) drive every CSS animation
+ * inside the stage through the Web Animations API, so heroes need nothing
+ * extra. They stay hidden without JS and under prefers-reduced-motion, where
+ * the global rule disables animation and a hero's un-animated styles must
+ * show the mechanism's final, meaningful state.
  */
 interface Props {
   label: string;
@@ -17,15 +20,24 @@ interface Props {
 const { label, caption } = Astro.props;
 ---
 
-<figure class="hero not-prose bg-panel border-line mt-6 max-w-[72ch] overflow-hidden rounded-xl border">
-  <div class="border-line flex items-center justify-between border-b px-4 py-2 font-mono text-[0.7rem]">
-    <span class="text-muted"><span class="text-line">trace&gt;</span> {label}</span>
-    <span class="hero-live text-muted flex items-center gap-1.5">
-      <span class="hero-dot bg-green inline-block h-1.5 w-1.5 rounded-full"></span>loop
+<figure class="hero not-prose bg-panel border-line mt-6 max-w-[72ch] overflow-hidden rounded-xl border" data-hero>
+  <div class="border-line flex items-center justify-between gap-3 border-b px-4 py-2 font-mono text-[0.7rem]">
+    <span class="text-muted min-w-0"><span class="text-line">trace&gt;</span> {label}</span>
+    <span class="hf-controls flex shrink-0 items-center gap-1.5" hidden>
+      <span class="hf-dot bg-green inline-block h-1.5 w-1.5 rounded-full" aria-hidden="true"></span>
+      <button type="button" class="hf-btn" data-act="toggle" aria-label="pause animation" title="pause (or click the animation)">
+        <svg class="hf-ico-pause" viewBox="0 0 10 10" aria-hidden="true"><rect x="2" y="1.5" width="2" height="7" /><rect x="6" y="1.5" width="2" height="7" /></svg>
+        <svg class="hf-ico-play" viewBox="0 0 10 10" aria-hidden="true"><path d="M2.5 1.5 L8.5 5 L2.5 8.5 Z" /></svg>
+      </button>
+      <button type="button" class="hf-btn hf-speed" data-act="speed" aria-label="playback speed 1×" title="playback speed">1×</button>
     </span>
   </div>
-  <div class="flex min-h-[168px] items-center justify-center overflow-x-auto px-4 py-6">
+  <div class="hf-stage flex min-h-[168px] items-center justify-center overflow-x-auto px-4 py-6">
     <slot />
+  </div>
+  <div class="hf-scrub flex items-center gap-3 px-4 pb-3 font-mono text-[0.68rem]" hidden>
+    <input type="range" min="0" max="1000" value="0" step="1" data-act="scrub" aria-label="animation position" />
+    <span class="hf-time text-muted w-[7ch] text-right tabular-nums">0.0s</span>
   </div>
   <figcaption class="border-line text-muted border-t px-4 py-2 font-mono text-[0.72rem]">
     {caption}
@@ -33,10 +45,15 @@ const { label, caption } = Astro.props;
 </figure>
 
 <style>
-  .hero-dot {
-    animation: hero-pulse 1.6s ease-in-out infinite;
+  .hf-dot {
+    animation: hf-pulse 1.6s ease-in-out infinite;
   }
-  @keyframes hero-pulse {
+  [data-state='paused'] .hf-dot {
+    animation: none;
+    opacity: 0.35;
+    background: var(--color-muted);
+  }
+  @keyframes hf-pulse {
     0%,
     100% {
       opacity: 0.25;
@@ -45,9 +62,177 @@ const { label, caption } = Astro.props;
       opacity: 1;
     }
   }
+
+  .hf-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 26px;
+    height: 20px;
+    padding: 0 5px;
+    border: 1px solid var(--color-line);
+    border-radius: 4px;
+    background: var(--color-panel2);
+    color: var(--color-muted);
+    font: inherit;
+    cursor: pointer;
+  }
+  .hf-btn:hover {
+    color: var(--color-ink);
+    border-color: var(--color-muted);
+  }
+  .hf-btn svg {
+    width: 10px;
+    height: 10px;
+    fill: currentColor;
+  }
+  .hf-ico-play,
+  [data-state='paused'] .hf-ico-pause {
+    display: none;
+  }
+  [data-state='paused'] .hf-ico-play {
+    display: block;
+  }
+
+  [data-hero-ready] .hf-stage {
+    cursor: pointer;
+  }
+
+  .hf-scrub input {
+    flex: 1;
+    min-width: 0;
+    height: 14px;
+    margin: 0;
+    appearance: none;
+    background: transparent;
+    cursor: pointer;
+  }
+  .hf-scrub input::-webkit-slider-runnable-track {
+    height: 3px;
+    border-radius: 2px;
+    background: linear-gradient(var(--color-muted), var(--color-muted)) 0 / var(--p, 0%) 100% no-repeat,
+      var(--color-line);
+  }
+  .hf-scrub input::-moz-range-track {
+    height: 3px;
+    border-radius: 2px;
+    background: var(--color-line);
+  }
+  .hf-scrub input::-moz-range-progress {
+    height: 3px;
+    border-radius: 2px;
+    background: var(--color-muted);
+  }
+  .hf-scrub input::-webkit-slider-thumb {
+    appearance: none;
+    width: 10px;
+    height: 10px;
+    margin-top: -3.5px;
+    border-radius: 50%;
+    background: var(--color-ink);
+  }
+  .hf-scrub input::-moz-range-thumb {
+    width: 10px;
+    height: 10px;
+    border: 0;
+    border-radius: 50%;
+    background: var(--color-ink);
+  }
+
   @media (prefers-reduced-motion: reduce) {
-    .hero-live {
-      visibility: hidden;
+    .hf-controls,
+    .hf-scrub {
+      display: none !important;
     }
   }
 </style>
+
+<script>
+  const SPEEDS = [0.5, 1, 2];
+
+  function setup(figure: HTMLElement) {
+    if (matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+    const stage = figure.querySelector<HTMLElement>('.hf-stage')!;
+    const anims = stage.getAnimations({ subtree: true });
+    if (!anims.length) return;
+
+    const loop = Math.max(...anims.map((a) => Number(a.effect?.getComputedTiming().duration) || 0));
+    const ref = anims.find((a) => Number(a.effect?.getComputedTiming().duration) === loop)!;
+    const controls = figure.querySelector<HTMLElement>('.hf-controls')!;
+    const scrubRow = figure.querySelector<HTMLElement>('.hf-scrub')!;
+    const toggle = figure.querySelector<HTMLButtonElement>('[data-act="toggle"]')!;
+    const speedBtn = figure.querySelector<HTMLButtonElement>('[data-act="speed"]')!;
+    const scrub = figure.querySelector<HTMLInputElement>('[data-act="scrub"]')!;
+    const time = figure.querySelector<HTMLElement>('.hf-time')!;
+
+    let wantPlaying = true;
+    let visible = true;
+    let speed = 1;
+    let frame = 0;
+
+    const position = () => ((Number(ref.currentTime) % loop) + loop) % loop;
+
+    const paint = () => {
+      const t = position();
+      scrub.value = String(Math.round((t / loop) * 1000));
+      scrub.style.setProperty('--p', `${(t / loop) * 100}%`);
+      time.textContent = `${(t / 1000).toFixed(1)}s`;
+    };
+
+    const tick = () => {
+      paint();
+      frame = requestAnimationFrame(tick);
+    };
+
+    const apply = () => {
+      const run = wantPlaying && visible;
+      for (const a of anims) run ? a.play() : a.pause();
+      cancelAnimationFrame(frame);
+      if (run) frame = requestAnimationFrame(tick);
+      else paint();
+      figure.dataset.state = wantPlaying ? 'playing' : 'paused';
+      toggle.setAttribute('aria-label', wantPlaying ? 'pause animation' : 'play animation');
+      toggle.title = wantPlaying ? 'pause (or click the animation)' : 'play (or click the animation)';
+    };
+
+    const seek = (t: number) => {
+      for (const a of anims) a.currentTime = t;
+      paint();
+    };
+
+    toggle.addEventListener('click', () => {
+      wantPlaying = !wantPlaying;
+      apply();
+    });
+    stage.addEventListener('click', () => {
+      wantPlaying = !wantPlaying;
+      apply();
+    });
+    speedBtn.addEventListener('click', () => {
+      speed = SPEEDS[(SPEEDS.indexOf(speed) + 1) % SPEEDS.length];
+      for (const a of anims) a.updatePlaybackRate(speed);
+      speedBtn.textContent = `${speed}×`;
+      speedBtn.setAttribute('aria-label', `playback speed ${speed}×`);
+    });
+    scrub.addEventListener('input', () => {
+      const target = (Number(scrub.value) / 1000) * loop;
+      if (wantPlaying) {
+        wantPlaying = false;
+        apply();
+      }
+      seek(target);
+    });
+
+    new IntersectionObserver(([entry]) => {
+      visible = entry.isIntersecting;
+      apply();
+    }).observe(figure);
+
+    controls.hidden = false;
+    scrubRow.hidden = false;
+    figure.dataset.heroReady = '';
+    apply();
+  }
+
+  document.querySelectorAll<HTMLElement>('[data-hero]').forEach(setup);
+</script>
