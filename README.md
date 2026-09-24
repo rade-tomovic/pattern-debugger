@@ -1,5 +1,7 @@
 # // pattern debugger
 
+Built and maintained by [AMPQ](https://ampq.dev/).
+
 A static learning site for coding-interview algorithm patterns — step through every pattern
 like a debugger — and for the systems, networking and design material underneath them. All
 solution code in modern **C#**. On the pattern and systems tiers every snippet is
