@@ -1,0 +1,206 @@
+---
+import HeroFrame from '../HeroFrame.astro';
+
+/**
+ * Jump Game on nums = [3, 0, 1, 1, 4], the never-regret frontier. Frames are computed at build
+ * time by running CanJump itself, one frame per index the scan visits:
+ *   i = 0: 0 + 3 = 3, farthest 0 → 3
+ *   i = 1: 1 + 0 = 1, inside the frontier, farthest stays 3
+ *   i = 2: 2 + 1 = 3, farthest stays 3
+ *   i = 3: 3 + 1 = 4, farthest 3 → 4 ≥ last index → return true
+ * Frames 0..n-2 crossfade on one shared keyframe with negative delays; the last frame holds to the
+ * end of the loop. Un-animated styles show the last frame (reduced motion).
+ */
+const nums = [3, 0, 1, 1, 4];
+const last = nums.length - 1;
+
+type Step = { i: number; reach: number; before: number; farthest: number; done: boolean };
+const steps: Step[] = [];
+for (let i = 0, farthest = 0; i < nums.length; i++) {
+  if (i > farthest) break;
+  const before = farthest;
+  farthest = Math.max(farthest, i + nums[i]);
+  const done = farthest >= last;
+  steps.push({ i, reach: i + nums[i], before, farthest, done });
+  if (done) break;
+}
+
+const cx = (i: number) => 38 + i * 56;
+const arc = (from: number, to: number) => {
+  const x1 = cx(from) + 4;
+  const x2 = cx(to);
+  const h = 10 + (x2 - x1) * 0.14;
+  return `M ${x1} 36 C ${x1} ${36 - h} ${x2} ${36 - h} ${x2} 53`;
+};
+
+const slot = 0.22;
+const delay = (k: number) => `animation-delay: calc(var(--t) * ${(k * slot - 1).toFixed(4)})`;
+---
+
+<HeroFrame label={`jump game · [${nums.join(', ')}]`} caption="one running variable, never reconsidered: farthest only grows, and any index at or below it is reachable">
+  <div class="hero-greedy font-mono">
+    <div class="layers">
+      {
+        steps.map((s, k) => {
+          const final = k === steps.length - 1;
+          return (
+            <div class:list={['layer', final && 'final']} style={final ? undefined : delay(k)}>
+              <svg viewBox="0 0 300 150" role="img" aria-label={`i = ${s.i}, farthest = ${s.farthest}`}>
+                {s.reach > s.i && (
+                  <g class="jump">
+                    <path d={arc(s.i, s.reach)} />
+                    <polygon points={`${cx(s.reach)},60 ${cx(s.reach) - 4},52 ${cx(s.reach) + 4},52`} />
+                  </g>
+                )}
+                <g transform={`translate(${cx(s.i)} 46)`}>
+                  <rect class="badge" x="-9" y="-8" width="18" height="16" rx="4" />
+                  <text class="badge-t">i</text>
+                </g>
+                {nums.map((v, j) => (
+                  <g class:list={['cell', j <= s.farthest ? 'win' : 'out', s.done && j === last && 'goal']}>
+                    <rect x={cx(j) - 22} y="62" width="44" height="40" rx="7" />
+                    <text x={cx(j)} y="82">
+                      {v}
+                    </text>
+                  </g>
+                ))}
+                {nums.map((_, j) => (
+                  <text class="idx" x={cx(j)} y="114">
+                    {j}
+                  </text>
+                ))}
+                <g class="frontier">
+                  <line x1="16" y1="128" x2={cx(s.farthest) + 22} y2="128" />
+                  <line x1={cx(s.farthest) + 22} y1="122" x2={cx(s.farthest) + 22} y2="134" />
+                  <text x={cx(s.farthest) + 22} y="143">
+                    farthest = {s.farthest}
+                  </text>
+                </g>
+              </svg>
+              <p class="note">
+                {s.done ? (
+                  <>
+                    i = {s.i} · {s.i} + {nums[s.i]} = {s.reach} ≥ {last} · <b class="text-green">return true</b>
+                  </>
+                ) : s.farthest > s.before ? (
+                  <>
+                    i = {s.i} · {s.i} + {nums[s.i]} = {s.reach} · <b class="text-green">farthest {s.before} → {s.farthest}</b>
+                  </>
+                ) : (
+                  <>
+                    i = {s.i} · {s.i} + {nums[s.i]} = {s.reach} · <b class="text-ink">farthest stays {s.farthest}</b>
+                  </>
+                )}
+              </p>
+            </div>
+          );
+        })
+      }
+    </div>
+  </div>
+</HeroFrame>
+
+<style is:inline>
+  .hero-greedy {
+    --t: 12s;
+    width: 100%;
+    max-width: 380px;
+    animation: greedy-stage var(--t) linear infinite both;
+  }
+  .hero-greedy .layers {
+    display: grid;
+  }
+  .hero-greedy .layer {
+    grid-area: 1 / 1;
+    opacity: 0;
+    animation: greedy-frame var(--t) linear infinite both;
+  }
+  .hero-greedy .layer.final {
+    opacity: 1;
+    animation: greedy-final var(--t) linear infinite both;
+  }
+  .hero-greedy svg {
+    display: block;
+    width: 100%;
+    height: auto;
+    overflow: visible;
+  }
+  .hero-greedy text {
+    font-family: var(--font-mono);
+    font-size: 14px;
+    fill: var(--color-ink);
+    text-anchor: middle;
+    dominant-baseline: central;
+  }
+  .hero-greedy .idx {
+    fill: var(--color-muted);
+    font-size: 10px;
+  }
+  .hero-greedy .badge {
+    fill: var(--color-amber);
+  }
+  .hero-greedy .badge-t {
+    fill: var(--color-bg);
+    font-size: 11px;
+    font-weight: 700;
+  }
+  .hero-greedy .jump path {
+    fill: none;
+    stroke: var(--color-amber);
+    stroke-width: 1.5;
+    stroke-dasharray: 4 3;
+  }
+  .hero-greedy .jump polygon {
+    fill: var(--color-amber);
+  }
+  .hero-greedy .cell rect {
+    fill: var(--color-panel2);
+    stroke: var(--color-line);
+    stroke-width: 1.5;
+  }
+  .hero-greedy .cell.win rect {
+    fill: var(--color-win-dim);
+    stroke: var(--color-green);
+  }
+  .hero-greedy .cell.goal rect {
+    fill: var(--color-green-dim);
+    stroke-width: 2.5;
+  }
+  .hero-greedy .cell.out {
+    opacity: 0.35;
+  }
+  .hero-greedy .frontier line {
+    stroke: var(--color-green);
+    stroke-width: 2;
+  }
+  .hero-greedy .frontier text {
+    fill: var(--color-green);
+    font-size: 10px;
+    text-anchor: end;
+  }
+  .hero-greedy .note {
+    margin: 8px 0 0;
+    color: var(--color-muted);
+    font-size: 0.76rem;
+    text-align: center;
+  }
+  .hero-greedy .note b {
+    font-weight: 600;
+  }
+
+  /* timeline: i = 0 at 0-22 · i = 1 at 22-44 · i = 2 at 44-66 · i = 3 (final) 66-100 · fade 95-100 */
+  @keyframes greedy-stage {
+    0% { opacity: 0; }
+    3%, 95% { opacity: 1; }
+    99%, 100% { opacity: 0; }
+  }
+  @keyframes greedy-frame {
+    0% { opacity: 0; }
+    2%, 20% { opacity: 1; }
+    22%, 100% { opacity: 0; }
+  }
+  @keyframes greedy-final {
+    0%, 66% { opacity: 0; }
+    68%, 100% { opacity: 1; }
+  }
+</style>

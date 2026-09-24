@@ -1,0 +1,351 @@
+---
+import HeroFrame from '../HeroFrame.astro';
+
+/**
+ * The page's Raft write path, three voters, leader in term 4:
+ *   client write X=5 → leader appends log[7] = {term: 4, X=5} locally, not yet committed
+ *   AppendEntries(7) to both followers; A appends and acks. The hero delays B's copy on purpose
+ *   (the page's diagram has B ack early) to show that the commit does not wait for B
+ *   leader + A = majority of 3 → log[7] COMMITTED → applied, client gets "ok"
+ *   B appends and acks later; the next heartbeat carries commit = 7 to both followers
+ * A follower's log[7] cell stays amber (appended, commit not yet known) until that heartbeat
+ * reaches it; green on a follower means it has learned commit = 7. The leader's cell turns
+ * green at the commit itself. Majority is floor(N / 2) + 1, computed below. Un-animated styles
+ * are the final frame (reduced motion): log[7] committed and known on all three, client answered.
+ */
+const voters = 3;
+const majority = Math.floor(voters / 2) + 1;
+const entry = 7;
+const nodes = [
+  { cls: 'leader', name: 'leader · term 4', x: 100, y: 10 },
+  { cls: 'fa', name: 'follower A', x: 16, y: 122 },
+  { cls: 'fb', name: 'follower B', x: 184, y: 122 },
+];
+const cellX = (x: number, k: number) => x + 14 + k * 32;
+---
+
+<HeroFrame label={`raft · commit log[${entry}]`} caption="an entry commits the moment a majority has it durably appended; the leader never waits for the slowest follower">
+  <div class="hero-consensus">
+    <svg viewBox="0 0 320 180" role="img" aria-label={`the leader appends log[${entry}], follower A acks first, and ${majority} of ${voters} commits it before follower B catches up`}>
+      <circle class="client" cx="26" cy="35" r="14" />
+      <text class="cn" x="26" y="35">C</text>
+      <line class="wire" x1="40" y1="35" x2="100" y2="35" />
+      <text class="op op-write" x="70" y="25">X=5</text>
+      <text class="op op-ok" x="70" y="46">ok</text>
+
+      <line class="wire" x1="130" y1="60" x2="76" y2="122" />
+      <line class="wire" x1="190" y1="60" x2="244" y2="122" />
+
+      {
+        nodes.map((n) => (
+          <g class={n.cls}>
+            <rect class="node" x={n.x} y={n.y} width="120" height="50" rx="6" />
+            <text class="nm" x={n.x + 60} y={n.y + 12}>{n.name}</text>
+            {[entry - 2, entry - 1].map((idx, k) => (
+              <>
+                <rect class="cell" x={cellX(n.x, k)} y={n.y + 22} width="28" height="20" rx="4" />
+                <text class="ci" x={cellX(n.x, k) + 14} y={n.y + 32}>{idx}</text>
+              </>
+            ))}
+            <rect class="cell slot" x={cellX(n.x, 2)} y={n.y + 22} width="28" height="20" rx="4" />
+            <g class="e7">
+              <rect class="cell new" x={cellX(n.x, 2)} y={n.y + 22} width="28" height="20" rx="4" />
+              <text class="ci new-t" x={cellX(n.x, 2) + 14} y={n.y + 32}>{entry}</text>
+            </g>
+          </g>
+        ))
+      }
+      <text class="cm cm6" x="228" y="28">commit = {entry - 1}</text>
+      <text class="cm cm7" x="228" y="28">commit = {entry}</text>
+      <text class="sub" x="228" y="44">{majority} of {voters} needed</text>
+
+      <circle class="pk pk-write" r="4" />
+      <circle class="pk pk-ok" r="4" />
+      <circle class="pk pk-ae-a" r="4" />
+      <circle class="pk pk-ack-a" r="4" />
+      <circle class="pk pk-ae-b" r="4" />
+      <circle class="pk pk-ack-b" r="4" />
+      <circle class="pk pk-hb pk-hb-a" r="4" />
+      <circle class="pk pk-hb pk-hb-b" r="4" />
+    </svg>
+    <div class="readout font-mono">
+      <span class="r r1">leader appends log[{entry}] = X=5 · <b class="text-amber">not committed yet</b></span>
+      <span class="r r2">AppendEntries({entry}) · <b class="text-amber">A acks, B still behind</b></span>
+      <span class="r r3">leader + A = {majority} of {voters} · <b class="text-green">committed, client gets ok</b></span>
+      <span class="r r4">B catches up later · <b class="text-green">the commit never waited for it</b></span>
+      <span class="r r5">next heartbeat carries commit = {entry} · <b class="text-green">A and B learn log[{entry}] is committed</b></span>
+    </div>
+  </div>
+</HeroFrame>
+
+<style is:inline>
+  .hero-consensus {
+    --t: 13s;
+    width: 100%;
+    max-width: 380px;
+    animation: consensus-stage var(--t) linear infinite both;
+  }
+  .hero-consensus svg {
+    display: block;
+    width: 100%;
+    height: auto;
+    overflow: visible;
+  }
+  .hero-consensus text {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    fill: var(--color-ink);
+    text-anchor: middle;
+    dominant-baseline: central;
+  }
+  .hero-consensus .client {
+    fill: var(--color-panel2);
+    stroke: var(--color-muted);
+    stroke-width: 1.5;
+  }
+  .hero-consensus .wire {
+    stroke: var(--color-line);
+    stroke-width: 1.5;
+  }
+  .hero-consensus .op {
+    font-size: 9.5px;
+  }
+  .hero-consensus .op-write {
+    fill: var(--color-amber);
+  }
+  .hero-consensus .op-ok {
+    fill: var(--color-green);
+    font-weight: 600;
+  }
+  .hero-consensus .node {
+    fill: var(--color-panel2);
+    stroke: var(--color-line);
+    stroke-width: 1.5;
+  }
+  .hero-consensus .leader .node {
+    stroke: var(--color-amber);
+  }
+  .hero-consensus .nm {
+    fill: var(--color-muted);
+    font-size: 10px;
+  }
+  .hero-consensus .cell {
+    fill: var(--color-panel);
+    stroke: var(--color-line);
+  }
+  .hero-consensus .ci {
+    fill: var(--color-muted);
+    font-size: 10px;
+  }
+  .hero-consensus .slot {
+    fill: none;
+    stroke-dasharray: 3 3;
+  }
+  .hero-consensus .cell.new {
+    fill: var(--color-green-dim);
+    stroke: var(--color-green);
+    stroke-width: 1.5;
+  }
+  .hero-consensus .ci.new-t {
+    fill: var(--color-green);
+    font-weight: 600;
+  }
+  .hero-consensus .cm {
+    text-anchor: start;
+    font-size: 10px;
+  }
+  .hero-consensus .cm6 {
+    fill: var(--color-muted);
+    opacity: 0;
+  }
+  .hero-consensus .cm7 {
+    fill: var(--color-green);
+  }
+  .hero-consensus .sub {
+    text-anchor: start;
+    font-size: 9px;
+    fill: var(--color-muted);
+  }
+  .hero-consensus .pk {
+    opacity: 0;
+  }
+  .hero-consensus .pk-write,
+  .hero-consensus .pk-ae-a,
+  .hero-consensus .pk-ae-b,
+  .hero-consensus .pk-hb {
+    fill: var(--color-amber);
+  }
+  .hero-consensus .pk-ack-a,
+  .hero-consensus .pk-ack-b,
+  .hero-consensus .pk-ok {
+    fill: var(--color-green);
+  }
+
+  .hero-consensus .op-write { animation: consensus-op-write var(--t) linear infinite both; }
+  .hero-consensus .op-ok { animation: consensus-op-ok var(--t) linear infinite both; }
+  .hero-consensus .leader .e7 { animation: consensus-e7-leader var(--t) linear infinite both; }
+  .hero-consensus .fa .e7 { animation: consensus-e7-a var(--t) linear infinite both; }
+  .hero-consensus .fb .e7 { animation: consensus-e7-b var(--t) linear infinite both; }
+  .hero-consensus .leader .new { animation: consensus-cell-quorum var(--t) linear infinite both; }
+  .hero-consensus .leader .new-t { animation: consensus-text-quorum var(--t) linear infinite both; }
+  .hero-consensus .fa .new,
+  .hero-consensus .fb .new { animation: consensus-cell-learn var(--t) linear infinite both; }
+  .hero-consensus .fa .new-t,
+  .hero-consensus .fb .new-t { animation: consensus-text-learn var(--t) linear infinite both; }
+  .hero-consensus .cm6 { animation: consensus-cm6 var(--t) linear infinite both; }
+  .hero-consensus .cm7 { animation: consensus-cm7 var(--t) linear infinite both; }
+  .hero-consensus .pk-write { animation: consensus-pk-write var(--t) linear infinite both; }
+  .hero-consensus .pk-ae-a { animation: consensus-pk-ae-a var(--t) linear infinite both; }
+  .hero-consensus .pk-ack-a { animation: consensus-pk-ack-a var(--t) linear infinite both; }
+  .hero-consensus .pk-ae-b { animation: consensus-pk-ae-b var(--t) linear infinite both; }
+  .hero-consensus .pk-ok { animation: consensus-pk-ok var(--t) linear infinite both; }
+  .hero-consensus .pk-ack-b { animation: consensus-pk-ack-b var(--t) linear infinite both; }
+  .hero-consensus .pk-hb-a { animation: consensus-pk-hb-a var(--t) linear infinite both; }
+  .hero-consensus .pk-hb-b { animation: consensus-pk-hb-b var(--t) linear infinite both; }
+
+  .hero-consensus .readout {
+    display: grid;
+    margin-top: 10px;
+    font-size: 0.76rem;
+    text-align: center;
+  }
+  .hero-consensus .readout b {
+    font-weight: 600;
+    white-space: nowrap;
+  }
+  .hero-consensus .r {
+    grid-area: 1 / 1;
+    opacity: 0;
+  }
+  .hero-consensus .r5 { opacity: 1; }
+  .hero-consensus .r1 { animation: consensus-r1 var(--t) linear infinite both; }
+  .hero-consensus .r2 { animation: consensus-r2 var(--t) linear infinite both; }
+  .hero-consensus .r3 { animation: consensus-r3 var(--t) linear infinite both; }
+  .hero-consensus .r4 { animation: consensus-r4 var(--t) linear infinite both; }
+  .hero-consensus .r5 { animation: consensus-r5 var(--t) linear infinite both; }
+
+  /* timeline: append 0-18 · replicate 18-42 · commit 42-64 · B catches up 64-74 · heartbeat, followers learn 74-94 · fade 94-100 */
+  @keyframes consensus-stage {
+    0% { opacity: 0; }
+    3%, 95% { opacity: 1; }
+    99%, 100% { opacity: 0; }
+  }
+
+  @keyframes consensus-pk-write {
+    0%, 3% { opacity: 0; transform: translate(40px, 35px); }
+    4% { opacity: 1; transform: translate(40px, 35px); }
+    9% { opacity: 1; transform: translate(100px, 35px); }
+    10%, 100% { opacity: 0; transform: translate(100px, 35px); }
+  }
+  @keyframes consensus-pk-ae-a {
+    0%, 19% { opacity: 0; transform: translate(130px, 60px); }
+    20% { opacity: 1; transform: translate(130px, 60px); }
+    27% { opacity: 1; transform: translate(76px, 122px); }
+    28%, 100% { opacity: 0; transform: translate(76px, 122px); }
+  }
+  @keyframes consensus-pk-ack-a {
+    0%, 30% { opacity: 0; transform: translate(76px, 122px); }
+    31% { opacity: 1; transform: translate(76px, 122px); }
+    39% { opacity: 1; transform: translate(130px, 60px); }
+    40%, 100% { opacity: 0; transform: translate(130px, 60px); }
+  }
+  @keyframes consensus-pk-ae-b {
+    0%, 19% { opacity: 0; transform: translate(190px, 60px); }
+    20% { opacity: 1; transform: translate(190px, 60px); }
+    63% { opacity: 1; transform: translate(244px, 122px); }
+    64%, 100% { opacity: 0; transform: translate(244px, 122px); }
+  }
+  @keyframes consensus-pk-ok {
+    0%, 44% { opacity: 0; transform: translate(100px, 35px); }
+    45% { opacity: 1; transform: translate(100px, 35px); }
+    51% { opacity: 1; transform: translate(40px, 35px); }
+    52%, 100% { opacity: 0; transform: translate(40px, 35px); }
+  }
+  @keyframes consensus-pk-ack-b {
+    0%, 65% { opacity: 0; transform: translate(244px, 122px); }
+    66% { opacity: 1; transform: translate(244px, 122px); }
+    72% { opacity: 1; transform: translate(190px, 60px); }
+    73%, 100% { opacity: 0; transform: translate(190px, 60px); }
+  }
+  @keyframes consensus-pk-hb-a {
+    0%, 74% { opacity: 0; transform: translate(130px, 60px); }
+    75% { opacity: 1; transform: translate(130px, 60px); }
+    81% { opacity: 1; transform: translate(76px, 122px); }
+    82%, 100% { opacity: 0; transform: translate(76px, 122px); }
+  }
+  @keyframes consensus-pk-hb-b {
+    0%, 74% { opacity: 0; transform: translate(190px, 60px); }
+    75% { opacity: 1; transform: translate(190px, 60px); }
+    81% { opacity: 1; transform: translate(244px, 122px); }
+    82%, 100% { opacity: 0; transform: translate(244px, 122px); }
+  }
+
+  @keyframes consensus-op-write {
+    0%, 3% { opacity: 0; }
+    5%, 100% { opacity: 1; }
+  }
+  @keyframes consensus-op-ok {
+    0%, 50% { opacity: 0; }
+    52%, 100% { opacity: 1; }
+  }
+  @keyframes consensus-e7-leader {
+    0%, 9% { opacity: 0; }
+    11%, 100% { opacity: 1; }
+  }
+  @keyframes consensus-e7-a {
+    0%, 27% { opacity: 0; }
+    29%, 100% { opacity: 1; }
+  }
+  @keyframes consensus-e7-b {
+    0%, 63% { opacity: 0; }
+    65%, 100% { opacity: 1; }
+  }
+  @keyframes consensus-cell-quorum {
+    0%, 41% { fill: var(--color-panel); stroke: var(--color-amber); stroke-dasharray: 3 2; }
+    43%, 100% { fill: var(--color-green-dim); stroke: var(--color-green); stroke-dasharray: none; }
+  }
+  @keyframes consensus-text-quorum {
+    0%, 41% { fill: var(--color-amber); }
+    43%, 100% { fill: var(--color-green); }
+  }
+  @keyframes consensus-cell-learn {
+    0%, 81% { fill: var(--color-panel); stroke: var(--color-amber); stroke-dasharray: 3 2; }
+    83%, 100% { fill: var(--color-green-dim); stroke: var(--color-green); stroke-dasharray: none; }
+  }
+  @keyframes consensus-text-learn {
+    0%, 81% { fill: var(--color-amber); }
+    83%, 100% { fill: var(--color-green); }
+  }
+  @keyframes consensus-cm6 {
+    0%, 41% { opacity: 1; }
+    43%, 100% { opacity: 0; }
+  }
+  @keyframes consensus-cm7 {
+    0%, 41% { opacity: 0; }
+    43%, 100% { opacity: 1; }
+  }
+
+  @keyframes consensus-r1 {
+    0%, 17% { opacity: 1; }
+    19%, 100% { opacity: 0; }
+  }
+  @keyframes consensus-r2 {
+    0%, 19% { opacity: 0; }
+    21%, 41% { opacity: 1; }
+    43%, 100% { opacity: 0; }
+  }
+  @keyframes consensus-r3 {
+    0%, 43% { opacity: 0; }
+    45%, 63% { opacity: 1; }
+    65%, 100% { opacity: 0; }
+  }
+  @keyframes consensus-r4 {
+    0%, 65% { opacity: 0; }
+    67%, 79% { opacity: 1; }
+    81%, 100% { opacity: 0; }
+  }
+  @keyframes consensus-r5 {
+    0%, 81% { opacity: 0; }
+    83%, 100% { opacity: 1; }
+  }
+</style>

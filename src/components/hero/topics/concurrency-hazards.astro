@@ -1,0 +1,291 @@
+---
+import HeroFrame from '../HeroFrame.astro';
+
+/**
+ * Check-then-act with atomic parts, the page's shape 2: capacity 1, seats = 0, and both threads run
+ *   if (Volatile.Read(ref seats) < 1) { Interlocked.Increment(ref seats); Interlocked.Increment(ref admitted); }
+ * The interleaving below is executed here at build time against that exact body:
+ *   A checks: reads 0, 0 < 1 passes
+ *   B checks: reads 0, 0 < 1 passes, because A has not acted yet
+ *   A acts: seats = 1, admitted = 1
+ *   B acts on its stale check: seats = 2, admitted = 2, one seat sold twice
+ * Every access is atomic; the span from A's check to A's act is not, and B lands inside it.
+ * Un-animated styles are the final frame (reduced motion).
+ */
+const capacity = 1;
+const schedule: ['A' | 'B', 'check' | 'act'][] = [
+  ['A', 'check'],
+  ['B', 'check'],
+  ['A', 'act'],
+  ['B', 'act'],
+];
+
+let seats = 0;
+let admitted = 0;
+const passed: Record<string, boolean> = {};
+const steps = schedule.map(([thread, op]) => {
+  if (op === 'check') {
+    const read = seats;
+    passed[thread] = read < capacity;
+    return { thread, op, top: 'check', bottom: `${read} < ${capacity} ${passed[thread] ? '✓' : '✗'}`, seats, admitted };
+  }
+  if (passed[thread]) {
+    seats++;
+    admitted++;
+  }
+  return { thread, op, top: 'act', bottom: `seats=${seats}`, seats, admitted };
+});
+const oversold = admitted > capacity;
+const final = steps[steps.length - 1];
+const afterFirstAct = steps[2];
+
+const colX = (k: number) => 66 + k * 72;
+const laneY = { A: 44, B: 94 };
+const aCheck = schedule.findIndex(([t, o]) => t === 'A' && o === 'check');
+const aAct = schedule.findIndex(([t, o]) => t === 'A' && o === 'act');
+const band = { x: colX(aCheck) - 36, w: colX(aAct) - colX(aCheck) + 72 };
+---
+
+<HeroFrame label={`check-then-act · capacity ${capacity}, threads A and B`} caption="the unit that must be indivisible is the span from check to act, not each access inside it">
+  <div class="hero-concurrency-hazards">
+    <svg viewBox="0 0 340 204" role="img" aria-label="threads A and B both check that a seat is free before either one takes it, so both take it and the seat is sold twice">
+      <g class="band">
+        <rect x={band.x} y="20" width={band.w} height="100" rx="6" />
+        <text x={band.x + band.w / 2} y="10">A: check → act is not one step</text>
+      </g>
+
+      {
+        (['A', 'B'] as const).map((t) => (
+          <>
+            <line class="lane" x1="30" y1={laneY[t]} x2="334" y2={laneY[t]} />
+            <text class="tn" x="14" y={laneY[t]}>{t}</text>
+          </>
+        ))
+      }
+      <line class="axis" x1="30" y1="132" x2="326" y2="132" />
+      <polygon class="axis-head" points="334,132 326,128 326,136" />
+      <text class="cap" x="30" y="143">time</text>
+
+      {
+        steps.map((s, k) => (
+          <g class={`op s${k + 1} ${s.op}${s.op === 'act' && oversold && k === steps.length - 1 ? ' bad' : ''}`} transform={`translate(${colX(k)} ${laneY[s.thread]})`}>
+            <rect x="-32" y="-18" width="64" height="36" rx="6" />
+            <text class="top" y="-7">{s.top}</text>
+            <text class="bot" y="8">{s.bottom}</text>
+          </g>
+        ))
+      }
+
+      <text class="lbl" x="12" y="176">seats</text>
+      <rect class="cell" x="54" y="160" width="44" height="32" rx="6" />
+      <text class="val u0" x="76" y="176">0</text>
+      <text class="val u1" x="76" y="176">{afterFirstAct.seats}</text>
+      <text class="val u2" x="76" y="176">{final.seats}</text>
+
+      <text class="lbl" x="114" y="176">admitted</text>
+      <rect class="cell" x="174" y="160" width="44" height="32" rx="6" />
+      <text class="val u0" x="196" y="176">0</text>
+      <text class="val u1" x="196" y="176">{afterFirstAct.admitted}</text>
+      <text class="val u2" x="196" y="176">{final.admitted}</text>
+
+      <text class="cap" x="240" y="176">capacity {capacity}</text>
+    </svg>
+    <div class="readout font-mono">
+      <span class="r r1">A: Volatile.Read(seats) = {steps[0].seats} · <b class="text-cyan">check passes</b></span>
+      <span class="r r2">A has not acted yet · <b class="text-cyan">B's check passes too</b></span>
+      <span class="r r3">A: Interlocked.Increment · <b class="text-amber">seats = {afterFirstAct.seats}</b></span>
+      <span class="r r4">B acts on a stale check · <b class="text-red">seats = {final.seats}, sold twice</b></span>
+      <span class="r r5">no data race here · <b class="text-red">still a race condition</b></span>
+    </div>
+  </div>
+</HeroFrame>
+
+<style is:inline>
+  .hero-concurrency-hazards {
+    --t: 13s;
+    width: 100%;
+    max-width: 380px;
+    animation: concurrency-hazards-stage var(--t) linear infinite both;
+  }
+  .hero-concurrency-hazards svg {
+    display: block;
+    width: 100%;
+    height: auto;
+    overflow: visible;
+  }
+  .hero-concurrency-hazards text {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    fill: var(--color-ink);
+    text-anchor: middle;
+    dominant-baseline: central;
+  }
+  .hero-concurrency-hazards .cap,
+  .hero-concurrency-hazards .lbl {
+    fill: var(--color-muted);
+    font-size: 10px;
+  }
+  .hero-concurrency-hazards .cap,
+  .hero-concurrency-hazards .lbl {
+    text-anchor: start;
+  }
+  .hero-concurrency-hazards .tn {
+    font-size: 12px;
+  }
+  .hero-concurrency-hazards .lane {
+    stroke: var(--color-line);
+    stroke-width: 1;
+    stroke-dasharray: 2 4;
+  }
+  .hero-concurrency-hazards .axis {
+    stroke: var(--color-line);
+    stroke-width: 1.5;
+  }
+  .hero-concurrency-hazards .axis-head {
+    fill: var(--color-line);
+  }
+  .hero-concurrency-hazards .band rect {
+    fill: var(--color-red-dim);
+    stroke: var(--color-red);
+    stroke-width: 1;
+    stroke-dasharray: 4 3;
+  }
+  .hero-concurrency-hazards .band text {
+    fill: var(--color-red);
+    font-size: 10px;
+  }
+  .hero-concurrency-hazards .op rect {
+    fill: var(--color-panel2);
+    stroke-width: 1.5;
+  }
+  .hero-concurrency-hazards .op .top {
+    fill: var(--color-muted);
+    font-size: 9px;
+  }
+  .hero-concurrency-hazards .op .bot {
+    font-size: 10px;
+  }
+  .hero-concurrency-hazards .op.check rect {
+    stroke: var(--color-cyan);
+  }
+  .hero-concurrency-hazards .op.act rect {
+    stroke: var(--color-amber);
+  }
+  .hero-concurrency-hazards .op.bad rect {
+    stroke: var(--color-red);
+    fill: var(--color-red-dim);
+  }
+  .hero-concurrency-hazards .op.bad .bot {
+    fill: var(--color-red);
+  }
+  .hero-concurrency-hazards .cell {
+    stroke: var(--color-red);
+    fill: var(--color-red-dim);
+    stroke-width: 1.5;
+  }
+  .hero-concurrency-hazards .val {
+    font-size: 15px;
+  }
+  .hero-concurrency-hazards .u0,
+  .hero-concurrency-hazards .u1 {
+    opacity: 0;
+  }
+
+  .hero-concurrency-hazards .s1 { animation: concurrency-hazards-in1 var(--t) linear infinite both; }
+  .hero-concurrency-hazards .s2 { animation: concurrency-hazards-in2 var(--t) linear infinite both; }
+  .hero-concurrency-hazards .s3 { animation: concurrency-hazards-in3 var(--t) linear infinite both; }
+  .hero-concurrency-hazards .s4 { animation: concurrency-hazards-in4 var(--t) linear infinite both; }
+  .hero-concurrency-hazards .band { animation: concurrency-hazards-band var(--t) linear infinite both; }
+  .hero-concurrency-hazards .u0 { animation: concurrency-hazards-u0 var(--t) linear infinite both; }
+  .hero-concurrency-hazards .u1 { animation: concurrency-hazards-u1 var(--t) linear infinite both; }
+  .hero-concurrency-hazards .u2 { animation: concurrency-hazards-u2 var(--t) linear infinite both; }
+  .hero-concurrency-hazards .cell { animation: concurrency-hazards-cell var(--t) linear infinite both; }
+
+  .hero-concurrency-hazards .readout {
+    display: grid;
+    margin-top: 12px;
+    font-size: 0.76rem;
+    text-align: center;
+  }
+  .hero-concurrency-hazards .readout b {
+    font-weight: 600;
+  }
+  .hero-concurrency-hazards .r {
+    grid-area: 1 / 1;
+    opacity: 0;
+  }
+  .hero-concurrency-hazards .r5 { opacity: 1; }
+  .hero-concurrency-hazards .r1 { animation: concurrency-hazards-r1 var(--t) linear infinite both; }
+  .hero-concurrency-hazards .r2 { animation: concurrency-hazards-r2 var(--t) linear infinite both; }
+  .hero-concurrency-hazards .r3 { animation: concurrency-hazards-r3 var(--t) linear infinite both; }
+  .hero-concurrency-hazards .r4 { animation: concurrency-hazards-r4 var(--t) linear infinite both; }
+  .hero-concurrency-hazards .r5 { animation: concurrency-hazards-r5 var(--t) linear infinite both; }
+
+  @keyframes concurrency-hazards-stage {
+    0% { opacity: 0; }
+    3%, 95% { opacity: 1; }
+    99%, 100% { opacity: 0; }
+  }
+  @keyframes concurrency-hazards-in1 {
+    0%, 4% { opacity: 0; }
+    7%, 100% { opacity: 1; }
+  }
+  @keyframes concurrency-hazards-in2 {
+    0%, 22% { opacity: 0; }
+    25%, 100% { opacity: 1; }
+  }
+  @keyframes concurrency-hazards-in3 {
+    0%, 40% { opacity: 0; }
+    43%, 100% { opacity: 1; }
+  }
+  @keyframes concurrency-hazards-in4 {
+    0%, 58% { opacity: 0; }
+    61%, 100% { opacity: 1; }
+  }
+  @keyframes concurrency-hazards-band {
+    0%, 26% { opacity: 0; }
+    30%, 100% { opacity: 1; }
+  }
+  @keyframes concurrency-hazards-u0 {
+    0%, 42% { opacity: 1; }
+    43%, 100% { opacity: 0; }
+  }
+  @keyframes concurrency-hazards-u1 {
+    0%, 42% { opacity: 0; }
+    43%, 60% { opacity: 1; }
+    61%, 100% { opacity: 0; }
+  }
+  @keyframes concurrency-hazards-u2 {
+    0%, 60% { opacity: 0; }
+    61%, 100% { opacity: 1; }
+  }
+  @keyframes concurrency-hazards-cell {
+    0%, 41% { stroke: var(--color-line); fill: var(--color-panel2); }
+    43%, 58% { stroke: var(--color-amber); fill: var(--color-panel2); }
+    61%, 100% { stroke: var(--color-red); fill: var(--color-red-dim); }
+  }
+
+  @keyframes concurrency-hazards-r1 {
+    0%, 21% { opacity: 1; }
+    23%, 100% { opacity: 0; }
+  }
+  @keyframes concurrency-hazards-r2 {
+    0%, 22% { opacity: 0; }
+    24%, 39% { opacity: 1; }
+    41%, 100% { opacity: 0; }
+  }
+  @keyframes concurrency-hazards-r3 {
+    0%, 40% { opacity: 0; }
+    42%, 57% { opacity: 1; }
+    59%, 100% { opacity: 0; }
+  }
+  @keyframes concurrency-hazards-r4 {
+    0%, 58% { opacity: 0; }
+    60%, 75% { opacity: 1; }
+    77%, 100% { opacity: 0; }
+  }
+  @keyframes concurrency-hazards-r5 {
+    0%, 76% { opacity: 0; }
+    78%, 100% { opacity: 1; }
+  }
+</style>

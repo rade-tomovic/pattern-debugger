@@ -1,0 +1,53 @@
+---
+/**
+ * Frame for a topic's head illustration: a looping, CSS-only animation of the
+ * topic's core mechanism. TopicLayout renders `hero/topics/<topic-slug>.astro`
+ * when it exists; every hero wraps its stage in this frame.
+ *
+ * label:   mono header, the shape being animated (e.g. "opposite ends")
+ * caption: one line under the stage naming the invariant the motion shows
+ *
+ * Under prefers-reduced-motion the global rule disables animation, so a hero's
+ * un-animated styles must show the mechanism's final, meaningful state.
+ */
+interface Props {
+  label: string;
+  caption: string;
+}
+const { label, caption } = Astro.props;
+---
+
+<figure class="hero not-prose bg-panel border-line mt-6 max-w-[72ch] overflow-hidden rounded-xl border">
+  <div class="border-line flex items-center justify-between border-b px-4 py-2 font-mono text-[0.7rem]">
+    <span class="text-muted"><span class="text-line">trace&gt;</span> {label}</span>
+    <span class="hero-live text-muted flex items-center gap-1.5">
+      <span class="hero-dot bg-green inline-block h-1.5 w-1.5 rounded-full"></span>loop
+    </span>
+  </div>
+  <div class="flex min-h-[168px] items-center justify-center overflow-x-auto px-4 py-6">
+    <slot />
+  </div>
+  <figcaption class="border-line text-muted border-t px-4 py-2 font-mono text-[0.72rem]">
+    {caption}
+  </figcaption>
+</figure>
+
+<style>
+  .hero-dot {
+    animation: hero-pulse 1.6s ease-in-out infinite;
+  }
+  @keyframes hero-pulse {
+    0%,
+    100% {
+      opacity: 0.25;
+    }
+    50% {
+      opacity: 1;
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .hero-live {
+      visibility: hidden;
+    }
+  }
+</style>

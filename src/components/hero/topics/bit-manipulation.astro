@@ -1,0 +1,165 @@
+---
+import HeroFrame from '../HeroFrame.astro';
+
+/**
+ * Kernighan popcount on n = 180 (0b10110100). Frames are computed at build time by running
+ * the loop itself, then crossfaded: one frame per `n &= n - 1`, plus the final n == 0 frame.
+ * Un-animated styles show the final frame (reduced motion).
+ */
+const start = 180;
+const width = 8;
+const bits = (x: number) => x.toString(2).padStart(width, '0').split('');
+const lowestSetColumn = (x: number) => width - 1 - Math.log2(x & -x);
+
+const steps: { n: number; m: number; r: number; count: number; col: number }[] = [];
+for (let n = start, count = 0; n !== 0; n &= n - 1) {
+  count++;
+  steps.push({ n, m: n - 1, r: n & (n - 1), count, col: lowestSetColumn(n) });
+}
+const frames = steps.length + 1;
+const delay = (k: number) => `animation-delay: calc(var(--t) * ${(k / frames - 1).toFixed(4)})`;
+---
+
+<HeroFrame label={`popcount · n = ${start}`} caption="n − 1 flips the lowest set bit and every bit below it, so n & (n − 1) clears exactly that one bit">
+  <div class="hero-bit-manipulation font-mono" style={`--frames: ${frames}`}>
+    <div class="layers">
+      {
+        steps.map((s, k) => (
+          <div class="layer" style={delay(k)}>
+            <div class="row">
+              <span class="lbl">n</span>
+              {bits(s.n).map((b, c) => (
+                <span class:list={['bit', b === '1' ? 'one' : 'zero', c === s.col && 'target']}>{b}</span>
+              ))}
+              <span class="dec">{s.n}</span>
+            </div>
+            <div class="row">
+              <span class="lbl">n − 1</span>
+              {bits(s.m).map((b, c) => (
+                <span class:list={['bit', b === '1' ? 'one' : 'zero', c >= s.col && 'flip']}>{b}</span>
+              ))}
+              <span class="dec">{s.m}</span>
+            </div>
+            <div class="row">
+              <span class="lbl">n &amp; (n−1)</span>
+              {bits(s.r).map((b, c) => (
+                <span class:list={['bit', b === '1' ? 'one' : 'zero', c === s.col && 'cleared']}>{b}</span>
+              ))}
+              <span class="dec">{s.r}</span>
+            </div>
+            <p class="note">
+              clear bit {width - 1 - s.col} · <b class="text-green">count = {s.count}</b>
+            </p>
+          </div>
+        ))
+      }
+      <div class="layer final" style={delay(steps.length)}>
+        <div class="row">
+          <span class="lbl">n</span>
+          {bits(0).map((b) => <span class="bit zero">{b}</span>)}
+          <span class="dec">0</span>
+        </div>
+        <p class="note done">
+          n == 0 → stop · <b class="text-green">popcount({start}) = {steps.length}</b>, one pass per set bit
+        </p>
+      </div>
+    </div>
+  </div>
+</HeroFrame>
+
+<style is:inline>
+  .hero-bit-manipulation {
+    --t: calc(var(--frames) * 2.6s);
+    --bit: 24px;
+    font-size: 0.8rem;
+  }
+  .hero-bit-manipulation .layers {
+    display: grid;
+  }
+  .hero-bit-manipulation .layer {
+    grid-area: 1 / 1;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    gap: 6px;
+    opacity: 0;
+    animation: bit-manipulation-frame var(--t) linear infinite both;
+  }
+  .hero-bit-manipulation .layer.final {
+    opacity: 1;
+  }
+  .hero-bit-manipulation .row {
+    display: flex;
+    align-items: center;
+    gap: 3px;
+  }
+  .hero-bit-manipulation .lbl {
+    width: 78px;
+    color: var(--color-muted);
+    font-size: 0.72rem;
+    text-align: right;
+    padding-right: 8px;
+    white-space: nowrap;
+  }
+  .hero-bit-manipulation .dec {
+    width: 40px;
+    padding-left: 8px;
+    color: var(--color-muted);
+    font-size: 0.72rem;
+  }
+  .hero-bit-manipulation .bit {
+    width: var(--bit);
+    height: var(--bit);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border: 1px solid var(--color-line);
+    border-radius: 5px;
+    background: var(--color-panel2);
+  }
+  .hero-bit-manipulation .bit.zero {
+    color: var(--color-muted);
+  }
+  .hero-bit-manipulation .bit.target {
+    border-color: var(--color-red);
+  }
+  .hero-bit-manipulation .bit.flip {
+    border-color: var(--color-amber);
+  }
+  .hero-bit-manipulation .bit.cleared {
+    border-color: var(--color-red);
+    background: var(--color-red-dim);
+    color: var(--color-red);
+  }
+  .hero-bit-manipulation .note {
+    margin: 6px 0 0 86px;
+    color: var(--color-muted);
+    font-size: 0.75rem;
+  }
+  .hero-bit-manipulation .note.done {
+    margin-left: 0;
+    text-align: center;
+  }
+  .hero-bit-manipulation .note b {
+    font-weight: 600;
+  }
+
+  @keyframes bit-manipulation-frame {
+    0% { opacity: 0; }
+    3%, 17% { opacity: 1; }
+    20%, 100% { opacity: 0; }
+  }
+
+  @media (max-width: 420px) {
+    .hero-bit-manipulation .dec {
+      display: none;
+    }
+    .hero-bit-manipulation .lbl {
+      width: 64px;
+      font-size: 0.66rem;
+    }
+    .hero-bit-manipulation .note {
+      margin-left: 72px;
+    }
+  }
+</style>

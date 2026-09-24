@@ -1,0 +1,281 @@
+---
+import HeroFrame from '../HeroFrame.astro';
+
+/**
+ * Best-effort delivery, and the ends rebuilding what the network did not promise:
+ *   A chops a message into packets 1-4, each a numbered header plus a payload
+ *   1 crosses R1 straight to B; 2 is sent the longer way through R2 and waits there
+ *   R1's queue is full (three queued ticks) when 3 arrives, so 3 is discarded and nobody is told
+ *   the queue drains, 4 crosses R1 and reaches B before 2 leaves R2
+ *   B files each packet by its number, leaving a gap at 3
+ *   no acknowledgement for 3 comes back, A's timer fires, A sends 3 again
+ *   B holds 1 2 3 4 in order: ordering and delivery were rebuilt at the two ends
+ * Packets follow the drawn links: out of A at (64,72), into B at (276,72) or (276,134).
+ * Timeline (13s): chop 0-17 · drop 17-31 · reorder 31-46 · gap 46-58 · resend 58-74 · settled 74-94 · fade 94-100.
+ * Un-animated styles are the final frame (reduced motion): all four packets green at B.
+ */
+const slotY = [38, 72, 106, 140];
+const ax = 34;
+const bx = 306;
+const pkt = [1, 2, 3, 4];
+---
+
+<HeroFrame label="best effort · 4 packets" caption="the network may drop, delay or reorder anything; order and delivery are rebuilt at the two ends">
+  <div class="hero-network-basics">
+    <svg viewBox="0 0 340 176" role="img" aria-label="four numbered packets cross a network that drops packet 3 and delivers 4 before 2; host B files them by number and host A resends 3">
+      <text class="hd" x={ax} y="8">host A</text>
+      <text class="hd" x="170" y="8">the network</text>
+      <text class="hd" x={bx} y="8">host B</text>
+
+      <rect class="host" x="4" y="18" width="60" height="150" rx="6" />
+      <rect class="host" x="276" y="18" width="60" height="150" rx="6" />
+
+      <g class="links">
+        <line x1="64" y1="72" x2="110" y2="72" />
+        <line x1="150" y1="72" x2="276" y2="72" />
+        <line x1="142" y1="84" x2="198" y2="122" />
+        <line x1="230" y1="134" x2="276" y2="134" />
+      </g>
+      <rect class="router" x="110" y="60" width="40" height="24" rx="5" />
+      <g class="queue">
+        <rect x="115" y="65" width="8" height="14" rx="1.5" />
+        <rect x="126" y="65" width="8" height="14" rx="1.5" />
+        <rect x="137" y="65" width="8" height="14" rx="1.5" />
+      </g>
+      <text class="rl" x="130" y="50">R1</text>
+      <rect class="router" x="190" y="122" width="40" height="24" rx="5" />
+      <text class="rl" x="210" y="158">R2</text>
+
+      {
+        slotY.map((y, k) => (
+          <>
+            <rect class="slot" x={ax - 22} y={y - 10} width="44" height="20" rx="4" />
+            <rect class:list={['slot', k === 2 && 'gap']} x={bx - 22} y={y - 10} width="44" height="20" rx="4" />
+          </>
+        ))
+      }
+
+      {
+        [...pkt.map((n) => ({ n, cls: `p${n}` })), { n: 3, cls: 'p3r' }].map(({ n, cls }) => (
+          <g class={`mv ${cls}`}>
+            <rect class="pk" x="-22" y="-10" width="44" height="20" rx="4" />
+            <rect class="hdr" x="-21" y="-9" width="15" height="18" rx="3" />
+            <text class="num" x="-13.5" y="0">{n}</text>
+            <text class="pay" x="8" y="0">data</text>
+          </g>
+        ))
+      }
+    </svg>
+    <div class="readout font-mono">
+      <span class="r r0">chop into packets · <b class="text-amber">numbered header + payload</b></span>
+      <span class="r r1">R1's queue is full · <b class="text-red">3 is dropped, silently</b></span>
+      <span class="r r2">2 goes the long way · <b class="text-red">4 arrives before 2</b></span>
+      <span class="r r3">B files by number · <b class="text-red">1 2 _ 4, gap at 3</b></span>
+      <span class="r r4">no ack for 3, A's timer fires · <b class="text-amber">send 3 again</b></span>
+      <span class="r r5">B has 1 2 3 4 in order · <b class="text-green">rebuilt at the ends</b></span>
+    </div>
+  </div>
+</HeroFrame>
+
+<style is:inline>
+  .hero-network-basics {
+    --t: 13s;
+    width: 100%;
+    max-width: 360px;
+    animation: network-basics-stage var(--t) linear infinite both;
+  }
+  .hero-network-basics svg {
+    display: block;
+    width: 100%;
+    height: auto;
+    overflow: visible;
+  }
+  .hero-network-basics text {
+    font-family: var(--font-mono);
+    fill: var(--color-ink);
+    text-anchor: middle;
+    dominant-baseline: central;
+  }
+  .hero-network-basics .hd {
+    fill: var(--color-muted);
+    font-size: 10px;
+  }
+  .hero-network-basics .rl {
+    fill: var(--color-muted);
+    font-size: 10px;
+  }
+  .hero-network-basics .host {
+    fill: none;
+    stroke: var(--color-line);
+    stroke-width: 1.5;
+  }
+  .hero-network-basics .router {
+    fill: var(--color-panel2);
+    stroke: var(--color-line);
+    stroke-width: 1.5;
+  }
+  .hero-network-basics .links line {
+    stroke: var(--color-line);
+    stroke-width: 1.5;
+  }
+  .hero-network-basics .queue rect {
+    fill: var(--color-muted);
+  }
+  .hero-network-basics .queue {
+    opacity: 0;
+    animation: network-basics-queue var(--t) linear infinite both;
+  }
+  .hero-network-basics .slot {
+    fill: none;
+    stroke: var(--color-line);
+    stroke-dasharray: 3 3;
+  }
+  .hero-network-basics .pk {
+    fill: var(--color-panel2);
+    stroke: var(--color-line);
+    stroke-width: 1.5;
+  }
+  .hero-network-basics .hdr {
+    fill: var(--color-panel);
+  }
+  .hero-network-basics .num {
+    font-size: 11px;
+  }
+  .hero-network-basics .pay {
+    fill: var(--color-muted);
+    font-size: 9px;
+  }
+
+  .hero-network-basics .p1 { transform: translate(306px, 38px); animation: network-basics-p1 var(--t) linear infinite both; }
+  .hero-network-basics .p2 { transform: translate(306px, 72px); animation: network-basics-p2 var(--t) linear infinite both; }
+  .hero-network-basics .p3 { transform: translate(86px, 72px); opacity: 0; animation: network-basics-p3 var(--t) linear infinite both; }
+  .hero-network-basics .p4 { transform: translate(306px, 140px); animation: network-basics-p4 var(--t) linear infinite both; }
+  .hero-network-basics .p3r { transform: translate(306px, 106px); animation: network-basics-p3r var(--t) linear infinite both; }
+  .hero-network-basics .p1 .pk,
+  .hero-network-basics .p2 .pk,
+  .hero-network-basics .p4 .pk,
+  .hero-network-basics .p3r .pk {
+    stroke: var(--color-green);
+    fill: var(--color-green-dim);
+  }
+  .hero-network-basics .p1 .pk,
+  .hero-network-basics .p2 .pk,
+  .hero-network-basics .p4 .pk { animation: network-basics-done var(--t) linear infinite both; }
+  .hero-network-basics .p3 .pk { stroke: var(--color-red); fill: var(--color-red-dim); animation: network-basics-drop var(--t) linear infinite both; }
+  .hero-network-basics .p3r .pk { animation: network-basics-resend var(--t) linear infinite both; }
+  .hero-network-basics .gap { animation: network-basics-gap var(--t) linear infinite both; }
+
+  .hero-network-basics .readout {
+    display: grid;
+    margin-top: 10px;
+    font-size: 0.78rem;
+    text-align: center;
+  }
+  .hero-network-basics .readout b {
+    font-weight: 600;
+  }
+  .hero-network-basics .r {
+    grid-area: 1 / 1;
+    opacity: 0;
+  }
+  .hero-network-basics .r5 { opacity: 1; }
+  .hero-network-basics .r0 { animation: network-basics-r0 var(--t) linear infinite both; }
+  .hero-network-basics .r1 { animation: network-basics-r1 var(--t) linear infinite both; }
+  .hero-network-basics .r2 { animation: network-basics-r2 var(--t) linear infinite both; }
+  .hero-network-basics .r3 { animation: network-basics-r3 var(--t) linear infinite both; }
+  .hero-network-basics .r4 { animation: network-basics-r4 var(--t) linear infinite both; }
+  .hero-network-basics .r5 { animation: network-basics-r5 var(--t) linear infinite both; }
+
+  @keyframes network-basics-stage {
+    0% { opacity: 0; }
+    3%, 94% { opacity: 1; }
+    99%, 100% { opacity: 0; }
+  }
+  @keyframes network-basics-p1 {
+    0%, 9% { transform: translate(34px, 38px); }
+    11% { transform: translate(64px, 72px); }
+    13% { transform: translate(130px, 72px); }
+    17% { transform: translate(276px, 72px); }
+    19%, 100% { transform: translate(306px, 38px); }
+  }
+  @keyframes network-basics-p2 {
+    0%, 12% { transform: translate(34px, 72px); }
+    14% { transform: translate(64px, 72px); }
+    16% { transform: translate(130px, 72px); }
+    20%, 39% { transform: translate(210px, 134px); }
+    42% { transform: translate(276px, 134px); }
+    45%, 100% { transform: translate(306px, 72px); }
+  }
+  @keyframes network-basics-p3 {
+    0%, 15% { transform: translate(34px, 106px); opacity: 1; }
+    17% { transform: translate(64px, 72px); opacity: 1; }
+    19%, 28% { transform: translate(86px, 72px); opacity: 1; }
+    31%, 100% { transform: translate(86px, 72px); opacity: 0; }
+  }
+  @keyframes network-basics-p4 {
+    0%, 29% { transform: translate(34px, 140px); }
+    31% { transform: translate(64px, 72px); }
+    33% { transform: translate(130px, 72px); }
+    36% { transform: translate(276px, 72px); }
+    38%, 100% { transform: translate(306px, 140px); }
+  }
+  @keyframes network-basics-p3r {
+    0%, 57% { transform: translate(34px, 106px); opacity: 0; }
+    59%, 61% { transform: translate(34px, 106px); opacity: 1; }
+    63% { transform: translate(64px, 72px); opacity: 1; }
+    65% { transform: translate(130px, 72px); opacity: 1; }
+    68% { transform: translate(276px, 72px); opacity: 1; }
+    70%, 100% { transform: translate(306px, 106px); opacity: 1; }
+  }
+  @keyframes network-basics-queue {
+    0%, 17% { opacity: 0; }
+    19%, 28% { opacity: 1; }
+    31%, 100% { opacity: 0; }
+  }
+  @keyframes network-basics-done {
+    0%, 73% { stroke: var(--color-line); fill: var(--color-panel2); }
+    76%, 100% { stroke: var(--color-green); fill: var(--color-green-dim); }
+  }
+  @keyframes network-basics-drop {
+    0%, 19% { stroke: var(--color-line); fill: var(--color-panel2); }
+    21%, 100% { stroke: var(--color-red); fill: var(--color-red-dim); }
+  }
+  @keyframes network-basics-resend {
+    0%, 73% { stroke: var(--color-amber); fill: var(--color-panel2); }
+    76%, 100% { stroke: var(--color-green); fill: var(--color-green-dim); }
+  }
+  @keyframes network-basics-gap {
+    0%, 45% { stroke: var(--color-line); }
+    47%, 68% { stroke: var(--color-red); }
+    70%, 100% { stroke: var(--color-line); }
+  }
+
+  @keyframes network-basics-r0 {
+    0%, 16% { opacity: 1; }
+    18%, 100% { opacity: 0; }
+  }
+  @keyframes network-basics-r1 {
+    0%, 18% { opacity: 0; }
+    20%, 30% { opacity: 1; }
+    32%, 100% { opacity: 0; }
+  }
+  @keyframes network-basics-r2 {
+    0%, 32% { opacity: 0; }
+    34%, 45% { opacity: 1; }
+    47%, 100% { opacity: 0; }
+  }
+  @keyframes network-basics-r3 {
+    0%, 46% { opacity: 0; }
+    48%, 57% { opacity: 1; }
+    59%, 100% { opacity: 0; }
+  }
+  @keyframes network-basics-r4 {
+    0%, 58% { opacity: 0; }
+    60%, 73% { opacity: 1; }
+    75%, 100% { opacity: 0; }
+  }
+  @keyframes network-basics-r5 {
+    0%, 74% { opacity: 0; }
+    76%, 100% { opacity: 1; }
+  }
+</style>

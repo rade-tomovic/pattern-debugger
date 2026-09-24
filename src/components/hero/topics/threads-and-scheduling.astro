@@ -1,0 +1,245 @@
+---
+import HeroFrame from '../HeroFrame.astro';
+
+/**
+ * One pool of 3 workers, 6 queued requests that each wait on I/O, run twice. Frames are computed
+ * at build time by running a tiny FIFO pool over the queue:
+ *   sync over async: each worker takes a request and blocks on .Result, so it is a parked stack;
+ *     r4 to r6 stay queued with no worker free to take them
+ *   async all the way: each worker takes a request and runs it up to its first await; then the
+ *     method returns, its locals move to a heap object, and the worker takes the next request
+ *   end: 6 pending awaits on the heap, 0 parked threads, all 3 workers free
+ * One frame per step, crossfaded with one shared keyframe and negative delays.
+ * Un-animated styles show the final frame (reduced motion).
+ */
+const workers = 3;
+const requests = 6;
+
+type Worker = { req: number | null; state: 'idle' | 'run' | 'parked' | 'free' };
+type Snap = { mode: 'block' | 'await'; queue: number[]; pool: Worker[]; heap: number[]; stalled: boolean };
+const frames: Snap[] = [];
+const fresh = () => ({
+  queue: Array.from({ length: requests }, (_, i) => i + 1),
+  pool: Array.from({ length: workers }, (): Worker => ({ req: null, state: 'idle' })),
+  heap: [] as number[],
+});
+const snap = (mode: Snap['mode'], s: ReturnType<typeof fresh>, stalled = false) =>
+  frames.push({ mode, queue: [...s.queue], pool: s.pool.map((w) => ({ ...w })), heap: [...s.heap], stalled });
+
+const blocking = fresh();
+for (const w of blocking.pool) {
+  const req = blocking.queue.shift();
+  if (req !== undefined) Object.assign(w, { req, state: 'parked' });
+}
+snap('block', blocking);
+const stalled = blocking.pool.every((w) => w.state === 'parked') && blocking.queue.length > 0;
+snap('block', blocking, stalled);
+
+const awaiting = fresh();
+const take = () => {
+  for (const w of awaiting.pool) {
+    const req = awaiting.queue.shift();
+    Object.assign(w, req === undefined ? { req: null, state: 'free' } : { req, state: 'run' });
+  }
+};
+const reachAwait = () => {
+  for (const w of awaiting.pool) if (w.req !== null) awaiting.heap.push(w.req);
+};
+take();
+snap('await', awaiting);
+while (awaiting.queue.length > 0 || awaiting.pool.some((w) => w.state === 'run')) {
+  reachAwait();
+  take();
+  snap('await', awaiting);
+}
+
+const range = (xs: number[]) => (xs.length > 1 ? `r${xs[0]} to r${xs[xs.length - 1]}` : `r${xs[0]}`);
+const wrange = (pool: Worker[]) => {
+  const ids = pool.flatMap((w, j) => (w.req !== null ? [j + 1] : []));
+  return ids.length > 1 ? `w${ids[0]} to w${ids[ids.length - 1]}` : `w${ids[0]}`;
+};
+const readout = (f: Snap) => {
+  const held = f.pool.filter((w) => w.req !== null).map((w) => w.req!);
+  if (f.mode === 'block' && !f.stalled)
+    return { lead: '.Result parks each worker', verdict: `${held.length} parked stacks`, cls: 'text-red' };
+  if (f.mode === 'block') return { lead: `${range(f.queue)} wait in the queue`, verdict: 'no worker free', cls: 'text-red' };
+  if (f.heap.length === 0) return { lead: `${wrange(f.pool)} run ${range(held)}`, verdict: 'up to the first await', cls: 'text-ink' };
+  if (held.length > 0)
+    return { lead: 'locals move to the heap', verdict: `workers take ${range(held)}`, cls: 'text-green' };
+  return { lead: `${f.heap.length} pending awaits`, verdict: `${f.pool.filter((w) => w.state === 'parked').length} parked, all ${workers} workers free`, cls: 'text-green' };
+};
+
+const n = frames.length;
+const delay = (k: number) => `animation-delay: calc(var(--t) * ${(k / n - 1).toFixed(4)})`;
+const chipX = (i: number) => 56 + i * 50;
+const chipW = 42;
+const workerX = (j: number) => 56 + j * 100;
+const workerW = 88;
+const workerText = (w: Worker) =>
+  w.state === 'parked' ? `r${w.req} · parked` : w.state === 'run' ? `runs r${w.req}` : w.state === 'free' ? 'free' : 'idle';
+
+const keyframes = (() => {
+  const s = 100 / n;
+  const p = (f: number) => `${(s * f).toFixed(2)}%`;
+  return `@keyframes threads-and-scheduling-frame { 0% { opacity: 0; } ${p(0.06)}, ${p(0.95)} { opacity: 1; } ${p(1.03)}, 100% { opacity: 0; } }`;
+})();
+---
+
+<HeroFrame label={`pool · ${workers} workers, ${requests} requests`} caption="blocking spends a pool thread per request; awaiting spends a small heap object and hands the thread back">
+  <div class="hero-threads-and-scheduling" style={`--frames: ${n}`}>
+    <svg viewBox="0 0 360 184" role="img" aria-label="three pool workers park on .Result and the queue stalls; with await the same workers hand six requests to the heap and end free">
+      <text class="lbl" x="8" y="40">queue</text>
+      <text class="lbl" x="8" y="96">pool</text>
+      <text class="lbl" x="8" y="160">heap</text>
+      {Array.from({ length: requests }, (_, i) => <rect class="slot" x={chipX(i)} y="28" width={chipW} height="24" rx="5" />)}
+      {Array.from({ length: workers }, (_, j) => <rect class="box" x={workerX(j)} y="74" width={workerW} height="44" rx="6" />)}
+      <rect class="region" x="52" y="142" width="300" height="36" rx="6" />
+
+      {
+        frames.map((f, k) => (
+          <g class:list={['layer', k === n - 1 && 'final']} style={delay(k)}>
+            <text class="hd" x="8" y="10">{f.mode === 'block' ? 'sync over async · .Result' : 'async all the way · await'}</text>
+            {f.queue.map((r) => (
+              <>
+                <rect class:list={['chip', f.stalled && 'stalled']} x={chipX(r - 1)} y="28" width={chipW} height="24" rx="5" />
+                <text class="cv" x={chipX(r - 1) + chipW / 2} y="40">r{r}</text>
+              </>
+            ))}
+            {f.pool.map((w, j) => (
+              <>
+                <rect class:list={['box', w.state]} x={workerX(j)} y="74" width={workerW} height="44" rx="6" />
+                <text class:list={['ws', w.state]} x={workerX(j) + workerW / 2} y="100">{workerText(w)}</text>
+              </>
+            ))}
+            {f.heap.map((r, i) => (
+              <>
+                <rect class="sm" x={chipX(i)} y="148" width={chipW} height="24" rx="5" />
+                <text class="hv" x={chipX(i) + chipW / 2} y="160">r{r}</text>
+              </>
+            ))}
+          </g>
+        ))
+      }
+      {Array.from({ length: workers }, (_, j) => <text class="wid" x={workerX(j) + 7} y="84">w{j + 1}</text>)}
+    </svg>
+    <div class="readout font-mono">
+      {
+        frames.map((f, k) => {
+          const r = readout(f);
+          return (
+            <span class:list={['r', k === n - 1 && 'final']} style={delay(k)}>
+              {r.lead} · <b class={r.cls}>{r.verdict}</b>
+            </span>
+          );
+        })
+      }
+    </div>
+  </div>
+</HeroFrame>
+
+<style is:inline set:html={keyframes}></style>
+<style is:inline>
+  .hero-threads-and-scheduling {
+    --t: calc(var(--frames) * 2.6s);
+    width: 100%;
+    max-width: 400px;
+    animation: threads-and-scheduling-stage var(--t) linear infinite both;
+  }
+  .hero-threads-and-scheduling svg {
+    display: block;
+    width: 100%;
+    height: auto;
+    overflow: visible;
+  }
+  .hero-threads-and-scheduling text {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    fill: var(--color-ink);
+    dominant-baseline: central;
+  }
+  .hero-threads-and-scheduling .lbl,
+  .hero-threads-and-scheduling .hd {
+    fill: var(--color-muted);
+    font-size: 11px;
+  }
+  .hero-threads-and-scheduling .wid {
+    fill: var(--color-muted);
+    font-size: 10px;
+  }
+  .hero-threads-and-scheduling .cv,
+  .hero-threads-and-scheduling .ws,
+  .hero-threads-and-scheduling .hv {
+    text-anchor: middle;
+  }
+  .hero-threads-and-scheduling .slot {
+    fill: none;
+    stroke: var(--color-line);
+    stroke-dasharray: 3 3;
+  }
+  .hero-threads-and-scheduling .region {
+    fill: none;
+    stroke: var(--color-line);
+    stroke-dasharray: 3 3;
+  }
+  .hero-threads-and-scheduling .box,
+  .hero-threads-and-scheduling .chip {
+    fill: var(--color-panel2);
+    stroke: var(--color-line);
+    stroke-width: 1.5;
+  }
+  .hero-threads-and-scheduling .chip.stalled {
+    stroke: var(--color-red);
+    stroke-dasharray: 4 3;
+  }
+  .hero-threads-and-scheduling .box.parked {
+    stroke: var(--color-red);
+    fill: var(--color-red-dim);
+  }
+  .hero-threads-and-scheduling .box.run {
+    stroke: var(--color-muted);
+  }
+  .hero-threads-and-scheduling .box.free {
+    stroke: var(--color-green);
+    fill: var(--color-green-dim);
+  }
+  .hero-threads-and-scheduling .ws.parked {
+    fill: var(--color-red);
+  }
+  .hero-threads-and-scheduling .ws.free {
+    fill: var(--color-green);
+  }
+  .hero-threads-and-scheduling .sm {
+    fill: var(--color-panel);
+    stroke: var(--color-amber);
+    stroke-width: 1.5;
+  }
+  .hero-threads-and-scheduling .hv {
+    fill: var(--color-amber);
+  }
+  .hero-threads-and-scheduling .layer,
+  .hero-threads-and-scheduling .r {
+    opacity: 0;
+    animation: threads-and-scheduling-frame var(--t) linear infinite both;
+  }
+  .hero-threads-and-scheduling .layer.final,
+  .hero-threads-and-scheduling .r.final {
+    opacity: 1;
+  }
+  .hero-threads-and-scheduling .readout {
+    display: grid;
+    margin-top: 10px;
+    font-size: 0.76rem;
+    text-align: center;
+  }
+  .hero-threads-and-scheduling .readout b {
+    font-weight: 600;
+  }
+  .hero-threads-and-scheduling .r {
+    grid-area: 1 / 1;
+  }
+  @keyframes threads-and-scheduling-stage {
+    0% { opacity: 0; }
+    3%, 96% { opacity: 1; }
+    100% { opacity: 0; }
+  }
+</style>

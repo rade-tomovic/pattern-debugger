@@ -1,0 +1,330 @@
+---
+import HeroFrame from '../HeroFrame.astro';
+
+/**
+ * The page's example, run at build time on a real dictionary trie that logs every step:
+ *   insert("car"):  c, a, r missing → create 3 nodes · mark r IsWord
+ *   insert("care"): c, a, r found → reuse 3 · e missing → create 1 · mark e IsWord
+ *   search("cat"):  c, a found · "ca" has no child t → false
+ * Edges carry the characters, the label under each node is the prefix its path spells.
+ * Keyframes are generated from the logged steps. Un-animated styles are the final frame:
+ * c-a-r-e built, r and e marked as words.
+ */
+type TrieNode = { prefix: string; children: Map<string, TrieNode>; isWord: boolean };
+type Kind = 'create' | 'reuse' | 'mark' | 'miss';
+type Step = { op: number; kind: Kind; prefix: string; ch: string };
+
+const newNode = (prefix: string): TrieNode => ({ prefix, children: new Map(), isWord: false });
+const root = newNode('');
+const steps: Step[] = [];
+
+const insert = (op: number, word: string) => {
+  let node = root;
+  for (const ch of word) {
+    let next = node.children.get(ch);
+    if (next) steps.push({ op, kind: 'reuse', prefix: next.prefix, ch });
+    else {
+      next = newNode(node.prefix + ch);
+      node.children.set(ch, next);
+      steps.push({ op, kind: 'create', prefix: next.prefix, ch });
+    }
+    node = next;
+  }
+  node.isWord = true;
+  steps.push({ op, kind: 'mark', prefix: node.prefix, ch: '' });
+};
+const search = (op: number, word: string) => {
+  let node = root;
+  for (const ch of word) {
+    const next = node.children.get(ch);
+    if (!next) {
+      steps.push({ op, kind: 'miss', prefix: node.prefix + ch, ch });
+      return false;
+    }
+    steps.push({ op, kind: 'reuse', prefix: next.prefix, ch });
+    node = next;
+  }
+  return node.isWord;
+};
+
+const ops = [
+  { name: 'insert("car")', run: () => insert(0, 'car') },
+  { name: 'insert("care")', run: () => insert(1, 'care') },
+  { name: 'search("cat")', run: () => search(2, 'cat') },
+];
+const results = ops.map((o) => o.run());
+if (results[2] !== false) throw new Error('trie hero: search("cat") must miss');
+
+const pos: Record<string, [number, number]> = {
+  '': [26, 36],
+  c: [92, 36],
+  ca: [158, 36],
+  car: [224, 36],
+  care: [290, 36],
+  cat: [224, 90],
+};
+const nodes: TrieNode[] = [];
+const collect = (n: TrieNode) => {
+  if (!pos[n.prefix]) throw new Error(`trie hero: no position for "${n.prefix}"`);
+  nodes.push(n);
+  n.children.forEach(collect);
+};
+collect(root);
+
+const T = 13;
+const lead = 0.5;
+const gap = 0.5;
+const stepLen = 0.7;
+const move = 0.25;
+const pct = (s: number) => `${((s / T) * 100).toFixed(2)}%`;
+
+let clock = lead;
+const timed = steps.map((s, i) => {
+  if (i > 0 && steps[i - 1].op !== s.op) clock += gap;
+  const start = clock;
+  clock += s.kind === 'miss' ? stepLen * 2 : stepLen;
+  return { ...s, start, end: clock };
+});
+const walkEnd = clock;
+const opSpan = ops.map((_, op) => {
+  const mine = timed.filter((s) => s.op === op);
+  return { start: mine[0].start - (op === 0 ? lead : gap), end: mine[mine.length - 1].end };
+});
+const createdAt = (prefix: string) => timed.find((s) => s.kind === 'create' && s.prefix === prefix)?.start;
+const markedAt = (prefix: string) => timed.find((s) => s.kind === 'mark' && s.prefix === prefix)?.start;
+const miss = timed.find((s) => s.kind === 'miss');
+
+type Stop = [number | string, string];
+const css: string[] = [];
+const keyframes = (name: string, stops: Stop[]) =>
+  css.push(`@keyframes trie-${name} { ${stops.map(([s, body]) => `${typeof s === 'number' ? pct(s) : s} { ${body} }`).join(' ')} }`);
+const animate = (sel: string, name: string, timing = 'linear') =>
+  css.push(`.hero-trie ${sel} { animation: trie-${name} var(--t) ${timing} infinite both; }`);
+
+const ring: Record<Kind, string> = {
+  create: 'var(--color-amber)',
+  reuse: 'var(--color-cyan)',
+  mark: 'var(--color-green)',
+  miss: 'var(--color-red)',
+};
+const place = (prefix: string, color: string, opacity = 1) =>
+  `transform: translate(${pos[prefix][0]}px, ${pos[prefix][1]}px); stroke: ${color}; opacity: ${opacity};`;
+keyframes('walker', [
+  ['0%', place('', ring.reuse, 0)],
+  ...opSpan.flatMap((span, op): Stop[] => [
+    [span.start + 0.05, place('', 'var(--color-muted)', 0)],
+    [span.start + 0.3, place('', 'var(--color-muted)')],
+    ...timed
+      .filter((s) => s.op === op)
+      .flatMap((s): Stop[] => [
+        [s.start + move, place(s.prefix, ring[s.kind])],
+        [s.end - 0.05, place(s.prefix, ring[s.kind])],
+      ]),
+    [span.end, place(timed.filter((s) => s.op === op).at(-1)?.prefix ?? '', 'var(--color-muted)', 0)],
+  ]),
+  ['100%', place('', 'var(--color-muted)', 0)],
+]);
+animate('.walker', 'walker', 'ease-in-out');
+
+nodes.forEach((n, k) => {
+  const born = createdAt(n.prefix);
+  const marked = markedAt(n.prefix);
+  if (born !== undefined) {
+    keyframes(`in${k}`, [
+      ['0%', 'opacity: 0;'],
+      [born + move - 0.1, 'opacity: 0;'],
+      [born + move + 0.1, 'opacity: 1;'],
+      ['100%', 'opacity: 1;'],
+    ]);
+    animate(`.in${k}`, `in${k}`);
+  }
+  const stops: Stop[] = [['0%', 'stroke: var(--color-line); fill: var(--color-panel2);']];
+  if (born !== undefined)
+    stops.push(
+      [born + move, 'stroke: var(--color-amber); fill: var(--color-panel2);'],
+      [born + stepLen, 'stroke: var(--color-amber); fill: var(--color-panel2);'],
+      [born + stepLen + 0.15, 'stroke: var(--color-line); fill: var(--color-panel2);'],
+    );
+  if (marked !== undefined)
+    stops.push(
+      [marked + move - 0.1, 'stroke: var(--color-line); fill: var(--color-panel2);'],
+      [marked + move + 0.1, 'stroke: var(--color-green); fill: var(--color-green-dim);'],
+      ['100%', 'stroke: var(--color-green); fill: var(--color-green-dim);'],
+    );
+  else stops.push(['100%', 'stroke: var(--color-line); fill: var(--color-panel2);']);
+  keyframes(`n${k}`, stops);
+  animate(`.n${k}`, `n${k}`);
+});
+
+if (miss) {
+  keyframes('ghost', [
+    ['0%', 'opacity: 0;'],
+    [miss.start + move - 0.1, 'opacity: 0;'],
+    [miss.start + move + 0.1, 'opacity: 1;'],
+    [miss.end, 'opacity: 1;'],
+    [miss.end + 0.3, 'opacity: 0;'],
+    ['100%', 'opacity: 0;'],
+  ]);
+  animate('.ghost', 'ghost');
+}
+
+opSpan.forEach((span, op) => {
+  keyframes(`r${op}`, [
+    ['0%', 'opacity: 0;'],
+    [Math.max(span.start, 0.01), 'opacity: 0;'],
+    [span.start + 0.15, 'opacity: 1;'],
+    [span.end - 0.05, 'opacity: 1;'],
+    [span.end + 0.1, 'opacity: 0;'],
+    ['100%', 'opacity: 0;'],
+  ]);
+  animate(`.r${op}`, `r${op}`);
+});
+keyframes('rfinal', [
+  ['0%', 'opacity: 0;'],
+  [walkEnd + 0.1, 'opacity: 0;'],
+  [walkEnd + 0.3, 'opacity: 1;'],
+  ['100%', 'opacity: 1;'],
+]);
+animate('.rfinal', 'rfinal');
+
+const count = (op: number, kind: Kind) => timed.filter((s) => s.op === op && s.kind === kind).length;
+const edgeOf = (n: TrieNode) => {
+  const parent = pos[n.prefix.slice(0, -1)];
+  const [x, y] = pos[n.prefix];
+  return { x1: parent[0] + 14, y1: parent[1], x2: x - 14, y2: y, lx: (parent[0] + x) / 2, ly: y - 11, ch: n.prefix.slice(-1) };
+};
+const ghostPos = miss ? pos[miss.prefix] : undefined;
+const ghostParent = miss ? pos[miss.prefix.slice(0, -1)] : undefined;
+---
+
+<HeroFrame label="insert car, care · search cat" caption="edges spell characters, paths spell prefixes; a lookup costs the length of the word, never the number of words stored">
+  <div class="hero-trie" style={`--t: ${T}s`}>
+    <svg viewBox="0 0 320 108" role="img" aria-label="insert car and care into a trie: care reuses the c, a, r nodes and adds only e; search cat breaks at the missing t edge">
+      {
+        nodes.slice(1).map((n, k) => {
+          const e = edgeOf(n);
+          return (
+            <g class={`in${k + 1}`}>
+              <line class="edge" x1={e.x1} y1={e.y1} x2={e.x2} y2={e.y2} />
+              <text class="ch" x={e.lx} y={e.ly}>{e.ch}</text>
+            </g>
+          );
+        })
+      }
+      {
+        ghostPos && ghostParent && miss && (
+          <g class="ghost">
+            <line class="gedge" x1={ghostParent[0] + 10} y1={ghostParent[1] + 10} x2={ghostPos[0] - 10} y2={ghostPos[1] - 10} />
+            <text class="gch" x={(ghostParent[0] + ghostPos[0]) / 2 - 10} y={(ghostParent[1] + ghostPos[1]) / 2 + 4}>{miss.ch}</text>
+            <circle class="gnode" cx={ghostPos[0]} cy={ghostPos[1]} r="14" />
+            <text class="gnull" x={ghostPos[0] + 22} y={ghostPos[1]}>null</text>
+          </g>
+        )
+      }
+      {
+        nodes.map((n, k) => (
+          <g class={k > 0 ? `in${k}` : undefined} transform={`translate(${pos[n.prefix][0]} ${pos[n.prefix][1]})`}>
+            <circle class:list={['node', `n${k}`, n.isWord && 'word']} r="14" />
+            <text class="pfx" y="26">{n.prefix === '' ? 'root' : `"${n.prefix}"`}</text>
+          </g>
+        ))
+      }
+      <circle class="walker" r="19" />
+    </svg>
+    <div class="readout font-mono">
+      <span class="r r0">{ops[0].name} · <b class="text-amber">{count(0, 'create')} nodes created</b> · <b class="text-green">r marked a word</b></span>
+      <span class="r r1">{ops[1].name} · <b class="text-cyan">c, a, r reused</b> · <b class="text-amber">only e is new</b></span>
+      <span class="r r2">{ops[2].name} · "ca" lacks t · <b class="text-red">path breaks → false</b></span>
+      <span class="r rfinal">"car" and "care" share c-a-r · <b class="text-green">r, e end words</b></span>
+    </div>
+  </div>
+</HeroFrame>
+
+<style is:inline>
+  .hero-trie {
+    width: 100%;
+    max-width: 380px;
+    animation: trie-stage var(--t) linear infinite both;
+  }
+  .hero-trie svg {
+    display: block;
+    width: 100%;
+    height: auto;
+    overflow: visible;
+  }
+  .hero-trie .edge {
+    stroke: var(--color-line);
+    stroke-width: 1.5;
+  }
+  .hero-trie .node {
+    fill: var(--color-panel2);
+    stroke: var(--color-line);
+    stroke-width: 1.5;
+  }
+  .hero-trie .node.word {
+    fill: var(--color-green-dim);
+    stroke: var(--color-green);
+  }
+  .hero-trie .walker {
+    fill: none;
+    stroke: var(--color-muted);
+    stroke-width: 2;
+    opacity: 0;
+  }
+  .hero-trie text {
+    font-family: var(--font-mono);
+    text-anchor: middle;
+    dominant-baseline: central;
+  }
+  .hero-trie .ch {
+    fill: var(--color-ink);
+    font-size: 14px;
+  }
+  .hero-trie .pfx {
+    fill: var(--color-muted);
+    font-size: 10px;
+  }
+  .hero-trie .ghost {
+    opacity: 0;
+  }
+  .hero-trie .gedge,
+  .hero-trie .gnode {
+    fill: none;
+    stroke: var(--color-red);
+    stroke-width: 1.5;
+    stroke-dasharray: 4 3;
+  }
+  .hero-trie .gch {
+    fill: var(--color-red);
+    font-size: 14px;
+  }
+  .hero-trie .gnull {
+    fill: var(--color-red);
+    font-size: 10px;
+    text-anchor: start;
+  }
+  .hero-trie .readout {
+    display: grid;
+    margin-top: 12px;
+    font-size: 0.78rem;
+    text-align: center;
+  }
+  .hero-trie .readout b {
+    font-weight: 600;
+    white-space: nowrap;
+  }
+  .hero-trie .r {
+    grid-area: 1 / 1;
+    opacity: 0;
+  }
+  .hero-trie .rfinal {
+    opacity: 1;
+  }
+
+  @keyframes trie-stage {
+    0% { opacity: 0; }
+    3%, 94% { opacity: 1; }
+    99%, 100% { opacity: 0; }
+  }
+</style>
+<style is:inline set:html={css.join('\n')}></style>

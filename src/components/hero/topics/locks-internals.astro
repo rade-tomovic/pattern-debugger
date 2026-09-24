@@ -1,0 +1,326 @@
+---
+import HeroFrame from '../HeroFrame.astro';
+
+/**
+ * One lock word, two threads, the page's Enter/Exit state machine:
+ *   T1: CAS the word 0 → T1, succeeds; fast path, the kernel is never asked
+ *   T2: CAS sees T1, fails; spins (pause, re-read, retry) within a bounded budget
+ *   T2: budget runs out; enqueue self, futex-wait, parked in the kernel
+ *   T1: Exit stores 0 to the word, then futex-wakes one parked waiter
+ *   T2: woken, not handed the lock; it races the CAS again and wins, word = T2
+ * Un-animated styles are the final frame (reduced motion): T2 owns the word via its CAS, nothing parked.
+ */
+---
+
+<HeroFrame label="lock word · T1 holds, T2 spins, parks, retries" caption="the lock itself is one CAS on one word in user space; the kernel is only asked about the waiting">
+  <div class="hero-locks-internals">
+    <svg viewBox="0 0 340 212" role="img" aria-label="thread T1 takes the lock word with one CAS, thread T2 fails, spins, parks in the kernel, is woken when T1 stores 0, and wins the CAS on retry">
+      <text class="hd" x="4" y="10">user space · the CAS</text>
+      <text class="hd" x="4" y="202">kernel · only for waiting</text>
+      <line class="divider" x1="0" y1="118" x2="340" y2="118" />
+
+      <text class="cap" x="170" y="30">lock word</text>
+      <rect class="word" x="128" y="42" width="84" height="36" rx="6" />
+      <text class="val v0" x="170" y="60">0</text>
+      <text class="val v1" x="170" y="60">T1</text>
+      <text class="val v2" x="170" y="60">T2</text>
+
+      <rect class="queue" x="248" y="146" width="88" height="44" rx="6" />
+      <text class="cap" x="292" y="202">wait queue</text>
+
+      <g class="arrow a1">
+        <line x1="78" y1="60" x2="120" y2="60" />
+        <polygon points="127,60 119,56 119,64" />
+        <text x="100" y="50">CAS</text>
+      </g>
+      <g class="arrow a2">
+        <line x1="258" y1="60" x2="220" y2="60" />
+        <polygon points="213,60 221,56 221,64" />
+        <text x="238" y="50">CAS ✗</text>
+      </g>
+      <g class="arrow a3">
+        <line x1="258" y1="60" x2="220" y2="60" />
+        <polygon points="213,60 221,56 221,64" />
+        <text x="238" y="50">CAS</text>
+      </g>
+
+      <g class="wake">
+        <path d="M44 76 V168 H240" />
+        <polygon points="247,168 239,164 239,172" />
+        <text x="146" y="160">futex-wake one</text>
+      </g>
+
+      <g class="note spin"><text class="pulse" x="292" y="96">spin · pause</text></g>
+      <g class="note wait"><text x="292" y="96">futex-wait ↓</text></g>
+
+      <g class="t1">
+        <rect class="pill p1" x="-32" y="-14" width="64" height="28" rx="14" />
+        <text class="tn">T1</text>
+      </g>
+      <g class="t2">
+        <rect class="pill p2" x="-32" y="-14" width="64" height="28" rx="14" />
+        <text class="tn">T2</text>
+      </g>
+    </svg>
+    <div class="readout font-mono">
+      <span class="r r1">T1: CAS the word 0 → T1 · <b class="text-green">fast path, no kernel</b></span>
+      <span class="r r2">T2: CAS sees T1 · <b class="text-red">fails, spins and retries</b></span>
+      <span class="r r3">spin budget runs out · <b class="text-ink">T2 parks in the kernel</b></span>
+      <span class="r r4">T1 exits: <b class="text-amber">store 0</b> · then futex-wake one waiter</span>
+      <span class="r r5">woken, not handed the lock · <b class="text-green">T2 CASes again, wins</b></span>
+    </div>
+  </div>
+</HeroFrame>
+
+<style is:inline>
+  .hero-locks-internals {
+    --t: 13s;
+    width: 100%;
+    max-width: 380px;
+    animation: locks-internals-stage var(--t) linear infinite both;
+  }
+  .hero-locks-internals svg {
+    display: block;
+    width: 100%;
+    height: auto;
+    overflow: visible;
+  }
+  .hero-locks-internals text {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    fill: var(--color-ink);
+    text-anchor: middle;
+    dominant-baseline: central;
+  }
+  .hero-locks-internals .hd {
+    fill: var(--color-muted);
+    font-size: 10px;
+    text-anchor: start;
+  }
+  .hero-locks-internals .cap {
+    fill: var(--color-muted);
+    font-size: 10px;
+  }
+  .hero-locks-internals .divider {
+    stroke: var(--color-line);
+    stroke-width: 1.5;
+    stroke-dasharray: 5 4;
+  }
+  .hero-locks-internals .word {
+    fill: var(--color-green-dim);
+    stroke: var(--color-green);
+    stroke-width: 1.5;
+  }
+  .hero-locks-internals .val {
+    font-size: 15px;
+  }
+  .hero-locks-internals .queue {
+    fill: none;
+    stroke: var(--color-line);
+    stroke-width: 1.5;
+    stroke-dasharray: 3 3;
+  }
+  .hero-locks-internals .pill {
+    fill: var(--color-panel2);
+    stroke: var(--color-line);
+    stroke-width: 1.5;
+  }
+  .hero-locks-internals .tn {
+    font-size: 12px;
+  }
+  .hero-locks-internals .arrow line {
+    stroke-width: 1.5;
+  }
+  .hero-locks-internals .arrow text {
+    font-size: 10px;
+  }
+  .hero-locks-internals .a1 line,
+  .hero-locks-internals .a3 line {
+    stroke: var(--color-amber);
+  }
+  .hero-locks-internals .a1 polygon,
+  .hero-locks-internals .a3 polygon,
+  .hero-locks-internals .a1 text,
+  .hero-locks-internals .a3 text {
+    fill: var(--color-amber);
+  }
+  .hero-locks-internals .a2 line {
+    stroke: var(--color-red);
+  }
+  .hero-locks-internals .a2 polygon,
+  .hero-locks-internals .a2 text {
+    fill: var(--color-red);
+  }
+  .hero-locks-internals .wake path {
+    fill: none;
+    stroke: var(--color-muted);
+    stroke-width: 1.5;
+    stroke-dasharray: 4 3;
+  }
+  .hero-locks-internals .wake polygon {
+    fill: var(--color-muted);
+  }
+  .hero-locks-internals .wake text,
+  .hero-locks-internals .note text {
+    fill: var(--color-muted);
+    font-size: 10px;
+  }
+
+  .hero-locks-internals .v0,
+  .hero-locks-internals .v1,
+  .hero-locks-internals .a1,
+  .hero-locks-internals .a2,
+  .hero-locks-internals .wake,
+  .hero-locks-internals .note {
+    opacity: 0;
+  }
+  .hero-locks-internals .t1 {
+    transform: translate(44px, 60px);
+  }
+  .hero-locks-internals .t2 {
+    transform: translate(292px, 60px);
+  }
+  .hero-locks-internals .p2 {
+    stroke: var(--color-green);
+    fill: var(--color-green-dim);
+  }
+
+  .hero-locks-internals .v0 { animation: locks-internals-v0 var(--t) linear infinite both; }
+  .hero-locks-internals .v1 { animation: locks-internals-v1 var(--t) linear infinite both; }
+  .hero-locks-internals .v2 { animation: locks-internals-v2 var(--t) linear infinite both; }
+  .hero-locks-internals .word { animation: locks-internals-word var(--t) linear infinite both; }
+  .hero-locks-internals .a1 { animation: locks-internals-a1 var(--t) linear infinite both; }
+  .hero-locks-internals .a2 { animation: locks-internals-a2 var(--t) linear infinite both; }
+  .hero-locks-internals .a3 { animation: locks-internals-a3 var(--t) linear infinite both; }
+  .hero-locks-internals .spin { animation: locks-internals-spin var(--t) linear infinite both; }
+  .hero-locks-internals .pulse { animation: locks-internals-pulse 0.9s ease-in-out infinite; }
+  .hero-locks-internals .wait { animation: locks-internals-wait var(--t) linear infinite both; }
+  .hero-locks-internals .wake { animation: locks-internals-wake var(--t) linear infinite both; }
+  .hero-locks-internals .t2 { animation: locks-internals-t2 var(--t) ease-in-out infinite both; }
+  .hero-locks-internals .p1 { animation: locks-internals-p1 var(--t) linear infinite both; }
+  .hero-locks-internals .p2 { animation: locks-internals-p2 var(--t) linear infinite both; }
+
+  .hero-locks-internals .readout {
+    display: grid;
+    margin-top: 12px;
+    font-size: 0.76rem;
+    text-align: center;
+  }
+  .hero-locks-internals .readout b {
+    font-weight: 600;
+  }
+  .hero-locks-internals .r {
+    grid-area: 1 / 1;
+    opacity: 0;
+  }
+  .hero-locks-internals .r5 { opacity: 1; }
+  .hero-locks-internals .r1 { animation: locks-internals-r1 var(--t) linear infinite both; }
+  .hero-locks-internals .r2 { animation: locks-internals-r2 var(--t) linear infinite both; }
+  .hero-locks-internals .r3 { animation: locks-internals-r3 var(--t) linear infinite both; }
+  .hero-locks-internals .r4 { animation: locks-internals-r4 var(--t) linear infinite both; }
+  .hero-locks-internals .r5 { animation: locks-internals-r5 var(--t) linear infinite both; }
+
+  @keyframes locks-internals-stage {
+    0% { opacity: 0; }
+    3%, 95% { opacity: 1; }
+    99%, 100% { opacity: 0; }
+  }
+  @keyframes locks-internals-v0 {
+    0%, 9% { opacity: 1; }
+    10%, 57% { opacity: 0; }
+    58%, 75% { opacity: 1; }
+    76%, 100% { opacity: 0; }
+  }
+  @keyframes locks-internals-v1 {
+    0%, 9% { opacity: 0; }
+    10%, 57% { opacity: 1; }
+    58%, 100% { opacity: 0; }
+  }
+  @keyframes locks-internals-v2 {
+    0%, 75% { opacity: 0; }
+    76%, 100% { opacity: 1; }
+  }
+  @keyframes locks-internals-word {
+    0%, 7% { stroke: var(--color-line); fill: var(--color-panel2); }
+    8%, 12% { stroke: var(--color-amber); fill: var(--color-panel2); }
+    14%, 55% { stroke: var(--color-green); fill: var(--color-green-dim); }
+    56%, 60% { stroke: var(--color-amber); fill: var(--color-panel2); }
+    62%, 73% { stroke: var(--color-line); fill: var(--color-panel2); }
+    74%, 78% { stroke: var(--color-amber); fill: var(--color-panel2); }
+    80%, 100% { stroke: var(--color-green); fill: var(--color-green-dim); }
+  }
+  @keyframes locks-internals-a1 {
+    0%, 4% { opacity: 0; }
+    6%, 16% { opacity: 1; }
+    18%, 100% { opacity: 0; }
+  }
+  @keyframes locks-internals-a2 {
+    0%, 21% { opacity: 0; }
+    23%, 35% { opacity: 1; }
+    37%, 100% { opacity: 0; }
+  }
+  @keyframes locks-internals-a3 {
+    0%, 71% { opacity: 0; }
+    73%, 86% { opacity: 1; }
+    88%, 100% { opacity: 0; }
+  }
+  @keyframes locks-internals-spin {
+    0%, 24% { opacity: 0; }
+    26%, 38% { opacity: 1; }
+    40%, 100% { opacity: 0; }
+  }
+  @keyframes locks-internals-pulse {
+    0%, 100% { opacity: 0.35; }
+    50% { opacity: 1; }
+  }
+  @keyframes locks-internals-wait {
+    0%, 39% { opacity: 0; }
+    41%, 52% { opacity: 1; }
+    54%, 100% { opacity: 0; }
+  }
+  @keyframes locks-internals-wake {
+    0%, 59% { opacity: 0; }
+    61%, 70% { opacity: 1; }
+    72%, 100% { opacity: 0; }
+  }
+  @keyframes locks-internals-t2 {
+    0%, 40% { transform: translate(292px, 60px); opacity: 1; }
+    46%, 64% { transform: translate(292px, 168px); opacity: 0.6; }
+    70%, 100% { transform: translate(292px, 60px); opacity: 1; }
+  }
+  @keyframes locks-internals-p1 {
+    0%, 9% { stroke: var(--color-line); fill: var(--color-panel2); }
+    11%, 57% { stroke: var(--color-green); fill: var(--color-green-dim); }
+    59%, 100% { stroke: var(--color-line); fill: var(--color-panel2); }
+  }
+  @keyframes locks-internals-p2 {
+    0%, 21% { stroke: var(--color-line); fill: var(--color-panel2); }
+    23%, 38% { stroke: var(--color-red); fill: var(--color-panel2); }
+    40%, 76% { stroke: var(--color-line); fill: var(--color-panel2); }
+    78%, 100% { stroke: var(--color-green); fill: var(--color-green-dim); }
+  }
+
+  @keyframes locks-internals-r1 {
+    0%, 19% { opacity: 1; }
+    21%, 100% { opacity: 0; }
+  }
+  @keyframes locks-internals-r2 {
+    0%, 20% { opacity: 0; }
+    22%, 37% { opacity: 1; }
+    39%, 100% { opacity: 0; }
+  }
+  @keyframes locks-internals-r3 {
+    0%, 38% { opacity: 0; }
+    40%, 53% { opacity: 1; }
+    55%, 100% { opacity: 0; }
+  }
+  @keyframes locks-internals-r4 {
+    0%, 54% { opacity: 0; }
+    56%, 70% { opacity: 1; }
+    72%, 100% { opacity: 0; }
+  }
+  @keyframes locks-internals-r5 {
+    0%, 71% { opacity: 0; }
+    73%, 100% { opacity: 1; }
+  }
+</style>

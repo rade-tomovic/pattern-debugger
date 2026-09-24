@@ -109,6 +109,11 @@ after ANY content page is written or edited — trace correctness is the site's 
   CheatCard, Connections — all data-driven, never hand-authored in pages).
 - `src/components/viz/` — `TracePlayer.tsx` (the one Preact island) + pure step builders per
   visualizer. Steps are built at BUILD time in `Viz.astro` and serialized to the island.
+- `src/components/hero/` — topic head illustrations. `TopicLayout` renders
+  `hero/topics/<topic-slug>.astro` when it exists, wrapped in `HeroFrame.astro`. Pure CSS
+  loops in `<style is:inline>` (so a page ships only its own hero), every selector prefixed
+  `.hero-<slug>` and every keyframe `<slug>-`; the un-animated styles are the final frame.
+  Topics with a `TracePlayer` visualizer do not get one.
 - `src/styles/global.css` — design tokens + article styling. `shiki-debugger.json` — the
   palette-matched code theme.
 - `scripts/check-links.mjs` — dist-wide internal link checker.

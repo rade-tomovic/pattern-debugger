@@ -1,0 +1,331 @@
+---
+import HeroFrame from '../HeroFrame.astro';
+
+/**
+ * Single-leader write path from the page, then the read-your-writes violation it allows:
+ *   client writes name = "Alex" to the leader, which appends LSN 1042 and commits locally
+ *   the leader streams 1042 to both followers: B is synchronous, A is asynchronous
+ *   B appends 1042 to its own WAL and acks; only then does the leader ack the client
+ *   the entry to A is still in flight; the client reads from A and gets "old-name"
+ *   later A applies 1042 and has "Alex"; nothing was lost, the read was served too early
+ * Fix named on the page: route the read to the leader, or require the replica to be at LSN 1042.
+ * Un-animated styles are the final frame (reduced motion): A caught up, the earlier stale read
+ * still shown but dimmed to muted so it does not read as A's current answer.
+ */
+---
+
+<HeroFrame label='write "Alex" · sync B, async A' caption="the leader waits only for the followers nominated as synchronous; any read served by a follower that is behind sees the past">
+  <div class="hero-replication">
+    <svg viewBox="0 0 340 178" role="img" aria-label="a write goes to the leader, is acknowledged after the synchronous follower confirms it, and a read from the asynchronous follower returns the old value until that follower applies the entry">
+      <g class="arrow write">
+        <line x1="68" y1="82" x2="100" y2="82" />
+        <polygon points="106,82 99,78 99,86" />
+        <text class="alabel" x="86" y="72">write</text>
+      </g>
+      <g class="arrow ack">
+        <line x1="104" y1="96" x2="72" y2="96" />
+        <polygon points="66,96 73,92 73,100" />
+        <text class="alabel" x="86" y="108">ok</text>
+      </g>
+
+      <g class="arrow stream">
+        <line x1="210" y1="70" x2="238" y2="38" />
+        <polygon points="243,32 234,36 240,42" />
+        <text class="alabel" x="212" y="46">sync</text>
+      </g>
+      <g class="arrow ack-b">
+        <line x1="248" y1="56" x2="222" y2="86" />
+        <polygon points="218,91 227,87 221,81" />
+        <text class="alabel" x="250" y="74">ack</text>
+      </g>
+
+      <g class="async">
+        <line x1="210" y1="102" x2="242" y2="136" />
+        <text class="alabel" x="210" y="130">async</text>
+      </g>
+      <circle class="dot" cx="0" cy="0" r="4" />
+
+      <g class="arrow read">
+        <line x1="40" y1="104" x2="236" y2="150" />
+        <polygon points="242,152 234,146 232,154" />
+        <text class="alabel" x="92" y="124">read</text>
+      </g>
+      <text class="stale" x="160" y="158">→ old-name</text>
+
+      <rect class="node client" x="4" y="74" width="62" height="30" rx="6" />
+      <text class="mid" x="35" y="89">client</text>
+
+      <rect class="node leader" x="108" y="64" width="100" height="48" rx="6" />
+      <text class="mid title" x="158" y="79">leader</text>
+      <text class="mid st lead-old" x="158" y="97">old-name</text>
+      <text class="mid st lead-new" x="158" y="97">1042 · Alex</text>
+
+      <rect class="node fb" x="246" y="6" width="90" height="48" rx="6" />
+      <text class="mid title" x="291" y="21">B · sync</text>
+      <text class="mid st b-old" x="291" y="39">old-name</text>
+      <text class="mid st b-new" x="291" y="39">1042 in WAL</text>
+
+      <rect class="node fa" x="246" y="124" width="90" height="48" rx="6" />
+      <text class="mid title" x="291" y="139">A · async</text>
+      <text class="mid st a-old" x="291" y="157">old-name</text>
+      <text class="mid st a-new" x="291" y="157">1042 · Alex</text>
+    </svg>
+    <div class="readout font-mono">
+      <span class="r r1">write lands on the leader · <b class="text-amber">append LSN 1042, commit locally</b></span>
+      <span class="r r2">stream to both followers · <b class="text-amber">wait for B's ack only</b></span>
+      <span class="r r3">B has 1042 durable · <b class="text-green">the client sees success</b></span>
+      <span class="r r4">client reads from A, still behind · <b class="text-red">old-name, its own write is missing</b></span>
+      <span class="r r5">A applies 1042 after the read · <b class="text-green">fix: read from the leader, or require LSN ≥ 1042</b></span>
+    </div>
+  </div>
+</HeroFrame>
+
+<style is:inline>
+  .hero-replication {
+    --t: 14s;
+    width: 100%;
+    max-width: 390px;
+    animation: replication-stage var(--t) linear infinite both;
+  }
+  .hero-replication svg {
+    display: block;
+    width: 100%;
+    height: auto;
+    overflow: visible;
+  }
+  .hero-replication text {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    fill: var(--color-ink);
+    dominant-baseline: central;
+  }
+  .hero-replication .mid,
+  .hero-replication .alabel {
+    text-anchor: middle;
+  }
+  .hero-replication .title {
+    fill: var(--color-muted);
+    font-size: 10px;
+  }
+  .hero-replication .st {
+    font-size: 10.5px;
+  }
+  .hero-replication .alabel {
+    fill: var(--color-muted);
+    font-size: 9.5px;
+  }
+  .hero-replication .node {
+    fill: var(--color-panel2);
+    stroke: var(--color-line);
+    stroke-width: 1.5;
+  }
+  .hero-replication .leader {
+    stroke: var(--color-amber);
+  }
+  .hero-replication .fb,
+  .hero-replication .fa {
+    stroke: var(--color-cyan);
+  }
+  .hero-replication .arrow line,
+  .hero-replication .async line {
+    stroke-width: 1.5;
+  }
+  .hero-replication .write line,
+  .hero-replication .stream line,
+  .hero-replication .async line {
+    stroke: var(--color-amber);
+  }
+  .hero-replication .write polygon,
+  .hero-replication .stream polygon {
+    fill: var(--color-amber);
+  }
+  .hero-replication .async line {
+    stroke-dasharray: 4 3;
+  }
+  .hero-replication .ack line,
+  .hero-replication .ack-b line {
+    stroke: var(--color-green);
+  }
+  .hero-replication .ack polygon,
+  .hero-replication .ack-b polygon {
+    fill: var(--color-green);
+  }
+  .hero-replication .read line {
+    stroke: var(--color-muted);
+  }
+  .hero-replication .read polygon {
+    fill: var(--color-muted);
+  }
+  .hero-replication .dot {
+    fill: var(--color-amber);
+  }
+  .hero-replication .stale {
+    fill: var(--color-muted);
+    font-size: 10.5px;
+    font-weight: 600;
+  }
+
+  .hero-replication .write,
+  .hero-replication .ack,
+  .hero-replication .stream,
+  .hero-replication .ack-b,
+  .hero-replication .async,
+  .hero-replication .dot,
+  .hero-replication .lead-old,
+  .hero-replication .b-old,
+  .hero-replication .a-old {
+    opacity: 0;
+  }
+  .hero-replication .a-new {
+    fill: var(--color-green);
+  }
+  .hero-replication .fa {
+    fill: var(--color-green-dim);
+    stroke: var(--color-green);
+  }
+
+  .hero-replication .write { animation: replication-write var(--t) linear infinite both; }
+  .hero-replication .lead-old { animation: replication-lead-old var(--t) linear infinite both; }
+  .hero-replication .lead-new { animation: replication-lead-new var(--t) linear infinite both; }
+  .hero-replication .stream { animation: replication-stream var(--t) linear infinite both; }
+  .hero-replication .ack-b { animation: replication-ack-b var(--t) linear infinite both; }
+  .hero-replication .b-old { animation: replication-b-old var(--t) linear infinite both; }
+  .hero-replication .b-new { animation: replication-b-new var(--t) linear infinite both; }
+  .hero-replication .async { animation: replication-async var(--t) linear infinite both; }
+  .hero-replication .dot { animation: replication-dot var(--t) linear infinite both; }
+  .hero-replication .ack { animation: replication-ack var(--t) linear infinite both; }
+  .hero-replication .read { animation: replication-read var(--t) linear infinite both; }
+  .hero-replication .stale { animation: replication-stale var(--t) linear infinite both; }
+  .hero-replication .read line { animation: replication-read-line var(--t) linear infinite both; }
+  .hero-replication .read polygon { animation: replication-read-head var(--t) linear infinite both; }
+  .hero-replication .a-old { animation: replication-a-old var(--t) linear infinite both; }
+  .hero-replication .a-new { animation: replication-a-new var(--t) linear infinite both; }
+  .hero-replication .fa { animation: replication-fa var(--t) linear infinite both; }
+
+  .hero-replication .readout {
+    display: grid;
+    margin-top: 12px;
+    font-size: 0.76rem;
+    text-align: center;
+    color: var(--color-muted);
+  }
+  .hero-replication .readout b {
+    font-weight: 600;
+  }
+  .hero-replication .r {
+    grid-area: 1 / 1;
+    opacity: 0;
+  }
+  .hero-replication .r5 { opacity: 1; }
+  .hero-replication .r1 { animation: replication-r1 var(--t) linear infinite both; }
+  .hero-replication .r2 { animation: replication-r2 var(--t) linear infinite both; }
+  .hero-replication .r3 { animation: replication-r3 var(--t) linear infinite both; }
+  .hero-replication .r4 { animation: replication-r4 var(--t) linear infinite both; }
+  .hero-replication .r5 { animation: replication-r5 var(--t) linear infinite both; }
+
+  @keyframes replication-stage {
+    0% { opacity: 0; }
+    3%, 95% { opacity: 1; }
+    99%, 100% { opacity: 0; }
+  }
+  @keyframes replication-write {
+    0%, 4% { opacity: 0; }
+    7%, 18% { opacity: 1; }
+    21%, 100% { opacity: 0; }
+  }
+  @keyframes replication-lead-old {
+    0%, 8% { opacity: 1; }
+    10%, 100% { opacity: 0; }
+  }
+  @keyframes replication-lead-new {
+    0%, 8% { opacity: 0; }
+    10%, 100% { opacity: 1; }
+  }
+  @keyframes replication-stream {
+    0%, 20% { opacity: 0; }
+    23%, 30% { opacity: 1; }
+    33%, 100% { opacity: 0; }
+  }
+  @keyframes replication-ack-b {
+    0%, 29% { opacity: 0; }
+    32%, 40% { opacity: 1; }
+    43%, 100% { opacity: 0; }
+  }
+  @keyframes replication-b-old {
+    0%, 28% { opacity: 1; }
+    30%, 100% { opacity: 0; }
+  }
+  @keyframes replication-b-new {
+    0%, 28% { opacity: 0; }
+    30%, 100% { opacity: 1; }
+  }
+  @keyframes replication-async {
+    0%, 20% { opacity: 0; }
+    23%, 76% { opacity: 1; }
+    79%, 100% { opacity: 0; }
+  }
+  @keyframes replication-dot {
+    0%, 20% { opacity: 0; transform: translate(210px, 102px); }
+    23% { opacity: 1; transform: translate(212px, 104px); }
+    76% { opacity: 1; transform: translate(240px, 134px); }
+    78%, 100% { opacity: 0; transform: translate(242px, 136px); }
+  }
+  @keyframes replication-ack {
+    0%, 40% { opacity: 0; }
+    43%, 52% { opacity: 1; }
+    55%, 100% { opacity: 0; }
+  }
+  @keyframes replication-read {
+    0%, 54% { opacity: 0; }
+    57%, 100% { opacity: 1; }
+  }
+  @keyframes replication-stale {
+    0%, 58% { opacity: 0; fill: var(--color-red); }
+    61%, 76% { opacity: 1; fill: var(--color-red); }
+    78%, 100% { opacity: 1; fill: var(--color-muted); }
+  }
+  @keyframes replication-read-line {
+    0%, 76% { stroke: var(--color-cyan); }
+    78%, 100% { stroke: var(--color-muted); }
+  }
+  @keyframes replication-read-head {
+    0%, 76% { fill: var(--color-cyan); }
+    78%, 100% { fill: var(--color-muted); }
+  }
+  @keyframes replication-a-old {
+    0%, 76% { opacity: 1; }
+    78%, 100% { opacity: 0; }
+  }
+  @keyframes replication-a-new {
+    0%, 76% { opacity: 0; }
+    78%, 100% { opacity: 1; }
+  }
+  @keyframes replication-fa {
+    0%, 76% { stroke: var(--color-cyan); fill: var(--color-panel2); }
+    78%, 100% { stroke: var(--color-green); fill: var(--color-green-dim); }
+  }
+
+  @keyframes replication-r1 {
+    0%, 18% { opacity: 1; }
+    20%, 100% { opacity: 0; }
+  }
+  @keyframes replication-r2 {
+    0%, 20% { opacity: 0; }
+    22%, 38% { opacity: 1; }
+    40%, 100% { opacity: 0; }
+  }
+  @keyframes replication-r3 {
+    0%, 40% { opacity: 0; }
+    42%, 52% { opacity: 1; }
+    54%, 100% { opacity: 0; }
+  }
+  @keyframes replication-r4 {
+    0%, 54% { opacity: 0; }
+    56%, 74% { opacity: 1; }
+    76%, 100% { opacity: 0; }
+  }
+  @keyframes replication-r5 {
+    0%, 76% { opacity: 0; }
+    78%, 100% { opacity: 1; }
+  }
+</style>

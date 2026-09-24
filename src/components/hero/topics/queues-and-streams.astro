@@ -1,0 +1,277 @@
+---
+import HeroFrame from '../HeroFrame.astro';
+
+/**
+ * The page's crash-before-commit trace on partition 7, plus the handler-side fix it prescribes:
+ *   consumer A polls offset 104; the last committed offset is 103
+ *   A's handler stores dedup key p7:104, then sends the confirmation email (emails sent = 1)
+ *   A is killed before it commits 104
+ *   rebalance: consumer B is assigned partition 7 and resumes from the last committed offset, so 104 is redelivered
+ *   B's handler finds p7:104 already stored, skips the send, commits 104 (emails sent stays 1)
+ * The offsets, the redelivery and the email count come from running that sequence below, and the
+ * build fails if they stop matching what the picture draws.
+ * Timeline (13s): poll 0-16 · send 16-34 · crash 34-50 · rebalance 50-68 · dedup + commit 68-94 · fade 94-100.
+ * Un-animated styles are the final frame (reduced motion): A dead, B owns p7, 104 committed, one email.
+ */
+const offsets = [102, 103, 104, 105, 106];
+let committed = 103;
+const dedup = new Set<string>();
+let emails = 0;
+const handle = (offset: number) => {
+  const key = `p7:${offset}`;
+  if (dedup.has(key)) return false;
+  dedup.add(key);
+  emails++;
+  return true;
+};
+const aReads = committed + 1;
+handle(aReads);
+const committedAtCrash = committed;
+const bReads = committed + 1;
+const bSent = handle(bReads);
+committed = bReads;
+if (aReads !== 104 || bReads !== 104 || committedAtCrash !== 103 || bSent || emails !== 1 || committed !== 104) {
+  throw new Error('queues-and-streams hero: trace no longer matches the drawing');
+}
+
+const cellX = (o: number) => 46 + offsets.indexOf(o) * 62;
+const commitShift = cellX(committed) - cellX(committedAtCrash);
+const key = `p7:${aReads}`;
+---
+
+<HeroFrame label="p7 · crash before commit" caption="delivery is at-least-once; a dedup key stored before the side effect is what makes the redelivery harmless">
+  <div class="hero-queues-and-streams" style={`--shift: ${commitShift}px`}>
+    <svg viewBox="0 0 340 176" role="img" aria-label="consumer A sends an email for offset 104 and is killed before committing; consumer B is redelivered 104, finds the dedup key and skips the second email">
+      <text class="hd" x="14" y="9">partition 7 · offsets</text>
+      {
+        offsets.map((o) => (
+          <g>
+            <rect class:list={['cell', o <= committedAtCrash && 'done', o === aReads && 'c-hot']} x={cellX(o) - 25} y="20" width="50" height="28" rx="5" />
+            <text class="off" x={cellX(o)} y="34">{o}</text>
+          </g>
+        ))
+      }
+
+      <g class="cm">
+        <polygon points={`${cellX(committedAtCrash)},54 ${cellX(committedAtCrash) - 5},61 ${cellX(committedAtCrash) + 5},61`} />
+        <text x={cellX(committedAtCrash)} y="71">committed</text>
+      </g>
+      <g class="rd rd-a">
+        <polygon points={`${cellX(aReads)},54 ${cellX(aReads) - 5},61 ${cellX(aReads) + 5},61`} />
+        <text x={cellX(aReads)} y="71">A reads</text>
+      </g>
+      <g class="rd rd-b">
+        <polygon points={`${cellX(bReads)},54 ${cellX(bReads) - 5},61 ${cellX(bReads) + 5},61`} />
+        <text x={cellX(bReads)} y="71">B reads</text>
+      </g>
+
+      <rect class="box ca" x="10" y="94" width="148" height="30" rx="6" />
+      <text class="name" x="20" y="109">consumer A</text>
+      <text class="st sa-on" x="148" y="109">owns p7</text>
+      <text class="st sa-off" x="148" y="109">killed</text>
+
+      <g class="cb">
+        <rect class="box cbr" x="10" y="136" width="148" height="30" rx="6" />
+        <text class="name" x="20" y="151">consumer B</text>
+        <text class="st sb" x="148" y="151">owns p7</text>
+      </g>
+
+      <rect class="box kb" x="178" y="94" width="152" height="30" rx="6" />
+      <text class="name" x="188" y="109">dedup keys</text>
+      <text class="val kv" x="320" y="109">{key}</text>
+
+      <rect class="box eb" x="178" y="136" width="152" height="30" rx="6" />
+      <text class="name" x="188" y="151">emails sent</text>
+      <text class="val e0" x="320" y="151">0</text>
+      <text class="val e1" x="320" y="151">{emails}</text>
+    </svg>
+    <div class="readout font-mono">
+      <span class="r r0">A polls offset {aReads} · <b class="text-cyan">read, not yet committed</b></span>
+      <span class="r r1">store key {key}, then send · <b class="text-amber">the email goes out</b></span>
+      <span class="r r2">A is killed before committing {aReads} · <b class="text-red">commit lost</b></span>
+      <span class="r r3">B takes p7, resumes after {committedAtCrash} · <b class="text-cyan">{bReads} redelivered</b></span>
+      <span class="r r4">{key} found, skip send · <b class="text-green">commit {committed}, one email</b></span>
+    </div>
+  </div>
+</HeroFrame>
+
+<style is:inline>
+  .hero-queues-and-streams {
+    --t: 13s;
+    width: 100%;
+    max-width: 360px;
+    animation: queues-and-streams-stage var(--t) linear infinite both;
+  }
+  .hero-queues-and-streams svg {
+    display: block;
+    width: 100%;
+    height: auto;
+    overflow: visible;
+  }
+  .hero-queues-and-streams text {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    fill: var(--color-ink);
+    dominant-baseline: central;
+  }
+  .hero-queues-and-streams .hd {
+    fill: var(--color-muted);
+    font-size: 10px;
+  }
+  .hero-queues-and-streams .off {
+    text-anchor: middle;
+    font-size: 12px;
+  }
+  .hero-queues-and-streams .cell,
+  .hero-queues-and-streams .box {
+    fill: var(--color-panel2);
+    stroke: var(--color-line);
+    stroke-width: 1.5;
+  }
+  .hero-queues-and-streams .cell.done {
+    stroke: var(--color-green);
+  }
+  .hero-queues-and-streams .name {
+    fill: var(--color-muted);
+    font-size: 10px;
+  }
+  .hero-queues-and-streams .st,
+  .hero-queues-and-streams .val {
+    text-anchor: end;
+  }
+  .hero-queues-and-streams .cm polygon { fill: var(--color-green); }
+  .hero-queues-and-streams .cm text { fill: var(--color-green); font-size: 10px; text-anchor: middle; }
+  .hero-queues-and-streams .rd polygon { fill: var(--color-cyan); }
+  .hero-queues-and-streams .rd text { fill: var(--color-cyan); font-size: 10px; text-anchor: middle; }
+
+  /* final frame: A dead, B owns p7, 104 committed, key hit, one email */
+  .hero-queues-and-streams .c-hot { stroke: var(--color-green); fill: var(--color-green-dim); animation: queues-and-streams-hot var(--t) linear infinite both; }
+  .hero-queues-and-streams .cm { transform: translateX(var(--shift)); animation: queues-and-streams-cm var(--t) ease-in-out infinite both; }
+  .hero-queues-and-streams .rd { opacity: 0; }
+  .hero-queues-and-streams .rd-a { animation: queues-and-streams-rd-a var(--t) linear infinite both; }
+  .hero-queues-and-streams .rd-b { animation: queues-and-streams-rd-b var(--t) linear infinite both; }
+  .hero-queues-and-streams .ca { stroke: var(--color-red); fill: var(--color-red-dim); animation: queues-and-streams-ca var(--t) linear infinite both; }
+  .hero-queues-and-streams .sa-on { fill: var(--color-cyan); opacity: 0; animation: queues-and-streams-sa-on var(--t) linear infinite both; }
+  .hero-queues-and-streams .sa-off { fill: var(--color-red); animation: queues-and-streams-sa-off var(--t) linear infinite both; }
+  .hero-queues-and-streams .cb { animation: queues-and-streams-cb var(--t) linear infinite both; }
+  .hero-queues-and-streams .cbr { stroke: var(--color-cyan); }
+  .hero-queues-and-streams .sb { fill: var(--color-cyan); }
+  .hero-queues-and-streams .kb { stroke: var(--color-green); animation: queues-and-streams-kb var(--t) linear infinite both; }
+  .hero-queues-and-streams .kv { fill: var(--color-green); animation: queues-and-streams-kv var(--t) linear infinite both; }
+  .hero-queues-and-streams .eb { stroke: var(--color-green); animation: queues-and-streams-eb var(--t) linear infinite both; }
+  .hero-queues-and-streams .e0 { opacity: 0; animation: queues-and-streams-e0 var(--t) linear infinite both; }
+  .hero-queues-and-streams .e1 { fill: var(--color-green); animation: queues-and-streams-e1 var(--t) linear infinite both; }
+
+  .hero-queues-and-streams .readout {
+    display: grid;
+    margin-top: 10px;
+    font-size: 0.76rem;
+    text-align: center;
+  }
+  .hero-queues-and-streams .readout b {
+    font-weight: 600;
+  }
+  .hero-queues-and-streams .r {
+    grid-area: 1 / 1;
+    opacity: 0;
+  }
+  .hero-queues-and-streams .r4 { opacity: 1; }
+  .hero-queues-and-streams .r0 { animation: queues-and-streams-r0 var(--t) linear infinite both; }
+  .hero-queues-and-streams .r1 { animation: queues-and-streams-r1 var(--t) linear infinite both; }
+  .hero-queues-and-streams .r2 { animation: queues-and-streams-r2 var(--t) linear infinite both; }
+  .hero-queues-and-streams .r3 { animation: queues-and-streams-r3 var(--t) linear infinite both; }
+  .hero-queues-and-streams .r4 { animation: queues-and-streams-r4 var(--t) linear infinite both; }
+
+  @keyframes queues-and-streams-stage {
+    0% { opacity: 0; }
+    3%, 94% { opacity: 1; }
+    99%, 100% { opacity: 0; }
+  }
+  @keyframes queues-and-streams-hot {
+    0%, 2% { stroke: var(--color-line); fill: var(--color-panel2); }
+    4%, 34% { stroke: var(--color-cyan); fill: var(--color-panel2); }
+    37%, 51% { stroke: var(--color-line); fill: var(--color-panel2); }
+    54%, 77% { stroke: var(--color-cyan); fill: var(--color-panel2); }
+    81%, 100% { stroke: var(--color-green); fill: var(--color-green-dim); }
+  }
+  @keyframes queues-and-streams-cm {
+    0%, 77% { transform: translateX(0); }
+    81%, 100% { transform: translateX(var(--shift)); }
+  }
+  @keyframes queues-and-streams-rd-a {
+    0%, 2% { opacity: 0; }
+    4%, 34% { opacity: 1; }
+    37%, 100% { opacity: 0; }
+  }
+  @keyframes queues-and-streams-rd-b {
+    0%, 51% { opacity: 0; }
+    54%, 73% { opacity: 1; }
+    76%, 100% { opacity: 0; }
+  }
+  @keyframes queues-and-streams-ca {
+    0%, 34% { stroke: var(--color-cyan); fill: var(--color-panel2); }
+    37%, 100% { stroke: var(--color-red); fill: var(--color-red-dim); }
+  }
+  @keyframes queues-and-streams-sa-on {
+    0%, 34% { opacity: 1; }
+    36%, 100% { opacity: 0; }
+  }
+  @keyframes queues-and-streams-sa-off {
+    0%, 35% { opacity: 0; }
+    37%, 100% { opacity: 1; }
+  }
+  @keyframes queues-and-streams-cb {
+    0%, 50% { opacity: 0; transform: translateY(6px); }
+    54%, 100% { opacity: 1; transform: translateY(0); }
+  }
+  @keyframes queues-and-streams-kb {
+    0%, 17% { stroke: var(--color-line); }
+    19%, 30% { stroke: var(--color-amber); }
+    33%, 69% { stroke: var(--color-line); }
+    72%, 100% { stroke: var(--color-green); }
+  }
+  @keyframes queues-and-streams-kv {
+    0%, 17% { opacity: 0; fill: var(--color-amber); }
+    19%, 69% { opacity: 1; fill: var(--color-amber); }
+    72%, 100% { opacity: 1; fill: var(--color-green); }
+  }
+  @keyframes queues-and-streams-eb {
+    0%, 23% { stroke: var(--color-line); }
+    25%, 33% { stroke: var(--color-amber); }
+    36%, 78% { stroke: var(--color-line); }
+    82%, 100% { stroke: var(--color-green); }
+  }
+  @keyframes queues-and-streams-e0 {
+    0%, 23% { opacity: 1; }
+    25%, 100% { opacity: 0; }
+  }
+  @keyframes queues-and-streams-e1 {
+    0%, 23% { opacity: 0; fill: var(--color-amber); }
+    25%, 78% { opacity: 1; fill: var(--color-amber); }
+    82%, 100% { opacity: 1; fill: var(--color-green); }
+  }
+
+  @keyframes queues-and-streams-r0 {
+    0%, 15% { opacity: 1; }
+    17%, 100% { opacity: 0; }
+  }
+  @keyframes queues-and-streams-r1 {
+    0%, 16% { opacity: 0; }
+    18%, 33% { opacity: 1; }
+    35%, 100% { opacity: 0; }
+  }
+  @keyframes queues-and-streams-r2 {
+    0%, 34% { opacity: 0; }
+    36%, 49% { opacity: 1; }
+    51%, 100% { opacity: 0; }
+  }
+  @keyframes queues-and-streams-r3 {
+    0%, 50% { opacity: 0; }
+    52%, 67% { opacity: 1; }
+    69%, 100% { opacity: 0; }
+  }
+  @keyframes queues-and-streams-r4 {
+    0%, 68% { opacity: 0; }
+    70%, 100% { opacity: 1; }
+  }
+</style>

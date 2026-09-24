@@ -1,0 +1,308 @@
+---
+import HeroFrame from '../HeroFrame.astro';
+
+/**
+ * The store-buffer litmus, core 0 runs `x = 1; r1 = y`, core 1 runs `y = 1; r2 = x`, x = y = 0.
+ * Frames are computed at build time by running the four lines on a model of two store buffers
+ * over one coherent cache (a load checks its own core's buffer first, then the cache):
+ *   start: x = 0, y = 0 in the cache
+ *   both stores go into their core's store buffer, not the cache
+ *   both loads miss their own buffer and read the cache: r1 = 0, r2 = 0
+ *   every sequential interleaving of the four lines is also enumerated here, and none gives
+ *     r1 = r2 = 0, so that outcome is the reordering, not a race
+ *   the buffers drain after both loads: x = 1, y = 1 reach the cache, too late
+ * One frame per step, crossfaded with one shared keyframe and negative delays.
+ * Un-animated styles show the final frame (reduced motion).
+ */
+type Var = 'x' | 'y';
+type Reg = 'r1' | 'r2';
+type Line = { kind: 'st'; v: Var } | { kind: 'ld'; v: Var; r: Reg };
+const program: Line[][] = [
+  [{ kind: 'st', v: 'x' }, { kind: 'ld', v: 'y', r: 'r1' }],
+  [{ kind: 'st', v: 'y' }, { kind: 'ld', v: 'x', r: 'r2' }],
+];
+const src = (l: Line) => (l.kind === 'st' ? `${l.v} = 1` : `${l.r} = ${l.v}`);
+
+const outcome = (r: Partial<Record<Reg, number>>) => `${r.r1},${r.r2}`;
+const interleavings = new Set<string>();
+const walk = (pc: number[], mem: Record<Var, number>, reg: Partial<Record<Reg, number>>) => {
+  if (pc.every((p, c) => p === program[c].length)) return void interleavings.add(outcome(reg));
+  pc.forEach((p, c) => {
+    if (p === program[c].length) return;
+    const l = program[c][p];
+    const m = { ...mem };
+    const r = { ...reg };
+    if (l.kind === 'st') m[l.v] = 1;
+    else r[l.r] = m[l.v];
+    walk(pc.map((q, d) => (d === c ? q + 1 : q)), m, r);
+  });
+};
+walk([0, 0], { x: 0, y: 0 }, {});
+
+type Snap = {
+  cache: Record<Var, number>;
+  buf: (Line | null)[];
+  reg: Partial<Record<Reg, number>>;
+  active: 'st' | 'ld' | 'drain' | null;
+  anomaly: boolean;
+};
+const cache: Record<Var, number> = { x: 0, y: 0 };
+const buf: (Line | null)[] = [null, null];
+const reg: Partial<Record<Reg, number>> = {};
+const snap = (active: Snap['active'], anomaly = false): Snap => ({ cache: { ...cache }, buf: [...buf], reg: { ...reg }, active, anomaly });
+const frames: Snap[] = [snap(null)];
+program.forEach((lines, c) => (buf[c] = lines[0]));
+frames.push(snap('st'));
+program.forEach((lines, c) => {
+  const l = lines[1];
+  if (l.kind !== 'ld') return;
+  const own = buf[c];
+  reg[l.r] = own && own.v === l.v ? 1 : cache[l.v];
+});
+frames.push(snap('ld'));
+const reordered = !interleavings.has(outcome(reg));
+frames.push(snap(null, reordered));
+buf.forEach((b, c) => {
+  if (b) cache[b.v] = 1;
+  buf[c] = null;
+});
+frames.push(snap('drain', reordered));
+
+const readouts = [
+  { lead: 'start', verdict: `x = ${frames[0].cache.x}, y = ${frames[0].cache.y} in the cache`, cls: 'text-ink' },
+  { lead: 'x = 1, y = 1 go into the store buffers', verdict: 'not in the cache yet', cls: 'text-amber' },
+  { lead: 'r1 = y, r2 = x read the cache', verdict: `both read ${frames[2].reg.r1}`, cls: 'text-cyan' },
+  { lead: `r1 = ${reg.r1}, r2 = ${reg.r2}`, verdict: reordered ? 'no interleaving of the four lines gives this' : 'an ordinary interleaving', cls: 'text-red' },
+  { lead: 'the stores drain after both loads', verdict: 'StoreLoad\u00a0reordering', cls: 'text-red', tail: 'x86-64 allows it' },
+];
+
+const n = frames.length;
+const delay = (k: number) => `animation-delay: calc(var(--t) * ${(k / n - 1).toFixed(4)})`;
+const core = [8, 188];
+const coreW = 164;
+const cellX: Record<Var, number> = { x: 110, y: 190 };
+const cellW = 60;
+const bufX = (c: number) => core[c] + 86;
+const bufW = 70;
+const rowY = [40, 66];
+const resX = (c: number) => core[c] + 86;
+const loadTo = (c: number) => ({ x: resX(c) + 10, y: rowY[1] + 12 });
+const drainFrom = (c: number) => (c === 0 ? bufX(c) + bufW / 2 : bufX(c) + bufW - 8);
+const cellMid = (v: Var) => cellX[v] + cellW / 2;
+const head = (x1: number, y1: number, x2: number, y2: number) => {
+  const a = Math.atan2(y2 - y1, x2 - x1);
+  const p = (d: number, s: number) => `${(x2 - d * Math.cos(a) + s * Math.sin(a)).toFixed(1)},${(y2 - d * Math.sin(a) - s * Math.cos(a)).toFixed(1)}`;
+  return `${x2},${y2} ${p(8, 4)} ${p(8, -4)}`;
+};
+
+const keyframes = (() => {
+  const s = 100 / n;
+  const p = (f: number) => `${(s * f).toFixed(2)}%`;
+  return `@keyframes memory-model-frame { 0% { opacity: 0; } ${p(0.06)}, ${p(0.95)} { opacity: 1; } ${p(1.03)}, 100% { opacity: 0; } }`;
+})();
+---
+
+<HeroFrame label="store buffer · x = 1 ∥ y = 1" caption="a store waits in its core's store buffer while the next load reads the cache, so both threads can read 0">
+  <div class="hero-memory-model" style={`--frames: ${n}`}>
+    <svg viewBox="0 0 360 192" role="img" aria-label="two cores each store to their store buffer, then load the other variable from the cache and both read 0">
+      {
+        program.map((lines, c) => (
+          <>
+            <rect class="box" x={core[c]} y="4" width={coreW} height="96" rx="6" />
+            <text class="hd" x={core[c] + 10} y="16">core {c}</text>
+            <text class="sb" x={bufX(c)} y="16">store buffer</text>
+            <rect class="slot" x={bufX(c)} y={rowY[0] - 10} width={bufW} height="20" rx="4" />
+          </>
+        ))
+      }
+      <rect class="box" x="8" y="128" width="344" height="58" rx="6" />
+      <text class="hd" x="18" y="150">cache</text>
+      <text class="sb" x="18" y="165">coherent</text>
+      {(['x', 'y'] as Var[]).map((v) => <rect class="box" x={cellX[v]} y="144" width={cellW} height="28" rx="5" />)}
+
+      {
+        frames.map((f, k) => (
+          <g class:list={['layer', k === n - 1 && 'final']} style={delay(k)}>
+            {program.map((lines, c) => (
+              <>
+                {lines.map((l, i) => (
+                  <text class:list={['src', f.active === l.kind && (l.kind === 'st' ? 'amber' : 'cyan')]} x={core[c] + 10} y={rowY[i]}>
+                    {src(l)}
+                  </text>
+                ))}
+                {lines.map((l) =>
+                  l.kind === 'ld' && f.reg[l.r] !== undefined ? (
+                    <text class:list={['res', f.anomaly ? 'red' : 'cyan']} x={resX(c)} y={rowY[1]}>
+                      → {f.reg[l.r]}
+                    </text>
+                  ) : null
+                )}
+                {f.buf[c] && (
+                  <>
+                    <rect class="pend" x={bufX(c)} y={rowY[0] - 10} width={bufW} height="20" rx="4" />
+                    <text class="bv" x={bufX(c) + bufW / 2} y={rowY[0]}>{src(f.buf[c]!)}</text>
+                  </>
+                )}
+              </>
+            ))}
+            {(['x', 'y'] as Var[]).map((v) => (
+              <>
+                {f.cache[v] === 1 && <rect class="done" x={cellX[v]} y="144" width={cellW} height="28" rx="5" />}
+                <text class:list={['cv', f.cache[v] === 1 && 'green']} x={cellMid(v)} y="158">
+                  {v} = {f.cache[v]}
+                </text>
+              </>
+            ))}
+            {f.active === 'ld' &&
+              program.map((lines, c) => {
+                const l = lines[1];
+                const x1 = cellMid(l.v) + (c === 0 ? 6 : -6);
+                const to = loadTo(c);
+                return (
+                  <g class="arrow cyan">
+                    <line x1={x1} y1="142" x2={to.x} y2={to.y} />
+                    <polygon points={head(x1, 142, to.x, to.y)} />
+                  </g>
+                );
+              })}
+            {f.active === 'drain' &&
+              program.map((lines, c) => {
+                const v = lines[0].v;
+                const x1 = drainFrom(c);
+                const x2 = cellMid(v) + (c === 0 ? -8 : 8);
+                return (
+                  <g class="arrow green">
+                    <line x1={x1} y1={rowY[0] + 12} x2={x2} y2="142" />
+                    <polygon points={head(x1, rowY[0] + 12, x2, 142)} />
+                  </g>
+                );
+              })}
+          </g>
+        ))
+      }
+    </svg>
+    <div class="readout font-mono">
+      {
+        readouts.map((r, k) => (
+          <span class:list={['r', k === n - 1 && 'final']} style={delay(k)}>
+            {r.lead} · <b class={r.cls}>{r.verdict}</b>
+            {r.tail && ` · ${r.tail}`}
+          </span>
+        ))
+      }
+    </div>
+  </div>
+</HeroFrame>
+
+<style is:inline set:html={keyframes}></style>
+<style is:inline>
+  .hero-memory-model {
+    --t: calc(var(--frames) * 2.6s);
+    width: 100%;
+    max-width: 400px;
+    animation: memory-model-stage var(--t) linear infinite both;
+  }
+  .hero-memory-model svg {
+    display: block;
+    width: 100%;
+    height: auto;
+    overflow: visible;
+  }
+  .hero-memory-model text {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    fill: var(--color-ink);
+    dominant-baseline: central;
+  }
+  .hero-memory-model .hd {
+    fill: var(--color-muted);
+    font-size: 10px;
+  }
+  .hero-memory-model .sb {
+    fill: var(--color-muted);
+    font-size: 9px;
+  }
+  .hero-memory-model .bv,
+  .hero-memory-model .cv {
+    text-anchor: middle;
+  }
+  .hero-memory-model .box {
+    fill: var(--color-panel2);
+    stroke: var(--color-line);
+    stroke-width: 1.5;
+  }
+  .hero-memory-model .slot {
+    fill: none;
+    stroke: var(--color-line);
+    stroke-dasharray: 3 3;
+  }
+  .hero-memory-model .pend {
+    fill: var(--color-panel);
+    stroke: var(--color-amber);
+    stroke-width: 1.5;
+  }
+  .hero-memory-model .bv {
+    fill: var(--color-amber);
+  }
+  .hero-memory-model .done {
+    fill: var(--color-green-dim);
+    stroke: var(--color-green);
+    stroke-width: 1.5;
+  }
+  .hero-memory-model .src.amber,
+  .hero-memory-model .res.amber {
+    fill: var(--color-amber);
+  }
+  .hero-memory-model .src.cyan,
+  .hero-memory-model .res.cyan {
+    fill: var(--color-cyan);
+  }
+  .hero-memory-model .res.red {
+    fill: var(--color-red);
+    font-weight: 600;
+  }
+  .hero-memory-model .cv.green {
+    fill: var(--color-green);
+  }
+  .hero-memory-model .arrow line {
+    stroke-width: 1.5;
+  }
+  .hero-memory-model .arrow.cyan line {
+    stroke: var(--color-cyan);
+  }
+  .hero-memory-model .arrow.cyan polygon {
+    fill: var(--color-cyan);
+  }
+  .hero-memory-model .arrow.green line {
+    stroke: var(--color-green);
+  }
+  .hero-memory-model .arrow.green polygon {
+    fill: var(--color-green);
+  }
+  .hero-memory-model .layer,
+  .hero-memory-model .r {
+    opacity: 0;
+    animation: memory-model-frame var(--t) linear infinite both;
+  }
+  .hero-memory-model .layer.final,
+  .hero-memory-model .r.final {
+    opacity: 1;
+  }
+  .hero-memory-model .readout {
+    display: grid;
+    margin-top: 10px;
+    font-size: 0.76rem;
+    text-align: center;
+  }
+  .hero-memory-model .readout b {
+    font-weight: 600;
+  }
+  .hero-memory-model .r {
+    grid-area: 1 / 1;
+  }
+  @keyframes memory-model-stage {
+    0% { opacity: 0; }
+    3%, 96% { opacity: 1; }
+    100% { opacity: 0; }
+  }
+</style>

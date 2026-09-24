@@ -1,0 +1,306 @@
+---
+import HeroFrame from '../HeroFrame.astro';
+
+/**
+ * Treiber stack, two racing pushes against _head → [7] → [3]:
+ *   A builds [9], B builds [4]; both read _head = [7] and set Next = [7], neither is published
+ *   A: CAS(_head, [9], expected [7]) returns [7] → won, _head swings to [9]
+ *   B: CAS(_head, [4], expected [7]) returns [9] → lost, B is not blocked
+ *   B: Next = [9], taken from what the CAS returned (no second load)
+ *   B: CAS(_head, [4], expected [9]) returns [9] → won, _head swings to [4]
+ * Result _head → [4] → [9] → [7] → [3]. Nodes never move: each is fully built where its thread
+ * made it, Next arrows stay attached, and only the _head pointer swings at each winning CAS.
+ * The CAS results in the readouts are computed below by running the race. Un-animated styles
+ * are the final frame (reduced motion).
+ */
+type Node = { v: number; next: Node | null };
+let head: Node = { v: 7, next: { v: 3, next: null } };
+const cas = (expected: Node, value: Node) => {
+  const seen = head;
+  if (seen === expected) head = value;
+  return seen;
+};
+const a: Node = { v: 9, next: null };
+const b: Node = { v: 4, next: null };
+const readA = head;
+const readB = head;
+a.next = readA;
+b.next = readB;
+const aSeen = cas(readA, a);
+const bSeen = cas(readB, b);
+b.next = bSeen;
+const bRetry = cas(bSeen, b);
+const chain: number[] = [];
+for (let n: Node | null = head; n; n = n.next) chain.push(n.v);
+
+const W = 18;
+const H = 14;
+const arrow = (x1: number, y1: number, x2: number, y2: number, trimStart = true) => {
+  const dx = x2 - x1;
+  const dy = y2 - y1;
+  const len = Math.hypot(dx, dy);
+  const ux = dx / len;
+  const uy = dy / len;
+  const edge = Math.min(dx ? W / Math.abs(dx) : Infinity, dy ? H / Math.abs(dy) : Infinity) * len + 2;
+  const sx = trimStart ? x1 + ux * edge : x1;
+  const sy = trimStart ? y1 + uy * edge : y1;
+  const ex = x2 - ux * edge;
+  const ey = y2 - uy * edge;
+  const px = -uy;
+  const py = ux;
+  const f = (n: number) => n.toFixed(1);
+  const tip = `${f(ex)},${f(ey)} ${f(ex - ux * 7 + px * 3.5)},${f(ey - uy * 7 + py * 3.5)} ${f(ex - ux * 7 - px * 3.5)},${f(ey - uy * 7 - py * 3.5)}`;
+  return { line: { x1: f(sx), y1: f(sy), x2: f(ex - ux * 6), y2: f(ey - uy * 6) }, tip };
+};
+const Y = 104;
+const n7 = { x: 210, y: Y };
+const n3 = { x: 270, y: Y };
+const nA = { x: 150, y: 42 };
+const nB = { x: 90, y: 166 };
+const hd = { x: 54, y: Y };
+const arrows = {
+  headTo7: arrow(hd.x, hd.y, n7.x, n7.y, false),
+  headTo9: arrow(hd.x, hd.y, nA.x, nA.y, false),
+  headTo4: arrow(hd.x, hd.y, nB.x, nB.y, false),
+  n9To7: arrow(nA.x, nA.y, n7.x, n7.y),
+  n4To7: arrow(nB.x, nB.y, n7.x, n7.y),
+  n4To9: arrow(nB.x, nB.y, nA.x, nA.y),
+  n7To3: arrow(n7.x, n7.y, n3.x, n3.y),
+};
+---
+
+<HeroFrame label="Treiber · Push(9) ∥ Push(4)" caption="the CAS is the publication: a loser owns nothing, so it retries from the value the CAS returned while nobody waits on it">
+  <div class="hero-lock-free-structures">
+    <svg viewBox="0 0 340 200" role="img" aria-label="two threads push onto a Treiber stack; thread A's compare-and-swap swings _head to its node, thread B's fails and returns A's node, B points its Next there and wins on retry">
+      {
+        Object.entries(arrows).map(([k, { line, tip }]) => (
+          <g class={`ar ${k}`}>
+            <line {...line} />
+            <polygon points={tip} />
+          </g>
+        ))
+      }
+      <text class="hd" x="30" y={Y}>_head</text>
+      <text class="nul" x="318" y={Y}>null</text>
+      <line class="ar-fixed" x1={n3.x + W + 2} y1={Y} x2="302" y2={Y} />
+
+      <g transform={`translate(${n7.x} ${n7.y})`}>
+        <rect class="n" x={-W} y={-H} width={W * 2} height={H * 2} rx="6" />
+        <text>7</text>
+      </g>
+      <g transform={`translate(${n3.x} ${n3.y})`}>
+        <rect class="n" x={-W} y={-H} width={W * 2} height={H * 2} rx="6" />
+        <text>3</text>
+      </g>
+
+      <text class="who wa" x={nA.x} y="14">thread A</text>
+      <text class="who wb" x={nB.x} y="194">thread B</text>
+
+      <g transform={`translate(${nA.x} ${nA.y})`}>
+        <rect class="n sa" x={-W} y={-H} width={W * 2} height={H * 2} rx="6" />
+        <text>9</text>
+      </g>
+      <g transform={`translate(${nB.x} ${nB.y})`}>
+        <rect class="n sb" x={-W} y={-H} width={W * 2} height={H * 2} rx="6" />
+        <text>4</text>
+      </g>
+    </svg>
+    <div class="readout font-mono">
+      <span class="r r0">both read _head = [{readA.v}] · Next = [{readA.v}] · <b class="text-amber">neither node is published</b></span>
+      <span class="r r1">A: CAS(_head, [9], expected [{readA.v}]) → [{aSeen.v}] · <b class="text-green">won, _head = [9]</b></span>
+      <span class="r r2">B: CAS(_head, [4], expected [{readB.v}]) → [{bSeen.v}] · <b class="text-red">lost, nobody blocked</b></span>
+      <span class="r r3">B: Next = [{bSeen.v}] · <b class="text-cyan">retry from what the CAS returned</b></span>
+      <span class="r r4">B: CAS(_head, [4], expected [{bSeen.v}]) → [{bRetry.v}] · <b class="text-green">won, _head = [4]</b></span>
+      <span class="r r5">_head → {chain.map((v) => `[${v}]`).join(' → ')} · <b class="text-green">no lock, B paid one retry</b></span>
+    </div>
+  </div>
+</HeroFrame>
+
+<style is:inline>
+  .hero-lock-free-structures {
+    --t: 14s;
+    width: 100%;
+    max-width: 400px;
+    animation: lock-free-structures-stage var(--t) linear infinite both;
+  }
+  .hero-lock-free-structures svg {
+    display: block;
+    width: 100%;
+    height: auto;
+    overflow: visible;
+  }
+  .hero-lock-free-structures text {
+    fill: var(--color-ink);
+    font-family: var(--font-mono);
+    font-size: 14px;
+    text-anchor: middle;
+    dominant-baseline: central;
+  }
+  .hero-lock-free-structures .hd {
+    font-size: 11px;
+  }
+  .hero-lock-free-structures .nul,
+  .hero-lock-free-structures .who {
+    fill: var(--color-muted);
+    font-size: 10px;
+  }
+  .hero-lock-free-structures .wa {
+    fill: var(--color-amber);
+  }
+  .hero-lock-free-structures .wb {
+    fill: var(--color-cyan);
+  }
+  .hero-lock-free-structures .n {
+    fill: var(--color-panel2);
+    stroke: var(--color-line);
+    stroke-width: 1.5;
+  }
+  .hero-lock-free-structures .ar line,
+  .hero-lock-free-structures .ar-fixed {
+    stroke: var(--color-muted);
+    stroke-width: 1.5;
+  }
+  .hero-lock-free-structures .ar polygon {
+    fill: var(--color-muted);
+  }
+
+  /* final frame: _head → [4] → [9] → [7] → [3], both pushes published */
+  .hero-lock-free-structures .headTo7,
+  .hero-lock-free-structures .headTo9,
+  .hero-lock-free-structures .n4To7 {
+    opacity: 0;
+  }
+  .hero-lock-free-structures .sa,
+  .hero-lock-free-structures .sb {
+    stroke: var(--color-green);
+    fill: var(--color-green-dim);
+  }
+
+  .hero-lock-free-structures .sa { animation: lock-free-structures-sa var(--t) linear infinite both; }
+  .hero-lock-free-structures .sb { animation: lock-free-structures-sb var(--t) linear infinite both; }
+  .hero-lock-free-structures .headTo7 { animation: lock-free-structures-head7 var(--t) linear infinite both; }
+  .hero-lock-free-structures .headTo9 { animation: lock-free-structures-head9 var(--t) linear infinite both; }
+  .hero-lock-free-structures .headTo4 { animation: lock-free-structures-head4 var(--t) linear infinite both; }
+  .hero-lock-free-structures .n9To7 line { animation: lock-free-structures-n97-stroke var(--t) linear infinite both; }
+  .hero-lock-free-structures .n9To7 polygon { animation: lock-free-structures-n97-fill var(--t) linear infinite both; }
+  .hero-lock-free-structures .n4To7 { animation: lock-free-structures-n47 var(--t) linear infinite both; }
+  .hero-lock-free-structures .n4To7 line { animation: lock-free-structures-n47-stroke var(--t) linear infinite both; }
+  .hero-lock-free-structures .n4To7 polygon { animation: lock-free-structures-n47-fill var(--t) linear infinite both; }
+  .hero-lock-free-structures .n4To9 { animation: lock-free-structures-n49 var(--t) linear infinite both; }
+  .hero-lock-free-structures .n4To9 line { animation: lock-free-structures-n49-stroke var(--t) linear infinite both; }
+  .hero-lock-free-structures .n4To9 polygon { animation: lock-free-structures-n49-fill var(--t) linear infinite both; }
+
+  .hero-lock-free-structures .readout {
+    display: grid;
+    margin-top: 10px;
+    font-size: 0.76rem;
+    text-align: center;
+  }
+  .hero-lock-free-structures .readout b {
+    font-weight: 600;
+    white-space: nowrap;
+  }
+  .hero-lock-free-structures .r {
+    grid-area: 1 / 1;
+    opacity: 0;
+  }
+  .hero-lock-free-structures .r5 { opacity: 1; }
+  .hero-lock-free-structures .r0 { animation: lock-free-structures-r0 var(--t) linear infinite both; }
+  .hero-lock-free-structures .r1 { animation: lock-free-structures-r1 var(--t) linear infinite both; }
+  .hero-lock-free-structures .r2 { animation: lock-free-structures-r2 var(--t) linear infinite both; }
+  .hero-lock-free-structures .r3 { animation: lock-free-structures-r3 var(--t) linear infinite both; }
+  .hero-lock-free-structures .r4 { animation: lock-free-structures-r4 var(--t) linear infinite both; }
+  .hero-lock-free-structures .r5 { animation: lock-free-structures-r5 var(--t) linear infinite both; }
+
+  /* timeline: both read 0-20 · A wins 21-38 · B loses 39-55 · B re-points 56-65 · B wins 66-78 · settled 79-95 · fade 95-100
+     every state change (node color, Next arrow, _head swing, readout) crosses over in the same 1% window */
+  @keyframes lock-free-structures-stage {
+    0% { opacity: 0; }
+    3%, 95% { opacity: 1; }
+    99%, 100% { opacity: 0; }
+  }
+  @keyframes lock-free-structures-sa {
+    0%, 20% { stroke: var(--color-amber); stroke-dasharray: 4 3; fill: var(--color-panel2); }
+    21%, 100% { stroke: var(--color-green); stroke-dasharray: none; fill: var(--color-green-dim); }
+  }
+  @keyframes lock-free-structures-sb {
+    0%, 38% { stroke: var(--color-cyan); stroke-dasharray: 4 3; fill: var(--color-panel2); }
+    39%, 55% { stroke: var(--color-red); stroke-dasharray: 4 3; fill: var(--color-red-dim); }
+    56%, 65% { stroke: var(--color-cyan); stroke-dasharray: 4 3; fill: var(--color-panel2); }
+    66%, 100% { stroke: var(--color-green); stroke-dasharray: none; fill: var(--color-green-dim); }
+  }
+  @keyframes lock-free-structures-head7 {
+    0%, 20% { opacity: 1; }
+    21%, 100% { opacity: 0; }
+  }
+  @keyframes lock-free-structures-head9 {
+    0%, 20% { opacity: 0; }
+    21%, 65% { opacity: 1; }
+    66%, 100% { opacity: 0; }
+  }
+  @keyframes lock-free-structures-head4 {
+    0%, 65% { opacity: 0; }
+    66%, 100% { opacity: 1; }
+  }
+  @keyframes lock-free-structures-n97-stroke {
+    0%, 20% { stroke: var(--color-amber); }
+    21%, 100% { stroke: var(--color-muted); }
+  }
+  @keyframes lock-free-structures-n97-fill {
+    0%, 20% { fill: var(--color-amber); }
+    21%, 100% { fill: var(--color-muted); }
+  }
+  @keyframes lock-free-structures-n47 {
+    0%, 55% { opacity: 1; }
+    56%, 100% { opacity: 0; }
+  }
+  @keyframes lock-free-structures-n47-stroke {
+    0%, 38% { stroke: var(--color-cyan); }
+    39%, 100% { stroke: var(--color-red); }
+  }
+  @keyframes lock-free-structures-n47-fill {
+    0%, 38% { fill: var(--color-cyan); }
+    39%, 100% { fill: var(--color-red); }
+  }
+  @keyframes lock-free-structures-n49 {
+    0%, 55% { opacity: 0; }
+    56%, 100% { opacity: 1; }
+  }
+  @keyframes lock-free-structures-n49-stroke {
+    0%, 65% { stroke: var(--color-cyan); }
+    66%, 100% { stroke: var(--color-muted); }
+  }
+  @keyframes lock-free-structures-n49-fill {
+    0%, 65% { fill: var(--color-cyan); }
+    66%, 100% { fill: var(--color-muted); }
+  }
+
+  @keyframes lock-free-structures-r0 {
+    0%, 20% { opacity: 1; }
+    21%, 100% { opacity: 0; }
+  }
+  @keyframes lock-free-structures-r1 {
+    0%, 20% { opacity: 0; }
+    21%, 38% { opacity: 1; }
+    39%, 100% { opacity: 0; }
+  }
+  @keyframes lock-free-structures-r2 {
+    0%, 38% { opacity: 0; }
+    39%, 55% { opacity: 1; }
+    56%, 100% { opacity: 0; }
+  }
+  @keyframes lock-free-structures-r3 {
+    0%, 55% { opacity: 0; }
+    56%, 65% { opacity: 1; }
+    66%, 100% { opacity: 0; }
+  }
+  @keyframes lock-free-structures-r4 {
+    0%, 65% { opacity: 0; }
+    66%, 78% { opacity: 1; }
+    79%, 100% { opacity: 0; }
+  }
+  @keyframes lock-free-structures-r5 {
+    0%, 78% { opacity: 0; }
+    79%, 100% { opacity: 1; }
+  }
+</style>

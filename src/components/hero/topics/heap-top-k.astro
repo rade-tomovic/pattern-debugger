@@ -1,0 +1,243 @@
+---
+import HeroFrame from '../HeroFrame.astro';
+
+/**
+ * Bounded min-heap of size k = 2 over nums = [3, 2, 1, 5, 6, 4], the page's own example:
+ *   Enqueue(n) every value; once Count > k, Dequeue() evicts the root (the smallest kept)
+ *   3 → {3} · 2 → {2,3} · 1 → {1,2,3} evict 1 · 5 → {2,3,5} evict 2
+ *   6 → {3,5,6} evict 3 · 4 → {4,5,6} evict 4 · final {5,6}, Peek() = 5, the 2nd largest
+ * The heap row shows the kept set with its minimum in the root slot; it makes no claim about the
+ * backing array layout. Frames are computed at build time by running the template.
+ * Un-animated styles are the final frame (reduced motion).
+ */
+const nums = [3, 2, 1, 5, 6, 4];
+const k = 2;
+
+const numX = (i: number) => 72 + i * 42;
+const heapX = (j: number) => 114 + j * 42;
+const evX = (m: number) => 72 + m * 42;
+const NUM_Y = 26;
+const HEAP_Y = 96;
+const EV_Y = 170;
+
+type Pos = [number, number];
+type Look = 'idle' | 'write' | 'kept' | 'evict' | 'answer';
+type Snap = { t: number; pos: Pos[]; look: Look[] };
+
+const START = 4;
+const STEP = 12;
+const stepAt = (s: number) => START + s * STEP;
+const FINAL = stepAt(nums.length);
+
+const pos: Pos[] = nums.map((_, i) => [numX(i), NUM_Y]);
+const look: Look[] = nums.map(() => 'idle');
+const snaps: Snap[] = [];
+const snap = (t: number) => snaps.push({ t, pos: pos.map((p) => [...p] as Pos), look: [...look] });
+const place = (heap: number[]) => heap.forEach((tok, j) => (pos[tok] = [heapX(j), HEAP_Y]));
+const byValue = (a: number, b: number) => nums[a] - nums[b];
+
+let heap: number[] = [];
+const evicted: number[] = [];
+const steps: { n: number; count: number; out: number | null; kept: number[] }[] = [];
+
+snap(0);
+nums.forEach((n, s) => {
+  const B = stepAt(s);
+  snap(B);
+  heap = [...heap, s].sort(byValue);
+  look[s] = 'write';
+  place(heap);
+  snap(B + 2);
+  const count = heap.length;
+  let out: number | null = null;
+  if (count > k) {
+    const root = heap[0];
+    snap(B + 4);
+    look[s] = 'kept';
+    look[root] = 'evict';
+    snap(B + 4.5);
+    pos[root] = [evX(evicted.length), EV_Y];
+    evicted.push(root);
+    snap(B + 6.5);
+    heap = heap.slice(1);
+    place(heap);
+    snap(B + 8);
+    out = nums[root];
+  } else {
+    snap(B + 4);
+    look[s] = 'kept';
+    snap(B + 4.5);
+  }
+  steps.push({ n, count, out, kept: heap.map((t) => nums[t]) });
+});
+snap(FINAL);
+heap.forEach((tok) => (look[tok] = 'answer'));
+snap(FINAL + 0.5);
+snap(100);
+
+const finalHeap = heap.map((t) => nums[t]);
+const peek = finalHeap[0];
+
+const fill: Record<Look, [string, string]> = {
+  idle: ['var(--color-line)', 'var(--color-panel2)'],
+  write: ['var(--color-amber)', 'var(--color-panel2)'],
+  kept: ['var(--color-line)', 'var(--color-panel2)'],
+  evict: ['var(--color-red)', 'var(--color-red-dim)'],
+  answer: ['var(--color-green)', 'var(--color-green-dim)'],
+};
+const pct = (t: number) => `${+t.toFixed(2)}%`;
+const last = snaps[snaps.length - 1];
+
+const tokenCss = nums
+  .map((_, i) => {
+    const [fx, fy] = last.pos[i];
+    const [stroke, bg] = fill[last.look[i]];
+    const move = snaps.map((sn) => `${pct(sn.t)} { transform: translate(${sn.pos[i][0]}px, ${sn.pos[i][1]}px); }`).join(' ');
+    const paint = snaps.map((sn) => `${pct(sn.t)} { stroke: ${fill[sn.look[i]][0]}; fill: ${fill[sn.look[i]][1]}; }`).join(' ');
+    return [
+      `.hero-heap-top-k .k${i} { transform: translate(${fx}px, ${fy}px); animation: heap-top-k-k${i} var(--t) ease-in-out infinite both; }`,
+      `.hero-heap-top-k .k${i} .c { stroke: ${stroke}; fill: ${bg}; animation: heap-top-k-c${i} var(--t) linear infinite both; }`,
+      `@keyframes heap-top-k-k${i} { ${move} }`,
+      `@keyframes heap-top-k-c${i} { ${paint} }`,
+    ].join('\n');
+  })
+  .join('\n');
+
+const lines = steps.length + 1;
+const readoutCss = Array.from({ length: lines }, (_, r) => {
+  const on = r === 0 ? 0 : stepAt(r);
+  const off = r === lines - 1 ? 100 : stepAt(r + 1);
+  const frames =
+    r === 0
+      ? `0%, ${pct(off - 0.5)} { opacity: 1; } ${pct(off)}, 100% { opacity: 0; }`
+      : r === lines - 1
+        ? `0%, ${pct(on)} { opacity: 0; } ${pct(on + 0.5)}, 100% { opacity: 1; }`
+        : `0%, ${pct(on)} { opacity: 0; } ${pct(on + 0.5)}, ${pct(off - 0.5)} { opacity: 1; } ${pct(off)}, 100% { opacity: 0; }`;
+  return `.hero-heap-top-k .r${r} { animation: heap-top-k-r${r} var(--t) linear infinite both; }\n@keyframes heap-top-k-r${r} { ${frames} }`;
+}).join('\n');
+
+const css = `${tokenCss}\n${readoutCss}`;
+const set = (vals: number[]) => `{${vals.join(',')}}`;
+---
+
+<HeroFrame label={`bounded min-heap · k = ${k}`} caption="keep only K: push each value, evict the smallest once Count > K">
+  <div class="hero-heap-top-k">
+    <svg viewBox="0 0 320 196" role="img" aria-label={`bounded min-heap of size ${k} over ${nums.join(', ')}: every value is enqueued, the root is evicted whenever Count exceeds ${k}, leaving ${finalHeap.join(' and ')}`}>
+      <text class="lbl" x="4" y={NUM_Y}>nums</text>
+      <text class="lbl" x="4" y={HEAP_Y - 7}>heap</text>
+      <text class="lbl" x="4" y={HEAP_Y + 7}>k = {k}</text>
+      <text class="lbl" x="4" y={EV_Y}>evicted</text>
+
+      {
+        nums.map((v, i) => (
+          <g transform={`translate(${numX(i)} ${NUM_Y})`}>
+            <rect class="slot" x="-17" y="-14" width="34" height="28" rx="6" />
+            <text class="ghost">{v}</text>
+          </g>
+        ))
+      }
+
+      <rect class="cap" x={heapX(0) - 21} y={HEAP_Y - 18} width={heapX(k - 1) - heapX(0) + 42} height="36" rx="8" />
+      <rect class="slot" x={heapX(k) - 17} y={HEAP_Y - 14} width="34" height="28" rx="6" />
+      <text class="lbl mid" x={heapX(0)} y={HEAP_Y + 30}>root</text>
+
+      {
+        nums.map((v, i) => (
+          <g class={`tok k${i}`}>
+            <rect class="c" x="-17" y="-14" width="34" height="28" rx="6" />
+            <text>{v}</text>
+          </g>
+        ))
+      }
+    </svg>
+    <div class="readout font-mono">
+      {
+        steps.map((st, r) => (
+          <span class={`r r${r}`}>
+            <b class="text-amber">Enqueue({st.n})</b>
+            {st.out === null ? (
+              <> · Count {st.count} ≤ {k} · heap {set(st.kept)}</>
+            ) : (
+              <>
+                {' '}· Count {st.count} &gt; {k} · <b class="text-red">Dequeue() evicts {st.out}</b>
+              </>
+            )}
+          </span>
+        ))
+      }
+      <span class={`r r${steps.length}`}>
+        heap {set(finalHeap)} · <b class="text-green">Peek() = {peek}, the {k}nd largest</b>
+      </span>
+    </div>
+  </div>
+</HeroFrame>
+
+<style is:inline>
+  .hero-heap-top-k {
+    --t: 14s;
+    width: 100%;
+    max-width: 340px;
+    animation: heap-top-k-stage var(--t) linear infinite both;
+  }
+  .hero-heap-top-k svg {
+    display: block;
+    width: 100%;
+    height: auto;
+    overflow: visible;
+  }
+  .hero-heap-top-k .slot {
+    fill: none;
+    stroke: var(--color-line);
+    stroke-dasharray: 3 3;
+  }
+  .hero-heap-top-k .cap {
+    fill: none;
+    stroke: var(--color-line);
+    stroke-width: 1.5;
+  }
+  .hero-heap-top-k .c {
+    stroke-width: 1.5;
+  }
+  .hero-heap-top-k text {
+    fill: var(--color-ink);
+    font-family: var(--font-mono);
+    font-size: 14px;
+    text-anchor: middle;
+    dominant-baseline: central;
+  }
+  .hero-heap-top-k text.ghost {
+    fill: var(--color-muted);
+  }
+  .hero-heap-top-k text.lbl {
+    fill: var(--color-muted);
+    font-size: 10px;
+    text-anchor: start;
+  }
+  .hero-heap-top-k text.lbl.mid {
+    text-anchor: middle;
+  }
+  .hero-heap-top-k .readout {
+    display: grid;
+    margin-top: 10px;
+    font-size: 0.78rem;
+    text-align: center;
+  }
+  .hero-heap-top-k .readout b {
+    font-weight: 600;
+  }
+  .hero-heap-top-k .r {
+    grid-area: 1 / 1;
+    opacity: 0;
+  }
+  .hero-heap-top-k .r6 {
+    opacity: 1;
+  }
+
+  /* timeline: one 12% step per value from 4% · final set 76-95 · fade 95-100 */
+  @keyframes heap-top-k-stage {
+    0% { opacity: 0; }
+    3%, 95% { opacity: 1; }
+    99.5%, 100% { opacity: 0; }
+  }
+</style>
+<style is:inline set:html={css}></style>

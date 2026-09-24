@@ -1,0 +1,266 @@
+---
+import HeroFrame from '../HeroFrame.astro';
+
+/**
+ * One recursive walk over the BST 4 (2 (1, 3), 6), recorded at build time by running it.
+ * Every call touches its node three times: before the left call (pre), between the calls (in),
+ * after the right call (post). The walker sits left of the node for pre, under it for in, right
+ * of it for post, and each touch appends the node to that row:
+ *   4 pre · 2 pre · leaf 1 pre/in/post · 2 in · leaf 3 pre/in/post · 2 post · 4 in · leaf 6 · 4 post
+ * Rows end as pre 4 2 1 3 6 · in 1 2 3 4 6 · post 1 3 2 6 4.
+ * Keyframes are generated from the recorded events. Un-animated styles are the final frame.
+ */
+type Node = { v: number; x: number; y: number; l?: Node; r?: Node };
+const tree: Node = {
+  v: 4, x: 160, y: 24,
+  l: { v: 2, x: 95, y: 70, l: { v: 1, x: 55, y: 116 }, r: { v: 3, x: 135, y: 116 } },
+  r: { v: 6, x: 225, y: 70 },
+};
+const nodes: Node[] = [];
+const edges: [Node, Node][] = [];
+const collect = (n: Node) => {
+  nodes.push(n);
+  for (const c of [n.l, n.r]) if (c) (edges.push([n, c]), collect(c));
+};
+collect(tree);
+
+type Phase = 'pre' | 'in' | 'post';
+const phases: Phase[] = ['pre', 'in', 'post'];
+const events: { n: Node; phase: Phase; leaf: boolean }[] = [];
+const walk = (n?: Node) => {
+  if (!n) return;
+  const leaf = !n.l && !n.r;
+  events.push({ n, phase: 'pre', leaf });
+  walk(n.l);
+  events.push({ n, phase: 'in', leaf });
+  walk(n.r);
+  events.push({ n, phase: 'post', leaf });
+};
+walk(tree);
+
+const T = 14;
+const lead = 0.25;
+const move = 0.25;
+const pct = (s: number) => `${((s / T) * 100).toFixed(2)}%`;
+let clock = lead;
+const timed = events.map((e) => {
+  const start = clock;
+  clock += e.leaf ? 0.43 : 1.3;
+  return { ...e, start, end: clock };
+});
+const walkEnd = clock;
+
+const groups: { n: Node; phase: Phase | 'leaf'; start: number; end: number }[] = [];
+const groupOf: number[] = [];
+for (const e of timed) {
+  const last = groups[groups.length - 1];
+  if (e.leaf && last?.n === e.n) last.end = e.end;
+  else groups.push({ n: e.n, phase: e.leaf ? 'leaf' : e.phase, start: e.start, end: e.end });
+  groupOf.push(groups.length - 1);
+}
+const lastEvent = timed[timed.length - 1];
+
+const offset: Record<Phase, [number, number]> = { pre: [-25, 0], in: [0, 25], post: [25, 0] };
+const at = (e: (typeof timed)[number]) => `translate(${e.n.x + offset[e.phase][0]}px, ${e.n.y + offset[e.phase][1]}px)`;
+
+const rowY: Record<Phase, number> = { pre: 166, in: 194, post: 222 };
+const cellX = (j: number) => 102 + j * 44;
+const tokens = timed.map((e, i) => ({
+  i,
+  v: e.n.v,
+  x: cellX(timed.filter((f, k) => k < i && f.phase === e.phase).length),
+  y: rowY[e.phase],
+  sorted: e.phase === 'in',
+}));
+
+type Stop = [number | string, string];
+const css: string[] = [];
+const keyframes = (name: string, stops: Stop[]) =>
+  css.push(`@keyframes tree-traversals-${name} { ${stops.map(([s, body]) => `${typeof s === 'number' ? pct(s) : s} { ${body} }`).join(' ')} }`);
+const animate = (sel: string, name: string, timing = 'linear') =>
+  css.push(`.hero-tree-traversals ${sel} { animation: tree-traversals-${name} var(--t) ${timing} infinite both; }`);
+
+keyframes('walker', [
+  ['0%', `transform: ${at(timed[0])}; opacity: 0;`],
+  ...timed.flatMap((e, i): Stop[] => [
+    [e.start + (i === 0 ? 0.2 : move), `transform: ${at(e)}; opacity: 1;`],
+    [e.end, `transform: ${at(e)}; opacity: 1;`],
+  ]),
+  [walkEnd + 0.3, `transform: ${at(lastEvent)}; opacity: 0;`],
+  ['100%', `transform: ${at(lastEvent)}; opacity: 0;`],
+]);
+animate('.walker', 'walker', 'ease-in-out');
+
+const settleInk: Stop[] = [['100%', 'opacity: 1; fill: var(--color-ink);']];
+const settleGreen: Stop[] = [
+  [walkEnd, 'opacity: 1; fill: var(--color-ink);'],
+  [walkEnd + 0.3, 'opacity: 1; fill: var(--color-green);'],
+  ['100%', 'opacity: 1; fill: var(--color-green);'],
+];
+timed.forEach((e, i) => {
+  const shown = e.start + move;
+  const g = groups[groupOf[i]];
+  keyframes(`t${i}`, [
+    ['0%', 'opacity: 0; fill: var(--color-amber);'],
+    [shown, 'opacity: 0; fill: var(--color-amber);'],
+    [shown + 0.1, 'opacity: 1; fill: var(--color-amber);'],
+    [g.end, 'opacity: 1; fill: var(--color-amber);'],
+    [g.end + 0.2, 'opacity: 1; fill: var(--color-ink);'],
+    ...(e.phase === 'in' ? settleGreen : settleInk),
+  ]);
+  animate(`.t${i}`, `t${i}`);
+});
+
+nodes.forEach((n, k) => {
+  const mine = groups.filter((g) => g.n === n);
+  keyframes(`n${k}`, [
+    ['0%', 'stroke: var(--color-line);'],
+    ...mine.flatMap((g): Stop[] => [
+      [g.start, 'stroke: var(--color-line);'],
+      [g.start + move, 'stroke: var(--color-amber);'],
+      [g.end, 'stroke: var(--color-amber);'],
+      [g.end + 0.15, 'stroke: var(--color-line);'],
+    ]),
+    ['100%', 'stroke: var(--color-line);'],
+  ]);
+  animate(`.n${k}`, `n${k}`);
+});
+
+const lines = groups.map((g) => {
+  const v = g.n.v;
+  if (g.phase === 'leaf') return { text: `leaf ${v}: both calls hit null ·`, verdict: `all three get ${v}` };
+  if (g.phase === 'pre') return { text: `enter ${v}, before the left call ·`, verdict: `pre gets ${v}` };
+  if (g.phase === 'in') return { text: `back at ${v} from the left ·`, verdict: `in gets ${v}` };
+  return { text: `back at ${v} from the right ·`, verdict: `post gets ${v}` };
+});
+groups.forEach((g, k) => {
+  keyframes(`r${k}`, [
+    ['0%', 'opacity: 0;'],
+    [Math.max(g.start, 0.01), 'opacity: 0;'],
+    [g.start + 0.1, 'opacity: 1;'],
+    [g.end - 0.02, 'opacity: 1;'],
+    [g.end + 0.08, 'opacity: 0;'],
+    ['100%', 'opacity: 0;'],
+  ]);
+  animate(`.r${k}`, `r${k}`);
+});
+keyframes('rfinal', [
+  ['0%', 'opacity: 0;'],
+  [walkEnd, 'opacity: 0;'],
+  [walkEnd + 0.2, 'opacity: 1;'],
+  ['100%', 'opacity: 1;'],
+]);
+animate('.rfinal', 'rfinal');
+
+const inorder = tokens.filter((t) => t.sorted).map((t) => t.v).join(' ');
+---
+
+<HeroFrame label="one walk · pre, in, post" caption="every call touches its node three times; preorder, inorder and postorder only choose which touch writes">
+  <div class="hero-tree-traversals" style={`--t: ${T}s`}>
+    <svg viewBox="0 0 320 236" role="img" aria-label={`recursive walk of a five-node BST; the same walk yields preorder, inorder (${inorder}) and postorder`}>
+      <g class="edges">
+        {edges.map(([a, b]) => <line x1={a.x} y1={a.y} x2={b.x} y2={b.y} />)}
+      </g>
+      {
+        nodes.map((n, k) => (
+          <g transform={`translate(${n.x} ${n.y})`}>
+            <circle class={`node n${k}`} r="15" />
+            <text>{n.v}</text>
+          </g>
+        ))
+      }
+      <circle class="walker" r="5" />
+
+      {
+        phases.map((p) => (
+          <>
+            <text class="lbl" x="68" y={rowY[p]}>{p}</text>
+            {[0, 1, 2, 3, 4].map((j) => (
+              <rect class="slot" x={cellX(j) - 17} y={rowY[p] - 12} width="34" height="24" rx="5" />
+            ))}
+          </>
+        ))
+      }
+      {tokens.map((t) => <text class:list={['tk', `t${t.i}`, t.sorted && 'sorted']} x={t.x} y={t.y}>{t.v}</text>)}
+    </svg>
+    <div class="readout font-mono">
+      {
+        lines.map((l, k) => (
+          <span class={`r r${k}`}>
+            {l.text} <b class="text-amber">{l.verdict}</b>
+          </span>
+        ))
+      }
+      <span class="r rfinal">one walk, three rows · <b class="text-green">BST inorder is sorted</b></span>
+    </div>
+  </div>
+</HeroFrame>
+
+<style is:inline>
+  .hero-tree-traversals {
+    width: 100%;
+    max-width: 340px;
+    animation: tree-traversals-stage var(--t) linear infinite both;
+  }
+  .hero-tree-traversals svg {
+    display: block;
+    width: 100%;
+    height: auto;
+    overflow: visible;
+  }
+  .hero-tree-traversals .edges line {
+    stroke: var(--color-line);
+    stroke-width: 1.5;
+  }
+  .hero-tree-traversals .node {
+    fill: var(--color-panel2);
+    stroke: var(--color-line);
+    stroke-width: 1.5;
+  }
+  .hero-tree-traversals .walker {
+    fill: var(--color-amber);
+    opacity: 0;
+  }
+  .hero-tree-traversals .slot {
+    fill: var(--color-panel2);
+    stroke: var(--color-line);
+  }
+  .hero-tree-traversals text {
+    fill: var(--color-ink);
+    font-family: var(--font-mono);
+    font-size: 13px;
+    text-anchor: middle;
+    dominant-baseline: central;
+  }
+  .hero-tree-traversals text.lbl {
+    fill: var(--color-muted);
+    font-size: 11px;
+    text-anchor: end;
+  }
+  .hero-tree-traversals text.sorted {
+    fill: var(--color-green);
+  }
+  .hero-tree-traversals .readout {
+    display: grid;
+    margin-top: 10px;
+    font-size: 0.78rem;
+    text-align: center;
+  }
+  .hero-tree-traversals .readout b {
+    font-weight: 600;
+  }
+  .hero-tree-traversals .r {
+    grid-area: 1 / 1;
+    opacity: 0;
+  }
+  .hero-tree-traversals .rfinal {
+    opacity: 1;
+  }
+
+  @keyframes tree-traversals-stage {
+    0% { opacity: 0; }
+    3%, 96% { opacity: 1; }
+    100% { opacity: 0; }
+  }
+</style>
+<style is:inline set:html={css.join('\n')}></style>

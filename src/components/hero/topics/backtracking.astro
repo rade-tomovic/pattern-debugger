@@ -1,0 +1,266 @@
+---
+import HeroFrame from '../HeroFrame.astro';
+
+/**
+ * Pick 2 of {A, B, C} with no repeats, the choose → explore → un-choose cycle from the core idea.
+ * The backtracking runs at build time and yields 18 steps (one per choose, a choose that completes
+ * the path also records it, one per un-choose). The A subtree is shown step by step:
+ *   choose A · choose B, record AB · un-choose B · choose C, record AC · un-choose C · un-choose A
+ * then the B and C subtrees as one frame each (the state after their top-level un-choose).
+ * Final frame: all 6 leaves recorded, path back to []. Un-animated styles show it (reduced motion).
+ */
+const items = ['A', 'B', 'C'];
+const depth = 2;
+
+type Step = { kind: 'choose' | 'record' | 'unchoose' | 'subtree'; item: string; path: string[]; recorded: string[] };
+const steps: Step[] = [];
+const path: string[] = [];
+const recorded: string[] = [];
+const explore = () => {
+  if (path.length === depth) return;
+  for (const c of items) {
+    if (path.includes(c)) continue;
+    path.push(c);
+    const complete = path.length === depth;
+    if (complete) recorded.push(path.join(''));
+    steps.push({ kind: complete ? 'record' : 'choose', item: c, path: [...path], recorded: [...recorded] });
+    explore();
+    path.pop();
+    steps.push({ kind: 'unchoose', item: c, path: [...path], recorded: [...recorded] });
+  }
+};
+explore();
+
+const nodes: { id: string; x: number; y: number }[] = [{ id: '', x: 160, y: 20 }];
+items.forEach((a, i) => {
+  const x = 60 + i * 100;
+  nodes.push({ id: a, x, y: 70 });
+  items.filter((b) => b !== a).forEach((b, j) => nodes.push({ id: a + b, x: x + (j === 0 ? -28 : 28), y: 122 }));
+});
+const at = (id: string) => nodes.find((n) => n.id === id)!;
+const edges = nodes.filter((n) => n.id !== '').map((n) => ({ from: at(n.id.slice(0, -1)), to: n }));
+
+const topUnchoose = (s: Step) => s.kind === 'unchoose' && s.path.length === 0;
+const firstSubtreeEnd = steps.findIndex(topUnchoose);
+const frames: Step[] = [
+  ...steps.slice(0, firstSubtreeEnd + 1),
+  ...steps.filter((s, i) => i > firstSubtreeEnd && topUnchoose(s)).map((s): Step => ({ ...s, kind: 'subtree' })),
+];
+const walked = (s: Step) => s.recorded.filter((r) => r.startsWith(s.item));
+
+const onPath = (id: string, p: string[]) => id !== '' && p.join('').startsWith(id);
+const undoing = (s: Step) => s.kind === 'unchoose' || s.kind === 'subtree';
+const undone = (s: Step) => (undoing(s) ? s.path.join('') + s.item : null);
+const nodeClass = (id: string, s: Step) => {
+  if (onPath(id, s.path)) return s.kind === 'record' && id === s.path.join('') ? 'rec' : 'on';
+  if (s.recorded.includes(id)) return 'rec';
+  if (id === undone(s)) return 'off';
+  return '';
+};
+const edgeClass = (id: string, s: Step) => (onPath(id, s.path) ? 'on' : id === undone(s) ? 'off' : '');
+
+const done: Step = { kind: 'choose', item: '', path: [], recorded: [...recorded] };
+const hold = { choose: 1.2, record: 1.5, unchoose: 1.2, subtree: 1.9 }; // seconds per frame
+const loop = 14; // matches --t
+const bounds: [number, number][] = [];
+let elapsed = 0;
+for (const f of frames) {
+  const start = (elapsed / loop) * 100;
+  elapsed += hold[f.kind];
+  bounds.push([start, (elapsed / loop) * 100]);
+}
+const finalStart = (elapsed / loop) * 100;
+const pct = (v: number) => `${Math.max(v, 0).toFixed(2)}%`;
+const css = [
+  ...bounds.map(([a, b], k) =>
+    [
+      `.hero-backtracking .layer.f${k} { animation-name: backtracking-f${k}; }`,
+      `@keyframes backtracking-f${k} {`,
+      a > 0 ? `  0%, ${pct(a - 0.01)} { opacity: 0; }` : '',
+      `  ${pct(a)}, ${pct(b - 0.01)} { opacity: 1; }`,
+      `  ${pct(b)}, 100% { opacity: 0; }`,
+      `}`,
+    ].join('\n'),
+  ),
+  `@keyframes backtracking-final {\n  0%, ${pct(finalStart - 0.01)} { opacity: 0; }\n  ${pct(finalStart)}, 100% { opacity: 1; }\n}`,
+];
+const list = (p: string[]) => `[${p.join(', ')}]`;
+const slots = [100, 140];
+---
+
+<HeroFrame label={`pick ${depth} of {${items.join(', ')}}`} caption="choose, explore, un-choose: each choice is undone before the next sibling, so siblings never see leftover state">
+  <div class="hero-backtracking">
+    <div class="layers">
+      {
+        [...frames, done].map((s, k) => {
+          const final = k === frames.length;
+          return (
+            <div class:list={['layer', final ? 'final' : `f${k}`]}>
+              <svg viewBox="0 0 320 188" role="img" aria-label={final ? `backtracking walk of the decision tree, ${recorded.length} leaves recorded` : undefined} aria-hidden={final ? undefined : 'true'}>
+                {edges.map(({ from, to }) => (
+                  <line class:list={['e', edgeClass(to.id, s)]} x1={from.x} y1={from.y} x2={to.x} y2={to.y} />
+                ))}
+                {nodes.map((n) => (
+                  <g class:list={['n', n.id === '' ? 'root' : nodeClass(n.id, s)]} transform={`translate(${n.x} ${n.y})`}>
+                    <circle r={n.id.length === depth ? 15 : 14} />
+                    <text>{n.id === '' ? '()' : n.id}</text>
+                  </g>
+                ))}
+                <text class="lbl" x="78" y="164">path</text>
+                {slots.map((x, i) => (
+                  <g class:list={['cell', s.path[i] ? 'on' : undoing(s) && i === s.path.length && 'off']} transform={`translate(${x} 164)`}>
+                    <rect x="-15" y="-13" width="30" height="26" rx="5" />
+                    <text>{s.path[i] ?? ''}</text>
+                  </g>
+                ))}
+                <text class="lbl" x="232" y="164">recorded</text>
+                <text class:list={['count', s.recorded.length === 0 && 'zero']} x="252" y="164">{s.recorded.length}</text>
+              </svg>
+              <p class="note">
+                {final ? (
+                  <>
+                    path = [] · <b class="text-green">{recorded.length} recorded, tree walked, never stored</b>
+                  </>
+                ) : s.kind === 'subtree' ? (
+                  <>
+                    <b class="text-amber">choose {s.item}</b> · <b class="text-green">record {walked(s).join(', ')}</b> · <span class="seg"><b class="text-red">un-choose {s.item}</b> → path {list(s.path)}</span>
+                  </>
+                ) : s.kind === 'unchoose' ? (
+                  <>
+                    <span class="seg"><b class="text-red">un-choose {s.item}</b> → path {list(s.path)}</span>
+                  </>
+                ) : s.kind === 'record' ? (
+                  <>
+                    <span class="seg"><b class="text-amber">choose {s.item}</b> → path {list(s.path)}</span> · <b class="text-green">complete, record {s.path.join('')}</b>
+                  </>
+                ) : (
+                  <>
+                    <b class="text-amber">choose {s.item}</b> → path {list(s.path)}
+                  </>
+                )}
+              </p>
+            </div>
+          );
+        })
+      }
+    </div>
+  </div>
+</HeroFrame>
+
+<style is:inline>
+  .hero-backtracking {
+    --t: 14s;
+    width: 100%;
+    max-width: 380px;
+    animation: backtracking-stage var(--t) linear infinite both;
+  }
+  .hero-backtracking .layers {
+    display: grid;
+  }
+  .hero-backtracking .layer {
+    grid-area: 1 / 1;
+    opacity: 0;
+    animation: var(--t) linear infinite both;
+  }
+  .hero-backtracking .layer.final {
+    opacity: 1;
+    animation: backtracking-final var(--t) linear infinite both;
+  }
+  .hero-backtracking svg {
+    display: block;
+    width: 100%;
+    height: auto;
+    overflow: visible;
+  }
+  .hero-backtracking text {
+    fill: var(--color-ink);
+    font-family: var(--font-mono);
+    font-size: 12px;
+    text-anchor: middle;
+    dominant-baseline: central;
+  }
+  .hero-backtracking .e {
+    stroke: var(--color-line);
+    stroke-width: 1.5;
+  }
+  .hero-backtracking .e.on {
+    stroke: var(--color-amber);
+    stroke-width: 2.5;
+  }
+  .hero-backtracking .e.off {
+    stroke: var(--color-red);
+    stroke-width: 2;
+    stroke-dasharray: 4 3;
+  }
+  .hero-backtracking .n circle,
+  .hero-backtracking .cell rect {
+    fill: var(--color-panel2);
+    stroke: var(--color-line);
+    stroke-width: 1.5;
+  }
+  .hero-backtracking .n text {
+    fill: var(--color-muted);
+  }
+  .hero-backtracking .n.root text {
+    font-size: 11px;
+  }
+  .hero-backtracking .n.on circle,
+  .hero-backtracking .cell.on rect {
+    stroke: var(--color-amber);
+    stroke-width: 2.5;
+  }
+  .hero-backtracking .n.on text,
+  .hero-backtracking .cell.on text {
+    fill: var(--color-amber);
+  }
+  .hero-backtracking .n.rec circle {
+    fill: var(--color-green-dim);
+    stroke: var(--color-green);
+  }
+  .hero-backtracking .n.rec text {
+    fill: var(--color-green);
+  }
+  .hero-backtracking .n.off circle,
+  .hero-backtracking .cell.off rect {
+    stroke: var(--color-red);
+    stroke-dasharray: 4 3;
+  }
+  .hero-backtracking .n.off text {
+    fill: var(--color-red);
+  }
+  .hero-backtracking .lbl {
+    fill: var(--color-muted);
+    font-size: 10px;
+    text-anchor: end;
+  }
+  .hero-backtracking .count {
+    fill: var(--color-green);
+    text-anchor: start;
+  }
+  .hero-backtracking .note {
+    margin: 8px 0 0;
+    color: var(--color-muted);
+    font-family: var(--font-mono);
+    font-size: 0.76rem;
+    text-align: center;
+  }
+  .hero-backtracking .count.zero {
+    fill: var(--color-muted);
+  }
+  .hero-backtracking .note b {
+    font-weight: 600;
+  }
+  .hero-backtracking .note b,
+  .hero-backtracking .note .seg {
+    white-space: nowrap;
+  }
+
+  /* timeline: A subtree step by step, then one frame per B and C subtree (per-frame keyframes
+     generated below from hold) · final frame to 100 · fade 95-100 */
+  @keyframes backtracking-stage {
+    0% { opacity: 0; }
+    2%, 95% { opacity: 1; }
+    100% { opacity: 0; }
+  }
+</style>
+<style is:inline set:html={css.join('\n')}></style>

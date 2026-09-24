@@ -1,0 +1,320 @@
+---
+import HeroFrame from '../HeroFrame.astro';
+
+/**
+ * One write, put(k7, v2), taken down both production write paths while k7 = v1 already exists:
+ *   both: append k7 to the WAL and fsync, durable from here
+ *   B-tree: walk to the leaf and overwrite k7 = v1 with v2 IN PLACE, the page is dirty in memory
+ *   LSM: insert k7 = v2 into the memtable, the old v1 still sits in an L1 SSTable on disk
+ *   B-tree: a background writer flushes the dirty page to the same place on disk
+ *   LSM: the memtable flushes to a new immutable L0 SSTable, two versions of k7 now on disk
+ *   LSM: compaction merges L0 into L1, rewrites k7 = v2 and drops v1
+ * Un-animated styles are the final frame (reduced motion): one current copy of k7 in each engine.
+ */
+const walKeys = ['k2', 'k5', 'k4'];
+const cellX = (i: number) => 38 + i * 29;
+const cols = [
+  { x: 0 },
+  { x: 172 },
+];
+---
+
+<HeroFrame label="put(k7, v2) · B-tree vs LSM" caption="a B-tree overwrites the sorted page in place; an LSM makes the write sequential now and pays for it later as compaction">
+  <div class="hero-storage-engines">
+    <svg viewBox="0 0 340 182" role="img" aria-label="the same write goes to the WAL in both engines, then overwrites a B-tree page in place, or lands in an LSM memtable, flushes to an SSTable and is compacted with the old version dropped">
+      <text class="hd" x="4" y="8">B-tree · update in place</text>
+      <text class="hd" x="176" y="8">LSM · append, merge later</text>
+      <line class="divider" x1="168" y1="2" x2="168" y2="176" />
+
+      {
+        cols.map(({ x }) => (
+          <g transform={`translate(${x} 0)`}>
+            <text class="lbl" x="4" y="36">WAL</text>
+            {walKeys.map((k, i) => (
+              <>
+                <rect class="cell" x={cellX(i)} y="25" width="26" height="22" rx="4" />
+                <text class="old" x={cellX(i) + 13} y="36">
+                  {k}
+                </text>
+              </>
+            ))}
+            <g class="wal-new">
+              <rect class="cell new" x={cellX(3)} y="25" width="26" height="22" rx="4" />
+              <text x={cellX(3) + 13} y="36">
+                k7
+              </text>
+            </g>
+          </g>
+        ))
+      }
+
+      <g class="edges">
+        <line x1="85" y1="82" x2="40" y2="104" />
+        <line x1="85" y1="82" x2="120" y2="104" />
+      </g>
+      <rect class="node" x="55" y="62" width="60" height="20" rx="4" />
+      <text class="mid" x="85" y="72">root</text>
+      <rect class="node" x="4" y="104" width="68" height="26" rx="4" />
+      <text class="mid" x="38" y="117">k2 k4</text>
+      <rect class="node bt-page" x="80" y="104" width="84" height="26" rx="4" />
+      <text class="mid bt-v1" x="122" y="117">k5 k7=v1</text>
+      <text class="mid bt-v2" x="122" y="117">k5 k7=v2</text>
+      <text class="tag bt-dirty" x="118" y="146">dirty in memory</text>
+      <text class="tag bt-flushed" x="118" y="146">flushed in place</text>
+
+      <text class="lbl" x="176" y="72">mem</text>
+      <rect class="node mem" x="210" y="61" width="126" height="22" rx="4" />
+      <text class="mid mem-k7" x="273" y="72">k7=v2</text>
+
+      <text class="lbl" x="176" y="106">L0</text>
+      <rect class="slot" x="210" y="95" width="126" height="22" rx="4" />
+      <g class="l0">
+        <rect class="node sst" x="210" y="95" width="126" height="22" rx="4" />
+        <text class="mid" x="273" y="106">k7=v2</text>
+      </g>
+
+      <text class="lbl" x="176" y="140">L1</text>
+      <rect class="node l1" x="210" y="129" width="126" height="22" rx="4" />
+      <text class="mid" x="244" y="140">k2 k4 k5</text>
+      <text class="mid l1-old" x="303" y="140">k7=v1</text>
+      <text class="mid l1-new" x="303" y="140">k7=v2</text>
+      <text class="tag l1-drop" x="273" y="166">compaction drops v1</text>
+      <text class="tag l1-done" x="270" y="166">k7 rewritten once more</text>
+    </svg>
+    <div class="readout font-mono">
+      <span class="r r1">both engines: append to the WAL, fsync · <b class="text-green">durable here</b></span>
+      <span class="r r2">B-tree overwrites the leaf page · <b class="text-amber">LSM appends to the memtable, v1 untouched</b></span>
+      <span class="r r3">dirty page flushes in place · <b class="text-amber">memtable flushes to an immutable SSTable</b></span>
+      <span class="r r4">compaction merges L0 into L1 · <b class="text-red">the old v1 is dropped</b></span>
+      <span class="r r5"><b class="text-green">one current k7 in each</b> · <b class="text-amber">LSM paid for its sequential write with a rewrite later</b></span>
+    </div>
+  </div>
+</HeroFrame>
+
+<style is:inline>
+  .hero-storage-engines {
+    --t: 13s;
+    width: 100%;
+    max-width: 390px;
+    animation: storage-engines-stage var(--t) linear infinite both;
+  }
+  .hero-storage-engines svg {
+    display: block;
+    width: 100%;
+    height: auto;
+    overflow: visible;
+  }
+  .hero-storage-engines text {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    fill: var(--color-ink);
+    dominant-baseline: central;
+  }
+  .hero-storage-engines .hd {
+    fill: var(--color-muted);
+    font-size: 10px;
+  }
+  .hero-storage-engines .lbl {
+    fill: var(--color-muted);
+    font-size: 10px;
+  }
+  .hero-storage-engines .mid,
+  .hero-storage-engines .tag,
+  .hero-storage-engines .cell + text,
+  .hero-storage-engines .wal-new text {
+    text-anchor: middle;
+  }
+  .hero-storage-engines .old {
+    fill: var(--color-muted);
+    font-size: 10px;
+  }
+  .hero-storage-engines .wal-new text {
+    font-size: 10px;
+  }
+  .hero-storage-engines .tag {
+    font-size: 9.5px;
+  }
+  .hero-storage-engines .divider {
+    stroke: var(--color-line);
+    stroke-dasharray: 3 3;
+  }
+  .hero-storage-engines .edges line {
+    stroke: var(--color-line);
+    stroke-width: 1.5;
+  }
+  .hero-storage-engines .cell,
+  .hero-storage-engines .node {
+    fill: var(--color-panel2);
+    stroke: var(--color-line);
+    stroke-width: 1.5;
+  }
+  .hero-storage-engines .slot {
+    fill: none;
+    stroke: var(--color-line);
+    stroke-dasharray: 3 3;
+  }
+
+  .hero-storage-engines .bt-v1,
+  .hero-storage-engines .bt-dirty,
+  .hero-storage-engines .mem-k7,
+  .hero-storage-engines .l0,
+  .hero-storage-engines .l1-old,
+  .hero-storage-engines .l1-drop {
+    opacity: 0;
+  }
+  .hero-storage-engines .bt-page,
+  .hero-storage-engines .l1 {
+    stroke: var(--color-green);
+    fill: var(--color-green-dim);
+  }
+  .hero-storage-engines .bt-flushed {
+    fill: var(--color-green);
+  }
+  .hero-storage-engines .bt-dirty,
+  .hero-storage-engines .l1-done {
+    fill: var(--color-amber);
+  }
+  .hero-storage-engines .l1-drop,
+  .hero-storage-engines .l1-old {
+    fill: var(--color-red);
+  }
+  .hero-storage-engines .sst {
+    stroke: var(--color-amber);
+  }
+
+  .hero-storage-engines .wal-new { animation: storage-engines-wal var(--t) ease-out infinite both; }
+  .hero-storage-engines .cell.new { animation: storage-engines-wal-stroke var(--t) linear infinite both; }
+  .hero-storage-engines .bt-v1 { animation: storage-engines-bt-v1 var(--t) linear infinite both; }
+  .hero-storage-engines .bt-v2 { animation: storage-engines-bt-v2 var(--t) linear infinite both; }
+  .hero-storage-engines .bt-page { animation: storage-engines-bt-page var(--t) linear infinite both; }
+  .hero-storage-engines .bt-dirty { animation: storage-engines-bt-dirty var(--t) linear infinite both; }
+  .hero-storage-engines .bt-flushed { animation: storage-engines-bt-flushed var(--t) linear infinite both; }
+  .hero-storage-engines .mem { animation: storage-engines-mem var(--t) linear infinite both; }
+  .hero-storage-engines .mem-k7 { animation: storage-engines-mem-k7 var(--t) linear infinite both; }
+  .hero-storage-engines .l0 { animation: storage-engines-l0 var(--t) ease-in-out infinite both; }
+  .hero-storage-engines .l1 { animation: storage-engines-l1 var(--t) linear infinite both; }
+  .hero-storage-engines .l1-old { animation: storage-engines-l1-old var(--t) linear infinite both; }
+  .hero-storage-engines .l1-new { animation: storage-engines-l1-new var(--t) linear infinite both; }
+  .hero-storage-engines .l1-drop { animation: storage-engines-l1-drop var(--t) linear infinite both; }
+  .hero-storage-engines .l1-done { animation: storage-engines-l1-done var(--t) linear infinite both; }
+
+  .hero-storage-engines .readout {
+    display: grid;
+    margin-top: 12px;
+    font-size: 0.76rem;
+    text-align: center;
+    color: var(--color-muted);
+  }
+  .hero-storage-engines .readout b {
+    font-weight: 600;
+  }
+  .hero-storage-engines .r {
+    grid-area: 1 / 1;
+    opacity: 0;
+  }
+  .hero-storage-engines .r5 { opacity: 1; }
+  .hero-storage-engines .r1 { animation: storage-engines-r1 var(--t) linear infinite both; }
+  .hero-storage-engines .r2 { animation: storage-engines-r2 var(--t) linear infinite both; }
+  .hero-storage-engines .r3 { animation: storage-engines-r3 var(--t) linear infinite both; }
+  .hero-storage-engines .r4 { animation: storage-engines-r4 var(--t) linear infinite both; }
+  .hero-storage-engines .r5 { animation: storage-engines-r5 var(--t) linear infinite both; }
+
+  @keyframes storage-engines-stage {
+    0% { opacity: 0; }
+    3%, 95% { opacity: 1; }
+    99%, 100% { opacity: 0; }
+  }
+  @keyframes storage-engines-wal {
+    0%, 4% { opacity: 0; transform: translateX(8px); }
+    8%, 100% { opacity: 1; transform: translateX(0); }
+  }
+  @keyframes storage-engines-wal-stroke {
+    0%, 20% { stroke: var(--color-amber); }
+    23%, 100% { stroke: var(--color-line); }
+  }
+  @keyframes storage-engines-bt-v1 {
+    0%, 23% { opacity: 1; }
+    26%, 100% { opacity: 0; }
+  }
+  @keyframes storage-engines-bt-v2 {
+    0%, 23% { opacity: 0; }
+    26%, 100% { opacity: 1; }
+  }
+  @keyframes storage-engines-bt-page {
+    0%, 22% { stroke: var(--color-line); fill: var(--color-panel2); }
+    24%, 44% { stroke: var(--color-amber); fill: var(--color-panel2); }
+    47%, 100% { stroke: var(--color-green); fill: var(--color-green-dim); }
+  }
+  @keyframes storage-engines-bt-dirty {
+    0%, 23% { opacity: 0; }
+    26%, 43% { opacity: 1; }
+    45%, 100% { opacity: 0; }
+  }
+  @keyframes storage-engines-bt-flushed {
+    0%, 45% { opacity: 0; }
+    48%, 100% { opacity: 1; }
+  }
+  @keyframes storage-engines-mem {
+    0%, 22% { stroke: var(--color-line); }
+    24%, 44% { stroke: var(--color-amber); }
+    46%, 100% { stroke: var(--color-line); }
+  }
+  @keyframes storage-engines-mem-k7 {
+    0%, 23% { opacity: 0; }
+    26%, 44% { opacity: 1; }
+    47%, 100% { opacity: 0; }
+  }
+  @keyframes storage-engines-l0 {
+    0%, 45% { opacity: 0; transform: translateY(-34px); }
+    49%, 64% { opacity: 1; transform: translateY(0); }
+    70% { opacity: 0.6; transform: translateY(34px); }
+    72%, 100% { opacity: 0; transform: translateY(34px); }
+  }
+  @keyframes storage-engines-l1 {
+    0%, 64% { stroke: var(--color-line); fill: var(--color-panel2); }
+    66%, 71% { stroke: var(--color-amber); fill: var(--color-panel2); }
+    74%, 100% { stroke: var(--color-green); fill: var(--color-green-dim); }
+  }
+  @keyframes storage-engines-l1-old {
+    0%, 64% { opacity: 1; fill: var(--color-ink); text-decoration: none; }
+    66%, 71% { opacity: 1; fill: var(--color-red); text-decoration: line-through; }
+    73%, 100% { opacity: 0; fill: var(--color-red); }
+  }
+  @keyframes storage-engines-l1-new {
+    0%, 71% { opacity: 0; }
+    74%, 100% { opacity: 1; }
+  }
+  @keyframes storage-engines-l1-drop {
+    0%, 65% { opacity: 0; }
+    67%, 79% { opacity: 1; }
+    81%, 100% { opacity: 0; }
+  }
+  @keyframes storage-engines-l1-done {
+    0%, 80% { opacity: 0; }
+    82%, 100% { opacity: 1; }
+  }
+
+  @keyframes storage-engines-r1 {
+    0%, 20% { opacity: 1; }
+    22%, 100% { opacity: 0; }
+  }
+  @keyframes storage-engines-r2 {
+    0%, 22% { opacity: 0; }
+    24%, 43% { opacity: 1; }
+    45%, 100% { opacity: 0; }
+  }
+  @keyframes storage-engines-r3 {
+    0%, 45% { opacity: 0; }
+    47%, 63% { opacity: 1; }
+    65%, 100% { opacity: 0; }
+  }
+  @keyframes storage-engines-r4 {
+    0%, 65% { opacity: 0; }
+    67%, 79% { opacity: 1; }
+    81%, 100% { opacity: 0; }
+  }
+  @keyframes storage-engines-r5 {
+    0%, 81% { opacity: 0; }
+    83%, 100% { opacity: 1; }
+  }
+</style>

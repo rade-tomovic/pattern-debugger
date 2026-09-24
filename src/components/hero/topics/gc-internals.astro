@@ -1,0 +1,333 @@
+---
+import HeroFrame from '../HeroFrame.astro';
+
+/**
+ * One gen0 collection, drawn as the roots above a row of gen0 slots:
+ *   allocate: A, x, y, B, C land in slots 0-4, each `new` bumps the amber alloc pointer one slot
+ *   references: local → A, A → B, static → C, and the cycle x → y, y → x
+ *   mark: from the roots, follow every reference · A, then B, then C turn green
+ *   x and y still point at each other, but no root reaches them · marked red, never visited
+ *   compact: x and y are gone, B slides to slot 1, C to slot 2, the references to them are
+ *   rewritten (amber), and the alloc pointer is set back to the start of the one free block
+ *   the survivors are now gen1 (one generation per collection survived), so the header says so
+ * Un-animated styles are the final frame (reduced motion).
+ */
+const cx = (i: number) => 32 + i * 50;
+const slots = [0, 1, 2, 3, 4, 5];
+---
+
+<HeroFrame label="gen0 GC · mark + compact" caption="garbage is whatever no root reaches, cycles included: marking visits only the live set, never the dead">
+  <div class="hero-gc-internals">
+    <svg viewBox="0 0 320 152" role="img" aria-label="objects are allocated by a pointer bump, marked from the roots, an unreachable cycle is discarded, and the survivors are compacted">
+      <text class="hd" x="10" y="10">roots</text>
+      <text class="hd end hd-g0" x="310" y="10">heap · gen0</text>
+      <text class="hd end hd-g1" x="310" y="10">heap · A, B, C now gen1</text>
+
+      <rect class="chip" x="10" y="24" width="44" height="20" rx="4" />
+      <text class="ctext" x="32" y="34">local</text>
+      <rect class="chip" x="100" y="24" width="64" height="20" rx="4" />
+      <text class="ctext" x="132" y="34">static</text>
+
+      {slots.map((i) => <rect class="slot" x={cx(i) - 22} y="80" width="44" height="36" rx="6" />)}
+
+      <g class="ar ar-local">
+        <path d={`M${cx(0)} 44 V73`} />
+        <polygon points={`${cx(0)},80 ${cx(0) - 4},72 ${cx(0) + 4},72`} />
+      </g>
+      <g class="ar ar-static0">
+        <path d={`M164 34 H${cx(4)} V73`} />
+        <polygon points={`${cx(4)},80 ${cx(4) - 4},72 ${cx(4) + 4},72`} />
+      </g>
+      <g class="ar ar-ab0">
+        <path d={`M${cx(0)} 116 V144 H${cx(3)} V123`} />
+        <polygon points={`${cx(3)},116 ${cx(3) - 4},124 ${cx(3) + 4},124`} />
+      </g>
+      <g class="ar ar-xy">
+        <path d={`M${cx(1)} 80 V66 H${cx(2)} V73`} />
+        <polygon points={`${cx(2)},80 ${cx(2) - 4},72 ${cx(2) + 4},72`} />
+        <path d={`M${cx(2)} 116 V128 H${cx(1)} V123`} />
+        <polygon points={`${cx(1)},116 ${cx(1) - 4},124 ${cx(1) + 4},124`} />
+      </g>
+      <g class="ar ar-static1">
+        <path d={`M${cx(2)} 44 V73`} />
+        <polygon points={`${cx(2)},80 ${cx(2) - 4},72 ${cx(2) + 4},72`} />
+      </g>
+      <g class="ar ar-ab1">
+        <path d={`M${cx(0)} 116 V130 H${cx(1)} V123`} />
+        <polygon points={`${cx(1)},116 ${cx(1) - 4},124 ${cx(1) + 4},124`} />
+      </g>
+
+      <g class="ob ob-a"><rect class="o o-a" x="-22" y="-18" width="44" height="36" rx="6" /><text>A</text></g>
+      <g class="ob ob-x"><rect class="o o-x" x="-22" y="-18" width="44" height="36" rx="6" /><text>x</text></g>
+      <g class="ob ob-y"><rect class="o o-y" x="-22" y="-18" width="44" height="36" rx="6" /><text>y</text></g>
+      <g class="ob ob-b"><rect class="o o-b" x="-22" y="-18" width="44" height="36" rx="6" /><text>B</text></g>
+      <g class="ob ob-c"><rect class="o o-c" x="-22" y="-18" width="44" height="36" rx="6" /><text>C</text></g>
+
+      <g class="ptr">
+        <line x1="0" y1="74" x2="0" y2="122" />
+        <text x="4" y="71">alloc</text>
+      </g>
+    </svg>
+    <div class="readout font-mono">
+      <span class="r r0">new is a pointer bump · <b class="text-amber">no free list, no search</b></span>
+      <span class="r r1">mark from the roots · <b class="text-green">A, B, C reached</b></span>
+      <span class="r r2">x and y only point at each other · <b class="text-red">garbage</b></span>
+      <span class="r r3">survivors slide down · <b class="text-amber">references rewritten</b></span>
+      <span class="r r4">packed at the front · <b class="text-green">free space is one block</b></span>
+    </div>
+  </div>
+</HeroFrame>
+
+<style is:inline>
+  .hero-gc-internals {
+    --t: 13s;
+    width: 100%;
+    max-width: 380px;
+    animation: gc-internals-stage var(--t) linear infinite both;
+  }
+  .hero-gc-internals svg {
+    display: block;
+    width: 100%;
+    height: auto;
+    overflow: visible;
+  }
+  .hero-gc-internals text {
+    font-family: var(--font-mono);
+    font-size: 13px;
+    fill: var(--color-ink);
+    text-anchor: middle;
+    dominant-baseline: central;
+  }
+  .hero-gc-internals .hd {
+    fill: var(--color-muted);
+    font-size: 10px;
+    text-anchor: start;
+  }
+  .hero-gc-internals .hd.end {
+    text-anchor: end;
+  }
+  .hero-gc-internals .ctext {
+    fill: var(--color-muted);
+    font-size: 10px;
+  }
+  .hero-gc-internals .chip {
+    fill: var(--color-panel2);
+    stroke: var(--color-line);
+    stroke-width: 1.5;
+  }
+  .hero-gc-internals .slot {
+    fill: none;
+    stroke: var(--color-line);
+    stroke-dasharray: 3 3;
+  }
+  .hero-gc-internals .ar {
+    color: var(--color-green);
+  }
+  .hero-gc-internals .ar path {
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.5;
+  }
+  .hero-gc-internals .ar polygon {
+    fill: currentColor;
+  }
+  .hero-gc-internals .o {
+    fill: var(--color-panel2);
+    stroke: var(--color-line);
+    stroke-width: 1.5;
+  }
+  .hero-gc-internals .ptr line {
+    stroke: var(--color-amber);
+    stroke-width: 2;
+  }
+  .hero-gc-internals .ptr text {
+    fill: var(--color-amber);
+    font-size: 9px;
+    text-anchor: start;
+  }
+
+  /* final frame: x and y gone, A B C compacted into slots 0-2 and reachable, pointer at slot 3 */
+  .hero-gc-internals .ob-a { transform: translate(32px, 98px); }
+  .hero-gc-internals .ob-x { transform: translate(82px, 98px); opacity: 0; }
+  .hero-gc-internals .ob-y { transform: translate(132px, 98px); opacity: 0; }
+  .hero-gc-internals .ob-b { transform: translate(82px, 98px); }
+  .hero-gc-internals .ob-c { transform: translate(132px, 98px); }
+  .hero-gc-internals .o-a,
+  .hero-gc-internals .o-b,
+  .hero-gc-internals .o-c {
+    stroke: var(--color-green);
+    fill: var(--color-green-dim);
+  }
+  .hero-gc-internals .ar-static0,
+  .hero-gc-internals .ar-ab0,
+  .hero-gc-internals .ar-xy {
+    opacity: 0;
+  }
+  .hero-gc-internals .ptr { transform: translateX(157px); }
+  .hero-gc-internals .hd-g0 { opacity: 0; }
+
+  .hero-gc-internals .ob-x { animation: gc-internals-ob-x var(--t) linear infinite both; }
+  .hero-gc-internals .ob-y { animation: gc-internals-ob-y var(--t) linear infinite both; }
+  .hero-gc-internals .ob-a { animation: gc-internals-ob-a var(--t) linear infinite both; }
+  .hero-gc-internals .ob-b { animation: gc-internals-ob-b var(--t) ease-in-out infinite both; }
+  .hero-gc-internals .ob-c { animation: gc-internals-ob-c var(--t) ease-in-out infinite both; }
+  .hero-gc-internals .o-a { animation: gc-internals-o-a var(--t) linear infinite both; }
+  .hero-gc-internals .o-b { animation: gc-internals-o-b var(--t) linear infinite both; }
+  .hero-gc-internals .o-c { animation: gc-internals-o-c var(--t) linear infinite both; }
+  .hero-gc-internals .o-x { animation: gc-internals-o-x var(--t) linear infinite both; }
+  .hero-gc-internals .o-y { animation: gc-internals-o-y var(--t) linear infinite both; }
+  .hero-gc-internals .ar-local { animation: gc-internals-ar-local var(--t) linear infinite both; }
+  .hero-gc-internals .ar-ab0 { animation: gc-internals-ar-ab0 var(--t) linear infinite both; }
+  .hero-gc-internals .ar-static0 { animation: gc-internals-ar-static0 var(--t) linear infinite both; }
+  .hero-gc-internals .ar-xy { animation: gc-internals-ar-xy var(--t) linear infinite both; }
+  .hero-gc-internals .ar-ab1,
+  .hero-gc-internals .ar-static1 { animation: gc-internals-ar-new var(--t) linear infinite both; }
+  .hero-gc-internals .ptr { animation: gc-internals-ptr var(--t) ease-in-out infinite both; }
+  .hero-gc-internals .hd-g0 { animation: gc-internals-hd-g0 var(--t) linear infinite both; }
+  .hero-gc-internals .hd-g1 { animation: gc-internals-hd-g1 var(--t) linear infinite both; }
+
+  .hero-gc-internals .readout {
+    display: grid;
+    margin-top: 12px;
+    font-size: 0.76rem;
+    text-align: center;
+  }
+  .hero-gc-internals .readout b {
+    font-weight: 600;
+  }
+  .hero-gc-internals .r {
+    grid-area: 1 / 1;
+    opacity: 0;
+  }
+  .hero-gc-internals .r4 { opacity: 1; }
+  .hero-gc-internals .r0 { animation: gc-internals-r0 var(--t) linear infinite both; }
+  .hero-gc-internals .r1 { animation: gc-internals-r1 var(--t) linear infinite both; }
+  .hero-gc-internals .r2 { animation: gc-internals-r2 var(--t) linear infinite both; }
+  .hero-gc-internals .r3 { animation: gc-internals-r3 var(--t) linear infinite both; }
+  .hero-gc-internals .r4 { animation: gc-internals-r4 var(--t) linear infinite both; }
+
+  /* timeline: allocate 3-20 · mark 22-44 · garbage 44-60 · x y freed 60-63 · compact 64-70 · rewrite 70-84 · settled 84-95 · fade 95-100 */
+  @keyframes gc-internals-stage {
+    0% { opacity: 0; }
+    3%, 95% { opacity: 1; }
+    99%, 100% { opacity: 0; }
+  }
+  @keyframes gc-internals-ptr {
+    0%, 4% { transform: translateX(7px); }
+    6%, 7% { transform: translateX(57px); }
+    9%, 10% { transform: translateX(107px); }
+    12%, 13% { transform: translateX(157px); }
+    15%, 16% { transform: translateX(207px); }
+    18%, 64% { transform: translateX(257px); }
+    70%, 100% { transform: translateX(157px); }
+  }
+  @keyframes gc-internals-ob-a {
+    0%, 4% { opacity: 0; }
+    6%, 100% { opacity: 1; }
+  }
+  @keyframes gc-internals-ob-x {
+    0%, 7% { opacity: 0; }
+    9%, 59% { opacity: 1; }
+    63%, 100% { opacity: 0; }
+  }
+  @keyframes gc-internals-ob-y {
+    0%, 10% { opacity: 0; }
+    12%, 59% { opacity: 1; }
+    63%, 100% { opacity: 0; }
+  }
+  @keyframes gc-internals-ob-b {
+    0%, 13% { opacity: 0; transform: translate(182px, 98px); }
+    15%, 64% { opacity: 1; transform: translate(182px, 98px); }
+    70%, 100% { opacity: 1; transform: translate(82px, 98px); }
+  }
+  @keyframes gc-internals-ob-c {
+    0%, 16% { opacity: 0; transform: translate(232px, 98px); }
+    18%, 64% { opacity: 1; transform: translate(232px, 98px); }
+    70%, 100% { opacity: 1; transform: translate(132px, 98px); }
+  }
+  @keyframes gc-internals-o-a {
+    0%, 6% { stroke: var(--color-amber); fill: var(--color-panel2); }
+    8%, 23% { stroke: var(--color-line); fill: var(--color-panel2); }
+    26%, 100% { stroke: var(--color-green); fill: var(--color-green-dim); }
+  }
+  @keyframes gc-internals-o-b {
+    0%, 15% { stroke: var(--color-amber); fill: var(--color-panel2); }
+    17%, 29% { stroke: var(--color-line); fill: var(--color-panel2); }
+    32%, 100% { stroke: var(--color-green); fill: var(--color-green-dim); }
+  }
+  @keyframes gc-internals-o-c {
+    0%, 18% { stroke: var(--color-amber); fill: var(--color-panel2); }
+    20%, 35% { stroke: var(--color-line); fill: var(--color-panel2); }
+    38%, 100% { stroke: var(--color-green); fill: var(--color-green-dim); }
+  }
+  @keyframes gc-internals-o-x {
+    0%, 9% { stroke: var(--color-amber); fill: var(--color-panel2); stroke-dasharray: none; }
+    11%, 44% { stroke: var(--color-line); fill: var(--color-panel2); stroke-dasharray: none; }
+    47%, 100% { stroke: var(--color-red); fill: var(--color-red-dim); stroke-dasharray: 4 3; }
+  }
+  @keyframes gc-internals-o-y {
+    0%, 12% { stroke: var(--color-amber); fill: var(--color-panel2); stroke-dasharray: none; }
+    14%, 44% { stroke: var(--color-line); fill: var(--color-panel2); stroke-dasharray: none; }
+    47%, 100% { stroke: var(--color-red); fill: var(--color-red-dim); stroke-dasharray: 4 3; }
+  }
+  @keyframes gc-internals-ar-local {
+    0%, 4% { opacity: 0; color: var(--color-muted); }
+    6%, 22% { opacity: 1; color: var(--color-muted); }
+    24%, 100% { opacity: 1; color: var(--color-green); }
+  }
+  @keyframes gc-internals-ar-ab0 {
+    0%, 13% { opacity: 0; color: var(--color-muted); }
+    15%, 28% { opacity: 1; color: var(--color-muted); }
+    30%, 63% { opacity: 1; color: var(--color-green); }
+    66%, 100% { opacity: 0; color: var(--color-green); }
+  }
+  @keyframes gc-internals-ar-static0 {
+    0%, 16% { opacity: 0; color: var(--color-muted); }
+    18%, 34% { opacity: 1; color: var(--color-muted); }
+    36%, 63% { opacity: 1; color: var(--color-green); }
+    66%, 100% { opacity: 0; color: var(--color-green); }
+  }
+  @keyframes gc-internals-ar-xy {
+    0%, 10% { opacity: 0; color: var(--color-muted); }
+    12%, 44% { opacity: 1; color: var(--color-muted); }
+    47%, 59% { opacity: 1; color: var(--color-red); }
+    63%, 100% { opacity: 0; color: var(--color-red); }
+  }
+  @keyframes gc-internals-ar-new {
+    0%, 69% { opacity: 0; color: var(--color-amber); }
+    72%, 80% { opacity: 1; color: var(--color-amber); }
+    84%, 100% { opacity: 1; color: var(--color-green); }
+  }
+
+  @keyframes gc-internals-r0 {
+    0%, 20% { opacity: 1; }
+    22%, 100% { opacity: 0; }
+  }
+  @keyframes gc-internals-r1 {
+    0%, 21% { opacity: 0; }
+    23%, 43% { opacity: 1; }
+    45%, 100% { opacity: 0; }
+  }
+  @keyframes gc-internals-r2 {
+    0%, 44% { opacity: 0; }
+    46%, 62% { opacity: 1; }
+    64%, 100% { opacity: 0; }
+  }
+  @keyframes gc-internals-r3 {
+    0%, 63% { opacity: 0; }
+    65%, 82% { opacity: 1; }
+    84%, 100% { opacity: 0; }
+  }
+  @keyframes gc-internals-r4 {
+    0%, 83% { opacity: 0; }
+    85%, 100% { opacity: 1; }
+  }
+  @keyframes gc-internals-hd-g0 {
+    0%, 64% { opacity: 1; }
+    67%, 100% { opacity: 0; }
+  }
+  @keyframes gc-internals-hd-g1 {
+    0%, 66% { opacity: 0; }
+    69%, 100% { opacity: 1; }
+  }
+</style>

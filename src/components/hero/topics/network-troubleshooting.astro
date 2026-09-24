@@ -1,0 +1,399 @@
+---
+import HeroFrame from '../HeroFrame.astro';
+
+/**
+ * The page's database case, climbed from the failing box, with the rung-3 distinction the page
+ * turns on:
+ *   rung 1 name: db.internal resolves → keep the address 203.0.113.20, test only that from here up
+ *   rung 2 route: a route to it exists, packets can leave
+ *   rung 3 port, first shape: SYN out, RST back → refused. A live kernel answered: the network is fine
+ *   rung 3 port, second shape: SYN out, nothing back → timeout. Dropped: the network is not fine
+ *   rungs 4 and 5 are never reached either way, so they dim and dash once rung 3 fails
+ * Each rung's readout asks the page's question while the rung is amber, and gives the verdict only
+ * at the keyframe where the rung turns green or red. The two port shapes are alternatives, split by
+ * an "or" rule, not one sequence.
+ * Addresses are the page's documentation-range placeholders. No timings: the page states order only.
+ * Un-animated styles are the final frame (reduced motion): both failure shapes side by side.
+ */
+const rungs = [
+  { n: 1, name: 'name', cls: 'g1' },
+  { n: 2, name: 'route', cls: 'g2' },
+  { n: 3, name: 'port', cls: 'g3' },
+  { n: 4, name: 'TLS', cls: 'g4' },
+  { n: 5, name: 'payload', cls: 'g5' },
+];
+const rowY = (k: number) => 20 + k * 34;
+---
+
+<HeroFrame label="db.internal:5432 · climb the ladder" caption="each rung is asked of the address the rung below produced; at the port, an RST means the network works and silence means it does not">
+  <div class="hero-network-troubleshooting">
+    <svg viewBox="0 0 320 200" role="img" aria-label="a five-rung troubleshooting ladder: name and route pass, the port rung fails either with a reset, meaning the network is fine, or with silence, meaning it is not">
+      {
+        rungs.map((r, k) => (
+          <g class={`rung ${r.cls}`}>
+            <rect x="6" y={rowY(k) - 13} width="92" height="26" rx="6" />
+            <text class="rn" x="16" y={rowY(k)}>
+              {r.n} {r.name}
+            </text>
+            <text class="st pass" x="90" y={rowY(k)}>pass</text>
+            <text class="st fail" x="90" y={rowY(k)}>fail</text>
+          </g>
+        ))
+      }
+
+      <text class="note n1" x="110" y={rowY(0)}>db.internal → <tspan class="addr">203.0.113.20</tspan></text>
+      <text class="note n2" x="110" y={rowY(1)}>route exists · packets can leave</text>
+
+      <text class="end" x="110" y="80">192.0.2.15</text>
+      <text class="end srv" x="314" y="80">203.0.113.20:5432</text>
+      <line class="life" x1="128" y1="88" x2="128" y2="194" />
+      <line class="life" x1="300" y1="88" x2="300" y2="194" />
+
+      <g class="msg syn-a">
+        <line x1="128" y1="100" x2="292" y2="100" pathLength="1" />
+        <polygon points="299,100 291,96 291,104" />
+      </g>
+      <text class="tag tag-syn-a" x="124" y="100">SYN</text>
+      <g class="msg rst">
+        <line x1="300" y1="116" x2="136" y2="116" pathLength="1" />
+        <polygon points="129,116 137,112 137,120" />
+      </g>
+      <text class="tag tag-rst" x="124" y="116">RST</text>
+      <text class="lane lane-a" x="214" y="129">refused → network is fine</text>
+
+      <g class="or">
+        <line x1="136" y1="141" x2="202" y2="141" />
+        <line x1="226" y1="141" x2="292" y2="141" />
+        <text x="214" y="141">or</text>
+      </g>
+
+      <g class="msg syn-b">
+        <line x1="128" y1="155" x2="228" y2="155" pathLength="1" />
+      </g>
+      <text class="tag tag-syn-b" x="124" y="155">SYN</text>
+      <g class="drop">
+        <line x1="231" y1="149" x2="243" y2="161" />
+        <line x1="243" y1="149" x2="231" y2="161" />
+        <line class="gone" x1="248" y1="155" x2="298" y2="155" />
+      </g>
+      <text class="lane lane-b" x="214" y="179">silence → network is not fine</text>
+    </svg>
+    <div class="readout font-mono">
+      <span class="r r1q">1 name · <b class="text-amber">does db.internal resolve?</b></span>
+      <span class="r r1">1 name: db.internal · <b class="text-green">keep the address 203.0.113.20</b></span>
+      <span class="r r2q">2 route · <b class="text-amber">is 203.0.113.20 routable from here?</b></span>
+      <span class="r r2">2 route to 203.0.113.20 · <b class="text-green">packets can leave</b></span>
+      <span class="r r3q">3 port: SYN out · <b class="text-amber">is something listening on 5432?</b></span>
+      <span class="r r3">3 port: SYN out, RST back · <b class="text-green">refused, network fine</b></span>
+      <span class="r r4q">or, the same SYN · <b class="text-amber">waiting on an answer</b></span>
+      <span class="r r4">3 port: SYN out, silence · <b class="text-red">timeout, network not fine</b></span>
+      <span class="r r5">an answer beats silence · <b class="text-green">even when it is a refusal</b></span>
+    </div>
+  </div>
+</HeroFrame>
+
+<style is:inline>
+  .hero-network-troubleshooting {
+    --t: 14s;
+    width: 100%;
+    max-width: 380px;
+    animation: network-troubleshooting-stage var(--t) linear infinite both;
+  }
+  .hero-network-troubleshooting svg {
+    display: block;
+    width: 100%;
+    height: auto;
+    overflow: visible;
+  }
+  .hero-network-troubleshooting text {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    fill: var(--color-ink);
+    dominant-baseline: central;
+  }
+  .hero-network-troubleshooting .rung rect {
+    fill: var(--color-panel2);
+    stroke: var(--color-line);
+    stroke-width: 1.5;
+  }
+  .hero-network-troubleshooting .st {
+    font-size: 8.5px;
+    text-anchor: end;
+    opacity: 0;
+  }
+  .hero-network-troubleshooting .st.pass {
+    fill: var(--color-green);
+  }
+  .hero-network-troubleshooting .st.fail {
+    fill: var(--color-red);
+  }
+  .hero-network-troubleshooting .note,
+  .hero-network-troubleshooting .end,
+  .hero-network-troubleshooting .tag,
+  .hero-network-troubleshooting .lane {
+    font-size: 9px;
+  }
+  .hero-network-troubleshooting .note {
+    fill: var(--color-muted);
+  }
+  .hero-network-troubleshooting .addr {
+    fill: var(--color-green);
+  }
+  .hero-network-troubleshooting .end {
+    fill: var(--color-muted);
+  }
+  .hero-network-troubleshooting .end.srv {
+    text-anchor: end;
+  }
+  .hero-network-troubleshooting .life {
+    stroke: var(--color-line);
+    stroke-width: 1.5;
+    stroke-dasharray: 3 3;
+  }
+  .hero-network-troubleshooting .msg line {
+    stroke: currentColor;
+    stroke-width: 1.5;
+    stroke-dasharray: 1;
+    stroke-dashoffset: 0;
+  }
+  .hero-network-troubleshooting .msg polygon {
+    fill: currentColor;
+  }
+  .hero-network-troubleshooting .syn-a,
+  .hero-network-troubleshooting .syn-b {
+    color: var(--color-ink);
+  }
+  .hero-network-troubleshooting .rst {
+    color: var(--color-red);
+  }
+  .hero-network-troubleshooting .tag {
+    text-anchor: end;
+    fill: var(--color-muted);
+  }
+  .hero-network-troubleshooting .tag-rst {
+    fill: var(--color-red);
+  }
+  .hero-network-troubleshooting .drop line {
+    stroke: var(--color-red);
+    stroke-width: 2;
+  }
+  .hero-network-troubleshooting .drop .gone {
+    stroke: var(--color-line);
+    stroke-width: 1.5;
+    stroke-dasharray: 2 4;
+  }
+  .hero-network-troubleshooting .lane {
+    text-anchor: middle;
+  }
+  .hero-network-troubleshooting .lane-a {
+    fill: var(--color-green);
+  }
+  .hero-network-troubleshooting .lane-b {
+    fill: var(--color-red);
+  }
+  .hero-network-troubleshooting .or line {
+    stroke: var(--color-line);
+    stroke-width: 1;
+  }
+  .hero-network-troubleshooting .or text {
+    font-size: 9px;
+    text-anchor: middle;
+    fill: var(--color-muted);
+  }
+
+  /* final frame: name and route passed, the port failed both ways, TLS and payload never reached */
+  .hero-network-troubleshooting .g1 rect,
+  .hero-network-troubleshooting .g2 rect {
+    stroke: var(--color-green);
+    fill: var(--color-green-dim);
+  }
+  .hero-network-troubleshooting .g1 .pass,
+  .hero-network-troubleshooting .g2 .pass,
+  .hero-network-troubleshooting .g3 .fail {
+    opacity: 1;
+  }
+  .hero-network-troubleshooting .g3 rect {
+    stroke: var(--color-red);
+    fill: var(--color-red-dim);
+  }
+  .hero-network-troubleshooting .g4,
+  .hero-network-troubleshooting .g5 {
+    opacity: 0.35;
+  }
+  .hero-network-troubleshooting .g4 rect,
+  .hero-network-troubleshooting .g5 rect {
+    stroke-dasharray: 4 3;
+  }
+  .hero-network-troubleshooting .g1 rect { animation: network-troubleshooting-g1 var(--t) linear infinite both; }
+  .hero-network-troubleshooting .g1 .pass { animation: network-troubleshooting-g1-pass var(--t) linear infinite both; }
+  .hero-network-troubleshooting .n1 { animation: network-troubleshooting-g1-pass var(--t) linear infinite both; }
+  .hero-network-troubleshooting .srv { animation: network-troubleshooting-g1-pass var(--t) linear infinite both; }
+  .hero-network-troubleshooting .g2 rect { animation: network-troubleshooting-g2 var(--t) linear infinite both; }
+  .hero-network-troubleshooting .g2 .pass { animation: network-troubleshooting-g2-pass var(--t) linear infinite both; }
+  .hero-network-troubleshooting .n2 { animation: network-troubleshooting-g2-pass var(--t) linear infinite both; }
+  .hero-network-troubleshooting .g3 rect { animation: network-troubleshooting-g3 var(--t) linear infinite both; }
+  .hero-network-troubleshooting .g3 .fail { animation: network-troubleshooting-g3-fail var(--t) linear infinite both; }
+  .hero-network-troubleshooting .g4,
+  .hero-network-troubleshooting .g5 { animation: network-troubleshooting-above var(--t) linear infinite both; }
+  .hero-network-troubleshooting .g4 rect,
+  .hero-network-troubleshooting .g5 rect { animation: network-troubleshooting-above-dash var(--t) linear infinite both; }
+  .hero-network-troubleshooting .or { animation: network-troubleshooting-or var(--t) linear infinite both; }
+  .hero-network-troubleshooting .syn-a line { animation: network-troubleshooting-syn-a var(--t) linear infinite both; }
+  .hero-network-troubleshooting .syn-a polygon { animation: network-troubleshooting-syn-a-head var(--t) linear infinite both; }
+  .hero-network-troubleshooting .tag-syn-a { animation: network-troubleshooting-syn-a-tag var(--t) linear infinite both; }
+  .hero-network-troubleshooting .rst line { animation: network-troubleshooting-rst var(--t) linear infinite both; }
+  .hero-network-troubleshooting .rst polygon,
+  .hero-network-troubleshooting .tag-rst,
+  .hero-network-troubleshooting .lane-a { animation: network-troubleshooting-rst-head var(--t) linear infinite both; }
+  .hero-network-troubleshooting .syn-b line { animation: network-troubleshooting-syn-b var(--t) linear infinite both; }
+  .hero-network-troubleshooting .tag-syn-b { animation: network-troubleshooting-syn-b-tag var(--t) linear infinite both; }
+  .hero-network-troubleshooting .drop,
+  .hero-network-troubleshooting .lane-b { animation: network-troubleshooting-drop var(--t) linear infinite both; }
+
+  .hero-network-troubleshooting .readout {
+    display: grid;
+    margin-top: 12px;
+    font-size: 0.76rem;
+    text-align: center;
+  }
+  .hero-network-troubleshooting .readout b {
+    font-weight: 600;
+  }
+  .hero-network-troubleshooting .r {
+    grid-area: 1 / 1;
+    opacity: 0;
+  }
+  .hero-network-troubleshooting .r5 { opacity: 1; }
+  .hero-network-troubleshooting .r1q { animation: network-troubleshooting-r1q var(--t) linear infinite both; }
+  .hero-network-troubleshooting .r1 { animation: network-troubleshooting-r1 var(--t) linear infinite both; }
+  .hero-network-troubleshooting .r2q { animation: network-troubleshooting-r2q var(--t) linear infinite both; }
+  .hero-network-troubleshooting .r2 { animation: network-troubleshooting-r2 var(--t) linear infinite both; }
+  .hero-network-troubleshooting .r3q { animation: network-troubleshooting-r3q var(--t) linear infinite both; }
+  .hero-network-troubleshooting .r3 { animation: network-troubleshooting-r3 var(--t) linear infinite both; }
+  .hero-network-troubleshooting .r4q { animation: network-troubleshooting-r4q var(--t) linear infinite both; }
+  .hero-network-troubleshooting .r4 { animation: network-troubleshooting-r4 var(--t) linear infinite both; }
+  .hero-network-troubleshooting .r5 { animation: network-troubleshooting-r5 var(--t) linear infinite both; }
+
+  /* timeline: name 0-22 · route 22-42 · port, RST 42-62 · port, silence 62-82 · settled 82-94 · fade 94-100
+     each rung: question 8% while amber, verdict 8% from the keyframe the rung turns green or red */
+  @keyframes network-troubleshooting-stage {
+    0% { opacity: 0; }
+    3%, 95% { opacity: 1; }
+    99%, 100% { opacity: 0; }
+  }
+  @keyframes network-troubleshooting-g1 {
+    0%, 2% { stroke: var(--color-line); fill: var(--color-panel2); }
+    4%, 10% { stroke: var(--color-amber); fill: var(--color-panel2); }
+    12%, 100% { stroke: var(--color-green); fill: var(--color-green-dim); }
+  }
+  @keyframes network-troubleshooting-g1-pass {
+    0%, 10% { opacity: 0; }
+    12%, 100% { opacity: 1; }
+  }
+  @keyframes network-troubleshooting-g2 {
+    0%, 20% { stroke: var(--color-line); fill: var(--color-panel2); }
+    22%, 30% { stroke: var(--color-amber); fill: var(--color-panel2); }
+    32%, 100% { stroke: var(--color-green); fill: var(--color-green-dim); }
+  }
+  @keyframes network-troubleshooting-g2-pass {
+    0%, 30% { opacity: 0; }
+    32%, 100% { opacity: 1; }
+  }
+  @keyframes network-troubleshooting-g3 {
+    0%, 40% { stroke: var(--color-line); fill: var(--color-panel2); }
+    42%, 50% { stroke: var(--color-amber); fill: var(--color-panel2); }
+    52%, 100% { stroke: var(--color-red); fill: var(--color-red-dim); }
+  }
+  @keyframes network-troubleshooting-g3-fail {
+    0%, 50% { opacity: 0; }
+    52%, 100% { opacity: 1; }
+  }
+  @keyframes network-troubleshooting-above {
+    0%, 50% { opacity: 1; }
+    52%, 100% { opacity: 0.35; }
+  }
+  @keyframes network-troubleshooting-above-dash {
+    0%, 50% { stroke-dasharray: 4 0; }
+    52%, 100% { stroke-dasharray: 4 3; }
+  }
+  @keyframes network-troubleshooting-syn-a {
+    0%, 43% { stroke-dashoffset: 1; }
+    47%, 100% { stroke-dashoffset: 0; }
+  }
+  @keyframes network-troubleshooting-syn-a-tag {
+    0%, 42% { opacity: 0; }
+    43%, 100% { opacity: 1; }
+  }
+  @keyframes network-troubleshooting-syn-a-head {
+    0%, 46% { opacity: 0; }
+    47%, 100% { opacity: 1; }
+  }
+  @keyframes network-troubleshooting-rst {
+    0%, 48% { stroke-dashoffset: 1; }
+    51%, 100% { stroke-dashoffset: 0; }
+  }
+  @keyframes network-troubleshooting-rst-head {
+    0%, 51% { opacity: 0; }
+    52%, 100% { opacity: 1; }
+  }
+  @keyframes network-troubleshooting-or {
+    0%, 60% { opacity: 0; }
+    62%, 100% { opacity: 1; }
+  }
+  @keyframes network-troubleshooting-syn-b {
+    0%, 63% { stroke-dashoffset: 1; }
+    68%, 100% { stroke-dashoffset: 0; }
+  }
+  @keyframes network-troubleshooting-syn-b-tag {
+    0%, 62% { opacity: 0; }
+    63%, 100% { opacity: 1; }
+  }
+  @keyframes network-troubleshooting-drop {
+    0%, 70% { opacity: 0; }
+    72%, 100% { opacity: 1; }
+  }
+
+  @keyframes network-troubleshooting-r1q {
+    0%, 10% { opacity: 1; }
+    12%, 100% { opacity: 0; }
+  }
+  @keyframes network-troubleshooting-r1 {
+    0%, 10% { opacity: 0; }
+    12%, 20% { opacity: 1; }
+    22%, 100% { opacity: 0; }
+  }
+  @keyframes network-troubleshooting-r2q {
+    0%, 20% { opacity: 0; }
+    22%, 30% { opacity: 1; }
+    32%, 100% { opacity: 0; }
+  }
+  @keyframes network-troubleshooting-r2 {
+    0%, 30% { opacity: 0; }
+    32%, 40% { opacity: 1; }
+    42%, 100% { opacity: 0; }
+  }
+  @keyframes network-troubleshooting-r3q {
+    0%, 40% { opacity: 0; }
+    42%, 50% { opacity: 1; }
+    52%, 100% { opacity: 0; }
+  }
+  @keyframes network-troubleshooting-r3 {
+    0%, 50% { opacity: 0; }
+    52%, 60% { opacity: 1; }
+    62%, 100% { opacity: 0; }
+  }
+  @keyframes network-troubleshooting-r4q {
+    0%, 60% { opacity: 0; }
+    62%, 70% { opacity: 1; }
+    72%, 100% { opacity: 0; }
+  }
+  @keyframes network-troubleshooting-r4 {
+    0%, 70% { opacity: 0; }
+    72%, 80% { opacity: 1; }
+    82%, 100% { opacity: 0; }
+  }
+  @keyframes network-troubleshooting-r5 {
+    0%, 80% { opacity: 0; }
+    82%, 100% { opacity: 1; }
+  }
+</style>

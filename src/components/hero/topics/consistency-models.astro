@@ -1,0 +1,353 @@
+---
+import HeroFrame from '../HeroFrame.astro';
+
+/**
+ * The page's "client watching two nodes disagree" timeline, with async replication:
+ *   client A: write(x = 5) → leader logs it and acks (durable on the leader)
+ *   client B: read(x) → follower still holds x = 4 → returns 4, stale: a committed write, unseen
+ *   replication lag closes → follower applies x = 5
+ *   client B: read(x) → follower returns 5, converged
+ * Un-animated styles are the final frame (reduced motion): both nodes at x = 5, and B's wire keeps
+ * both results side by side, "→ 4" (the stale first read, red) then "→ 5" (the fresh read, green).
+ */
+const laneA = 34;
+const laneB = 140;
+const cx = 171;
+---
+
+<HeroFrame label="leader ack · follower read" caption="an acked write is durable on the leader, not visible everywhere; a follower read inside the replication lag returns the old value">
+  <div class="hero-consistency-models">
+    <svg viewBox="0 0 320 176" role="img" aria-label="client A writes x = 5 to the leader and is acknowledged; client B reads the follower and gets the stale x = 4 inside the replication lag window, then reads x = 5 once replication lands">
+      <circle class="client ca" cx="24" cy={laneA} r="14" />
+      <text class="cn" x="24" y={laneA}>A</text>
+      <circle class="client cb" cx="24" cy={laneB} r="14" />
+      <text class="cn" x="24" y={laneB}>B</text>
+
+      <line class="wire" x1="40" y1={laneA} x2="114" y2={laneA} />
+      <line class="wire" x1="40" y1={laneB} x2="114" y2={laneB} />
+      <g class="repl">
+        <line x1={cx} y1="58" x2={cx} y2="110" />
+        <polygon points={`${cx},116 ${cx - 4},108 ${cx + 4},108`} />
+      </g>
+
+      <text class="op op-write" x="77" y={laneA - 10}>write x = 5</text>
+      <text class="op op-ack" x="77" y={laneA + 11}>ack</text>
+      <text class="op op-read" x="77" y={laneB - 10}>read x</text>
+      <text class="op op-stale" x="62" y={laneB + 11}>→ 4</text>
+      <text class="op op-fresh" x="94" y={laneB + 11}>→ 5</text>
+      <text class="side" x="182" y="80">async</text>
+      <text class="side" x="182" y="93">replication</text>
+      <text class="side lag" x="182" y="106">lag window</text>
+
+      <rect class="node leader" x="116" y="12" width="110" height="44" rx="6" />
+      <text class="role" x={cx} y="25">leader</text>
+      <text class="val v-l4" x={cx} y="42">x = 4</text>
+      <text class="val v-l5" x={cx} y="42">x = 5</text>
+
+      <rect class="node follower" x="116" y="118" width="110" height="44" rx="6" />
+      <text class="role" x={cx} y="131">follower</text>
+      <text class="val v-f4" x={cx} y="148">x = 4</text>
+      <text class="val v-f5" x={cx} y="148">x = 5</text>
+
+      <circle class="pk pk-write" r="4" />
+      <circle class="pk pk-ack" r="4" />
+      <circle class="pk pk-read1" r="4" />
+      <circle class="pk pk-stale" r="4" />
+      <circle class="pk pk-repl" r="4" />
+      <circle class="pk pk-read2" r="4" />
+      <circle class="pk pk-fresh" r="4" />
+    </svg>
+    <div class="readout font-mono">
+      <span class="r r1">A: write(x = 5) · <b class="text-amber">leader logs it and acks</b></span>
+      <span class="r r2">B reads the follower · <b class="text-red">x = 4, stale</b></span>
+      <span class="r r3">replication in flight · <b class="text-red">follower still x = 4</b></span>
+      <span class="r r4">replication lands · <b class="text-amber">follower applies x = 5</b></span>
+      <span class="r r5">B reads again · <b class="text-green">x = 5, converged</b></span>
+    </div>
+  </div>
+</HeroFrame>
+
+<style is:inline>
+  .hero-consistency-models {
+    --t: 14s;
+    width: 100%;
+    max-width: 360px;
+    animation: consistency-models-stage var(--t) linear infinite both;
+  }
+  .hero-consistency-models svg {
+    display: block;
+    width: 100%;
+    height: auto;
+    overflow: visible;
+  }
+  .hero-consistency-models text {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    fill: var(--color-ink);
+    text-anchor: middle;
+    dominant-baseline: central;
+  }
+  .hero-consistency-models .client {
+    fill: var(--color-panel2);
+    stroke-width: 1.5;
+  }
+  .hero-consistency-models .ca {
+    stroke: var(--color-amber);
+  }
+  .hero-consistency-models .cb {
+    stroke: var(--color-cyan);
+  }
+  .hero-consistency-models .cn {
+    font-size: 12px;
+  }
+  .hero-consistency-models .wire {
+    stroke: var(--color-line);
+    stroke-width: 1.5;
+  }
+  .hero-consistency-models .repl line {
+    stroke: var(--color-muted);
+    stroke-width: 1.5;
+    stroke-dasharray: 4 3;
+  }
+  .hero-consistency-models .repl polygon {
+    fill: var(--color-muted);
+  }
+  .hero-consistency-models .op {
+    font-size: 9.5px;
+    fill: var(--color-muted);
+  }
+  .hero-consistency-models .op-write {
+    fill: var(--color-amber);
+  }
+  .hero-consistency-models .op-ack {
+    fill: var(--color-green);
+  }
+  .hero-consistency-models .op-read {
+    fill: var(--color-cyan);
+  }
+  .hero-consistency-models .op-stale {
+    fill: var(--color-red);
+    font-weight: 600;
+  }
+  .hero-consistency-models .op-fresh {
+    fill: var(--color-green);
+    font-weight: 600;
+  }
+  .hero-consistency-models .side {
+    text-anchor: start;
+    font-size: 9.5px;
+    fill: var(--color-muted);
+  }
+  .hero-consistency-models .side.lag {
+    fill: var(--color-muted);
+  }
+  .hero-consistency-models .node {
+    fill: var(--color-panel2);
+    stroke-width: 1.5;
+    stroke: var(--color-green);
+  }
+  .hero-consistency-models .role {
+    fill: var(--color-muted);
+    font-size: 10px;
+  }
+  .hero-consistency-models .val {
+    font-size: 13px;
+  }
+  .hero-consistency-models .v-l4,
+  .hero-consistency-models .v-f4 {
+    opacity: 0;
+  }
+  .hero-consistency-models .v-l5,
+  .hero-consistency-models .v-f5 {
+    fill: var(--color-green);
+  }
+  .hero-consistency-models .pk {
+    opacity: 0;
+  }
+  .hero-consistency-models .pk-write,
+  .hero-consistency-models .pk-repl {
+    fill: var(--color-amber);
+  }
+  .hero-consistency-models .pk-ack,
+  .hero-consistency-models .pk-fresh {
+    fill: var(--color-green);
+  }
+  .hero-consistency-models .pk-read1,
+  .hero-consistency-models .pk-read2 {
+    fill: var(--color-cyan);
+  }
+  .hero-consistency-models .pk-stale {
+    fill: var(--color-red);
+  }
+
+  .hero-consistency-models .op-write { animation: consistency-models-op-write var(--t) linear infinite both; }
+  .hero-consistency-models .op-ack { animation: consistency-models-op-ack var(--t) linear infinite both; }
+  .hero-consistency-models .op-read { animation: consistency-models-op-read var(--t) linear infinite both; }
+  .hero-consistency-models .op-stale { animation: consistency-models-op-stale var(--t) linear infinite both; }
+  .hero-consistency-models .op-fresh { animation: consistency-models-op-fresh var(--t) linear infinite both; }
+  .hero-consistency-models .side.lag { animation: consistency-models-lag var(--t) linear infinite both; }
+  .hero-consistency-models .leader { animation: consistency-models-leader var(--t) linear infinite both; }
+  .hero-consistency-models .follower { animation: consistency-models-follower var(--t) linear infinite both; }
+  .hero-consistency-models .v-l4 { animation: consistency-models-v-l4 var(--t) linear infinite both; }
+  .hero-consistency-models .v-l5 { animation: consistency-models-v-l5 var(--t) linear infinite both; }
+  .hero-consistency-models .v-f4 { animation: consistency-models-v-f4 var(--t) linear infinite both; }
+  .hero-consistency-models .v-f5 { animation: consistency-models-v-f5 var(--t) linear infinite both; }
+  .hero-consistency-models .pk-write { animation: consistency-models-pk-write var(--t) linear infinite both; }
+  .hero-consistency-models .pk-ack { animation: consistency-models-pk-ack var(--t) linear infinite both; }
+  .hero-consistency-models .pk-read1 { animation: consistency-models-pk-read1 var(--t) linear infinite both; }
+  .hero-consistency-models .pk-stale { animation: consistency-models-pk-stale var(--t) linear infinite both; }
+  .hero-consistency-models .pk-repl { animation: consistency-models-pk-repl var(--t) linear infinite both; }
+  .hero-consistency-models .pk-read2 { animation: consistency-models-pk-read2 var(--t) linear infinite both; }
+  .hero-consistency-models .pk-fresh { animation: consistency-models-pk-fresh var(--t) linear infinite both; }
+
+  .hero-consistency-models .readout {
+    display: grid;
+    margin-top: 10px;
+    font-size: 0.76rem;
+    text-align: center;
+  }
+  .hero-consistency-models .readout b {
+    font-weight: 600;
+    white-space: nowrap;
+  }
+  .hero-consistency-models .r {
+    grid-area: 1 / 1;
+    opacity: 0;
+  }
+  .hero-consistency-models .r5 { opacity: 1; }
+  .hero-consistency-models .r1 { animation: consistency-models-r1 var(--t) linear infinite both; }
+  .hero-consistency-models .r2 { animation: consistency-models-r2 var(--t) linear infinite both; }
+  .hero-consistency-models .r3 { animation: consistency-models-r3 var(--t) linear infinite both; }
+  .hero-consistency-models .r4 { animation: consistency-models-r4 var(--t) linear infinite both; }
+  .hero-consistency-models .r5 { animation: consistency-models-r5 var(--t) linear infinite both; }
+
+  /* timeline (14s): write + ack 0-22 · stale read 24-45 · replication in flight 47-58 · applied 60-72 · fresh read 74-94 · fade 94-100 */
+  @keyframes consistency-models-stage {
+    0% { opacity: 0; }
+    3%, 95% { opacity: 1; }
+    99%, 100% { opacity: 0; }
+  }
+
+  @keyframes consistency-models-pk-write {
+    0%, 3% { opacity: 0; transform: translate(40px, 34px); }
+    4% { opacity: 1; transform: translate(40px, 34px); }
+    10% { opacity: 1; transform: translate(114px, 34px); }
+    11%, 100% { opacity: 0; transform: translate(114px, 34px); }
+  }
+  @keyframes consistency-models-pk-ack {
+    0%, 12% { opacity: 0; transform: translate(114px, 34px); }
+    13% { opacity: 1; transform: translate(114px, 34px); }
+    19% { opacity: 1; transform: translate(40px, 34px); }
+    20%, 100% { opacity: 0; transform: translate(40px, 34px); }
+  }
+  @keyframes consistency-models-pk-read1 {
+    0%, 24% { opacity: 0; transform: translate(40px, 140px); }
+    25% { opacity: 1; transform: translate(40px, 140px); }
+    30% { opacity: 1; transform: translate(114px, 140px); }
+    31%, 100% { opacity: 0; transform: translate(114px, 140px); }
+  }
+  @keyframes consistency-models-pk-stale {
+    0%, 32% { opacity: 0; transform: translate(114px, 140px); }
+    33% { opacity: 1; transform: translate(114px, 140px); }
+    38% { opacity: 1; transform: translate(40px, 140px); }
+    39%, 100% { opacity: 0; transform: translate(40px, 140px); }
+  }
+  @keyframes consistency-models-pk-repl {
+    0%, 47% { opacity: 0; transform: translate(171px, 58px); }
+    48% { opacity: 1; transform: translate(171px, 58px); }
+    58% { opacity: 1; transform: translate(171px, 116px); }
+    59%, 100% { opacity: 0; transform: translate(171px, 116px); }
+  }
+  @keyframes consistency-models-pk-read2 {
+    0%, 74% { opacity: 0; transform: translate(40px, 140px); }
+    75% { opacity: 1; transform: translate(40px, 140px); }
+    79% { opacity: 1; transform: translate(114px, 140px); }
+    80%, 100% { opacity: 0; transform: translate(114px, 140px); }
+  }
+  @keyframes consistency-models-pk-fresh {
+    0%, 80% { opacity: 0; transform: translate(114px, 140px); }
+    81% { opacity: 1; transform: translate(114px, 140px); }
+    85% { opacity: 1; transform: translate(40px, 140px); }
+    86%, 100% { opacity: 0; transform: translate(40px, 140px); }
+  }
+
+  @keyframes consistency-models-op-write {
+    0%, 3% { opacity: 0; }
+    5%, 100% { opacity: 1; }
+  }
+  @keyframes consistency-models-op-ack {
+    0%, 12% { opacity: 0; }
+    14%, 100% { opacity: 1; }
+  }
+  @keyframes consistency-models-op-read {
+    0%, 24% { opacity: 0; }
+    26%, 100% { opacity: 1; }
+  }
+  @keyframes consistency-models-op-stale {
+    0%, 37% { opacity: 0; }
+    39%, 100% { opacity: 1; }
+  }
+  @keyframes consistency-models-op-fresh {
+    0%, 84% { opacity: 0; }
+    86%, 100% { opacity: 1; }
+  }
+  @keyframes consistency-models-lag {
+    0%, 21% { fill: var(--color-muted); }
+    24%, 58% { fill: var(--color-red); }
+    60%, 100% { fill: var(--color-muted); }
+  }
+
+  @keyframes consistency-models-v-l4 {
+    0%, 9% { opacity: 1; }
+    11%, 100% { opacity: 0; }
+  }
+  @keyframes consistency-models-v-l5 {
+    0%, 9% { opacity: 0; fill: var(--color-amber); }
+    11%, 84% { opacity: 1; fill: var(--color-amber); }
+    87%, 100% { opacity: 1; fill: var(--color-green); }
+  }
+  @keyframes consistency-models-v-f4 {
+    0%, 58% { opacity: 1; }
+    60%, 100% { opacity: 0; }
+  }
+  @keyframes consistency-models-v-f5 {
+    0%, 58% { opacity: 0; fill: var(--color-amber); }
+    60%, 84% { opacity: 1; fill: var(--color-amber); }
+    87%, 100% { opacity: 1; fill: var(--color-green); }
+  }
+  @keyframes consistency-models-leader {
+    0%, 9% { stroke: var(--color-line); }
+    11%, 84% { stroke: var(--color-amber); }
+    87%, 100% { stroke: var(--color-green); }
+  }
+  @keyframes consistency-models-follower {
+    0%, 31% { stroke: var(--color-line); }
+    33%, 58% { stroke: var(--color-red); }
+    60%, 84% { stroke: var(--color-amber); }
+    87%, 100% { stroke: var(--color-green); }
+  }
+
+  @keyframes consistency-models-r1 {
+    0%, 21% { opacity: 1; }
+    23%, 100% { opacity: 0; }
+  }
+  @keyframes consistency-models-r2 {
+    0%, 23% { opacity: 0; }
+    25%, 44% { opacity: 1; }
+    46%, 100% { opacity: 0; }
+  }
+  @keyframes consistency-models-r3 {
+    0%, 46% { opacity: 0; }
+    48%, 57% { opacity: 1; }
+    59%, 100% { opacity: 0; }
+  }
+  @keyframes consistency-models-r4 {
+    0%, 59% { opacity: 0; }
+    61%, 71% { opacity: 1; }
+    73%, 100% { opacity: 0; }
+  }
+  @keyframes consistency-models-r5 {
+    0%, 73% { opacity: 0; }
+    75%, 100% { opacity: 1; }
+  }
+</style>

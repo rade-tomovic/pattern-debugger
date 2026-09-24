@@ -1,0 +1,279 @@
+---
+import HeroFrame from '../HeroFrame.astro';
+
+/**
+ * Two threads increment one shared counter, twice over. Frames are computed at build time by
+ * running both schedules against a simulated count and per-thread register:
+ *   plain count++, interleaved:
+ *     A loads 0 · B loads 0 before A stores · A adds and stores 1 · B adds 1 to the 0 it loaded earlier, stores 1
+ *     two increments, count = 1: one update lost
+ *   Interlocked.Increment (lock inc, result ignored, so no register holds it):
+ *     A holds the cache line from its load to its store, count = 1
+ *     B gets the line only after A's store, reads 1, stores 2: none lost
+ *   the final layer also notes the plain run's result, so the reduced-motion frame keeps the contrast
+ * One frame per step, crossfaded with one shared keyframe and negative delays.
+ * Un-animated styles show the final frame (reduced motion).
+ */
+type Who = 'A' | 'B';
+type Op = 'load' | 'add, store' | 'lock inc';
+const plain: [Who, Op][] = [
+  ['A', 'load'],
+  ['B', 'load'],
+  ['A', 'add, store'],
+  ['B', 'add, store'],
+];
+const locked: [Who, Op][] = [
+  ['A', 'lock inc'],
+  ['B', 'lock inc'],
+];
+
+type Step = { phase: 'plain' | 'locked'; who: Who; op: Op; count: number; reg: Record<Who, number | null>; last: boolean };
+const run = (phase: Step['phase'], schedule: [Who, Op][]) => {
+  let count = 0;
+  const reg: Record<Who, number | null> = { A: null, B: null };
+  return schedule.map(([who, op], k): Step => {
+    if (op === 'load') reg[who] = count;
+    if (op === 'add, store') count = reg[who] = (reg[who] ?? 0) + 1;
+    if (op === 'lock inc') count += 1;
+    return { phase, who, op, count, reg: { ...reg }, last: k === schedule.length - 1 };
+  });
+};
+const plainSteps = run('plain', plain);
+const plainCount = plainSteps[plainSteps.length - 1].count;
+const steps = [...plainSteps, ...run('locked', locked)];
+const increments = locked.length;
+const n = steps.length;
+const delay = (k: number) => `animation-delay: calc(var(--t) * ${(k / n - 1).toFixed(4)})`;
+
+const color: Record<Who, string> = { A: 'amber', B: 'cyan' };
+const other = (w: Who): Who => (w === 'A' ? 'B' : 'A');
+const idle = (s: Step) => {
+  if (s.phase === 'locked') return s.last ? 'done' : 'waits for line';
+  if (s.reg[other(s.who)] === null) return 'not started';
+  return s.last ? 'done' : 'paused';
+};
+const state = (s: Step) => {
+  if (s.phase === 'plain' && s.last) return s.count === increments ? 'ok' : 'lost';
+  if (s.phase === 'locked' && s.last) return s.count === increments ? 'ok' : 'lost';
+  return s.phase === 'locked' ? `own-${s.who}` : 'plain';
+};
+const readout = (s: Step) => {
+  const c = color[s.who];
+  if (s.op === 'load') {
+    const early = s.who === 'B' ? 'B loads before A stores' : 'A loads count';
+    return { lead: early, verdict: `${s.who} reg = ${s.reg[s.who]}`, cls: `text-${c}` };
+  }
+  if (s.op === 'add, store') {
+    if (s.last) return { lead: `${s.who} stores ${s.reg[s.who]! - 1} + 1 from its earlier load`, verdict: `count = ${s.count}, update lost`, cls: 'text-red' };
+    return { lead: `${s.who} adds 1, stores`, verdict: `count = ${s.count}`, cls: `text-${c}` };
+  }
+  if (s.last) return { lead: `${s.who} gets the line next, reads ${s.count - 1}`, verdict: `count = ${s.count}, none lost`, cls: 'text-green' };
+  return { lead: `${s.who} holds the line from load to store`, verdict: `count = ${s.count}`, cls: `text-${c}` };
+};
+
+const box = { A: 8, B: 232 };
+const boxW = 100;
+const mid = (w: Who) => box[w] + boxW / 2;
+const cell = { x: 132, y: 44, w: 76, h: 52 };
+const arrowY = 70;
+const arrow = (w: Who, toCell: boolean) => {
+  const near = w === 'A' ? box.A + boxW + 2 : box.B - 2;
+  const far = w === 'A' ? cell.x - 2 : cell.x + cell.w + 2;
+  const [x1, x2] = toCell ? [near, far] : [far, near];
+  const d = x2 > x1 ? -7 : 7;
+  return { x1, x2: x2 + d, head: `${x2},${arrowY} ${x2 + d},${arrowY - 4} ${x2 + d},${arrowY + 4}` };
+};
+
+const keyframes = (() => {
+  const s = 100 / n;
+  const p = (f: number) => `${(s * f).toFixed(2)}%`;
+  return `@keyframes atomics-and-cas-frame { 0% { opacity: 0; } ${p(0.08)}, ${p(0.94)} { opacity: 1; } ${p(1.04)}, 100% { opacity: 0; } }`;
+})();
+---
+
+<HeroFrame label="count++ · two threads" caption="count++ is load, add, store; the lock prefix keeps the cache line on one core from the load until the store">
+  <div class="hero-atomics-and-cas" style={`--frames: ${n}`}>
+    <svg viewBox="0 0 340 128" role="img" aria-label="two threads run plain count++ and lose an update, then run lock inc and the counter reaches 2">
+      <rect class="box" x={box.A} y="32" width={boxW} height="76" rx="6" />
+      <rect class="box" x={box.B} y="32" width={boxW} height="76" rx="6" />
+      <text class="who text-amber" x={box.A + 8} y="44">thread A</text>
+      <text class="who text-cyan" x={box.B + 8} y="44">thread B</text>
+      <text class="lbl" x="170" y="36">count</text>
+      <rect class="box" x={cell.x} y={cell.y} width={cell.w} height={cell.h} rx="6" />
+
+      {
+        steps.map((s, k) => {
+          const a = arrow(s.who, s.op !== 'load');
+          const st = state(s);
+          return (
+            <g class:list={['layer', k === n - 1 && 'final']} style={delay(k)}>
+              <text class="hd" x="170" y="10">
+                {s.phase === 'plain' ? 'plain count++ · load, add, store' : 'Interlocked.Increment · lock inc'}
+              </text>
+              <rect class:list={['cell', st]} x={cell.x} y={cell.y} width={cell.w} height={cell.h} rx="6" />
+              <text class:list={['val', st]} x="170" y={cell.y + cell.h / 2}>{s.count}</text>
+              {s.phase === 'locked' && !s.last && (
+                <text class={`own text-${color[s.who]}`} x="170" y="112">line held by {s.who}</text>
+              )}
+              {s.phase === 'locked' && s.last && (
+                <text class="own was" x="170" y="118">
+                  plain count++ ended at <tspan class="lostv">{plainCount}</tspan>
+                </text>
+              )}
+              <g class={`arrow ${color[s.who]}`}>
+                <line x1={a.x1} y1={arrowY} x2={a.x2} y2={arrowY} />
+                <polygon points={a.head} />
+              </g>
+              <text class={`op text-${color[s.who]}`} x={mid(s.who)} y="68">{s.op}</text>
+              <text class="op idle" x={mid(other(s.who))} y="68">
+                {idle(s)}
+              </text>
+              {(['A', 'B'] as Who[]).map((w) => (
+                <text class="reg" x={mid(w)} y="90">reg = {s.reg[w] ?? '·'}</text>
+              ))}
+            </g>
+          );
+        })
+      }
+    </svg>
+    <div class="readout font-mono">
+      {
+        steps.map((s, k) => {
+          const r = readout(s);
+          return (
+            <span class:list={['r', k === n - 1 && 'final']} style={delay(k)}>
+              {r.lead} · <b class={r.cls}>{r.verdict}</b>
+            </span>
+          );
+        })
+      }
+    </div>
+  </div>
+</HeroFrame>
+
+<style is:inline set:html={keyframes}></style>
+<style is:inline>
+  .hero-atomics-and-cas {
+    --t: calc(var(--frames) * 2.1s);
+    width: 100%;
+    max-width: 400px;
+    animation: atomics-and-cas-stage var(--t) linear infinite both;
+  }
+  .hero-atomics-and-cas svg {
+    display: block;
+    width: 100%;
+    height: auto;
+    overflow: visible;
+  }
+  .hero-atomics-and-cas text {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    fill: var(--color-ink);
+    text-anchor: middle;
+    dominant-baseline: central;
+  }
+  .hero-atomics-and-cas .who {
+    text-anchor: start;
+    font-size: 10px;
+  }
+  .hero-atomics-and-cas .text-amber {
+    fill: var(--color-amber);
+  }
+  .hero-atomics-and-cas .text-cyan {
+    fill: var(--color-cyan);
+  }
+  .hero-atomics-and-cas .hd,
+  .hero-atomics-and-cas .lbl,
+  .hero-atomics-and-cas .reg {
+    fill: var(--color-muted);
+    font-size: 10px;
+  }
+  .hero-atomics-and-cas .op.idle {
+    fill: var(--color-muted);
+    font-size: 10px;
+  }
+  .hero-atomics-and-cas .own {
+    font-size: 9px;
+  }
+  .hero-atomics-and-cas .own.was {
+    fill: var(--color-muted);
+  }
+  .hero-atomics-and-cas .own .lostv {
+    fill: var(--color-red);
+    font-weight: 600;
+  }
+  .hero-atomics-and-cas .box {
+    fill: var(--color-panel2);
+    stroke: var(--color-line);
+    stroke-width: 1.5;
+  }
+  .hero-atomics-and-cas .cell {
+    fill: var(--color-panel2);
+    stroke: var(--color-line);
+    stroke-width: 1.5;
+  }
+  .hero-atomics-and-cas .cell.own-A {
+    stroke: var(--color-amber);
+  }
+  .hero-atomics-and-cas .cell.own-B {
+    stroke: var(--color-cyan);
+  }
+  .hero-atomics-and-cas .cell.lost {
+    stroke: var(--color-red);
+    fill: var(--color-red-dim);
+  }
+  .hero-atomics-and-cas .cell.ok {
+    stroke: var(--color-green);
+    fill: var(--color-green-dim);
+  }
+  .hero-atomics-and-cas .val {
+    font-size: 18px;
+  }
+  .hero-atomics-and-cas .val.lost {
+    fill: var(--color-red);
+  }
+  .hero-atomics-and-cas .val.ok {
+    fill: var(--color-green);
+  }
+  .hero-atomics-and-cas .arrow line {
+    stroke-width: 1.5;
+  }
+  .hero-atomics-and-cas .arrow.amber line {
+    stroke: var(--color-amber);
+  }
+  .hero-atomics-and-cas .arrow.amber polygon {
+    fill: var(--color-amber);
+  }
+  .hero-atomics-and-cas .arrow.cyan line {
+    stroke: var(--color-cyan);
+  }
+  .hero-atomics-and-cas .arrow.cyan polygon {
+    fill: var(--color-cyan);
+  }
+  .hero-atomics-and-cas .layer,
+  .hero-atomics-and-cas .r {
+    opacity: 0;
+    animation: atomics-and-cas-frame var(--t) linear infinite both;
+  }
+  .hero-atomics-and-cas .layer.final,
+  .hero-atomics-and-cas .r.final {
+    opacity: 1;
+  }
+  .hero-atomics-and-cas .readout {
+    display: grid;
+    margin-top: 10px;
+    font-size: 0.76rem;
+    text-align: center;
+  }
+  .hero-atomics-and-cas .readout b {
+    font-weight: 600;
+  }
+  .hero-atomics-and-cas .r {
+    grid-area: 1 / 1;
+  }
+  @keyframes atomics-and-cas-stage {
+    0% { opacity: 0; }
+    3%, 96% { opacity: 1; }
+    100% { opacity: 0; }
+  }
+</style>
