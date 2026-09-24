@@ -28,7 +28,7 @@
 # to get wrong.
 set -euo pipefail
 
-LOCK="${BENCH_LOCK_FILE:-/tmp/algo-ds-bench.lock}"
+LOCK="${BENCH_LOCK_FILE:-/tmp/pattern-debugger-bench.lock}"
 TIMEOUT="${BENCH_LOCK_TIMEOUT:-7200}"
 MODE=-x
 MODE_NAME=exclusive

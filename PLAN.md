@@ -1,4 +1,4 @@
-# algo-ds-learning — Content Tree & Build Plan
+# pattern-debugger — Content Tree & Build Plan
 
 A static learning site for coding-interview algorithm patterns. All solution code in **modern C#**
 (collection expressions, tuples, pattern matching), compile-verified with .NET 10.
