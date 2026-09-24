@@ -24,6 +24,20 @@ const mapSections = sections.filter((s) => s.id !== 'reference');
   title="Algorithm Patterns in C#"
   description="Step through every coding-interview pattern like a debugger — templates, hand-verified traces, and interactive visualizers, all in modern C#."
 >
+  <script type="application/ld+json" slot="head" set:html={JSON.stringify({
+    '@context': 'https://schema.org',
+    '@type': 'WebSite',
+    name: 'pattern debugger',
+    url: 'https://pattern-debugger.pages.dev/',
+    inLanguage: 'en',
+    license: 'https://opensource.org/licenses/MIT',
+    creator: {
+      '@type': 'Organization',
+      name: 'AMPQ',
+      url: 'https://ampq.dev/',
+      sameAs: ['https://github.com/rade-tomovic', 'https://www.linkedin.com/in/rade-tomovic'],
+    },
+  })} />
   <!-- hero -->
   <section class="mt-4">
     <h1 class="font-mono text-2xl leading-tight font-semibold tracking-tight sm:text-3xl">

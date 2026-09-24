@@ -22,7 +22,9 @@ const { title, description } = Astro.props;
     <meta property="og:title" content={title} />
     <meta property="og:description" content={description} />
     <meta property="og:type" content="article" />
+    <meta name="author" content="AMPQ" />
     <meta name="generator" content={Astro.generator} />
+    <slot name="head" />
   </head>
   <body>
     <div class="mx-auto flex min-h-dvh max-w-6xl">
@@ -30,8 +32,20 @@ const { title, description } = Astro.props;
       <main class="min-w-0 flex-1 px-4 pt-16 pb-24 sm:px-8 lg:pt-8">
         <slot />
         <footer class="border-line text-muted mt-20 border-t pt-6 font-mono text-xs">
-          <span class="text-muted">//</span> algorithm patterns for coding interviews · all
-          solutions in C# · step through everything
+          <p>
+            <span class="text-muted">//</span> algorithm patterns for coding interviews · all
+            solutions in C# · step through everything
+          </p>
+          <p class="mt-2">
+            <span class="text-muted">//</span> built by
+            <a href="https://ampq.dev/" class="text-ink underline decoration-line underline-offset-4 hover:decoration-amber"
+              >AMPQ, a product development and platform engineering practice</a
+            >. Source on
+            <a
+              href="https://github.com/rade-tomovic/pattern-debugger"
+              class="text-ink underline decoration-line underline-offset-4 hover:decoration-amber">GitHub</a
+            >, MIT licensed.
+          </p>
         </footer>
       </main>
     </div>
