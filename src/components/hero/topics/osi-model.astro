@@ -1,0 +1,237 @@
+---
+import HeroFrame from '../HeroFrame.astro';
+
+/**
+ * Encapsulation of the page's 88-byte HTTP GET, one row per layer on the way down:
+ *   layer 7 · the message your code wrote                     88 bytes
+ *   layer 4 · TCP prepends a 20-byte header                  108-byte segment
+ *   layer 3 · IP prepends a 20-byte header                   128-byte packet
+ *   layer 2 · Ethernet prepends 14 and appends a 4-byte FCS  146-byte frame
+ *   on the wire, 88 of the 146 bytes are yours and 146 - 88 = 58 are framing
+ * Totals are computed below from the header sizes, so the numbers cannot drift from the sum.
+ * Each new header is amber while it is being written; the finished frame's payload turns green.
+ * Timeline (12s): L7 0-18 · L4 18-36 · L3 36-54 · L2 54-72 · settled 72-94 · fade 94-100.
+ * Un-animated styles are the final frame (reduced motion): all four rows, frame complete.
+ */
+const payload = 88;
+const layers = [
+  { n: 7, pdu: 'message', head: null, trail: null },
+  { n: 4, pdu: 'segment', head: { name: 'TCP', bytes: 20 }, trail: null },
+  { n: 3, pdu: 'packet', head: { name: 'IP', bytes: 20 }, trail: null },
+  { n: 2, pdu: 'frame', head: { name: 'Eth', bytes: 14 }, trail: { name: 'FCS', bytes: 4 } },
+];
+
+const col: Record<string, number> = { Eth: 28, IP: 66, TCP: 104, HTTP: 142, FCS: 236 };
+const w: Record<string, number> = { Eth: 38, IP: 38, TCP: 38, HTTP: 94, FCS: 28 };
+const rowY = (i: number) => 6 + i * 44;
+
+let total = payload;
+const rows = layers.map((l, i) => {
+  total += (l.head?.bytes ?? 0) + (l.trail?.bytes ?? 0);
+  const segs = [
+    ...layers
+      .slice(1, i + 1)
+      .map((x) => ({ name: x.head!.name, bytes: x.head!.bytes, fresh: x === l })),
+    { name: 'HTTP', bytes: payload, fresh: false },
+    ...layers
+      .slice(1, i + 1)
+      .filter((x) => x.trail)
+      .map((x) => ({ name: x.trail!.name, bytes: x.trail!.bytes, fresh: x === l })),
+  ];
+  return { ...l, i, total, segs };
+});
+const wire = rows[rows.length - 1].total;
+const overhead = wire - payload;
+---
+
+<HeroFrame label={`encapsulation · ${payload}-byte GET`} caption="each layer treats what it was handed as opaque payload and glues its own header on the front">
+  <div class="hero-osi-model">
+    <svg viewBox="0 0 340 176" role="img" aria-label={`an ${payload}-byte HTTP request gaining a TCP, IP and Ethernet header on the way down, ending as a ${wire}-byte frame`}>
+      {
+        rows.map((r) => (
+          <g class={`row row${r.i}`} transform={`translate(0 ${rowY(r.i)})`}>
+            <text class="lyr" x={Math.min(...r.segs.map((s) => col[s.name])) - 6} y="15">L{r.n}</text>
+            {r.segs.map((s) => (
+              <g class:list={['seg', s.fresh && 'fresh', s.name === 'HTTP' && 'pay', s.name === 'HTTP' && r.i === rows.length - 1 && 'mine']}>
+                <rect x={col[s.name]} y="0" width={w[s.name]} height="30" rx="4" />
+                <text class="nm" x={col[s.name] + w[s.name] / 2} y="10">{s.name}</text>
+                <text class="by" x={col[s.name] + w[s.name] / 2} y="22">{s.bytes}</text>
+              </g>
+            ))}
+            <text class="pdu" x="274" y="9">{r.pdu}</text>
+            <text class="tot" x="274" y="22">{r.total} bytes</text>
+          </g>
+        ))
+      }
+    </svg>
+    <div class="readout font-mono">
+      <span class="r r0">layer 7 · the message your code wrote · <b class="text-amber">{payload} bytes</b></span>
+      {
+        rows.slice(1).map((r) => (
+          <span class={`r r${r.i}`}>
+            layer {r.n} · {r.head!.name === 'Eth' ? 'Ethernet' : r.head!.name} {r.trail ? `adds ${r.head!.bytes} + ${r.trail.bytes}` : `prepends ${r.head!.bytes}`} ·{' '}
+            <b class="text-amber">
+              {r.total}-byte {r.pdu}
+            </b>
+          </span>
+        ))
+      }
+      <span class="r r4">{wire} bytes on the wire · <span class="nw"><b class="text-green">{payload} are yours</b>, {overhead} are framing</span></span>
+    </div>
+  </div>
+</HeroFrame>
+
+<style is:inline>
+  .hero-osi-model {
+    --t: 12s;
+    width: 100%;
+    max-width: 360px;
+    animation: osi-model-stage var(--t) linear infinite both;
+  }
+  .hero-osi-model svg {
+    display: block;
+    width: 100%;
+    height: auto;
+    overflow: visible;
+  }
+  .hero-osi-model text {
+    font-family: var(--font-mono);
+    fill: var(--color-ink);
+    dominant-baseline: central;
+  }
+  .hero-osi-model .lyr {
+    fill: var(--color-muted);
+    font-size: 11px;
+    text-anchor: end;
+  }
+  .hero-osi-model .pdu {
+    font-size: 11px;
+  }
+  .hero-osi-model .tot {
+    fill: var(--color-muted);
+    font-size: 10px;
+  }
+  .hero-osi-model .seg rect {
+    fill: var(--color-panel2);
+    stroke: var(--color-line);
+    stroke-width: 1.5;
+  }
+  .hero-osi-model .seg .nm {
+    font-size: 10px;
+    text-anchor: middle;
+  }
+  .hero-osi-model .seg .by {
+    fill: var(--color-muted);
+    font-size: 9px;
+    text-anchor: middle;
+  }
+  .hero-osi-model .pay .nm {
+    fill: var(--color-muted);
+  }
+  .hero-osi-model .mine rect {
+    stroke: var(--color-green);
+    fill: var(--color-green-dim);
+  }
+  .hero-osi-model .mine .nm {
+    fill: var(--color-green);
+  }
+
+  .hero-osi-model .row1 { animation: osi-model-row1 var(--t) ease-out infinite both; }
+  .hero-osi-model .row2 { animation: osi-model-row2 var(--t) ease-out infinite both; }
+  .hero-osi-model .row3 { animation: osi-model-row3 var(--t) ease-out infinite both; }
+  .hero-osi-model .row0 .pay rect { animation: osi-model-fresh0 var(--t) linear infinite both; }
+  .hero-osi-model .row1 .fresh rect { animation: osi-model-fresh1 var(--t) linear infinite both; }
+  .hero-osi-model .row2 .fresh rect { animation: osi-model-fresh2 var(--t) linear infinite both; }
+  .hero-osi-model .row3 .fresh rect { animation: osi-model-fresh3 var(--t) linear infinite both; }
+  .hero-osi-model .mine rect { animation: osi-model-mine var(--t) linear infinite both; }
+  .hero-osi-model .mine .nm { animation: osi-model-mine-nm var(--t) linear infinite both; }
+
+  .hero-osi-model .readout {
+    display: grid;
+    margin-top: 10px;
+    font-size: 0.78rem;
+    text-align: center;
+  }
+  .hero-osi-model .readout .nw {
+    white-space: nowrap;
+  }
+  .hero-osi-model .readout b {
+    font-weight: 600;
+  }
+  .hero-osi-model .r {
+    grid-area: 1 / 1;
+    opacity: 0;
+  }
+  .hero-osi-model .r4 { opacity: 1; }
+  .hero-osi-model .r0 { animation: osi-model-r0 var(--t) linear infinite both; }
+  .hero-osi-model .r1 { animation: osi-model-r1 var(--t) linear infinite both; }
+  .hero-osi-model .r2 { animation: osi-model-r2 var(--t) linear infinite both; }
+  .hero-osi-model .r3 { animation: osi-model-r3 var(--t) linear infinite both; }
+  .hero-osi-model .r4 { animation: osi-model-r4 var(--t) linear infinite both; }
+
+  @keyframes osi-model-stage {
+    0% { opacity: 0; }
+    3%, 94% { opacity: 1; }
+    99%, 100% { opacity: 0; }
+  }
+  @keyframes osi-model-row1 {
+    0%, 17% { opacity: 0; transform: translate(-10px, 50px); }
+    20%, 100% { opacity: 1; transform: translate(0, 50px); }
+  }
+  @keyframes osi-model-row2 {
+    0%, 35% { opacity: 0; transform: translate(-10px, 94px); }
+    38%, 100% { opacity: 1; transform: translate(0, 94px); }
+  }
+  @keyframes osi-model-row3 {
+    0%, 53% { opacity: 0; transform: translate(-10px, 138px); }
+    56%, 100% { opacity: 1; transform: translate(0, 138px); }
+  }
+  @keyframes osi-model-fresh0 {
+    0%, 17% { stroke: var(--color-amber); }
+    19%, 100% { stroke: var(--color-line); }
+  }
+  @keyframes osi-model-fresh1 {
+    0%, 35% { stroke: var(--color-amber); }
+    37%, 100% { stroke: var(--color-line); }
+  }
+  @keyframes osi-model-fresh2 {
+    0%, 53% { stroke: var(--color-amber); }
+    55%, 100% { stroke: var(--color-line); }
+  }
+  @keyframes osi-model-fresh3 {
+    0%, 71% { stroke: var(--color-amber); }
+    73%, 100% { stroke: var(--color-line); }
+  }
+  @keyframes osi-model-mine {
+    0%, 71% { stroke: var(--color-line); fill: var(--color-panel2); }
+    74%, 100% { stroke: var(--color-green); fill: var(--color-green-dim); }
+  }
+  @keyframes osi-model-mine-nm {
+    0%, 71% { fill: var(--color-muted); }
+    74%, 100% { fill: var(--color-green); }
+  }
+
+  @keyframes osi-model-r0 {
+    0%, 17% { opacity: 1; }
+    19%, 100% { opacity: 0; }
+  }
+  @keyframes osi-model-r1 {
+    0%, 18% { opacity: 0; }
+    20%, 35% { opacity: 1; }
+    37%, 100% { opacity: 0; }
+  }
+  @keyframes osi-model-r2 {
+    0%, 36% { opacity: 0; }
+    38%, 53% { opacity: 1; }
+    55%, 100% { opacity: 0; }
+  }
+  @keyframes osi-model-r3 {
+    0%, 54% { opacity: 0; }
+    56%, 71% { opacity: 1; }
+    73%, 100% { opacity: 0; }
+  }
+  @keyframes osi-model-r4 {
+    0%, 72% { opacity: 0; }
+    74%, 100% { opacity: 1; }
+  }
+</style>

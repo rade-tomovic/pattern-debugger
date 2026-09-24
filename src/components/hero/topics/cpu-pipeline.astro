@@ -1,0 +1,243 @@
+---
+import HeroFrame from '../HeroFrame.astro';
+
+/**
+ * A four-stage line (fetch, decode, execute, writeback) running the tail of the page's Chain1
+ * loop, `inc`, `cmp`, `jl`, with the branch mispredicted. The cycle grid is computed at build time
+ * by stepping the pipeline itself, one frame per cycle, crossfaded:
+ *   cycles 1-3: one new instruction enters fetch per cycle; jl is fetched in cycle 3
+ *   cycle 4: jl's outcome is unknown until execute, so fetch follows the predictor's guess
+ *   cycle 5: jl executes, the guess was wrong; everything fetched since the guess is flushed
+ *   cycles 6-8: fetch restarts at the real target; execute has nothing to run until it arrives
+ * Each row label enters with its first fetch, like its cells. The loop has CYCLES + 1 slots: the
+ * final cycle holds two, so the takeaway line stays up long enough to read.
+ * Un-animated styles show the final frame (reduced motion).
+ */
+const STAGES = ['F', 'D', 'E', 'W'];
+const EXECUTE = STAGES.indexOf('E');
+const CYCLES = 8;
+
+type Kind = 'plain' | 'branch' | 'guess' | 'real';
+type Row = { name: string; kind: Kind; cells: { c: number; s: number }[]; flushedAt?: number };
+const rows: Row[] = [];
+const program: { name: string; kind: Kind }[] = [
+  { name: 'inc', kind: 'plain' },
+  { name: 'cmp', kind: 'plain' },
+  { name: 'jl', kind: 'branch' },
+];
+const guessed = [1, 2, 3].map((i) => ({ name: `guess ${i}`, kind: 'guess' as Kind }));
+const real = [1, 2, 3].map((i) => ({ name: `real ${i}`, kind: 'real' as Kind }));
+
+let fetchQueue = [...program, ...guessed];
+let inflight: { row: Row; s: number }[] = [];
+let resolveCycle = 0;
+let branchFetchCycle = 0;
+for (let c = 1; c <= CYCLES; c++) {
+  inflight = inflight.map((x) => ({ ...x, s: x.s + 1 })).filter((x) => x.s < STAGES.length);
+  const next = fetchQueue.shift();
+  if (next) {
+    const row: Row = { ...next, cells: [] };
+    rows.push(row);
+    inflight.push({ row, s: 0 });
+    if (next.kind === 'branch') branchFetchCycle = c;
+  }
+  for (const x of inflight) x.row.cells.push({ c, s: x.s });
+  const branch = inflight.find((x) => x.row.kind === 'branch' && x.s === EXECUTE);
+  if (branch) {
+    resolveCycle = c;
+    for (const x of inflight) if (x.row.kind === 'guess') x.row.flushedAt = c;
+    inflight = inflight.filter((x) => x.row.kind !== 'guess');
+    fetchQueue = [...real];
+  }
+}
+const flushed = rows.filter((r) => r.flushedAt).length;
+const firstReal = rows.find((r) => r.kind === 'real')!;
+const realFetch = firstReal.cells[0].c;
+const realExecute = firstReal.cells.find((x) => x.s === EXECUTE)?.c ?? CYCLES + 1;
+
+const readouts: string[] = [];
+for (let k = 1; k <= CYCLES; k++) {
+  const fetched = rows.find((r) => r.cells[0].c === k)?.name;
+  let line = `cycle ${k} · ${fetched} enters fetch`;
+  if (k === 2) line = `cycle ${k} · ${fetched} fetched while ${rows[0].name} decodes · <b class="text-ink">stages overlap</b>`;
+  if (k === branchFetchCycle) line = `cycle ${k} · jl fetched · <b class="text-ink">its outcome is unknown until execute</b>`;
+  if (k > branchFetchCycle && k < resolveCycle) line = `cycle ${k} · jl still in flight · <b class="text-ink">fetch follows the predictor's guess</b>`;
+  if (k === resolveCycle) line = `cycle ${k} · jl executes, the guess was wrong · <b class="text-red">flush</b>`;
+  if (k === realFetch) line = `cycle ${k} · fetch restarts at the real target · <b class="text-red">${flushed} guesses thrown away</b>`;
+  if (k > realFetch && k < realExecute) line = `cycle ${k} · <b class="text-ink">execute has nothing to run</b>`;
+  if (k === realExecute) line = `cycle ${k} · real 1 reaches execute · <b class="text-red">${flushed} guesses discarded; a deeper line loses more</b>`;
+  readouts.push(line);
+}
+
+const X0 = 66;
+const CW = 34;
+const colX = (c: number) => X0 + (c - 1) * CW + CW / 2;
+const rowY = (r: number) => 30 + r * 19;
+const gridBottom = rowY(rows.length - 1) + 10;
+const cellClass = (row: Row, s: number, c: number, k: number) => {
+  if (row.flushedAt && k >= row.flushedAt) return 'cell flushed';
+  if (row.kind === 'guess') return 'cell spec';
+  if (row.kind === 'branch' && s === EXECUTE && c === resolveCycle) return 'cell resolve';
+  return 'cell';
+};
+const SLOTS = CYCLES + 1;
+const frames = Array.from({ length: CYCLES }, (_, i) => i + 1);
+const delay = (k: number) => `animation-delay: calc(var(--t) * ${((k - 1) / SLOTS - 1).toFixed(4)})`;
+---
+
+<HeroFrame label="pipeline · jl mispredicted" caption="fetch guesses past a branch that only resolves in execute; a wrong guess throws away everything fetched since">
+  <div class="hero-cpu-pipeline">
+    <svg viewBox={`0 0 340 ${gridBottom + 18}`} role="img" aria-label={`cycle grid: jl resolves in execute at cycle ${resolveCycle}, ${flushed} guessed instructions are flushed, fetch restarts at the real target`}>
+      {frames.map((c) => <text class="hd mid" x={colX(c)} y="10">{c}</text>)}
+      {
+        frames.map((k) => (
+          <g class:list={['layer', k === CYCLES && 'final']} style={delay(k)}>
+            <rect class="band" x={X0 + (k - 1) * CW + 1} y="1" width={CW - 2} height={gridBottom} rx="4" />
+            <text class="now mid" x={colX(k)} y="10">{k}</text>
+            {rows.map((row, r) =>
+              row.cells[0].c <= k ? (
+                <text class:list={['lbl', row.kind]} x="58" y={rowY(r)}>
+                  {row.name}
+                </text>
+              ) : null,
+            )}
+            {rows.map((row, r) =>
+              row.cells
+                .filter((x) => x.c <= k)
+                .map((x) => (
+                  <g transform={`translate(${colX(x.c)} ${rowY(r)})`}>
+                    <rect class={cellClass(row, x.s, x.c, k)} x="-13" y="-8" width="26" height="16" rx="3" />
+                    <text class={`mid ${cellClass(row, x.s, x.c, k)}`}>{STAGES[x.s]}</text>
+                  </g>
+                )),
+            )}
+          </g>
+        ))
+      }
+      <text class="hd" x={X0} y={gridBottom + 12}>F fetch · D decode · E execute · W writeback</text>
+    </svg>
+    <div class="readout font-mono">
+      {frames.map((k) => <span class:list={['r', k === CYCLES && 'final']} style={delay(k)} set:html={readouts[k - 1]} />)}
+    </div>
+  </div>
+</HeroFrame>
+
+<style is:inline>
+  .hero-cpu-pipeline {
+    --t: 14s;
+    width: 100%;
+    max-width: 400px;
+    animation: cpu-pipeline-stage var(--t) linear infinite both;
+  }
+  .hero-cpu-pipeline svg {
+    display: block;
+    width: 100%;
+    height: auto;
+    overflow: visible;
+  }
+  .hero-cpu-pipeline text {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    fill: var(--color-ink);
+    dominant-baseline: central;
+  }
+  .hero-cpu-pipeline .mid {
+    text-anchor: middle;
+  }
+  .hero-cpu-pipeline .hd {
+    fill: var(--color-muted);
+    font-size: 9px;
+  }
+  .hero-cpu-pipeline .now {
+    font-size: 9px;
+    font-weight: 700;
+  }
+  .hero-cpu-pipeline .lbl {
+    text-anchor: end;
+  }
+  .hero-cpu-pipeline .lbl.guess {
+    fill: var(--color-muted);
+  }
+  .hero-cpu-pipeline .band {
+    fill: var(--color-panel2);
+  }
+  .hero-cpu-pipeline rect.cell {
+    fill: var(--color-panel2);
+    stroke: var(--color-line);
+    stroke-width: 1.2;
+  }
+  .hero-cpu-pipeline rect.spec {
+    fill: var(--color-panel);
+    stroke: var(--color-muted);
+    stroke-dasharray: 3 2;
+  }
+  .hero-cpu-pipeline text.spec {
+    fill: var(--color-muted);
+  }
+  .hero-cpu-pipeline rect.resolve {
+    stroke: var(--color-red);
+  }
+  .hero-cpu-pipeline rect.flushed {
+    fill: var(--color-red-dim);
+    stroke: var(--color-red);
+    stroke-dasharray: 3 2;
+  }
+  .hero-cpu-pipeline text.flushed {
+    fill: var(--color-red);
+    text-decoration: line-through;
+  }
+  .hero-cpu-pipeline .layer {
+    opacity: 0;
+    animation: cpu-pipeline-frame var(--t) linear infinite both;
+  }
+  .hero-cpu-pipeline .layer.final {
+    opacity: 1;
+    animation-name: cpu-pipeline-frame-final;
+  }
+
+  .hero-cpu-pipeline .readout {
+    display: grid;
+    margin-top: 10px;
+    font-size: 0.76rem;
+    text-align: center;
+  }
+  .hero-cpu-pipeline .readout b {
+    font-weight: 600;
+  }
+  .hero-cpu-pipeline .r {
+    grid-area: 1 / 1;
+    opacity: 0;
+    animation: cpu-pipeline-line var(--t) linear infinite both;
+  }
+  .hero-cpu-pipeline .r.final {
+    opacity: 1;
+    animation-name: cpu-pipeline-line-final;
+  }
+
+  /* nine slots of 1/9 of the loop: cycles 1-7 take one each, cycle 8 takes the last two; frames overlap briefly so the grid never blinks */
+  @keyframes cpu-pipeline-stage {
+    0% { opacity: 0; }
+    3%, 96% { opacity: 1; }
+    99.5%, 100% { opacity: 0; }
+  }
+  @keyframes cpu-pipeline-frame {
+    0% { opacity: 0; }
+    1%, 12.1% { opacity: 1; }
+    13.1%, 100% { opacity: 0; }
+  }
+  @keyframes cpu-pipeline-line {
+    0% { opacity: 0; }
+    1%, 10.6% { opacity: 1; }
+    11.1%, 100% { opacity: 0; }
+  }
+  @keyframes cpu-pipeline-frame-final {
+    0% { opacity: 0; }
+    1%, 22% { opacity: 1; }
+    22.3%, 100% { opacity: 0; }
+  }
+  @keyframes cpu-pipeline-line-final {
+    0% { opacity: 0; }
+    1%, 22% { opacity: 1; }
+    22.3%, 100% { opacity: 0; }
+  }
+</style>

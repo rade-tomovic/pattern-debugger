@@ -1,9 +1,16 @@
 ---
+import type { AstroComponentFactory } from 'astro/runtime/server/index.js';
 import Base from '@layouts/Base.astro';
 import PrevNext from '@components/PrevNext.astro';
 import CheatCard from '@components/CheatCard.astro';
 import Connections from '@components/Connections.astro';
 import { sections, topicBySlug, topicPath } from '@data/curriculum';
+
+// Head illustrations: hero/topics/<topic-slug>.astro, rendered when present. Each hero keeps its
+// CSS in `<style is:inline>` so a page ships only its own hero's styles.
+const heroes = import.meta.glob<{ default: AstroComponentFactory }>('../components/hero/topics/*.astro', {
+  eager: true,
+});
 
 /**
  * Layout for topic pages (patterns, foundations, deep dives, reference).
@@ -17,6 +24,7 @@ if (!topic) {
 }
 const section = sections.find((s) => s.id === topic.section)!;
 const path = topicPath(topic);
+const Hero = heroes[`../components/hero/topics/${topic.slug}.astro`]?.default;
 ---
 
 <Base title={topic.title} description={topic.summary}>
@@ -30,6 +38,7 @@ const path = topicPath(topic);
     <span class="text-muted">// </span>{topic.title}
   </h1>
   <p class="text-muted mt-2 max-w-[64ch] text-[0.95rem]">{topic.summary}</p>
+  {Hero && <Hero />}
 
   <article class="article mt-8">
     <slot />

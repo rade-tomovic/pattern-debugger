@@ -1,0 +1,268 @@
+---
+import HeroFrame from '../HeroFrame.astro';
+
+/**
+ * ARP for an off-subnet destination, with the page's example addresses:
+ *   A (192.0.2.10) sends to 203.0.113.7; it is off-link, so the next hop is the gateway 192.0.2.1
+ *   ARP cache miss: A broadcasts "who has 192.0.2.1?" to ff:ff:ff:ff:ff:ff, the switch floods it
+ *   B (192.0.2.50) parses it and discards it (red, held until the reply is under way); the gateway answers unicast, straight back to A:
+ *     192.0.2.1 is at 12:22:33:44:55:66
+ *   A caches the answer and builds the frame: dst MAC = the gateway's, dst IP = 203.0.113.7
+ * The two destination addresses in one frame name two different machines.
+ * Timeline (13s): route 0-14 · broadcast 14-38 · reply 38-58 · frame 58-94 · fade 94-100.
+ * Un-animated styles are the final frame (reduced motion): the frame at the gateway, dst MAC filled.
+ */
+const at = {
+  A: [34, 44],
+  sw: [130, 44],
+  gw: [226, 44],
+  B: [130, 108],
+};
+const gwMac = '12:22:33:44:55:66';
+const dstIp = '203.0.113.7';
+---
+
+<HeroFrame label={`ARP · A → ${dstIp}`} caption="ARP resolves the next hop: off your subnet, the frame's destination MAC is the gateway's, not the server's">
+  <div class="hero-link-layer">
+    <svg viewBox="0 0 340 198" role="img" aria-label="host A broadcasts an ARP request for its gateway, the gateway answers, and A's frame carries the gateway's MAC with the far server's IP">
+      <g class="links">
+        <line x1="60" y1="44" x2="102" y2="44" />
+        <line x1="158" y1="44" x2="200" y2="44" />
+        <line x1="130" y1="56" x2="130" y2="95" />
+        <line class="far" x1="252" y1="44" x2="284" y2="44" />
+      </g>
+
+      <rect class="node" x={at.A[0] - 26} y={at.A[1] - 13} width="52" height="26" rx="5" />
+      <text x={at.A[0]} y={at.A[1]}>A</text>
+      <text class="ip" x={at.A[0]} y="68">192.0.2.10</text>
+
+      <rect class="node" x={at.sw[0] - 28} y={at.sw[1] - 12} width="56" height="24" rx="5" />
+      <text class="sw" x={at.sw[0]} y={at.sw[1]}>switch</text>
+
+      <rect class="node" x={at.gw[0] - 26} y={at.gw[1] - 13} width="52" height="26" rx="5" />
+      <text x={at.gw[0]} y={at.gw[1]}>gw</text>
+      <text class="ip" x={at.gw[0]} y="68">192.0.2.1</text>
+
+      <rect class="node srv" x="284" y="31" width="44" height="26" rx="5" />
+      <text x="306" y="44">srv</text>
+      <text class="ip" x="306" y="68">{dstIp}</text>
+
+      <rect class="node" x={at.B[0] - 26} y={at.B[1] - 13} width="52" height="26" rx="5" />
+      <text x={at.B[0]} y={at.B[1]}>B</text>
+      <text class="ip" x={at.B[0]} y="132">192.0.2.50</text>
+
+      <g class="mv q0"><rect class="bk" x="-20" y="-8" width="40" height="16" rx="8" /><rect class="pill req" x="-20" y="-8" width="40" height="16" rx="8" /><text>who?</text></g>
+      <g class="mv qb"><rect class="bk" x="-20" y="-8" width="40" height="16" rx="8" /><rect class="pill req" x="-20" y="-8" width="40" height="16" rx="8" /><text>who?</text></g>
+      <g class="mv qg"><rect class="bk" x="-20" y="-8" width="40" height="16" rx="8" /><rect class="pill req" x="-20" y="-8" width="40" height="16" rx="8" /><text>who?</text></g>
+      <g class="mv rp"><rect class="bk" x="-20" y="-8" width="40" height="16" rx="8" /><rect class="pill rep" x="-20" y="-8" width="40" height="16" rx="8" /><text>reply</text></g>
+      <g class="mv fr"><rect class="bk" x="-22" y="-8" width="44" height="16" rx="8" /><rect class="pill dat" x="-22" y="-8" width="44" height="16" rx="8" /><text>frame</text></g>
+
+      <text class="cap" x="4" y="152">the frame A builds</text>
+      <rect class="field fmac" x="4" y="160" width="200" height="34" rx="5" />
+      <text class="fl" x="12" y="170">dst MAC</text>
+      <text class="fv unk" x="12" y="184">?</text>
+      <text class="fv mac" x="12" y="184">{gwMac} · gw</text>
+      <rect class="field" x="212" y="160" width="124" height="34" rx="5" />
+      <text class="fl" x="220" y="170">dst IP</text>
+      <text class="fv" x="220" y="184">{dstIp} · srv</text>
+    </svg>
+    <div class="readout font-mono">
+      <span class="r r0">srv is off-link · <b class="text-cyan">next hop = gw 192.0.2.1</b></span>
+      <span class="r r1">ARP miss · broadcast · <b class="text-amber">who has 192.0.2.1?</b></span>
+      <span class="r r2">B discards · gw replies · <b class="text-green">{gwMac}</b></span>
+      <span class="r r3">one frame, two machines · <b class="text-green">MAC&nbsp;→&nbsp;gw, IP&nbsp;→&nbsp;srv</b></span>
+    </div>
+  </div>
+</HeroFrame>
+
+<style is:inline>
+  .hero-link-layer {
+    --t: 13s;
+    width: 100%;
+    max-width: 360px;
+    animation: link-layer-stage var(--t) linear infinite both;
+  }
+  .hero-link-layer svg {
+    display: block;
+    width: 100%;
+    height: auto;
+    overflow: visible;
+  }
+  .hero-link-layer text {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    fill: var(--color-ink);
+    text-anchor: middle;
+    dominant-baseline: central;
+  }
+  .hero-link-layer .ip {
+    fill: var(--color-muted);
+    font-size: 10px;
+  }
+  .hero-link-layer .sw {
+    fill: var(--color-muted);
+    font-size: 10px;
+  }
+  .hero-link-layer .links line {
+    stroke: var(--color-line);
+    stroke-width: 1.5;
+  }
+  .hero-link-layer .links .far {
+    stroke-dasharray: 3 3;
+  }
+  .hero-link-layer .node {
+    fill: var(--color-panel2);
+    stroke: var(--color-line);
+    stroke-width: 1.5;
+  }
+  .hero-link-layer .node.srv {
+    fill: none;
+    stroke-dasharray: 3 3;
+  }
+  .hero-link-layer .pill {
+    fill: var(--color-panel2);
+    stroke-width: 1.5;
+  }
+  .hero-link-layer .bk {
+    fill: var(--color-panel2);
+  }
+  .hero-link-layer .mv text {
+    font-size: 9px;
+  }
+  .hero-link-layer .req {
+    stroke: var(--color-amber);
+  }
+  .hero-link-layer .rep {
+    stroke: var(--color-green);
+    fill: var(--color-green-dim);
+  }
+  .hero-link-layer .dat {
+    stroke: var(--color-amber);
+  }
+  .hero-link-layer .cap,
+  .hero-link-layer .fl {
+    fill: var(--color-muted);
+    font-size: 9px;
+    text-anchor: start;
+  }
+  .hero-link-layer .fv {
+    font-size: 10px;
+    text-anchor: start;
+  }
+  .hero-link-layer .field {
+    fill: var(--color-panel2);
+    stroke: var(--color-line);
+    stroke-width: 1.5;
+  }
+  .hero-link-layer .fmac {
+    stroke: var(--color-green);
+  }
+  .hero-link-layer .unk {
+    fill: var(--color-muted);
+    opacity: 0;
+  }
+  .hero-link-layer .mac {
+    fill: var(--color-green);
+  }
+
+  .hero-link-layer .q0 { transform: translate(130px, 44px); opacity: 0; animation: link-layer-q0 var(--t) ease-in-out infinite both; }
+  .hero-link-layer .qb { transform: translate(130px, 108px); opacity: 0; animation: link-layer-qb var(--t) ease-in-out infinite both; }
+  .hero-link-layer .qg { transform: translate(226px, 44px); opacity: 0; animation: link-layer-qg var(--t) ease-in-out infinite both; }
+  .hero-link-layer .rp { transform: translate(34px, 44px); opacity: 0; animation: link-layer-rp var(--t) ease-in-out infinite both; }
+  .hero-link-layer .fr { transform: translate(226px, 44px); animation: link-layer-fr var(--t) ease-in-out infinite both; }
+  .hero-link-layer .qb .req { animation: link-layer-discard var(--t) linear infinite both; }
+  .hero-link-layer .fmac { animation: link-layer-fmac var(--t) linear infinite both; }
+  .hero-link-layer .unk { animation: link-layer-unk var(--t) linear infinite both; }
+  .hero-link-layer .mac { animation: link-layer-mac var(--t) linear infinite both; }
+
+  .hero-link-layer .readout {
+    display: grid;
+    margin-top: 10px;
+    font-size: 0.78rem;
+    text-align: center;
+  }
+  .hero-link-layer .readout b {
+    font-weight: 600;
+  }
+  .hero-link-layer .r {
+    grid-area: 1 / 1;
+    opacity: 0;
+  }
+  .hero-link-layer .r3 { opacity: 1; }
+  .hero-link-layer .r0 { animation: link-layer-r0 var(--t) linear infinite both; }
+  .hero-link-layer .r1 { animation: link-layer-r1 var(--t) linear infinite both; }
+  .hero-link-layer .r2 { animation: link-layer-r2 var(--t) linear infinite both; }
+  .hero-link-layer .r3 { animation: link-layer-r3 var(--t) linear infinite both; }
+
+  @keyframes link-layer-stage {
+    0% { opacity: 0; }
+    3%, 94% { opacity: 1; }
+    99%, 100% { opacity: 0; }
+  }
+  @keyframes link-layer-q0 {
+    0%, 14% { transform: translate(34px, 44px); opacity: 0; }
+    15% { transform: translate(34px, 44px); opacity: 1; }
+    21% { transform: translate(130px, 44px); opacity: 1; }
+    22%, 100% { transform: translate(130px, 44px); opacity: 0; }
+  }
+  @keyframes link-layer-qb {
+    0%, 21% { transform: translate(130px, 44px); opacity: 0; }
+    22% { transform: translate(130px, 44px); opacity: 1; }
+    28%, 45% { transform: translate(130px, 108px) scale(1); opacity: 1; }
+    47%, 100% { transform: translate(130px, 108px) scale(0.4); opacity: 0; }
+  }
+  @keyframes link-layer-qg {
+    0%, 21% { transform: translate(130px, 44px); opacity: 0; }
+    22% { transform: translate(130px, 44px); opacity: 1; }
+    28%, 37% { transform: translate(226px, 44px); opacity: 1; }
+    39%, 100% { transform: translate(226px, 44px); opacity: 0; }
+  }
+  @keyframes link-layer-discard {
+    0%, 37% { stroke: var(--color-amber); fill: var(--color-panel2); }
+    39%, 100% { stroke: var(--color-red); fill: var(--color-red-dim); }
+  }
+  @keyframes link-layer-rp {
+    0%, 39% { transform: translate(226px, 44px); opacity: 0; }
+    41% { transform: translate(226px, 44px); opacity: 1; }
+    46% { transform: translate(130px, 44px); opacity: 1; }
+    52%, 54% { transform: translate(34px, 44px); opacity: 1; }
+    56%, 100% { transform: translate(34px, 44px); opacity: 0; }
+  }
+  @keyframes link-layer-fr {
+    0%, 59% { transform: translate(34px, 44px); opacity: 0; }
+    61% { transform: translate(34px, 44px); opacity: 1; }
+    67% { transform: translate(130px, 44px); opacity: 1; }
+    73%, 100% { transform: translate(226px, 44px); opacity: 1; }
+  }
+  @keyframes link-layer-fmac {
+    0%, 53% { stroke: var(--color-line); }
+    56%, 100% { stroke: var(--color-green); }
+  }
+  @keyframes link-layer-unk {
+    0%, 53% { opacity: 1; }
+    55%, 100% { opacity: 0; }
+  }
+  @keyframes link-layer-mac {
+    0%, 54% { opacity: 0; }
+    56%, 100% { opacity: 1; }
+  }
+
+  @keyframes link-layer-r0 {
+    0%, 13% { opacity: 1; }
+    15%, 100% { opacity: 0; }
+  }
+  @keyframes link-layer-r1 {
+    0%, 14% { opacity: 0; }
+    16%, 37% { opacity: 1; }
+    39%, 100% { opacity: 0; }
+  }
+  @keyframes link-layer-r2 {
+    0%, 38% { opacity: 0; }
+    40%, 57% { opacity: 1; }
+    59%, 100% { opacity: 0; }
+  }
+  @keyframes link-layer-r3 {
+    0%, 58% { opacity: 0; }
+    60%, 100% { opacity: 1; }
+  }
+</style>

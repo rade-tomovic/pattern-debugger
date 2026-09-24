@@ -1,0 +1,243 @@
+---
+import HeroFrame from '../HeroFrame.astro';
+
+/**
+ * The same input through both tools, in lockstep: nums = [5, 2, 7, 4, 3], target = 6.
+ * Both traces are computed here by running the two algorithms, so the frames cannot drift:
+ *   dictionary, one pass, ask before store:
+ *     i = 0: need 1, miss, store 5→0 · i = 1: need 4, miss, store 2→1
+ *     i = 2: need −1, miss, store 7→2 · i = 3: need 2, hit seen[2] = 1 → [1, 3]
+ *   pointers on the sorted copy [2, 3, 4, 5, 7]:
+ *     L0 R4: 9 > 6, R moves in · L0 R3: 7 > 6, R moves in · L0 R2: 6, hit → [0, 2]
+ * Both land on 2 + 4; only the dictionary still knows where they sat in the original array.
+ * Frames crossfade with one shared keyframe and negative delays. Un-animated styles show the
+ * final frame (reduced motion).
+ */
+const nums = [5, 2, 7, 4, 3];
+const target = 6;
+const sorted = [...nums].sort((a, b) => a - b);
+
+type DictStep = { i: number; need: number; seen: [number, number][]; hit: number[] | null };
+const dict: DictStep[] = [];
+{
+  const seen = new Map<number, number>();
+  for (let i = 0; i < nums.length; i++) {
+    const need = target - nums[i];
+    const before = [...seen.entries()];
+    if (seen.has(need)) {
+      dict.push({ i, need, seen: before, hit: [seen.get(need)!, i] });
+      break;
+    }
+    dict.push({ i, need, seen: before, hit: null });
+    seen.set(nums[i], i);
+  }
+}
+
+type PtrStep = { l: number; r: number; sum: number; hit: boolean };
+const ptr: PtrStep[] = [];
+for (let l = 0, r = sorted.length - 1; l < r; ) {
+  const sum = sorted[l] + sorted[r];
+  ptr.push({ l, r, sum, hit: sum === target });
+  if (sum === target) break;
+  if (sum < target) l++;
+  else r--;
+}
+
+const frames = Math.max(dict.length, ptr.length);
+const at = <T,>(xs: T[], k: number) => xs[Math.min(k, xs.length - 1)];
+const fmt = (n: number) => (n < 0 ? `−${-n}` : `${n}`);
+const delay = (k: number) => `animation-delay: calc(var(--t) * ${(k / frames - 1).toFixed(4)})`;
+const steps = [...Array(frames).keys()].map((k) => ({ d: at(dict, k), p: at(ptr, k), last: k === frames - 1 }));
+---
+
+<HeroFrame label={`two sum · [${nums.join(', ')}] → ${target}`} caption="sorted order answers the lookup for free; unsorted data has to buy a dictionary, and of the two, only the dictionary keeps original indices">
+  <div class="hero-two-sum-family font-mono" style={`--frames: ${frames}`}>
+    <div class="layers">
+      {
+        steps.map(({ d, p, last }, k) => (
+          <div class:list={['layer', last && 'final']} style={delay(k)}>
+            <p class="hd">hashmap · original order</p>
+            <div class="row">
+              {nums.map((v, c) => (
+                <span class="cellwrap">
+                  <span class:list={['cell', d.hit ? d.hit.includes(c) && 'ok' : c === d.i && 'cur', c > d.i && 'later']}>{v}</span>
+                  <span class="idx">{c}</span>
+                </span>
+              ))}
+            </div>
+            <div class="seen">
+              <span class="lbl">seen</span>
+              {d.seen.map(([v, i]) => (
+                <span class:list={['chip', d.hit && v === d.need && 'ok']}>
+                  {v}→{i}
+                </span>
+              ))}
+              {!d.hit && (
+                <span class="chip new">
+                  {nums[d.i]}→{d.i}
+                </span>
+              )}
+            </div>
+            <p class="note">
+              i = {d.i} · need {target} − {nums[d.i]} = {fmt(d.need)} ·{' '}
+              {d.hit ? (
+                <b class="text-green">hit → [{d.hit.join(', ')}]</b>
+              ) : (
+                <b class="text-amber">
+                  miss, store {nums[d.i]}→{d.i}
+                </b>
+              )}
+            </p>
+
+            <p class="hd gap">two pointers · sorted copy</p>
+            <div class="row">
+              {sorted.map((v, c) => (
+                <span class="cellwrap">
+                  <span class:list={['cell', p.hit && (c === p.l || c === p.r) && 'ok', !p.hit && c === p.l && 'left', !p.hit && c === p.r && 'right', (c < p.l || c > p.r) && 'gone']}>{v}</span>
+                  <span class:list={['idx', c === p.l && 'text-amber', c === p.r && 'text-cyan']}>{c}</span>
+                  <span class:list={['ptr', c === p.l && 'text-amber', c === p.r && 'text-cyan']}>{c === p.l ? 'L' : c === p.r ? 'R' : ''}</span>
+                </span>
+              ))}
+            </div>
+            <p class="note">
+              {sorted[p.l]} + {sorted[p.r]} = {p.sum} ·{' '}
+              {p.hit ? (
+                <b class="text-green"><span class="nw">hit → [{p.l}, {p.r}]</span>, <span class="nw">sorted positions</span></b>
+              ) : (
+                <b class="text-red">
+                  {p.sum} &gt; {target}, R moves in
+                </b>
+              )}
+            </p>
+          </div>
+        ))
+      }
+    </div>
+  </div>
+</HeroFrame>
+
+<style is:inline>
+  .hero-two-sum-family {
+    --t: calc(var(--frames) * 3s);
+    --cell: 30px;
+    width: 100%;
+    max-width: 360px;
+    font-size: 0.8rem;
+  }
+  .hero-two-sum-family .layers {
+    display: grid;
+  }
+  .hero-two-sum-family .layer {
+    grid-area: 1 / 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 5px;
+    opacity: 0;
+    animation: two-sum-family-frame var(--t) linear infinite both;
+  }
+  .hero-two-sum-family .layer.final {
+    opacity: 1;
+  }
+  .hero-two-sum-family .hd {
+    margin: 0;
+    color: var(--color-muted);
+    font-size: 0.68rem;
+  }
+  .hero-two-sum-family .hd.gap {
+    margin-top: 10px;
+  }
+  .hero-two-sum-family .row {
+    display: flex;
+    gap: 4px;
+  }
+  .hero-two-sum-family .cellwrap {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 2px;
+  }
+  .hero-two-sum-family .cell {
+    width: var(--cell);
+    height: var(--cell);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border: 1px solid var(--color-line);
+    border-radius: 5px;
+    background: var(--color-panel2);
+    color: var(--color-ink);
+  }
+  .hero-two-sum-family .cell.later,
+  .hero-two-sum-family .cell.gone {
+    color: var(--color-muted);
+    border-style: dashed;
+  }
+  .hero-two-sum-family .cell.gone {
+    opacity: 0.45;
+  }
+  .hero-two-sum-family .cell.cur,
+  .hero-two-sum-family .cell.left {
+    border-color: var(--color-amber);
+  }
+  .hero-two-sum-family .cell.right {
+    border-color: var(--color-cyan);
+  }
+  .hero-two-sum-family .cell.ok {
+    border-color: var(--color-green);
+    background: var(--color-green-dim);
+  }
+  .hero-two-sum-family .idx {
+    color: var(--color-muted);
+    font-size: 0.62rem;
+  }
+  .hero-two-sum-family .ptr {
+    height: 0.9em;
+    font-size: 0.66rem;
+    font-weight: 600;
+    line-height: 1;
+  }
+  .hero-two-sum-family .seen {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    min-height: 22px;
+    font-size: 0.7rem;
+  }
+  .hero-two-sum-family .lbl {
+    color: var(--color-muted);
+  }
+  .hero-two-sum-family .chip {
+    padding: 1px 6px;
+    border: 1px solid var(--color-line);
+    border-radius: 4px;
+    background: var(--color-panel2);
+  }
+  .hero-two-sum-family .chip.new {
+    border-style: dashed;
+    border-color: var(--color-amber);
+    color: var(--color-amber);
+  }
+  .hero-two-sum-family .chip.ok {
+    border-color: var(--color-green);
+    background: var(--color-green-dim);
+  }
+  .hero-two-sum-family .note {
+    margin: 0;
+    color: var(--color-muted);
+    font-size: 0.72rem;
+    text-align: center;
+  }
+  .hero-two-sum-family b {
+    font-weight: 600;
+  }
+  .hero-two-sum-family .nw {
+    white-space: nowrap;
+  }
+
+  @keyframes two-sum-family-frame {
+    0% { opacity: 0; }
+    3%, 22% { opacity: 1; }
+    25%, 100% { opacity: 0; }
+  }
+</style>

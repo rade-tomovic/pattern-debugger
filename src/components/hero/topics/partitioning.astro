@@ -1,0 +1,311 @@
+---
+import HeroFrame from '../HeroFrame.astro';
+
+/**
+ * Consistent hashing ring from the page: hash space 0..359, walked clockwise, wraps at 360.
+ *   vnodes C2 @ 0, A1 @ 40, B1 @ 95, C1 @ 150, A2 @ 210, B2 @ 260
+ *   a key belongs to the first vnode clockwise from its hash: 302 wraps to C2
+ *   node D joins with D1 @ 70 and D2 @ 230
+ *   only the arcs (A1, D1] and (A2, D2] change owner (B1 → D1, B2 → D2); every other key stays
+ * Owners before and after, the moved arcs and the counts are computed below by running the
+ * ownership rule on both rings, so the picture cannot drift from the rule.
+ * Un-animated styles are the final frame (reduced motion).
+ */
+type VNode = { id: string; at: number };
+const before: VNode[] = [
+  { id: 'C2', at: 0 },
+  { id: 'A1', at: 40 },
+  { id: 'B1', at: 95 },
+  { id: 'C1', at: 150 },
+  { id: 'A2', at: 210 },
+  { id: 'B2', at: 260 },
+];
+const joins: VNode[] = [
+  { id: 'D1', at: 70 },
+  { id: 'D2', at: 230 },
+];
+const after = [...before, ...joins].sort((a, b) => a.at - b.at);
+const keys = [20, 55, 120, 180, 222, 302];
+const lookupKey = 302;
+
+const owner = (ring: VNode[], h: number) => {
+  const sorted = [...ring].sort((a, b) => a.at - b.at);
+  return (sorted.find((v) => v.at >= h) ?? sorted[0]).id;
+};
+const rows = keys.map((h) => {
+  const b = owner(before, h);
+  const a = owner(after, h);
+  return { h, before: b, after: a, moved: a !== b };
+});
+const movedCount = rows.filter((r) => r.moved).length;
+const arcs = joins.map((j) => {
+  const i = after.findIndex((v) => v.id === j.id);
+  const prev = after[(i - 1 + after.length) % after.length];
+  return { from: prev.at, to: j.at, label: `(${prev.at}, ${j.at}]`, lost: owner(before, j.at) };
+});
+
+const cx = 92;
+const cy = 100;
+const r = 66;
+const pt = (deg: number, rad = r) => {
+  const t = (deg * Math.PI) / 180;
+  return [+(cx + rad * Math.sin(t)).toFixed(1), +(cy - rad * Math.cos(t)).toFixed(1)];
+};
+const arcPath = (from: number, to: number) => {
+  const [x1, y1] = pt(from);
+  const [x2, y2] = pt(to);
+  const span = (to - from + 360) % 360 || 360;
+  return `M ${x1} ${y1} A ${r} ${r} 0 ${span > 180 ? 1 : 0} 1 ${x2} ${y2}`;
+};
+const lookupOwner = owner(before, lookupKey);
+const lookupArc = arcPath(lookupKey, before.find((v) => v.id === lookupOwner)!.at);
+const rowY = (i: number) => 52 + i * 22;
+---
+
+<HeroFrame label="hash ring · node D joins" caption="a vnode owns the arc behind it, so a join moves only the arcs the new vnodes split; every other key keeps its owner">
+  <div class="hero-partitioning">
+    <svg viewBox="0 0 340 200" role="img" aria-label={`consistent hashing ring: node D joins with two vnodes and only ${movedCount} of ${keys.length} keys change owner`}>
+      <circle class="ring" cx={cx} cy={cy} r={r} />
+      <path class="lookup" d={lookupArc} />
+      {arcs.map((a) => <path class="moved-arc" d={arcPath(a.from, a.to)} />)}
+
+      {
+        before.map((v) => {
+          const [x, y] = pt(v.at);
+          const [lx, ly] = pt(v.at, r + 15);
+          return (
+            <>
+              <circle class="vn" cx={x} cy={y} r="5" />
+              <text class="vl" x={lx} y={ly}>{v.id}</text>
+            </>
+          );
+        })
+      }
+      {
+        joins.map((v) => {
+          const [x, y] = pt(v.at);
+          const [lx, ly] = pt(v.at, r + 15);
+          return (
+            <g class="join">
+              <circle class="vn d" cx={x} cy={y} r="5" />
+              <text class="vl d" x={lx} y={ly}>{v.id}</text>
+            </g>
+          );
+        })
+      }
+      {
+        rows.map((row) => {
+          const [x, y] = pt(row.h);
+          const [lx, ly] = pt(row.h, r - 16);
+          return (
+            <>
+              <rect class:list={['key', row.moved ? 'k-moved' : 'k-kept', row.h === lookupKey && 'k-look']} x={x - 3.5} y={y - 3.5} width="7" height="7" rx="1.5" />
+              <text class="kl" x={lx} y={ly}>{row.h}</text>
+            </>
+          );
+        })
+      }
+
+      <text class="th" x="206" y="26">hash</text>
+      <text class="th" x="254" y="26">owner</text>
+      <text class="th" x="304" y="26">with D</text>
+      <line class="rule" x1="186" y1="36" x2="332" y2="36" />
+      {
+        rows.map((row, i) => (
+          <>
+            <text class:list={['td', row.h === lookupKey && 'look']} x="206" y={rowY(i)}>{row.h}</text>
+            <text class:list={['td', row.h === lookupKey && 'look']} x="254" y={rowY(i)}>{row.before}</text>
+            <text class:list={['td', 'aft', row.moved ? 'a-moved' : 'a-kept']} x="304" y={rowY(i)}>{row.after}</text>
+          </>
+        ))
+      }
+    </svg>
+    <div class="readout font-mono">
+      <span class="r r1">key → first vnode clockwise · <b class="text-cyan">{lookupKey} wraps to {lookupOwner}</b></span>
+      <span class="r r2">node D joins · <b class="text-amber">{joins.map((j) => `${j.id} at ${j.at}`).join(', ')}</b></span>
+      <span class="r r3">only {arcs.map((a) => a.label).join(' and ')} move · <b class="text-amber">{movedCount} keys → D</b></span>
+      <span class="r r4">{keys.length - movedCount} of {keys.length} keep their owner · <b class="text-green">rest of ring untouched</b></span>
+    </div>
+  </div>
+</HeroFrame>
+
+<style is:inline>
+  .hero-partitioning {
+    --t: 13s;
+    width: 100%;
+    max-width: 380px;
+    animation: partitioning-stage var(--t) linear infinite both;
+  }
+  .hero-partitioning svg {
+    display: block;
+    width: 100%;
+    height: auto;
+    overflow: visible;
+  }
+  .hero-partitioning text {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    fill: var(--color-ink);
+    text-anchor: middle;
+    dominant-baseline: central;
+  }
+  .hero-partitioning .ring {
+    fill: none;
+    stroke: var(--color-line);
+    stroke-width: 2;
+  }
+  .hero-partitioning .lookup {
+    fill: none;
+    stroke: var(--color-cyan);
+    stroke-width: 4;
+    stroke-linecap: round;
+    opacity: 0;
+  }
+  .hero-partitioning .moved-arc {
+    fill: none;
+    stroke: var(--color-amber);
+    stroke-width: 4;
+    stroke-linecap: round;
+  }
+  .hero-partitioning .vn {
+    fill: var(--color-panel2);
+    stroke: var(--color-muted);
+    stroke-width: 1.5;
+  }
+  .hero-partitioning .vn.d {
+    stroke: var(--color-amber);
+    fill: var(--color-panel2);
+  }
+  .hero-partitioning .vl {
+    fill: var(--color-muted);
+    font-size: 11px;
+  }
+  .hero-partitioning .vl.d {
+    fill: var(--color-amber);
+  }
+  .hero-partitioning .key {
+    stroke-width: 1.5;
+  }
+  .hero-partitioning .kl {
+    fill: var(--color-muted);
+    font-size: 10px;
+  }
+  .hero-partitioning .k-moved {
+    fill: var(--color-panel2);
+    stroke: var(--color-amber);
+  }
+  .hero-partitioning .k-kept {
+    fill: var(--color-green-dim);
+    stroke: var(--color-green);
+  }
+  .hero-partitioning .th {
+    fill: var(--color-muted);
+    font-size: 10px;
+  }
+  .hero-partitioning .rule {
+    stroke: var(--color-line);
+  }
+  .hero-partitioning .a-moved {
+    fill: var(--color-amber);
+    font-weight: 600;
+  }
+  .hero-partitioning .a-kept {
+    fill: var(--color-green);
+  }
+
+  .hero-partitioning .join { animation: partitioning-join var(--t) ease-in-out infinite both; }
+  .hero-partitioning .lookup { animation: partitioning-lookup var(--t) linear infinite both; }
+  .hero-partitioning .moved-arc { animation: partitioning-moved-arc var(--t) linear infinite both; }
+  .hero-partitioning .k-moved { animation: partitioning-k-moved var(--t) linear infinite both; }
+  .hero-partitioning .k-kept { animation: partitioning-k-kept var(--t) linear infinite both; }
+  .hero-partitioning .k-kept.k-look { animation: partitioning-k-look var(--t) linear infinite both; }
+  .hero-partitioning .td.look { animation: partitioning-td-look var(--t) linear infinite both; }
+  .hero-partitioning .a-moved { animation: partitioning-a-moved var(--t) linear infinite both; }
+  .hero-partitioning .a-kept { animation: partitioning-a-kept var(--t) linear infinite both; }
+
+  .hero-partitioning .readout {
+    display: grid;
+    margin-top: 10px;
+    font-size: 0.76rem;
+    text-align: center;
+  }
+  .hero-partitioning .readout b {
+    font-weight: 600;
+    white-space: nowrap;
+  }
+  .hero-partitioning .r {
+    grid-area: 1 / 1;
+    opacity: 0;
+  }
+  .hero-partitioning .r4 { opacity: 1; }
+  .hero-partitioning .r1 { animation: partitioning-r1 var(--t) linear infinite both; }
+  .hero-partitioning .r2 { animation: partitioning-r2 var(--t) linear infinite both; }
+  .hero-partitioning .r3 { animation: partitioning-r3 var(--t) linear infinite both; }
+  .hero-partitioning .r4 { animation: partitioning-r4 var(--t) linear infinite both; }
+
+  /* timeline: lookup 0-24 · D joins 24-46 · moved arcs 46-70 · kept keys 70-94 · fade 94-100 */
+  @keyframes partitioning-stage {
+    0% { opacity: 0; }
+    3%, 95% { opacity: 1; }
+    99%, 100% { opacity: 0; }
+  }
+  @keyframes partitioning-lookup {
+    0%, 5% { opacity: 0; }
+    8%, 21% { opacity: 1; }
+    24%, 100% { opacity: 0; }
+  }
+  @keyframes partitioning-td-look {
+    0%, 5% { fill: var(--color-ink); }
+    8%, 21% { fill: var(--color-cyan); }
+    24%, 100% { fill: var(--color-ink); }
+  }
+  @keyframes partitioning-k-look {
+    0%, 5% { fill: var(--color-panel2); stroke: var(--color-muted); }
+    8%, 21% { fill: var(--color-panel2); stroke: var(--color-cyan); }
+    24%, 70% { fill: var(--color-panel2); stroke: var(--color-muted); }
+    74%, 100% { fill: var(--color-green-dim); stroke: var(--color-green); }
+  }
+  @keyframes partitioning-join {
+    0%, 25% { opacity: 0; transform: translateY(-4px); }
+    30%, 100% { opacity: 1; transform: translateY(0); }
+  }
+  @keyframes partitioning-moved-arc {
+    0%, 46% { opacity: 0; }
+    50%, 100% { opacity: 1; }
+  }
+  @keyframes partitioning-k-moved {
+    0%, 47% { stroke: var(--color-muted); }
+    51%, 100% { stroke: var(--color-amber); }
+  }
+  @keyframes partitioning-k-kept {
+    0%, 70% { fill: var(--color-panel2); stroke: var(--color-muted); }
+    74%, 100% { fill: var(--color-green-dim); stroke: var(--color-green); }
+  }
+  @keyframes partitioning-a-moved {
+    0%, 48% { opacity: 0; }
+    52%, 100% { opacity: 1; }
+  }
+  @keyframes partitioning-a-kept {
+    0%, 71% { opacity: 0; }
+    75%, 100% { opacity: 1; }
+  }
+
+  @keyframes partitioning-r1 {
+    0%, 22% { opacity: 1; }
+    24%, 100% { opacity: 0; }
+  }
+  @keyframes partitioning-r2 {
+    0%, 24% { opacity: 0; }
+    26%, 45% { opacity: 1; }
+    47%, 100% { opacity: 0; }
+  }
+  @keyframes partitioning-r3 {
+    0%, 47% { opacity: 0; }
+    49%, 69% { opacity: 1; }
+    71%, 100% { opacity: 0; }
+  }
+  @keyframes partitioning-r4 {
+    0%, 71% { opacity: 0; }
+    73%, 100% { opacity: 1; }
+  }
+</style>

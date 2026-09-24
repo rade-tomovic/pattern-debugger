@@ -1,0 +1,340 @@
+---
+import HeroFrame from '../HeroFrame.astro';
+
+/**
+ * The page's write-skew example under snapshot isolation. Invariant: at least one doctor on call.
+ *   start: Alice and Bob both on call, count = 2
+ *   A BEGINs, then B BEGINs, each snapshot fixed at count = 2
+ *   A reads 2, B reads 2: each decides it is safe to leave
+ *   A: UPDATE alice off, COMMIT, count = 1 (still valid)
+ *   B: UPDATE bob off, COMMIT, count = 0; B's snapshot still says 2
+ * The on_call table shows committed rows only: each UPDATE stays pending (amber) until its COMMIT.
+ * No dirty read, no overwritten row, both commits succeed, the invariant is broken.
+ * Un-animated styles are the final frame (reduced motion): both commits shown, count = 0 in red.
+ */
+const lanes = [
+  { cls: 'a', name: 'Txn A', x: 4, row: 'alice' },
+  { cls: 'b', name: 'Txn B', x: 236, row: 'bob' },
+];
+---
+
+<HeroFrame label="snapshot isolation · write skew" caption="an isolation level is a list of anomalies you agreed to tolerate; snapshot isolation still lets two disjoint writes break an invariant">
+  <div class="hero-transactions">
+    <svg viewBox="0 0 340 150" role="img" aria-label="two transactions each read two doctors on call from their snapshots, each takes a different doctor off call, both commit, and the on-call count reaches zero">
+      {
+        lanes.map((l) => (
+          <g transform={`translate(${l.x} 0)`}>
+            <text class="hd" x="50" y="10">
+              {l.name}
+            </text>
+            <g class={`snapshot snap-${l.cls}`}>
+              <rect class="snapbox" x="0" y="22" width="100" height="24" rx="5" />
+              <text class="mid snaptext" x="50" y="34">
+                snapshot: 2 on
+              </text>
+            </g>
+            <text class={`stmt read sel-${l.cls}`} x="50" y="64">
+              SELECT → 2
+            </text>
+            <text class={`stmt write upd-${l.cls}`} x="50" y="84">
+              UPDATE {l.row}
+            </text>
+            <text class={`stmt ok com-${l.cls}`} x="50" y="104">
+              COMMIT ✓
+            </text>
+          </g>
+        ))
+      }
+
+      <text class="hd" x="170" y="10">on_call</text>
+      <rect class="row row-a" x="118" y="22" width="104" height="24" rx="5" />
+      <text class="name" x="128" y="34">alice</text>
+      <text class="val on-a" x="212" y="34">on</text>
+      <text class="val off off-a" x="212" y="34">off</text>
+      <rect class="row row-b" x="118" y="52" width="104" height="24" rx="5" />
+      <text class="name" x="128" y="64">bob</text>
+      <text class="val on-b" x="212" y="64">on</text>
+      <text class="val off off-b" x="212" y="64">off</text>
+
+      <rect class="count" x="126" y="92" width="88" height="26" rx="5" />
+      <text class="mid c c2" x="170" y="105">count = 2</text>
+      <text class="mid c c1" x="170" y="105">count = 1</text>
+      <text class="mid c c0" x="170" y="105">count = 0</text>
+      <text class="mid inv" x="170" y="134">invariant: count ≥ 1</text>
+
+      <g class="arrow arrow-a">
+        <line x1="94" y1="82" x2="112" y2="38" />
+        <polygon points="116,34 108,38 115,42" />
+      </g>
+      <g class="arrow arrow-b">
+        <line x1="244" y1="84" x2="228" y2="68" />
+        <polygon points="224,64 226,73 233,67" />
+      </g>
+    </svg>
+    <div class="readout font-mono">
+      <span class="r r1">A and B BEGIN under snapshot isolation · <b class="text-cyan">each snapshot fixes count = 2</b></span>
+      <span class="r r2">each reads 2 on call · <b class="text-cyan">each decides it is safe to leave</b></span>
+      <span class="r r3">A takes Alice off call and commits<span class="v v3"> · <b class="text-green">count = 1, still valid</b></span></span>
+      <span class="r r4">B takes Bob off call and commits<span class="v v4"> · <b class="text-red">count = 0, invariant broken</b></span></span>
+      <span class="r r5">no dirty read, no overwritten row · <b class="text-red">write skew, only serializable rejects a commit</b></span>
+    </div>
+  </div>
+</HeroFrame>
+
+<style is:inline>
+  .hero-transactions {
+    --t: 14s;
+    width: 100%;
+    max-width: 390px;
+    animation: transactions-stage var(--t) linear infinite both;
+  }
+  .hero-transactions svg {
+    display: block;
+    width: 100%;
+    height: auto;
+    overflow: visible;
+  }
+  .hero-transactions text {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    fill: var(--color-ink);
+    dominant-baseline: central;
+  }
+  .hero-transactions .hd {
+    fill: var(--color-muted);
+    font-size: 10px;
+    text-anchor: middle;
+  }
+  .hero-transactions .mid,
+  .hero-transactions .stmt {
+    text-anchor: middle;
+  }
+  .hero-transactions .stmt {
+    font-size: 10px;
+  }
+  .hero-transactions .read,
+  .hero-transactions .snaptext {
+    fill: var(--color-cyan);
+  }
+  .hero-transactions .snaptext {
+    font-size: 10px;
+  }
+  .hero-transactions .write {
+    fill: var(--color-amber);
+  }
+  .hero-transactions .ok {
+    fill: var(--color-green);
+  }
+  .hero-transactions .snapbox {
+    fill: var(--color-panel2);
+    stroke: var(--color-cyan);
+    stroke-width: 1.5;
+  }
+  .hero-transactions .row,
+  .hero-transactions .count {
+    fill: var(--color-panel2);
+    stroke: var(--color-line);
+    stroke-width: 1.5;
+  }
+  .hero-transactions .val {
+    text-anchor: end;
+  }
+  .hero-transactions .val.off {
+    fill: var(--color-muted);
+  }
+  .hero-transactions .inv {
+    fill: var(--color-muted);
+    font-size: 10px;
+  }
+  .hero-transactions .arrow line {
+    stroke: var(--color-amber);
+    stroke-width: 1.5;
+  }
+  .hero-transactions .arrow polygon {
+    fill: var(--color-amber);
+  }
+
+  .hero-transactions .on-a,
+  .hero-transactions .on-b,
+  .hero-transactions .c2,
+  .hero-transactions .c1,
+  .hero-transactions .arrow {
+    opacity: 0;
+  }
+  .hero-transactions .count {
+    stroke: var(--color-red);
+    fill: var(--color-red-dim);
+  }
+  .hero-transactions .c0 {
+    fill: var(--color-red);
+    font-weight: 600;
+  }
+
+  .hero-transactions .snap-a { animation: transactions-snap-a var(--t) ease-out infinite both; }
+  .hero-transactions .snap-b { animation: transactions-snap-b var(--t) ease-out infinite both; }
+  .hero-transactions .sel-a { animation: transactions-sel-a var(--t) linear infinite both; }
+  .hero-transactions .sel-b { animation: transactions-sel-b var(--t) linear infinite both; }
+  .hero-transactions .upd-a { animation: transactions-upd-a var(--t) linear infinite both; }
+  .hero-transactions .com-a { animation: transactions-com-a var(--t) linear infinite both; }
+  .hero-transactions .upd-b { animation: transactions-upd-b var(--t) linear infinite both; }
+  .hero-transactions .com-b { animation: transactions-com-b var(--t) linear infinite both; }
+  .hero-transactions .arrow-a { animation: transactions-arrow-a var(--t) linear infinite both; }
+  .hero-transactions .arrow-b { animation: transactions-arrow-b var(--t) linear infinite both; }
+  .hero-transactions .row-a { animation: transactions-row-a var(--t) linear infinite both; }
+  .hero-transactions .row-b { animation: transactions-row-b var(--t) linear infinite both; }
+  .hero-transactions .on-a { animation: transactions-on-a var(--t) linear infinite both; }
+  .hero-transactions .off-a { animation: transactions-off-a var(--t) linear infinite both; }
+  .hero-transactions .on-b { animation: transactions-on-b var(--t) linear infinite both; }
+  .hero-transactions .off-b { animation: transactions-off-b var(--t) linear infinite both; }
+  .hero-transactions .c2 { animation: transactions-c2 var(--t) linear infinite both; }
+  .hero-transactions .c1 { animation: transactions-c1 var(--t) linear infinite both; }
+  .hero-transactions .c0 { animation: transactions-c0 var(--t) linear infinite both; }
+  .hero-transactions .count { animation: transactions-count var(--t) linear infinite both; }
+
+  .hero-transactions .readout {
+    display: grid;
+    margin-top: 12px;
+    font-size: 0.76rem;
+    text-align: center;
+    color: var(--color-muted);
+  }
+  .hero-transactions .readout b {
+    font-weight: 600;
+  }
+  .hero-transactions .r {
+    grid-area: 1 / 1;
+    opacity: 0;
+  }
+  .hero-transactions .r5 { opacity: 1; }
+  .hero-transactions .r1 { animation: transactions-r1 var(--t) linear infinite both; }
+  .hero-transactions .r2 { animation: transactions-r2 var(--t) linear infinite both; }
+  .hero-transactions .r3 { animation: transactions-r3 var(--t) linear infinite both; }
+  .hero-transactions .r4 { animation: transactions-r4 var(--t) linear infinite both; }
+  .hero-transactions .r5 { animation: transactions-r5 var(--t) linear infinite both; }
+  .hero-transactions .v3 { animation: transactions-v3 var(--t) linear infinite both; }
+  .hero-transactions .v4 { animation: transactions-v4 var(--t) linear infinite both; }
+
+  @keyframes transactions-stage {
+    0% { opacity: 0; }
+    3%, 95% { opacity: 1; }
+    99%, 100% { opacity: 0; }
+  }
+  @keyframes transactions-snap-a {
+    0%, 4% { opacity: 0; transform: translateY(-4px); }
+    8%, 100% { opacity: 1; transform: translateY(0); }
+  }
+  @keyframes transactions-snap-b {
+    0%, 9% { opacity: 0; transform: translateY(-4px); }
+    13%, 100% { opacity: 1; transform: translateY(0); }
+  }
+  @keyframes transactions-sel-a {
+    0%, 19% { opacity: 0; }
+    22%, 100% { opacity: 1; }
+  }
+  @keyframes transactions-sel-b {
+    0%, 24% { opacity: 0; }
+    27%, 100% { opacity: 1; }
+  }
+  @keyframes transactions-upd-a {
+    0%, 37% { opacity: 0; }
+    40%, 100% { opacity: 1; }
+  }
+  @keyframes transactions-com-a {
+    0%, 45% { opacity: 0; }
+    48%, 100% { opacity: 1; }
+  }
+  @keyframes transactions-upd-b {
+    0%, 58% { opacity: 0; }
+    61%, 100% { opacity: 1; }
+  }
+  @keyframes transactions-com-b {
+    0%, 66% { opacity: 0; }
+    69%, 100% { opacity: 1; }
+  }
+  @keyframes transactions-arrow-a {
+    0%, 37% { opacity: 0; }
+    40%, 47% { opacity: 1; }
+    50%, 100% { opacity: 0; }
+  }
+  @keyframes transactions-arrow-b {
+    0%, 58% { opacity: 0; }
+    61%, 68% { opacity: 1; }
+    71%, 100% { opacity: 0; }
+  }
+  @keyframes transactions-row-a {
+    0%, 37% { stroke: var(--color-line); }
+    40%, 47% { stroke: var(--color-amber); }
+    50%, 100% { stroke: var(--color-line); }
+  }
+  @keyframes transactions-row-b {
+    0%, 58% { stroke: var(--color-line); }
+    61%, 68% { stroke: var(--color-amber); }
+    71%, 100% { stroke: var(--color-line); }
+  }
+  @keyframes transactions-on-a {
+    0%, 46% { opacity: 1; }
+    48%, 100% { opacity: 0; }
+  }
+  @keyframes transactions-off-a {
+    0%, 46% { opacity: 0; }
+    48%, 100% { opacity: 1; }
+  }
+  @keyframes transactions-on-b {
+    0%, 67% { opacity: 1; }
+    69%, 100% { opacity: 0; }
+  }
+  @keyframes transactions-off-b {
+    0%, 67% { opacity: 0; }
+    69%, 100% { opacity: 1; }
+  }
+  @keyframes transactions-c2 {
+    0%, 46% { opacity: 1; }
+    48%, 100% { opacity: 0; }
+  }
+  @keyframes transactions-c1 {
+    0%, 46% { opacity: 0; }
+    48%, 67% { opacity: 1; }
+    69%, 100% { opacity: 0; }
+  }
+  @keyframes transactions-c0 {
+    0%, 67% { opacity: 0; }
+    69%, 100% { opacity: 1; }
+  }
+  @keyframes transactions-count {
+    0%, 46% { stroke: var(--color-line); fill: var(--color-panel2); }
+    48%, 67% { stroke: var(--color-green); fill: var(--color-panel2); }
+    69%, 100% { stroke: var(--color-red); fill: var(--color-red-dim); }
+  }
+
+  @keyframes transactions-r1 {
+    0%, 18% { opacity: 1; }
+    20%, 100% { opacity: 0; }
+  }
+  @keyframes transactions-r2 {
+    0%, 20% { opacity: 0; }
+    22%, 36% { opacity: 1; }
+    38%, 100% { opacity: 0; }
+  }
+  @keyframes transactions-r3 {
+    0%, 38% { opacity: 0; }
+    40%, 57% { opacity: 1; }
+    59%, 100% { opacity: 0; }
+  }
+  @keyframes transactions-v3 {
+    0%, 46% { opacity: 0; }
+    48%, 100% { opacity: 1; }
+  }
+  @keyframes transactions-r4 {
+    0%, 59% { opacity: 0; }
+    61%, 79% { opacity: 1; }
+    81%, 100% { opacity: 0; }
+  }
+  @keyframes transactions-v4 {
+    0%, 67% { opacity: 0; }
+    69%, 100% { opacity: 1; }
+  }
+  @keyframes transactions-r5 {
+    0%, 81% { opacity: 0; }
+    83%, 100% { opacity: 1; }
+  }
+</style>

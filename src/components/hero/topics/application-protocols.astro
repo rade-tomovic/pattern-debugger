@@ -1,0 +1,296 @@
+---
+import HeroFrame from '../HeroFrame.astro';
+
+/**
+ * The page's 94-byte response, arriving the way the page says it might: reads of 40, then 12,
+ * then 42 bytes. The reader frames it with the page's two steps:
+ *   reads land: none of their boundaries means anything
+ *   step 1: scan for the first empty line (<CR><LF><CR><LF>) · the body starts at byte 71
+ *   step 2: Content-Length said 23 · read exactly 23 more bytes, 71 + 23 = 94, message over
+ * Every offset is computed here from the literal bytes, and the build fails if the reads, the
+ * header end or the length stop agreeing with the message. `··` is <CR><LF>, as on the page.
+ * Each line's offset appears with the read that delivers its first byte: the reader cannot know
+ * where a line starts before those bytes arrive.
+ * Un-animated styles are the final frame (reduced motion).
+ */
+const msg = 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 23\r\n\r\n{"id":42,"total":19.99}';
+const reads = [40, 12, 42];
+const headerEnd = msg.indexOf('\r\n\r\n') + 4;
+const lengthMatch = /Content-Length: (\d+)\r\n/.exec(msg);
+if (!lengthMatch) throw new Error('application-protocols hero: no Content-Length');
+const contentLength = Number(lengthMatch[1]);
+const lengthAt = lengthMatch.index + 'Content-Length: '.length;
+const end = headerEnd + contentLength;
+if (end !== msg.length) throw new Error(`application-protocols hero: framing ends at ${end}, message is ${msg.length}`);
+if (reads.reduce((a, b) => a + b, 0) !== msg.length) throw new Error('application-protocols hero: reads do not cover the message');
+
+const cuts = reads.slice(0, -1).map((_, k) => reads.slice(0, k + 1).reduce((a, b) => a + b, 0));
+const readOf = (i: number) => 1 + cuts.filter((c) => i >= c).length;
+const kind = (i: number) =>
+  i >= headerEnd ? 'k-body' : i >= headerEnd - 2 ? 'k-blank' : i >= lengthAt && i < lengthAt + lengthMatch[1].length ? 'k-cl' : 'k-hdr';
+
+const lines: { at: number; chars: { ch: string; i: number }[] }[] = [];
+let at = 0;
+for (const text of msg.split('\r\n')) {
+  const withEol = at + text.length < msg.length ? text + '··' : text;
+  lines.push({ at, chars: [...withEol].map((ch, k) => ({ ch, i: at + k })) });
+  at += withEol.length;
+}
+---
+
+<HeroFrame label={`HTTP/1.1 response · ${msg.length} bytes`} caption="TCP has no messages: scan for the empty line, then read exactly Content-Length more bytes, and that is where this one ends">
+  <div class="hero-application-protocols font-mono">
+    <div class="reads">
+      <span class="rl">reads</span>
+      {reads.map((n, k) => <span class={`chip ch${k + 1}`}>{n}</span>)}
+    </div>
+    <div class="bytes">
+      {
+        lines.map((ln) => (
+          <div class="ln">
+            <span class:list={['off', `rd${readOf(ln.at)}`]}>
+              <span class:list={[ln.at === headerEnd && 'off-end']}>{ln.at}</span>
+            </span>
+            {ln.chars.map(({ ch, i }) => (
+              <span class:list={['b', `rd${readOf(i)}`, cuts.includes(i) && 'cut']}>
+                <span class:list={[kind(i), ch === '·' && 'eol']}>{ch}</span>
+              </span>
+            ))}
+            {ln.at === headerEnd - 2 && <span class="note n-blank">empty line</span>}
+            {ln.at === headerEnd && <span class="note n-body">{contentLength} bytes</span>}
+          </div>
+        ))
+      }
+    </div>
+    <div class="readout">
+      <span class="r r1">reads of {reads.join(', ')} · <b class="text-cyan">no boundary means anything</b></span>
+      <span class="r r2">step 1: find the empty line · <b class="text-amber">body starts at {headerEnd}</b></span>
+      <span class="r r3">step 2: Content-Length: {contentLength} · <b class="text-cyan">read exactly {contentLength} more</b></span>
+      <span class="r r4">{headerEnd} + {contentLength} = {end} · <b class="text-green">this message ends, the next begins</b></span>
+    </div>
+  </div>
+</HeroFrame>
+
+<style is:inline>
+  .hero-application-protocols {
+    --t: 12s;
+    width: 100%;
+    max-width: 380px;
+    font-size: 0.74rem;
+    animation: application-protocols-stage var(--t) linear infinite both;
+  }
+  @media (max-width: 359px) {
+    .hero-application-protocols {
+      font-size: 0.68rem;
+    }
+  }
+  .hero-application-protocols .reads {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-bottom: 12px;
+    font-size: 0.7rem;
+  }
+  .hero-application-protocols .rl {
+    width: 4.5ch;
+    margin-right: 4px;
+    text-align: right;
+    color: var(--color-muted);
+  }
+  .hero-application-protocols .chip {
+    padding: 1px 8px;
+    border: 1px solid var(--color-line);
+    border-radius: 5px;
+    background: var(--color-panel2);
+    color: var(--color-muted);
+  }
+  .hero-application-protocols .bytes {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    padding: 8px 10px;
+    border: 1px solid var(--color-line);
+    border-radius: 6px;
+    background: var(--color-panel2);
+    overflow: hidden;
+  }
+  .hero-application-protocols .ln {
+    display: flex;
+    white-space: pre;
+    line-height: 1.5;
+  }
+  .hero-application-protocols .off {
+    width: 3ch;
+    margin-right: 1.5ch;
+    color: var(--color-muted);
+    text-align: right;
+    flex: none;
+  }
+  .hero-application-protocols .b {
+    display: inline-block;
+    width: 1ch;
+    flex: none;
+    text-align: center;
+  }
+  .hero-application-protocols .b.cut {
+    position: relative;
+  }
+  .hero-application-protocols .b.cut::before {
+    content: '';
+    position: absolute;
+    top: -2px;
+    bottom: -2px;
+    left: -1px;
+    width: 2px;
+    background: var(--color-line);
+  }
+  .hero-application-protocols .k-hdr {
+    color: var(--color-ink);
+  }
+  .hero-application-protocols .eol {
+    color: var(--color-muted);
+  }
+  .hero-application-protocols .note {
+    margin-left: 2ch;
+    font-size: 0.66rem;
+  }
+  .hero-application-protocols .n-blank {
+    color: var(--color-amber);
+  }
+  .hero-application-protocols .n-body {
+    color: var(--color-green);
+  }
+  .hero-application-protocols .n-blank { animation: application-protocols-n-blank var(--t) linear infinite both; }
+  .hero-application-protocols .n-body { animation: application-protocols-n-body var(--t) linear infinite both; }
+
+  /* final frame: every byte in, the empty line and the length found, the body framed */
+  .hero-application-protocols .k-blank {
+    display: inline-block;
+    width: 100%;
+    color: var(--color-amber);
+    background: var(--color-panel);
+    box-shadow: 0 1px 0 var(--color-amber);
+  }
+  .hero-application-protocols .off-end {
+    color: var(--color-amber);
+  }
+  .hero-application-protocols .k-cl {
+    color: var(--color-cyan);
+    font-weight: 600;
+  }
+  .hero-application-protocols .k-body {
+    color: var(--color-green);
+  }
+  .hero-application-protocols .rd1 { animation: application-protocols-rd1 var(--t) linear infinite both; }
+  .hero-application-protocols .rd2 { animation: application-protocols-rd2 var(--t) linear infinite both; }
+  .hero-application-protocols .rd3 { animation: application-protocols-rd3 var(--t) linear infinite both; }
+  .hero-application-protocols .b.cut::before { animation: application-protocols-cut var(--t) linear infinite both; }
+  .hero-application-protocols .ch1 { animation: application-protocols-ch1 var(--t) linear infinite both; }
+  .hero-application-protocols .ch2 { animation: application-protocols-ch2 var(--t) linear infinite both; }
+  .hero-application-protocols .ch3 { animation: application-protocols-ch3 var(--t) linear infinite both; }
+  .hero-application-protocols .k-blank { animation: application-protocols-blank var(--t) linear infinite both; }
+  .hero-application-protocols .off-end { animation: application-protocols-off-end var(--t) linear infinite both; }
+  .hero-application-protocols .k-cl { animation: application-protocols-cl var(--t) linear infinite both; }
+  .hero-application-protocols .k-body { animation: application-protocols-body var(--t) linear infinite both; }
+
+  .hero-application-protocols .readout {
+    display: grid;
+    margin-top: 12px;
+    font-size: 0.76rem;
+    text-align: center;
+  }
+  .hero-application-protocols .readout b {
+    font-weight: 600;
+  }
+  .hero-application-protocols .r {
+    grid-area: 1 / 1;
+    opacity: 0;
+  }
+  .hero-application-protocols .r4 { opacity: 1; }
+  .hero-application-protocols .r1 { animation: application-protocols-r1 var(--t) linear infinite both; }
+  .hero-application-protocols .r2 { animation: application-protocols-r2 var(--t) linear infinite both; }
+  .hero-application-protocols .r3 { animation: application-protocols-r3 var(--t) linear infinite both; }
+  .hero-application-protocols .r4 { animation: application-protocols-r4 var(--t) linear infinite both; }
+
+  /* timeline: read 40 at 4 · read 12 at 14 · read 42 at 24 · scan 38-58 · length 58-78 · settled 78-94 · fade 94-100 */
+  @keyframes application-protocols-stage {
+    0% { opacity: 0; }
+    3%, 95% { opacity: 1; }
+    99%, 100% { opacity: 0; }
+  }
+  @keyframes application-protocols-rd1 {
+    0%, 4% { opacity: 0; }
+    7%, 100% { opacity: 1; }
+  }
+  @keyframes application-protocols-rd2 {
+    0%, 14% { opacity: 0; }
+    17%, 100% { opacity: 1; }
+  }
+  @keyframes application-protocols-rd3 {
+    0%, 24% { opacity: 0; }
+    27%, 100% { opacity: 1; }
+  }
+  @keyframes application-protocols-cut {
+    0%, 36% { background: var(--color-cyan); }
+    40%, 100% { background: var(--color-line); }
+  }
+  @keyframes application-protocols-ch1 {
+    0%, 4% { border-color: var(--color-line); color: var(--color-muted); }
+    7%, 36% { border-color: var(--color-cyan); color: var(--color-cyan); }
+    40%, 100% { border-color: var(--color-line); color: var(--color-muted); }
+  }
+  @keyframes application-protocols-ch2 {
+    0%, 14% { border-color: var(--color-line); color: var(--color-muted); }
+    17%, 36% { border-color: var(--color-cyan); color: var(--color-cyan); }
+    40%, 100% { border-color: var(--color-line); color: var(--color-muted); }
+  }
+  @keyframes application-protocols-ch3 {
+    0%, 24% { border-color: var(--color-line); color: var(--color-muted); }
+    27%, 36% { border-color: var(--color-cyan); color: var(--color-cyan); }
+    40%, 100% { border-color: var(--color-line); color: var(--color-muted); }
+  }
+  @keyframes application-protocols-blank {
+    0%, 42% { color: var(--color-muted); background: transparent; box-shadow: 0 1px 0 transparent; }
+    46%, 100% { color: var(--color-amber); background: var(--color-panel); box-shadow: 0 1px 0 var(--color-amber); }
+  }
+  @keyframes application-protocols-off-end {
+    0%, 42% { color: var(--color-muted); }
+    46%, 100% { color: var(--color-amber); }
+  }
+  @keyframes application-protocols-cl {
+    0%, 58% { color: var(--color-ink); font-weight: 400; }
+    61%, 100% { color: var(--color-cyan); font-weight: 600; }
+  }
+  @keyframes application-protocols-body {
+    0%, 64% { color: var(--color-ink); }
+    68%, 100% { color: var(--color-green); }
+  }
+
+  @keyframes application-protocols-n-blank {
+    0%, 42% { opacity: 0; }
+    46%, 100% { opacity: 1; }
+  }
+  @keyframes application-protocols-n-body {
+    0%, 64% { opacity: 0; }
+    68%, 100% { opacity: 1; }
+  }
+
+  @keyframes application-protocols-r1 {
+    0%, 36% { opacity: 1; }
+    38%, 100% { opacity: 0; }
+  }
+  @keyframes application-protocols-r2 {
+    0%, 38% { opacity: 0; }
+    40%, 57% { opacity: 1; }
+    59%, 100% { opacity: 0; }
+  }
+  @keyframes application-protocols-r3 {
+    0%, 57% { opacity: 0; }
+    59%, 76% { opacity: 1; }
+    78%, 100% { opacity: 0; }
+  }
+  @keyframes application-protocols-r4 {
+    0%, 76% { opacity: 0; }
+    78%, 100% { opacity: 1; }
+  }
+</style>

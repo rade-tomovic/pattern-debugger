@@ -1,0 +1,282 @@
+---
+import HeroFrame from '../HeroFrame.astro';
+
+/**
+ * Climbing Stairs, ways(n) = ways(n-1) + ways(n-2), base ways(1) = 1, ways(2) = 2, asked for n = 6.
+ * The brute-force call tree is built at build time (15 calls, ways(3) asked 3 times, the three
+ * ways(3) nodes outlined cyan on the intro frame), then the
+ * memoized recursion runs over it in call order and every store or cache hit becomes a frame:
+ *   ways(3) = 2 + 1, store · ways(4) = 3 + 2, store · ways(3) again, memo hit, subtree skipped
+ *   ways(5) = 5 + 3, store · ways(4) again, memo hit, subtree skipped · ways(6) = 8 + 5, store
+ * Final frame: 9 calls made, 6 never made, readout ends on ways(6) = 13. Un-animated styles show it
+ * (reduced motion).
+ */
+const target = 6;
+const isBase = (n: number) => n <= 2;
+
+type Node = { id: number; n: number; depth: number; x: number; kids: Node[] };
+const all: Node[] = [];
+let leaf = 0;
+const build = (n: number, depth: number): Node => {
+  const node: Node = { id: all.length, n, depth, x: 0, kids: [] };
+  all.push(node);
+  if (!isBase(n)) node.kids = [build(n - 1, depth + 1), build(n - 2, depth + 1)];
+  node.x = node.kids.length ? (node.kids[0].x + node.kids[1].x) / 2 : 20 + 40 * leaf++;
+  return node;
+};
+const root = build(target, 0);
+const bruteCalls = all.length;
+const repeated = 3;
+const repeatCount = all.filter((v) => v.n === repeated).length;
+
+type Status = '' | 'done' | 'hit' | 'pruned';
+type Frame = {
+  status: Status[];
+  memo: Map<number, number>;
+  kind: 'intro' | 'store' | 'hit';
+  node?: Node;
+  reads?: number[];
+};
+const status: Status[] = all.map(() => '');
+const memo = new Map<number, number>();
+const frames: Frame[] = [{ status: [...status], memo: new Map(), kind: 'intro' }];
+const snap = (f: Omit<Frame, 'status' | 'memo'>) => frames.push({ ...f, status: [...status], memo: new Map(memo) });
+const prune = (v: Node) => v.kids.forEach((c) => ((status[c.id] = 'pruned'), prune(c)));
+const ways = (v: Node): number => {
+  if (isBase(v.n)) {
+    status[v.id] = 'done';
+    return v.n;
+  }
+  if (memo.has(v.n)) {
+    status[v.id] = 'hit';
+    prune(v);
+    snap({ kind: 'hit', node: v });
+    return memo.get(v.n)!;
+  }
+  const reads = v.kids.map(ways);
+  memo.set(v.n, reads[0] + reads[1]);
+  status[v.id] = 'done';
+  snap({ kind: 'store', node: v, reads });
+  return memo.get(v.n)!;
+};
+const answer = ways(root);
+const memoCalls = status.filter((s) => s !== 'pruned').length;
+const steps = frames.length;
+frames.push({ status: [...status], memo: new Map(memo), kind: 'intro' });
+
+const y = (depth: number) => 16 + depth * 32;
+const edges = all.flatMap((v) => v.kids.map((c) => ({ from: v, to: c })));
+const cells = [...memo.keys()].sort((a, b) => a - b);
+const cellX = (i: number) => 128 + i * 48;
+
+const nodeClass = (f: Frame, v: Node, final: boolean) => {
+  if (f.node === v) return f.kind === 'store' ? 'write' : 'read';
+  if (f.kind === 'store' && f.node!.kids.includes(v)) return 'read';
+  if (final && v === root) return 'answer';
+  if (f.kind === 'intro' && !final && v.n === repeated) return 'read';
+  return f.status[v.id];
+};
+const cellClass = (f: Frame, n: number, final: boolean) => {
+  if (!f.memo.has(n)) return '';
+  if (f.node?.n === n) return f.kind === 'store' ? 'write' : 'read';
+  return final && n === root.n ? 'answer' : 'done';
+};
+
+const slot = 0.11; // matches dynamic-programming-step: each step holds 11% of the loop
+const delay = (k: number) => `animation-delay: calc(var(--t) * ${(k * slot - 1).toFixed(2)})`;
+---
+
+<HeroFrame label={`ways(${target}) · top-down with memo`} caption="same recursion as backtracking plus a cache: each repeated state is answered once, every repeat is a lookup">
+  <div class="hero-dynamic-programming">
+    <div class="layers">
+      {
+        frames.map((f, k) => {
+          const final = k === steps;
+          return (
+            <div class:list={['layer', final && 'final']} style={final ? undefined : delay(k)}>
+              <svg viewBox="0 0 320 226" role="img" aria-label={final ? `memoized call tree for ways(${target}) = ${answer}: ${memoCalls} of ${bruteCalls} calls made` : undefined} aria-hidden={final ? undefined : 'true'}>
+                {edges.map(({ from, to }) => (
+                  <line class:list={['e', f.status[to.id] === 'pruned' && 'pruned']} x1={from.x} y1={y(from.depth)} x2={to.x} y2={y(to.depth)} />
+                ))}
+                {all.map((v) => (
+                  <g class:list={['n', nodeClass(f, v, final)]} transform={`translate(${v.x} ${y(v.depth)})`}>
+                    <circle r="12" />
+                    <text>{v.n}</text>
+                  </g>
+                ))}
+                <text class="lbl" x="98" y="194">memo</text>
+                {cells.map((n, i) => (
+                  <g class:list={['cell', cellClass(f, n, final)]} transform={`translate(${cellX(i)} 194)`}>
+                    <rect x="-20" y="-13" width="40" height="26" rx="5" />
+                    <text>{f.memo.get(n) ?? ''}</text>
+                    <text class="idx" y="22">{n}</text>
+                  </g>
+                ))}
+              </svg>
+              <p class="note">
+                {final ? (
+                  <>
+                    <span class="seg">{memoCalls} calls, not {bruteCalls}</span> · <span class="seg">each memo entry computed once</span> · <b class="text-green">ways({target}) = {answer}</b>
+                  </>
+                ) : f.kind === 'intro' ? (
+                  <>
+                    no memo: {bruteCalls} calls · <b class="text-cyan">ways({repeated}) asked {repeatCount} times</b>
+                  </>
+                ) : f.kind === 'store' ? (
+                  <>
+                    ways({f.node!.n}) = {f.reads![0]} + {f.reads![1]} · <b class="text-amber">store memo[{f.node!.n}] = {f.reads![0] + f.reads![1]}</b>
+                  </>
+                ) : (
+                  <>
+                    ways({f.node!.n}) asked again · <b class="text-cyan">memo hit, subtree never called</b>
+                  </>
+                )}
+              </p>
+            </div>
+          );
+        })
+      }
+    </div>
+  </div>
+</HeroFrame>
+
+<style is:inline>
+  .hero-dynamic-programming {
+    --t: 14s;
+    width: 100%;
+    max-width: 380px;
+    animation: dynamic-programming-stage var(--t) linear infinite both;
+  }
+  .hero-dynamic-programming .layers {
+    display: grid;
+  }
+  .hero-dynamic-programming .layer {
+    grid-area: 1 / 1;
+    opacity: 0;
+    animation: dynamic-programming-step var(--t) linear infinite both;
+  }
+  .hero-dynamic-programming .layer.final {
+    opacity: 1;
+    animation: dynamic-programming-final var(--t) linear infinite both;
+  }
+  .hero-dynamic-programming svg {
+    display: block;
+    width: 100%;
+    height: auto;
+    overflow: visible;
+  }
+  .hero-dynamic-programming text {
+    fill: var(--color-ink);
+    font-family: var(--font-mono);
+    font-size: 12px;
+    text-anchor: middle;
+    dominant-baseline: central;
+  }
+  .hero-dynamic-programming .e {
+    stroke: var(--color-line);
+    stroke-width: 1.5;
+  }
+  .hero-dynamic-programming .e.pruned {
+    stroke: var(--color-red);
+    stroke-dasharray: 3 3;
+    opacity: 0.6;
+  }
+  .hero-dynamic-programming .n circle,
+  .hero-dynamic-programming .cell rect {
+    fill: var(--color-panel2);
+    stroke: var(--color-line);
+    stroke-width: 1.5;
+  }
+  .hero-dynamic-programming .n text {
+    fill: var(--color-muted);
+  }
+  .hero-dynamic-programming .n.done circle,
+  .hero-dynamic-programming .cell.done rect {
+    stroke: var(--color-green);
+  }
+  .hero-dynamic-programming .n.done text {
+    fill: var(--color-green);
+  }
+  .hero-dynamic-programming .n.hit circle {
+    stroke: var(--color-cyan);
+  }
+  .hero-dynamic-programming .n.hit text {
+    fill: var(--color-cyan);
+  }
+  .hero-dynamic-programming .n.pruned circle {
+    fill: var(--color-panel);
+    stroke: var(--color-red);
+    stroke-dasharray: 3 3;
+  }
+  .hero-dynamic-programming .n.pruned {
+    opacity: 0.6;
+  }
+  .hero-dynamic-programming .n.pruned text {
+    fill: var(--color-red);
+  }
+  .hero-dynamic-programming .n.write circle,
+  .hero-dynamic-programming .cell.write rect {
+    stroke: var(--color-amber);
+    stroke-width: 2.5;
+  }
+  .hero-dynamic-programming .n.write text,
+  .hero-dynamic-programming .cell.write text {
+    fill: var(--color-amber);
+  }
+  .hero-dynamic-programming .n.read circle,
+  .hero-dynamic-programming .cell.read rect {
+    stroke: var(--color-cyan);
+    stroke-width: 2.5;
+  }
+  .hero-dynamic-programming .n.read text,
+  .hero-dynamic-programming .cell.read text {
+    fill: var(--color-cyan);
+  }
+  .hero-dynamic-programming .n.answer circle,
+  .hero-dynamic-programming .cell.answer rect {
+    fill: var(--color-green-dim);
+    stroke: var(--color-green);
+    stroke-width: 2.5;
+  }
+  .hero-dynamic-programming .n.answer text,
+  .hero-dynamic-programming .cell.answer text {
+    fill: var(--color-green);
+  }
+  .hero-dynamic-programming .cell text.idx,
+  .hero-dynamic-programming .lbl {
+    fill: var(--color-muted);
+    font-size: 10px;
+  }
+  .hero-dynamic-programming .lbl {
+    text-anchor: end;
+  }
+  .hero-dynamic-programming .note {
+    margin: 10px 0 0;
+    color: var(--color-muted);
+    font-family: var(--font-mono);
+    font-size: 0.76rem;
+    text-align: center;
+  }
+  .hero-dynamic-programming .note b {
+    font-weight: 600;
+  }
+  .hero-dynamic-programming .note b,
+  .hero-dynamic-programming .note .seg {
+    white-space: nowrap;
+  }
+
+  /* timeline: intro + 6 memo steps at 11% each (0-77) · final frame 77-100 · fade 95-100 */
+  @keyframes dynamic-programming-stage {
+    0% { opacity: 0; }
+    2%, 95% { opacity: 1; }
+    100% { opacity: 0; }
+  }
+  @keyframes dynamic-programming-step {
+    0%, 10.9% { opacity: 1; }
+    11%, 100% { opacity: 0; }
+  }
+  @keyframes dynamic-programming-final {
+    0%, 76.9% { opacity: 0; }
+    77%, 100% { opacity: 1; }
+  }
+</style>

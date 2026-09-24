@@ -1,0 +1,326 @@
+---
+import HeroFrame from '../HeroFrame.astro';
+
+/**
+ * The page's classic cache-aside race, reader R and writer W on one key:
+ *   t0  R: cache.get(key)          → miss
+ *   t1  R: store.read(key)         → "v1" (old)
+ *   t2  W: store.write(key, "v2")  → store now has v2
+ *   t3  W: cache.delete(key)       → cache empty (correctly, briefly)
+ *   t4  R: cache.set(key, "v1")    → cache holds v1, STALE until TTL
+ * Op labels accumulate on the wires, so the un-animated final frame (reduced motion) shows the
+ * whole interleaving next to the stale result.
+ */
+const top = 44;
+const bot = 132;
+const ops = [
+  { cls: 'o0', x: 76, y: top - 10, text: 't0 miss' },
+  { cls: 'o1', x: 76, y: bot - 10, text: 't1 read v1' },
+  { cls: 'o2', x: 264, y: bot - 10, text: 't2 write v2' },
+  { cls: 'o3', x: 264, y: top - 10, text: 't3 delete' },
+  { cls: 'o4', x: 76, y: top + 11, text: 't4 set v1' },
+];
+---
+
+<HeroFrame label="cache-aside · delete race" caption="delete after write is necessary, not sufficient: a slow reader's set lands after the delete and, with no further write, stays wrong until TTL">
+  <div class="hero-caching">
+    <svg viewBox="0 0 340 176" role="img" aria-label="reader R misses and reads v1 from the store, writer W writes v2 and deletes the key, then R sets the stale v1 into the cache">
+      <rect class="actor ar" x="6" y="20" width="30" height="136" rx="6" />
+      <text class="an" x="21" y="88">R</text>
+      <rect class="actor aw" x="304" y="20" width="30" height="136" rx="6" />
+      <text class="an" x="319" y="88">W</text>
+
+      <line class="wire" x1="36" y1={top} x2="116" y2={top} />
+      <line class="wire" x1="36" y1={bot} x2="116" y2={bot} />
+      <line class="wire" x1="224" y1={top} x2="304" y2={top} />
+      <line class="wire" x1="224" y1={bot} x2="304" y2={bot} />
+
+      {ops.map((o) => <text class:list={['op', o.cls]} x={o.x} y={o.y}>{o.text}</text>)}
+
+      <rect class="box cache" x="116" y="22" width="108" height="44" rx="6" />
+      <text class="bn" x="170" y="34">cache</text>
+      <text class="val c-empty" x="170" y="52">no entry</text>
+      <text class="val c-v1" x="170" y="52">key = v1</text>
+
+      <text class="ttl" x="170" y="88">cache ≠ store</text>
+
+      <rect class="box store" x="116" y="110" width="108" height="44" rx="6" />
+      <text class="bn" x="170" y="122">store</text>
+      <text class="val s-v1" x="170" y="140">key = v1</text>
+      <text class="val s-v2" x="170" y="140">key = v2</text>
+
+      <circle class="pk pk0" r="4" />
+      <circle class="pk pk1" r="4" />
+      <circle class="pk pk2" r="4" />
+      <circle class="pk pk3" r="4" />
+      <circle class="pk pk4" r="4" />
+    </svg>
+    <div class="readout font-mono">
+      <span class="r r0">t0 R: cache.get(key) · <b class="text-cyan">miss</b></span>
+      <span class="r r1">t1 R reads the store · <b class="text-cyan">gets v1</b></span>
+      <span class="r r2">t2 W writes the store · <b class="text-amber">store now has v2</b></span>
+      <span class="r r3">t3 W deletes the key · <b class="text-amber">cache empty, correctly</b></span>
+      <span class="r r4">t4 R sets v1 after the delete · <b class="text-red">stale until TTL</b></span>
+    </div>
+  </div>
+</HeroFrame>
+
+<style is:inline>
+  .hero-caching {
+    --t: 13s;
+    width: 100%;
+    max-width: 380px;
+    animation: caching-stage var(--t) linear infinite both;
+  }
+  .hero-caching svg {
+    display: block;
+    width: 100%;
+    height: auto;
+    overflow: visible;
+  }
+  .hero-caching text {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    fill: var(--color-ink);
+    text-anchor: middle;
+    dominant-baseline: central;
+  }
+  .hero-caching .actor {
+    fill: var(--color-panel2);
+    stroke-width: 1.5;
+  }
+  .hero-caching .ar {
+    stroke: var(--color-cyan);
+  }
+  .hero-caching .aw {
+    stroke: var(--color-amber);
+  }
+  .hero-caching .an {
+    font-size: 12px;
+  }
+  .hero-caching .wire {
+    stroke: var(--color-line);
+    stroke-width: 1.5;
+  }
+  .hero-caching .op {
+    font-size: 9.5px;
+  }
+  .hero-caching .o0,
+  .hero-caching .o1 {
+    fill: var(--color-cyan);
+  }
+  .hero-caching .o2,
+  .hero-caching .o3 {
+    fill: var(--color-amber);
+  }
+  .hero-caching .o4 {
+    fill: var(--color-red);
+    font-weight: 600;
+  }
+  .hero-caching .box {
+    fill: var(--color-panel2);
+    stroke-width: 1.5;
+  }
+  .hero-caching .cache {
+    stroke: var(--color-red);
+  }
+  .hero-caching .store {
+    stroke: var(--color-green);
+  }
+  .hero-caching .bn {
+    fill: var(--color-muted);
+    font-size: 10px;
+  }
+  .hero-caching .val {
+    font-size: 12px;
+  }
+  .hero-caching .c-empty,
+  .hero-caching .s-v1 {
+    fill: var(--color-muted);
+    opacity: 0;
+  }
+  .hero-caching .c-v1 {
+    fill: var(--color-red);
+    font-weight: 600;
+  }
+  .hero-caching .s-v2 {
+    fill: var(--color-green);
+  }
+  .hero-caching .ttl {
+    fill: var(--color-red);
+    font-size: 10px;
+  }
+  .hero-caching .pk {
+    opacity: 0;
+  }
+  .hero-caching .pk0,
+  .hero-caching .pk1 {
+    fill: var(--color-cyan);
+  }
+  .hero-caching .pk2,
+  .hero-caching .pk3 {
+    fill: var(--color-amber);
+  }
+  .hero-caching .pk4 {
+    fill: var(--color-red);
+  }
+
+  .hero-caching .o0 { animation: caching-o0 var(--t) linear infinite both; }
+  .hero-caching .o1 { animation: caching-o1 var(--t) linear infinite both; }
+  .hero-caching .o2 { animation: caching-o2 var(--t) linear infinite both; }
+  .hero-caching .o3 { animation: caching-o3 var(--t) linear infinite both; }
+  .hero-caching .o4 { animation: caching-o4 var(--t) linear infinite both; }
+  .hero-caching .cache { animation: caching-cache var(--t) linear infinite both; }
+  .hero-caching .store { animation: caching-store var(--t) linear infinite both; }
+  .hero-caching .c-empty { animation: caching-c-empty var(--t) linear infinite both; }
+  .hero-caching .c-v1 { animation: caching-c-v1 var(--t) linear infinite both; }
+  .hero-caching .s-v1 { animation: caching-s-v1 var(--t) linear infinite both; }
+  .hero-caching .s-v2 { animation: caching-s-v2 var(--t) linear infinite both; }
+  .hero-caching .ttl { animation: caching-ttl var(--t) linear infinite both; }
+  .hero-caching .pk0 { animation: caching-pk0 var(--t) linear infinite both; }
+  .hero-caching .pk1 { animation: caching-pk1 var(--t) linear infinite both; }
+  .hero-caching .pk2 { animation: caching-pk2 var(--t) linear infinite both; }
+  .hero-caching .pk3 { animation: caching-pk3 var(--t) linear infinite both; }
+  .hero-caching .pk4 { animation: caching-pk4 var(--t) linear infinite both; }
+
+  .hero-caching .readout {
+    display: grid;
+    margin-top: 10px;
+    font-size: 0.76rem;
+    text-align: center;
+  }
+  .hero-caching .readout b {
+    font-weight: 600;
+    white-space: nowrap;
+  }
+  .hero-caching .r {
+    grid-area: 1 / 1;
+    opacity: 0;
+  }
+  .hero-caching .r4 { opacity: 1; }
+  .hero-caching .r0 { animation: caching-r0 var(--t) linear infinite both; }
+  .hero-caching .r1 { animation: caching-r1 var(--t) linear infinite both; }
+  .hero-caching .r2 { animation: caching-r2 var(--t) linear infinite both; }
+  .hero-caching .r3 { animation: caching-r3 var(--t) linear infinite both; }
+  .hero-caching .r4 { animation: caching-r4 var(--t) linear infinite both; }
+
+  /* timeline: t0 0-16 · t1 16-32 · t2 32-48 · t3 48-62 · t4 + stale 62-94 · fade 94-100 */
+  @keyframes caching-stage {
+    0% { opacity: 0; }
+    3%, 95% { opacity: 1; }
+    99%, 100% { opacity: 0; }
+  }
+
+  @keyframes caching-pk0 {
+    0%, 3% { opacity: 0; transform: translate(36px, 44px); }
+    4% { opacity: 1; transform: translate(36px, 44px); }
+    9% { opacity: 1; transform: translate(116px, 44px); }
+    10%, 100% { opacity: 0; transform: translate(116px, 44px); }
+  }
+  @keyframes caching-pk1 {
+    0%, 18% { opacity: 0; transform: translate(116px, 132px); }
+    19% { opacity: 1; transform: translate(116px, 132px); }
+    24% { opacity: 1; transform: translate(36px, 132px); }
+    25%, 100% { opacity: 0; transform: translate(36px, 132px); }
+  }
+  @keyframes caching-pk2 {
+    0%, 34% { opacity: 0; transform: translate(304px, 132px); }
+    35% { opacity: 1; transform: translate(304px, 132px); }
+    40% { opacity: 1; transform: translate(224px, 132px); }
+    41%, 100% { opacity: 0; transform: translate(224px, 132px); }
+  }
+  @keyframes caching-pk3 {
+    0%, 50% { opacity: 0; transform: translate(304px, 44px); }
+    51% { opacity: 1; transform: translate(304px, 44px); }
+    56% { opacity: 1; transform: translate(224px, 44px); }
+    57%, 100% { opacity: 0; transform: translate(224px, 44px); }
+  }
+  @keyframes caching-pk4 {
+    0%, 64% { opacity: 0; transform: translate(36px, 44px); }
+    65% { opacity: 1; transform: translate(36px, 44px); }
+    70% { opacity: 1; transform: translate(116px, 44px); }
+    71%, 100% { opacity: 0; transform: translate(116px, 44px); }
+  }
+
+  @keyframes caching-o0 {
+    0%, 8% { opacity: 0; }
+    10%, 100% { opacity: 1; }
+  }
+  @keyframes caching-o1 {
+    0%, 23% { opacity: 0; }
+    25%, 100% { opacity: 1; }
+  }
+  @keyframes caching-o2 {
+    0%, 39% { opacity: 0; }
+    41%, 100% { opacity: 1; }
+  }
+  @keyframes caching-o3 {
+    0%, 55% { opacity: 0; }
+    57%, 100% { opacity: 1; }
+  }
+  @keyframes caching-o4 {
+    0%, 69% { opacity: 0; }
+    71%, 100% { opacity: 1; }
+  }
+
+  @keyframes caching-c-empty {
+    0%, 69% { opacity: 1; }
+    71%, 100% { opacity: 0; }
+  }
+  @keyframes caching-c-v1 {
+    0%, 69% { opacity: 0; }
+    71%, 100% { opacity: 1; }
+  }
+  @keyframes caching-cache {
+    0%, 8% { stroke: var(--color-line); }
+    10%, 16% { stroke: var(--color-cyan); }
+    18%, 55% { stroke: var(--color-line); }
+    57%, 62% { stroke: var(--color-amber); }
+    64%, 69% { stroke: var(--color-line); }
+    71%, 100% { stroke: var(--color-red); }
+  }
+  @keyframes caching-s-v1 {
+    0%, 39% { opacity: 1; }
+    41%, 100% { opacity: 0; }
+  }
+  @keyframes caching-s-v2 {
+    0%, 39% { opacity: 0; fill: var(--color-amber); }
+    41%, 69% { opacity: 1; fill: var(--color-amber); }
+    71%, 100% { opacity: 1; fill: var(--color-green); }
+  }
+  @keyframes caching-store {
+    0%, 17% { stroke: var(--color-line); }
+    19%, 30% { stroke: var(--color-cyan); }
+    32%, 39% { stroke: var(--color-line); }
+    41%, 69% { stroke: var(--color-amber); }
+    71%, 100% { stroke: var(--color-green); }
+  }
+  @keyframes caching-ttl {
+    0%, 71% { opacity: 0; }
+    74%, 100% { opacity: 1; }
+  }
+
+  @keyframes caching-r0 {
+    0%, 15% { opacity: 1; }
+    17%, 100% { opacity: 0; }
+  }
+  @keyframes caching-r1 {
+    0%, 17% { opacity: 0; }
+    19%, 31% { opacity: 1; }
+    33%, 100% { opacity: 0; }
+  }
+  @keyframes caching-r2 {
+    0%, 33% { opacity: 0; }
+    35%, 47% { opacity: 1; }
+    49%, 100% { opacity: 0; }
+  }
+  @keyframes caching-r3 {
+    0%, 49% { opacity: 0; }
+    51%, 61% { opacity: 1; }
+    63%, 100% { opacity: 0; }
+  }
+  @keyframes caching-r4 {
+    0%, 63% { opacity: 0; }
+    65%, 100% { opacity: 1; }
+  }
+</style>

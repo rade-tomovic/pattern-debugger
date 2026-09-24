@@ -1,0 +1,320 @@
+---
+import HeroFrame from '../HeroFrame.astro';
+
+/**
+ * A cold lookup of app.example.com, then the same lookup again, as the page's walk draws it:
+ *   (1) stub → recursive resolver: one question, RD = 1, "you do the work"
+ *   (2) resolver → root: no answer, a referral to the NS records for com. · cached
+ *   (3) resolver → .com TLD: another referral, NS for example.com. · cached
+ *   (4) resolver → example.com's authoritative server: ANSWER, aa = 1, A 203.0.113.10 · cached
+ *   (6) resolver → stub: A 203.0.113.10
+ *   next lookup, TTL not expired: the cached A answers, steps (2) to (5) never happen
+ * Un-animated styles are the final frame (reduced motion): the cache hit, servers untouched.
+ */
+const servers = [
+  { cls: 'root', y: 8, name: 'root', reply: '→ NS com.' },
+  { cls: 'tld', y: 56, name: '.com TLD', reply: '→ NS example.com.' },
+  { cls: 'auth', y: 104, name: 'authoritative', reply: '→ A · aa = 1' },
+];
+const cache = [
+  { cls: 'c1', name: 'com.', rec: 'NS · from root' },
+  { cls: 'c2', name: 'example.com.', rec: 'NS · from .com' },
+  { cls: 'c3', name: 'app.example.com.', rec: 'A 203.0.113.10' },
+];
+---
+
+<HeroFrame label="resolve app.example.com · cold, then cached" caption="a cold lookup walks the delegation chain once; every record is cached under its TTL, and until it expires this resolver does not walk it again">
+  <div class="hero-dns">
+    <svg viewBox="0 0 320 222" role="img" aria-label="a recursive resolver walks root, TLD and authoritative servers once, caches each record, then answers the next lookup from its cache">
+      <rect class="box" x="6" y="8" width="100" height="38" rx="6" />
+      <text class="nm" x="56" y="21">stub resolver</text>
+      <text class="sub" x="56" y="34">your process</text>
+
+      <rect class="box" x="6" y="92" width="100" height="38" rx="6" />
+      <text class="nm" x="56" y="105">recursive</text>
+      <text class="sub" x="56" y="118">resolver</text>
+
+      <g class="arrow q-down">
+        <line x1="48" y1="48" x2="48" y2="84" />
+        <polygon points="48,90 44,82 52,82" />
+      </g>
+      <g class="arrow q-up">
+        <line x1="64" y1="90" x2="64" y2="54" />
+        <polygon points="64,48 60,56 68,56" />
+      </g>
+      <text class="lbl rd" x="74" y="60">RD = 1</text>
+      <text class="lbl ans" x="74" y="76">A 203.0.113.10</text>
+
+      <g class="walk">
+        <g class="arrow a-root">
+          <line x1="106" y1="100" x2="202" y2="29" />
+          <polygon points="208,26 199,26 204,33" />
+        </g>
+        <g class="arrow a-tld">
+          <line x1="106" y1="110" x2="202" y2="76" />
+          <polygon points="208,75 199,72 202,80" />
+        </g>
+        <g class="arrow a-auth">
+          <line x1="106" y1="120" x2="202" y2="122" />
+          <polygon points="208,123 200,119 200,127" />
+        </g>
+        {
+          servers.map((s) => (
+            <g class={`srv ${s.cls}`}>
+              <rect class="box" x="210" y={s.y} width="104" height="38" rx="6" />
+              <text class="nm" x="262" y={s.y + 13}>{s.name}</text>
+              <text class="reply" x="262" y={s.y + 27}>{s.reply}</text>
+            </g>
+          ))
+        }
+      </g>
+
+      <line class="tie" x1="56" y1="130" x2="56" y2="146" />
+      <rect class="box" x="6" y="146" width="208" height="70" rx="6" />
+      <text class="hd" x="14" y="158">resolver cache · each has a TTL</text>
+      {
+        cache.map((c, k) => (
+          <text class={`entry ${c.cls}`} y={174 + k * 15}>
+            <tspan x="14">{c.name}</tspan>
+            <tspan x="112">{c.rec}</tspan>
+          </text>
+        ))
+      }
+    </svg>
+    <div class="readout font-mono">
+      <span class="r r1">stub → resolver · <b class="text-ink">RD = 1, you do the work</b></span>
+      <span class="r r2">root: no answer, a referral · <b class="text-amber">NS for com. cached</b></span>
+      <span class="r r3">.com TLD: a referral · <b class="text-amber">NS for example.com. cached</b></span>
+      <span class="r r4">authoritative, aa = 1 · <b class="text-green">A 203.0.113.10, cached</b></span>
+      <span class="r r5">resolver → stub: one datagram back · <b class="text-green">A 203.0.113.10</b></span>
+      <span class="r r6">next lookup, TTL not expired · <b class="text-green">cache hit</b></span>
+    </div>
+  </div>
+</HeroFrame>
+
+<style is:inline>
+  .hero-dns {
+    --t: 13s;
+    width: 100%;
+    max-width: 380px;
+    animation: dns-stage var(--t) linear infinite both;
+  }
+  .hero-dns svg {
+    display: block;
+    width: 100%;
+    height: auto;
+    overflow: visible;
+  }
+  .hero-dns text {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    fill: var(--color-ink);
+    dominant-baseline: central;
+  }
+  .hero-dns .nm,
+  .hero-dns .sub,
+  .hero-dns .reply {
+    text-anchor: middle;
+  }
+  .hero-dns .sub,
+  .hero-dns .hd {
+    fill: var(--color-muted);
+    font-size: 9px;
+  }
+  .hero-dns .reply,
+  .hero-dns .lbl,
+  .hero-dns .entry {
+    font-size: 9px;
+  }
+  .hero-dns .box {
+    fill: var(--color-panel2);
+    stroke: var(--color-line);
+    stroke-width: 1.5;
+  }
+  .hero-dns .tie {
+    stroke: var(--color-line);
+    stroke-width: 1.5;
+  }
+  .hero-dns .arrow {
+    color: var(--color-line);
+  }
+  .hero-dns .arrow line {
+    stroke: currentColor;
+    stroke-width: 1.5;
+  }
+  .hero-dns .arrow polygon {
+    fill: currentColor;
+  }
+  .hero-dns .rd {
+    fill: var(--color-muted);
+  }
+  .hero-dns .ans {
+    fill: var(--color-green);
+  }
+  .hero-dns .reply {
+    fill: var(--color-muted);
+  }
+  .hero-dns .auth .reply {
+    fill: var(--color-green);
+  }
+
+  /* final frame: the second lookup, answered from cache, the servers untouched */
+  .hero-dns .walk {
+    opacity: 0.3;
+  }
+  .hero-dns .rd {
+    opacity: 0;
+  }
+  .hero-dns .q-down {
+    color: var(--color-ink);
+  }
+  .hero-dns .q-up {
+    color: var(--color-green);
+  }
+  .hero-dns .c3 {
+    fill: var(--color-green);
+  }
+  .hero-dns .walk { animation: dns-walk var(--t) linear infinite both; }
+  .hero-dns .q-down { animation: dns-q-down var(--t) linear infinite both; }
+  .hero-dns .q-up { animation: dns-q-up var(--t) linear infinite both; }
+  .hero-dns .rd { animation: dns-rd var(--t) linear infinite both; }
+  .hero-dns .ans { animation: dns-ans var(--t) linear infinite both; }
+  .hero-dns .a-root { animation: dns-a-root var(--t) linear infinite both; }
+  .hero-dns .a-tld { animation: dns-a-tld var(--t) linear infinite both; }
+  .hero-dns .a-auth { animation: dns-a-auth var(--t) linear infinite both; }
+  .hero-dns .root .reply { animation: dns-rep-root var(--t) linear infinite both; }
+  .hero-dns .tld .reply { animation: dns-rep-tld var(--t) linear infinite both; }
+  .hero-dns .auth .reply { animation: dns-rep-auth var(--t) linear infinite both; }
+  .hero-dns .c1 { animation: dns-c1 var(--t) linear infinite both; }
+  .hero-dns .c2 { animation: dns-c2 var(--t) linear infinite both; }
+  .hero-dns .c3 { animation: dns-c3 var(--t) linear infinite both; }
+
+  .hero-dns .readout {
+    display: grid;
+    margin-top: 12px;
+    font-size: 0.76rem;
+    text-align: center;
+  }
+  .hero-dns .readout b {
+    font-weight: 600;
+  }
+  .hero-dns .r {
+    grid-area: 1 / 1;
+    opacity: 0;
+  }
+  .hero-dns .r6 { opacity: 1; }
+  .hero-dns .r1 { animation: dns-r1 var(--t) linear infinite both; }
+  .hero-dns .r2 { animation: dns-r2 var(--t) linear infinite both; }
+  .hero-dns .r3 { animation: dns-r3 var(--t) linear infinite both; }
+  .hero-dns .r4 { animation: dns-r4 var(--t) linear infinite both; }
+  .hero-dns .r5 { animation: dns-r5 var(--t) linear infinite both; }
+  .hero-dns .r6 { animation: dns-r6 var(--t) linear infinite both; }
+
+  /* timeline: ask 0-12 · root 12-26 · tld 26-40 · auth 40-54 · answer 54-66 · second lookup 66-73, cache hit 73-94 · fade 94-100 */
+  @keyframes dns-stage {
+    0% { opacity: 0; }
+    3%, 95% { opacity: 1; }
+    99%, 100% { opacity: 0; }
+  }
+  @keyframes dns-walk {
+    0%, 66% { opacity: 1; }
+    70%, 100% { opacity: 0.3; }
+  }
+  @keyframes dns-q-down {
+    0%, 2% { color: var(--color-line); }
+    4%, 12% { color: var(--color-ink); }
+    14%, 68% { color: var(--color-line); }
+    70%, 100% { color: var(--color-ink); }
+  }
+  @keyframes dns-q-up {
+    0%, 54% { color: var(--color-line); }
+    57%, 66% { color: var(--color-green); }
+    68%, 74% { color: var(--color-line); }
+    77%, 100% { color: var(--color-green); }
+  }
+  @keyframes dns-rd {
+    0%, 2% { opacity: 0; }
+    4%, 12% { opacity: 1; }
+    14%, 68% { opacity: 0; }
+    70%, 76% { opacity: 1; }
+    78%, 100% { opacity: 0; }
+  }
+  @keyframes dns-ans {
+    0%, 54% { opacity: 0; }
+    57%, 66% { opacity: 1; }
+    68%, 76% { opacity: 0; }
+    78%, 100% { opacity: 1; }
+  }
+  @keyframes dns-a-root {
+    0%, 12% { color: var(--color-line); }
+    14%, 24% { color: var(--color-ink); }
+    26%, 100% { color: var(--color-line); }
+  }
+  @keyframes dns-a-tld {
+    0%, 26% { color: var(--color-line); }
+    28%, 38% { color: var(--color-ink); }
+    40%, 100% { color: var(--color-line); }
+  }
+  @keyframes dns-a-auth {
+    0%, 40% { color: var(--color-line); }
+    42%, 52% { color: var(--color-ink); }
+    54%, 100% { color: var(--color-line); }
+  }
+  @keyframes dns-rep-root {
+    0%, 16% { opacity: 0; }
+    18%, 100% { opacity: 1; }
+  }
+  @keyframes dns-rep-tld {
+    0%, 30% { opacity: 0; }
+    32%, 100% { opacity: 1; }
+  }
+  @keyframes dns-rep-auth {
+    0%, 44% { opacity: 0; }
+    46%, 100% { opacity: 1; }
+  }
+  @keyframes dns-c1 {
+    0%, 18% { opacity: 0; fill: var(--color-amber); }
+    20%, 24% { opacity: 1; fill: var(--color-amber); }
+    27%, 100% { opacity: 1; fill: var(--color-ink); }
+  }
+  @keyframes dns-c2 {
+    0%, 32% { opacity: 0; fill: var(--color-amber); }
+    34%, 38% { opacity: 1; fill: var(--color-amber); }
+    41%, 100% { opacity: 1; fill: var(--color-ink); }
+  }
+  @keyframes dns-c3 {
+    0%, 46% { opacity: 0; fill: var(--color-amber); }
+    48%, 60% { opacity: 1; fill: var(--color-amber); }
+    63%, 71% { opacity: 1; fill: var(--color-ink); }
+    73%, 100% { opacity: 1; fill: var(--color-green); }
+  }
+
+  @keyframes dns-r1 {
+    0%, 12% { opacity: 1; }
+    14%, 100% { opacity: 0; }
+  }
+  @keyframes dns-r2 {
+    0%, 13% { opacity: 0; }
+    15%, 25% { opacity: 1; }
+    27%, 100% { opacity: 0; }
+  }
+  @keyframes dns-r3 {
+    0%, 27% { opacity: 0; }
+    29%, 39% { opacity: 1; }
+    41%, 100% { opacity: 0; }
+  }
+  @keyframes dns-r4 {
+    0%, 41% { opacity: 0; }
+    43%, 53% { opacity: 1; }
+    55%, 100% { opacity: 0; }
+  }
+  @keyframes dns-r5 {
+    0%, 55% { opacity: 0; }
+    57%, 67% { opacity: 1; }
+    69%, 100% { opacity: 0; }
+  }
+  @keyframes dns-r6 {
+    0%, 71% { opacity: 0; }
+    73%, 100% { opacity: 1; }
+  }
+</style>

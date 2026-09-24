@@ -1,0 +1,386 @@
+---
+import HeroFrame from '../HeroFrame.astro';
+
+/**
+ * The page's circuit breaker state machine, driven by calls from a caller to a failing dependency
+ * (threshold of 3 failures in the rolling window, chosen for the picture):
+ *   CLOSED: calls pass through; the dependency fails three of them, the window hits the threshold
+ *   trip to OPEN: calls now fail fast at the breaker, the dependency is not called at all
+ *   cooldown elapses: HALF-OPEN lets one bounded trial call through
+ *   the trial call succeeds: back to CLOSED, traffic flows to the dependency again
+ * Timeline (13s): closed + 3 failures 0-22 · trip 22-34 · open, fail fast, cooldown 34-54 ·
+ * half-open trial 54-72 · closed again 72-94 · fade 94-100.
+ * Un-animated styles are the final frame (reduced motion): CLOSED, dependency healthy, the
+ * half-open → closed edge lit, the trip and cooldown edges kept as a muted trail.
+ */
+const laneY = 26;
+const box = { caller: 4, breaker: 135, dep: 266 };
+const boxW = 70;
+const passFrom = box.caller + boxW + 6;
+const passTo = box.dep - 8;
+const rejectAt = box.breaker - 8;
+const tally = [158, 170, 182];
+---
+
+<HeroFrame label="circuit breaker · threshold 3" caption="open fails fast without touching the dependency; half-open lets one bounded probe decide whether to close">
+  <div class="hero-reliability" style={`--pass-from: ${passFrom}px; --pass-to: ${passTo}px; --reject-at: ${rejectAt}px; --lane: ${laneY}px`}>
+    <svg viewBox="0 0 340 192" role="img" aria-label="a circuit breaker trips from closed to open after three failures, fails calls fast while open, lets one trial call through when half-open, and closes again when it succeeds">
+      <line class="wire" x1={box.caller + boxW} y1={laneY} x2={box.breaker} y2={laneY} />
+      <line class="wire" x1={box.breaker + boxW} y1={laneY} x2={box.dep} y2={laneY} />
+      <circle class="call c1" r="5" />
+      <circle class="call c2" r="5" />
+      <circle class="call c3" r="5" />
+      <circle class="call c4" r="5" />
+      <circle class="call c5" r="5" />
+      <circle class="call c6" r="5" />
+      <circle class="call c7" r="5" />
+      <circle class="call c8" r="5" />
+      <rect class="box" x={box.caller} y={laneY - 14} width={boxW} height="28" rx="6" />
+      <text class="bl" x={box.caller + boxW / 2} y={laneY}>caller</text>
+      <rect class="box brk" x={box.breaker} y={laneY - 14} width={boxW} height="28" rx="6" />
+      <text class="bl" x={box.breaker + boxW / 2} y={laneY}>breaker</text>
+      <rect class="box dep" x={box.dep} y={laneY - 14} width={boxW} height="28" rx="6" />
+      <text class="bl" x={box.dep + boxW / 2} y={laneY}>dependency</text>
+
+      {tally.map((x, k) => <circle class={`tl tl${k + 1}`} cx={x} cy={laneY + 24} r="3.5" />)}
+
+      <g class="edge e1">
+        <line x1="108" y1="112" x2="226" y2="112" />
+        <polygon points="232,112 224,108 224,116" />
+      </g>
+      <text class="el" x="170" y="102">3 failures</text>
+      <g class="edge e2">
+        <line x1="270" y1="127" x2="226" y2="158" />
+        <polygon points="221,162 225,153 230,159" />
+      </g>
+      <text class="el el-start" x="262" y="150">cooldown</text>
+      <g class="edge e3">
+        <line x1="114" y1="162" x2="72" y2="130" />
+        <polygon points="67,126 76,128 71,134" />
+      </g>
+      <text class="el el-end" x="80" y="150">trial ok</text>
+
+      <rect class="node n-closed" x="20" y="98" width="86" height="28" rx="6" />
+      <text class="nl nl-closed" x="63" y="112">CLOSED</text>
+      <rect class="node n-open" x="234" y="98" width="86" height="28" rx="6" />
+      <text class="nl nl-open" x="277" y="112">OPEN</text>
+      <rect class="cool-bg" x="244" y="130" width="66" height="3" rx="1.5" />
+      <rect class="cool" x="244" y="130" width="66" height="3" rx="1.5" />
+      <rect class="node n-half" x="118" y="160" width="104" height="28" rx="6" />
+      <text class="nl nl-half" x="170" y="174">HALF-OPEN</text>
+    </svg>
+    <div class="readout font-mono">
+      <span class="r r0">closed: calls pass through · <b class="text-red">dependency failing</b></span>
+      <span class="r r0b">failures reach threshold 3 · <b class="text-red">trip to open</b></span>
+      <span class="r r1">open: calls fail fast at the breaker · <b class="text-red">dependency not called</b></span>
+      <span class="r r2">cooldown elapsed · <b class="text-purple">half-open, one trial call</b></span>
+      <span class="r r3">trial call succeeds · <b class="text-green">closed, traffic flows again</b></span>
+    </div>
+  </div>
+</HeroFrame>
+
+<style is:inline>
+  .hero-reliability {
+    --t: 13s;
+    width: 100%;
+    max-width: 360px;
+    animation: reliability-stage var(--t) linear infinite both;
+  }
+  .hero-reliability svg {
+    display: block;
+    width: 100%;
+    height: auto;
+    overflow: visible;
+  }
+  .hero-reliability text {
+    font-family: var(--font-mono);
+    fill: var(--color-ink);
+    text-anchor: middle;
+    dominant-baseline: central;
+  }
+  .hero-reliability .bl {
+    font-size: 10px;
+  }
+  .hero-reliability .el {
+    fill: var(--color-muted);
+    font-size: 9px;
+  }
+  .hero-reliability .el-start {
+    text-anchor: start;
+  }
+  .hero-reliability .el-end {
+    text-anchor: end;
+  }
+  .hero-reliability .nl {
+    font-size: 11px;
+    fill: var(--color-muted);
+  }
+  .hero-reliability .wire {
+    stroke: var(--color-line);
+    stroke-width: 1.5;
+  }
+  .hero-reliability .box,
+  .hero-reliability .node {
+    fill: var(--color-panel2);
+    stroke: var(--color-line);
+    stroke-width: 1.5;
+  }
+  .hero-reliability .edge line {
+    stroke: var(--color-line);
+    stroke-width: 1.5;
+  }
+  .hero-reliability .edge polygon {
+    fill: var(--color-line);
+  }
+  .hero-reliability .tl {
+    fill: var(--color-panel2);
+    stroke: var(--color-line);
+  }
+  .hero-reliability .cool-bg {
+    fill: var(--color-line);
+  }
+  .hero-reliability .cool {
+    fill: var(--color-muted);
+    transform-box: fill-box;
+    transform-origin: left center;
+    transform: scaleX(0);
+    animation: reliability-cool var(--t) linear infinite both;
+  }
+  .hero-reliability .call {
+    fill: var(--color-ink);
+    opacity: 0;
+  }
+
+  /* final frame: CLOSED again, dependency healthy, half-open → closed edge lit, earlier edges muted */
+  .hero-reliability .brk { stroke: var(--color-green); animation: reliability-brk var(--t) linear infinite both; }
+  .hero-reliability .dep { stroke: var(--color-green); fill: var(--color-green-dim); animation: reliability-dep var(--t) linear infinite both; }
+  .hero-reliability .n-closed { stroke: var(--color-green); fill: var(--color-green-dim); animation: reliability-n-closed var(--t) linear infinite both; }
+  .hero-reliability .nl-closed { fill: var(--color-green); animation: reliability-nl-closed var(--t) linear infinite both; }
+  .hero-reliability .n-open { animation: reliability-n-open var(--t) linear infinite both; }
+  .hero-reliability .nl-open { animation: reliability-nl-open var(--t) linear infinite both; }
+  .hero-reliability .n-half { animation: reliability-n-half var(--t) linear infinite both; }
+  .hero-reliability .nl-half { animation: reliability-nl-half var(--t) linear infinite both; }
+  .hero-reliability .e1 line,
+  .hero-reliability .e2 line { stroke: var(--color-muted); }
+  .hero-reliability .e1 polygon,
+  .hero-reliability .e2 polygon { fill: var(--color-muted); }
+  .hero-reliability .e1 line { animation: reliability-e1-line var(--t) linear infinite both; }
+  .hero-reliability .e1 polygon { animation: reliability-e1-head var(--t) linear infinite both; }
+  .hero-reliability .e2 line { animation: reliability-e2-line var(--t) linear infinite both; }
+  .hero-reliability .e2 polygon { animation: reliability-e2-head var(--t) linear infinite both; }
+  .hero-reliability .e3 line { stroke: var(--color-green); animation: reliability-e3-line var(--t) linear infinite both; }
+  .hero-reliability .e3 polygon { fill: var(--color-green); animation: reliability-e3-head var(--t) linear infinite both; }
+  .hero-reliability .tl1 { animation: reliability-tl1 var(--t) linear infinite both; }
+  .hero-reliability .tl2 { animation: reliability-tl2 var(--t) linear infinite both; }
+  .hero-reliability .tl3 { animation: reliability-tl3 var(--t) linear infinite both; }
+  .hero-reliability .c1 { animation: reliability-c1 var(--t) linear infinite both; }
+  .hero-reliability .c2 { animation: reliability-c2 var(--t) linear infinite both; }
+  .hero-reliability .c3 { animation: reliability-c3 var(--t) linear infinite both; }
+  .hero-reliability .c4 { animation: reliability-c4 var(--t) linear infinite both; }
+  .hero-reliability .c5 { animation: reliability-c5 var(--t) linear infinite both; }
+  .hero-reliability .c6 { animation: reliability-c6 var(--t) linear infinite both; }
+  .hero-reliability .c7 { animation: reliability-c7 var(--t) linear infinite both; }
+  .hero-reliability .c8 { animation: reliability-c8 var(--t) linear infinite both; }
+
+  .hero-reliability .readout {
+    display: grid;
+    margin-top: 10px;
+    font-size: 0.76rem;
+    text-align: center;
+  }
+  .hero-reliability .readout b {
+    font-weight: 600;
+  }
+  .hero-reliability .r {
+    grid-area: 1 / 1;
+    opacity: 0;
+  }
+  .hero-reliability .r3 { opacity: 1; }
+  .hero-reliability .r0 { animation: reliability-r0 var(--t) linear infinite both; }
+  .hero-reliability .r0b { animation: reliability-r0b var(--t) linear infinite both; }
+  .hero-reliability .r1 { animation: reliability-r1 var(--t) linear infinite both; }
+  .hero-reliability .r2 { animation: reliability-r2 var(--t) linear infinite both; }
+  .hero-reliability .r3 { animation: reliability-r3 var(--t) linear infinite both; }
+
+  @keyframes reliability-stage {
+    0% { opacity: 0; }
+    3%, 94% { opacity: 1; }
+    99%, 100% { opacity: 0; }
+  }
+
+  @keyframes reliability-brk {
+    0%, 25% { stroke: var(--color-green); }
+    27%, 53% { stroke: var(--color-red); }
+    55%, 71% { stroke: var(--color-purple); }
+    73%, 100% { stroke: var(--color-green); }
+  }
+  @keyframes reliability-dep {
+    0%, 6% { stroke: var(--color-line); fill: var(--color-panel2); }
+    8%, 44% { stroke: var(--color-red); fill: var(--color-red-dim); }
+    48%, 63% { stroke: var(--color-line); fill: var(--color-panel2); }
+    65%, 100% { stroke: var(--color-green); fill: var(--color-green-dim); }
+  }
+  @keyframes reliability-n-closed {
+    0%, 25% { stroke: var(--color-green); fill: var(--color-green-dim); }
+    27%, 71% { stroke: var(--color-line); fill: var(--color-panel2); }
+    73%, 100% { stroke: var(--color-green); fill: var(--color-green-dim); }
+  }
+  @keyframes reliability-nl-closed {
+    0%, 25% { fill: var(--color-green); }
+    27%, 71% { fill: var(--color-muted); }
+    73%, 100% { fill: var(--color-green); }
+  }
+  @keyframes reliability-n-open {
+    0%, 25% { stroke: var(--color-line); fill: var(--color-panel2); }
+    27%, 53% { stroke: var(--color-red); fill: var(--color-red-dim); }
+    55%, 100% { stroke: var(--color-line); fill: var(--color-panel2); }
+  }
+  @keyframes reliability-nl-open {
+    0%, 25% { fill: var(--color-muted); }
+    27%, 53% { fill: var(--color-red); }
+    55%, 100% { fill: var(--color-muted); }
+  }
+  @keyframes reliability-n-half {
+    0%, 53% { stroke: var(--color-line); fill: var(--color-panel2); }
+    55%, 71% { stroke: var(--color-purple); fill: var(--color-purple-dim); }
+    73%, 100% { stroke: var(--color-line); fill: var(--color-panel2); }
+  }
+  @keyframes reliability-nl-half {
+    0%, 53% { fill: var(--color-muted); }
+    55%, 71% { fill: var(--color-purple); }
+    73%, 100% { fill: var(--color-muted); }
+  }
+  @keyframes reliability-e1-line {
+    0%, 22% { stroke: var(--color-line); }
+    24%, 32% { stroke: var(--color-red); }
+    36%, 100% { stroke: var(--color-muted); }
+  }
+  @keyframes reliability-e1-head {
+    0%, 22% { fill: var(--color-line); }
+    24%, 32% { fill: var(--color-red); }
+    36%, 100% { fill: var(--color-muted); }
+  }
+  @keyframes reliability-e2-line {
+    0%, 50% { stroke: var(--color-line); }
+    52%, 60% { stroke: var(--color-purple); }
+    64%, 100% { stroke: var(--color-muted); }
+  }
+  @keyframes reliability-e2-head {
+    0%, 50% { fill: var(--color-line); }
+    52%, 60% { fill: var(--color-purple); }
+    64%, 100% { fill: var(--color-muted); }
+  }
+  @keyframes reliability-e3-line {
+    0%, 68% { stroke: var(--color-line); }
+    70%, 100% { stroke: var(--color-green); }
+  }
+  @keyframes reliability-e3-head {
+    0%, 68% { fill: var(--color-line); }
+    70%, 100% { fill: var(--color-green); }
+  }
+  @keyframes reliability-cool {
+    0%, 28% { transform: scaleX(0); }
+    52% { transform: scaleX(1); }
+    55%, 100% { transform: scaleX(0); }
+  }
+  @keyframes reliability-tl1 {
+    0%, 7% { fill: var(--color-panel2); stroke: var(--color-line); }
+    8%, 71% { fill: var(--color-red); stroke: var(--color-red); }
+    73%, 100% { fill: var(--color-panel2); stroke: var(--color-line); }
+  }
+  @keyframes reliability-tl2 {
+    0%, 14% { fill: var(--color-panel2); stroke: var(--color-line); }
+    15%, 71% { fill: var(--color-red); stroke: var(--color-red); }
+    73%, 100% { fill: var(--color-panel2); stroke: var(--color-line); }
+  }
+  @keyframes reliability-tl3 {
+    0%, 21% { fill: var(--color-panel2); stroke: var(--color-line); }
+    22%, 71% { fill: var(--color-red); stroke: var(--color-red); }
+    73%, 100% { fill: var(--color-panel2); stroke: var(--color-line); }
+  }
+
+  /* failing calls in CLOSED: cross to the dependency, turn red */
+  @keyframes reliability-c1 {
+    0%, 2% { transform: translate(var(--pass-from), var(--lane)); opacity: 0; fill: var(--color-ink); }
+    3% { transform: translate(var(--pass-from), var(--lane)); opacity: 1; fill: var(--color-ink); }
+    7% { transform: translate(var(--pass-to), var(--lane)); opacity: 1; fill: var(--color-ink); }
+    8%, 10% { transform: translate(var(--pass-to), var(--lane)); opacity: 1; fill: var(--color-red); }
+    12%, 100% { transform: translate(var(--pass-to), var(--lane)); opacity: 0; fill: var(--color-red); }
+  }
+  @keyframes reliability-c2 {
+    0%, 9% { transform: translate(var(--pass-from), var(--lane)); opacity: 0; fill: var(--color-ink); }
+    10% { transform: translate(var(--pass-from), var(--lane)); opacity: 1; fill: var(--color-ink); }
+    14% { transform: translate(var(--pass-to), var(--lane)); opacity: 1; fill: var(--color-ink); }
+    15%, 17% { transform: translate(var(--pass-to), var(--lane)); opacity: 1; fill: var(--color-red); }
+    19%, 100% { transform: translate(var(--pass-to), var(--lane)); opacity: 0; fill: var(--color-red); }
+  }
+  @keyframes reliability-c3 {
+    0%, 16% { transform: translate(var(--pass-from), var(--lane)); opacity: 0; fill: var(--color-ink); }
+    17% { transform: translate(var(--pass-from), var(--lane)); opacity: 1; fill: var(--color-ink); }
+    21% { transform: translate(var(--pass-to), var(--lane)); opacity: 1; fill: var(--color-ink); }
+    22%, 24% { transform: translate(var(--pass-to), var(--lane)); opacity: 1; fill: var(--color-red); }
+    26%, 100% { transform: translate(var(--pass-to), var(--lane)); opacity: 0; fill: var(--color-red); }
+  }
+  /* calls in OPEN: rejected at the breaker, never reach the dependency */
+  @keyframes reliability-c4 {
+    0%, 31% { transform: translate(var(--pass-from), var(--lane)); opacity: 0; fill: var(--color-ink); }
+    32% { transform: translate(var(--pass-from), var(--lane)); opacity: 1; fill: var(--color-ink); }
+    34% { transform: translate(var(--reject-at), var(--lane)); opacity: 1; fill: var(--color-ink); }
+    35%, 37% { transform: translate(var(--reject-at), var(--lane)); opacity: 1; fill: var(--color-red); }
+    39%, 100% { transform: translate(var(--reject-at), var(--lane)); opacity: 0; fill: var(--color-red); }
+  }
+  @keyframes reliability-c5 {
+    0%, 40% { transform: translate(var(--pass-from), var(--lane)); opacity: 0; fill: var(--color-ink); }
+    41% { transform: translate(var(--pass-from), var(--lane)); opacity: 1; fill: var(--color-ink); }
+    43% { transform: translate(var(--reject-at), var(--lane)); opacity: 1; fill: var(--color-ink); }
+    44%, 46% { transform: translate(var(--reject-at), var(--lane)); opacity: 1; fill: var(--color-red); }
+    48%, 100% { transform: translate(var(--reject-at), var(--lane)); opacity: 0; fill: var(--color-red); }
+  }
+  /* the one trial call in HALF-OPEN */
+  @keyframes reliability-c6 {
+    0%, 57% { transform: translate(var(--pass-from), var(--lane)); opacity: 0; fill: var(--color-purple); }
+    58% { transform: translate(var(--pass-from), var(--lane)); opacity: 1; fill: var(--color-purple); }
+    64% { transform: translate(var(--pass-to), var(--lane)); opacity: 1; fill: var(--color-purple); }
+    65%, 68% { transform: translate(var(--pass-to), var(--lane)); opacity: 1; fill: var(--color-green); }
+    70%, 100% { transform: translate(var(--pass-to), var(--lane)); opacity: 0; fill: var(--color-green); }
+  }
+  /* CLOSED again: calls flow */
+  @keyframes reliability-c7 {
+    0%, 75% { transform: translate(var(--pass-from), var(--lane)); opacity: 0; fill: var(--color-ink); }
+    76% { transform: translate(var(--pass-from), var(--lane)); opacity: 1; fill: var(--color-ink); }
+    80% { transform: translate(var(--pass-to), var(--lane)); opacity: 1; fill: var(--color-ink); }
+    81%, 83% { transform: translate(var(--pass-to), var(--lane)); opacity: 1; fill: var(--color-green); }
+    85%, 100% { transform: translate(var(--pass-to), var(--lane)); opacity: 0; fill: var(--color-green); }
+  }
+  @keyframes reliability-c8 {
+    0%, 82% { transform: translate(var(--pass-from), var(--lane)); opacity: 0; fill: var(--color-ink); }
+    83% { transform: translate(var(--pass-from), var(--lane)); opacity: 1; fill: var(--color-ink); }
+    87% { transform: translate(var(--pass-to), var(--lane)); opacity: 1; fill: var(--color-ink); }
+    88%, 90% { transform: translate(var(--pass-to), var(--lane)); opacity: 1; fill: var(--color-green); }
+    92%, 100% { transform: translate(var(--pass-to), var(--lane)); opacity: 0; fill: var(--color-green); }
+  }
+
+  @keyframes reliability-r0 {
+    0%, 20% { opacity: 1; }
+    22%, 100% { opacity: 0; }
+  }
+  @keyframes reliability-r0b {
+    0%, 21% { opacity: 0; }
+    23%, 33% { opacity: 1; }
+    35%, 100% { opacity: 0; }
+  }
+  @keyframes reliability-r1 {
+    0%, 34% { opacity: 0; }
+    36%, 53% { opacity: 1; }
+    55%, 100% { opacity: 0; }
+  }
+  @keyframes reliability-r2 {
+    0%, 54% { opacity: 0; }
+    56%, 71% { opacity: 1; }
+    73%, 100% { opacity: 0; }
+  }
+  @keyframes reliability-r3 {
+    0%, 72% { opacity: 0; }
+    74%, 100% { opacity: 1; }
+  }
+</style>

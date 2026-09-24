@@ -1,0 +1,269 @@
+---
+import HeroFrame from '../HeroFrame.astro';
+
+/**
+ * Merge template on [[8,10],[1,3],[15,18],[2,6]], computed at build time by running it:
+ *   sort by start → [[1,3],[2,6],[8,10],[15,18]]; the input bars slide into sorted order
+ *   seed: the open run is [1,3]
+ *   [2,6]:   2 ≤ 3  → overlap, extend the open run to [1,6]
+ *   [8,10]:  8 > 6  → close [1,6], open [8,10]
+ *   [15,18]: 15 > 10 → close [8,10], open [15,18]
+ *   done: [[1,6],[8,10],[15,18]]
+ * The sort is one shared keyframe driven by per-bar --y0/--y1; sweep steps are layers on one
+ * shared keyframe with negative delays, and the result layer holds to the end of the loop.
+ * Un-animated styles show the sorted bars and the merged result (reduced motion).
+ */
+type Iv = [number, number];
+const input: Iv[] = [
+  [8, 10],
+  [1, 3],
+  [15, 18],
+  [2, 6],
+];
+const sorted = input.map((iv, from) => ({ iv, from })).sort((a, b) => a.iv[0] - b.iv[0]);
+const sortedRow = new Map(sorted.map((s, row) => [s.from, row]));
+
+type Step = { cur: number | null; lastEnd: number | null; merged: Iv[]; open: boolean; kind: 'seed' | 'extend' | 'new' | 'done'; text: string; verdict: string; tail?: string };
+const fmt = (iv: Iv) => `[${iv[0]},${iv[1]}]`;
+const steps: Step[] = [];
+const merged: Iv[] = [[...sorted[0].iv]];
+steps.push({ cur: 0, lastEnd: null, merged: merged.map((m) => [...m] as Iv), open: true, kind: 'seed', text: `seed with ${fmt(sorted[0].iv)}`, verdict: `open run ${fmt(sorted[0].iv)}` });
+for (let i = 1; i < sorted.length; i++) {
+  const cur = sorted[i].iv;
+  const last = merged[merged.length - 1];
+  const lastEnd = last[1];
+  if (cur[0] <= last[1]) {
+    last[1] = Math.max(last[1], cur[1]);
+    steps.push({ cur: i, lastEnd, merged: merged.map((m) => [...m] as Iv), open: true, kind: 'extend', text: `${fmt(cur)}: ${cur[0]} ≤ ${lastEnd}`, verdict: `overlap, extend to ${fmt(last)}` });
+  } else {
+    const closed = fmt(last);
+    merged.push([...cur]);
+    steps.push({ cur: i, lastEnd, merged: merged.map((m) => [...m] as Iv), open: true, kind: 'new', text: `${fmt(cur)}: ${cur[0]} > ${lastEnd}`, verdict: `close ${closed}`, tail: `open ${fmt(cur)}` });
+  }
+}
+steps.push({ cur: null, lastEnd: null, merged: merged.map((m) => [...m] as Iv), open: false, kind: 'done', text: 'one sweep', verdict: `[${merged.map(fmt).join(',')}]` });
+
+const x = (v: number) => 14 + v * 13;
+const rowY = (row: number) => 8 + row * 22;
+const barH = 14;
+const ticks = [0, 5, 10, 15, 20];
+
+const sortEnd = 0.24;
+const slot = 0.14;
+const startOf = (k: number) => sortEnd + k * slot;
+const delay = (k: number) => `animation-delay: calc(var(--t) * ${(startOf(k) - 1).toFixed(4)})`;
+const verdictCls = (s: Step) => (s.kind === 'seed' || s.kind === 'extend' ? 'text-amber' : 'text-green');
+---
+
+<HeroFrame label="merge · sort by start" caption="sorted by start, anything that overlaps the open run is the very next interval, so one pass merges everything">
+  <div class="hero-intervals">
+    <svg viewBox="0 0 300 176" role="img" aria-label="four intervals sorted by start, then swept once into three merged intervals">
+      <g class="axis">
+        <line x1={x(0)} y1="100" x2={x(20)} y2="100" />
+        {
+          ticks.map((t) => (
+            <>
+              <line x1={x(t)} y1="97" x2={x(t)} y2="103" />
+              <text x={x(t)} y="112">
+                {t}
+              </text>
+            </>
+          ))
+        }
+      </g>
+
+      {
+        input.map((iv, from) => (
+          <g class="bar" style={`--y0: ${rowY(from)}px; --y1: ${rowY(sortedRow.get(from) ?? 0)}px`}>
+            <rect x={x(iv[0])} y="0" width={x(iv[1]) - x(iv[0])} height={barH} rx="3" />
+            <text class="lbl" x={x(iv[1]) + 7} y={barH / 2}>
+              {fmt(iv)}
+            </text>
+          </g>
+        ))
+      }
+
+      <text class="hd" x="0" y="128">merged</text>
+
+      {
+        steps.map((s, k) => {
+          const final = k === steps.length - 1;
+          return (
+            <g class:list={['layer', final && 'final']} style={final ? undefined : delay(k)}>
+              {s.cur !== null && (
+                <rect class="cur" x={x(sorted[s.cur].iv[0]) - 3} y={rowY(s.cur) - 3} width={x(sorted[s.cur].iv[1]) - x(sorted[s.cur].iv[0]) + 6} height={barH + 6} rx="5" />
+              )}
+              {s.lastEnd !== null && (
+                <>
+                  <line class:list={['edge', s.kind === 'new' && 'past']} x1={x(s.lastEnd)} y1="2" x2={x(s.lastEnd)} y2="94" />
+                  <line class:list={['edge', s.kind === 'new' && 'past']} x1={x(s.lastEnd)} y1="120" x2={x(s.lastEnd)} y2="156" />
+                </>
+              )}
+              {s.merged.map((m, j) => {
+                const isOpen = s.open && j === s.merged.length - 1;
+                return (
+                  <>
+                    <rect class:list={['run', isOpen ? 'open' : 'closed']} x={x(m[0])} y="136" width={x(m[1]) - x(m[0])} height="16" rx="3" />
+                    <text class:list={['rl', isOpen ? 'open' : 'closed']} x={(x(m[0]) + x(m[1])) / 2} y="166">
+                      {fmt(m)}
+                    </text>
+                  </>
+                );
+              })}
+            </g>
+          );
+        })
+      }
+    </svg>
+    <div class="readout font-mono">
+      <span class="r r-sort">sort by start · <b class="text-ink">overlapping ranges become neighbors</b></span>
+      {
+        steps.map((s, k) => {
+          const final = k === steps.length - 1;
+          return (
+            <span class:list={['r', 'step', final && 'final']} style={final ? undefined : delay(k)}>
+              {s.text} · <b class={verdictCls(s)}>{s.verdict}</b>
+              {s.tail && <>, <b class="text-amber">{s.tail}</b></>}
+            </span>
+          );
+        })
+      }
+    </div>
+  </div>
+</HeroFrame>
+
+<style is:inline>
+  .hero-intervals {
+    --t: 13s;
+    width: 100%;
+    max-width: 380px;
+    animation: intervals-stage var(--t) linear infinite both;
+  }
+  .hero-intervals svg {
+    display: block;
+    width: 100%;
+    height: auto;
+    overflow: visible;
+  }
+  .hero-intervals text {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    fill: var(--color-ink);
+    dominant-baseline: central;
+  }
+  .hero-intervals .axis line {
+    stroke: var(--color-line);
+    stroke-width: 1.5;
+  }
+  .hero-intervals .axis text {
+    fill: var(--color-muted);
+    font-size: 9px;
+    text-anchor: middle;
+  }
+  .hero-intervals .hd {
+    fill: var(--color-muted);
+    font-size: 9px;
+  }
+  .hero-intervals .bar {
+    transform: translate(0, var(--y1));
+    animation: intervals-sort var(--t) ease-in-out infinite both;
+  }
+  .hero-intervals .bar rect {
+    fill: var(--color-panel2);
+    stroke: var(--color-muted);
+    stroke-width: 1.5;
+  }
+  .hero-intervals .bar .lbl {
+    fill: var(--color-muted);
+  }
+  .hero-intervals .cur {
+    fill: none;
+    stroke: var(--color-cyan);
+    stroke-width: 1.5;
+  }
+  .hero-intervals .edge {
+    stroke: var(--color-amber);
+    stroke-width: 1;
+    stroke-dasharray: 3 3;
+  }
+  .hero-intervals .edge.past {
+    stroke: var(--color-muted);
+  }
+  .hero-intervals .run {
+    stroke-width: 1.5;
+  }
+  .hero-intervals .run.open {
+    fill: var(--color-panel2);
+    stroke: var(--color-amber);
+  }
+  .hero-intervals .run.closed {
+    fill: var(--color-green-dim);
+    stroke: var(--color-green);
+  }
+  .hero-intervals .rl {
+    text-anchor: middle;
+  }
+  .hero-intervals .rl.open {
+    fill: var(--color-amber);
+  }
+  .hero-intervals .rl.closed {
+    fill: var(--color-green);
+  }
+  .hero-intervals .layer {
+    opacity: 0;
+    animation: intervals-step var(--t) linear infinite both;
+  }
+  .hero-intervals .layer.final {
+    opacity: 1;
+    animation: intervals-final var(--t) linear infinite both;
+  }
+
+  .hero-intervals .readout {
+    display: grid;
+    margin-top: 10px;
+    font-size: 0.76rem;
+    text-align: center;
+  }
+  .hero-intervals .readout b {
+    font-weight: 600;
+    white-space: nowrap;
+  }
+  .hero-intervals .r {
+    grid-area: 1 / 1;
+    opacity: 0;
+  }
+  .hero-intervals .r-sort {
+    animation: intervals-sort-note var(--t) linear infinite both;
+  }
+  .hero-intervals .r.step {
+    animation: intervals-step var(--t) linear infinite both;
+  }
+  .hero-intervals .r.final {
+    opacity: 1;
+    animation: intervals-final var(--t) linear infinite both;
+  }
+
+  /* timeline: unsorted 0-14 · sort 14-22 · seed 24-38 · [2,6] 38-52 · [8,10] 52-66 · [15,18] 66-80 · result 80-100 · fade 95-100 */
+  @keyframes intervals-stage {
+    0% { opacity: 0; }
+    3%, 95% { opacity: 1; }
+    99%, 100% { opacity: 0; }
+  }
+  @keyframes intervals-sort {
+    0%, 14% { transform: translate(0, var(--y0)); }
+    22%, 100% { transform: translate(0, var(--y1)); }
+  }
+  @keyframes intervals-sort-note {
+    0%, 22% { opacity: 1; }
+    24%, 100% { opacity: 0; }
+  }
+  @keyframes intervals-step {
+    0% { opacity: 0; }
+    1.5%, 12.5% { opacity: 1; }
+    14%, 100% { opacity: 0; }
+  }
+  @keyframes intervals-final {
+    0%, 80% { opacity: 0; }
+    81.5%, 100% { opacity: 1; }
+  }
+</style>

@@ -1,0 +1,203 @@
+---
+import HeroFrame from '../HeroFrame.astro';
+
+/**
+ * List<T>.Add called 20 times on an empty list. Frames are computed at build time by
+ * simulating the backing array: when count == capacity, allocate max(4, 2 × capacity) and
+ * copy every existing element, otherwise write the next open slot.
+ *   add #1  → allocate 4, copy 0      adds #2 to #4   → no copy
+ *   add #5  → allocate 8, copy 4      adds #6 to #8   → no copy
+ *   add #9  → allocate 16, copy 8     adds #10 to #16 → no copy
+ *   add #17 → allocate 32, copy 16    adds #18 to #20 → no copy
+ * 28 elements copied in total across 20 adds. One frame per resize generation (the resize
+ * plus the free adds after it), crossfaded; the last frame holds for two slots. Un-animated
+ * styles show the final frame (reduced motion).
+ */
+const adds = 20;
+
+type Frame = {
+  gen: number;
+  count: number;
+  cap: number;
+  resizeAdd: number;
+  lastAdd: number;
+  prevCap: number;
+  copied: number;
+  total: number;
+};
+
+const caps: number[] = [];
+const frames: Frame[] = [];
+let cap = 0;
+let count = 0;
+let total = 0;
+for (let add = 1; add <= adds; add++) {
+  if (count === cap) {
+    const prevCap = cap;
+    cap = cap === 0 ? 4 : cap * 2;
+    caps.push(cap);
+    total += count;
+    frames.push({ gen: caps.length - 1, count: count + 1, cap, resizeAdd: add, lastAdd: add, prevCap, copied: count, total });
+  } else {
+    const last = frames[frames.length - 1];
+    last.lastAdd = add;
+    last.count = count + 1;
+  }
+  count++;
+}
+
+const slots = frames.length + 1;
+const last = frames.length - 1;
+const delay = (k: number) => `animation-delay: calc(var(--t) * ${(k / slots - 1).toFixed(4)})`;
+
+const pitch = 9;
+const x0 = 46;
+const rowY = (g: number) => 4 + g * 24;
+const height = rowY(caps.length - 1) + 20;
+const cellState = (f: Frame, g: number, c: number) => {
+  if (g < f.gen) return g === f.gen - 1 ? 'src' : 'old';
+  if (c >= f.count) return 'empty';
+  if (c < f.copied) return 'copy';
+  return 'new';
+};
+const range = (from: number, to: number) => (from === to ? `add #${from}` : `adds #${from} to #${to}`);
+const freeAdds = (f: Frame) => (f.lastAdd > f.resizeAdd ? range(f.resizeAdd + 1, f.lastAdd) : null);
+---
+
+<HeroFrame label={`List<T>.Add · ${adds} adds`} caption="capacity doubles, so each O(n) copy buys as many free writes: O(1) per Add, amortized">
+  <div class="hero-big-o font-mono" style={`--slots: ${slots}`}>
+    <div class="layers">
+      {
+        frames.map((f, k) => (
+          <div class:list={['layer', k === last && 'final']} style={delay(k)}>
+            <svg viewBox={`0 0 340 ${height}`} role="img" aria-label={`after add #${f.lastAdd}: count ${f.count}, capacity ${f.cap}, ${f.total} elements copied so far`}>
+              {caps.map((c, g) => (
+                <g class:list={['row', g > f.gen && 'hidden']}>
+                  <text class="cap" x="0" y={rowY(g) + 8}>
+                    cap {c}
+                  </text>
+                  {Array.from({ length: c }, (_, i) => (
+                    <rect class={cellState(f, g, i)} x={x0 + i * pitch} y={rowY(g)} width="8" height="16" rx="2" />
+                  ))}
+                </g>
+              ))}
+            </svg>
+            <div class="readouts">
+              <p class="note">
+                add #{f.resizeAdd} · {f.prevCap === 0 ? 'empty' : `full at ${f.prevCap}`} → allocate {f.cap} ·{' '}
+                <b class="text-amber">copy {f.copied}</b>
+              </p>
+              {freeAdds(f) && (
+                <p class="free">
+                  {freeAdds(f)} · <b class="text-green">no copy</b>
+                  {k !== last && <> · copied so far {f.total}</>}
+                </p>
+              )}
+              {k === last && (
+                <p class="tally">
+                  {adds} adds · {f.total} copied · <b class="text-green">under 1.5n, O(1) amortized</b>
+                </p>
+              )}
+            </div>
+          </div>
+        ))
+      }
+    </div>
+  </div>
+</HeroFrame>
+
+<style is:inline>
+  .hero-big-o {
+    --t: calc(var(--slots) * 2.8s);
+    width: 100%;
+    max-width: 400px;
+    font-size: 0.78rem;
+  }
+  .hero-big-o .layers {
+    display: grid;
+  }
+  .hero-big-o .layer {
+    grid-area: 1 / 1;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    opacity: 0;
+    animation: big-o-frame var(--t) linear infinite both;
+  }
+  .hero-big-o .layer.final {
+    opacity: 1;
+    animation-name: big-o-final;
+  }
+  .hero-big-o svg {
+    display: block;
+    width: 100%;
+    height: auto;
+    margin-bottom: 8px;
+  }
+  .hero-big-o .row.hidden {
+    visibility: hidden;
+  }
+  .hero-big-o text.cap {
+    fill: var(--color-muted);
+    font-family: var(--font-mono);
+    font-size: 10px;
+    dominant-baseline: central;
+  }
+  .hero-big-o rect {
+    stroke-width: 1;
+  }
+  .hero-big-o rect.empty {
+    fill: none;
+    stroke: var(--color-line);
+    stroke-dasharray: 2 2;
+  }
+  .hero-big-o rect.new {
+    fill: var(--color-panel2);
+    stroke: var(--color-ink);
+  }
+  .hero-big-o rect.copy {
+    fill: var(--color-panel2);
+    stroke: var(--color-amber);
+    stroke-width: 1.5;
+  }
+  .hero-big-o rect.src {
+    fill: var(--color-panel2);
+    stroke: var(--color-cyan);
+  }
+  .hero-big-o rect.old {
+    fill: var(--color-red-dim);
+    stroke: var(--color-red);
+    stroke-dasharray: 2 2;
+    opacity: 0.45;
+  }
+  .hero-big-o .readouts {
+    display: grid;
+    gap: 4px;
+  }
+  .hero-big-o .readouts p {
+    margin: 0;
+    text-align: center;
+  }
+  .hero-big-o .free {
+    color: var(--color-ink);
+  }
+  .hero-big-o .tally {
+    color: var(--color-muted);
+    font-size: 0.72rem;
+  }
+  .hero-big-o b {
+    font-weight: 600;
+    white-space: nowrap;
+  }
+
+  @keyframes big-o-frame {
+    0% { opacity: 0; }
+    1.5%, 19% { opacity: 1; }
+    20%, 100% { opacity: 0; }
+  }
+  @keyframes big-o-final {
+    0% { opacity: 0; }
+    1.5%, 39% { opacity: 1; }
+    40%, 100% { opacity: 0; }
+  }
+</style>

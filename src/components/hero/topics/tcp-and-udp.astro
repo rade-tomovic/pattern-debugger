@@ -1,0 +1,284 @@
+---
+import HeroFrame from '../HeroFrame.astro';
+
+/**
+ * The stream-vs-datagram exercise, side by side: the same two sends on a TCP socket and a UDP socket.
+ *   each chip appears at the sender when its Send runs, then moves into the receiver's queue
+ *   Send("AAA"): TCP appends 3 bytes to the receiver's byte queue, UDP queues one datagram [AAA]
+ *   Send("BBB"): TCP's queue is AAABBB with nothing marking where the first Send ended,
+ *                UDP's queue is [AAA] [BBB], two separate entries
+ *   TCP Receive(1024): can return all 6 bytes, AAABBB, in one read
+ *   UDP ReceiveFrom(1024): pops exactly one datagram, AAA; [BBB] waits for the next call
+ *   both reads are correct outcomes, so the TCP read is drawn in the read color (cyan) and settles
+ *   neutral; red is kept for the lost boundary only
+ *   the popped datagram [AAA] dips below the queue to pass [BBB], which then moves to the head
+ * Timeline (percent of the loop): send AAA 3-19 · send BBB 19-29 · queues hold both 29-41 · TCP read 41-58 · UDP read 58-80 · settled 80-94 · fade 94-100.
+ * Un-animated styles are the final frame (reduced motion).
+ */
+const cell = 14;
+const lanes = [
+  { key: 'tcp', y: 54, title: 'TCP · byte stream', note: 'one read · 6 bytes', noteCls: 'note-tcp' },
+  { key: 'udp', y: 120, title: 'UDP · datagrams', note: 'one read · 3 bytes', noteCls: 'note-udp' },
+];
+const chips = [
+  { id: 'a', text: 'AAA' },
+  { id: 'b', text: 'BBB' },
+];
+---
+
+<HeroFrame label={'Send("AAA") · Send("BBB")'} caption="TCP delivers your bytes, not your messages: two Sends can come back as one Receive, while UDP returns one datagram per read">
+  <div class="hero-tcp-and-udp">
+    <svg viewBox="0 0 360 160" role="img" aria-label="two sends of AAA and BBB: over TCP one receive returns AAABBB, over UDP the first receive returns AAA">
+      <text class="hd" x="14" y="12">your Sends</text>
+      <text class="hd" x="128" y="12">receiver's queue</text>
+      <text class="hd" x="254" y="12">first read</text>
+      {
+        lanes.map((l) => (
+          <g transform={`translate(0 ${l.y})`}>
+            <text class="lane" x="14" y="-26">{l.title}</text>
+            <rect class="queue" x="128" y="-16" width="120" height="32" rx="6" />
+            <rect class={`slot slot-${l.key}`} x="254" y="-16" width="100" height="32" rx="6" />
+            {chips.map((c) => (
+              <g class={`chip ${l.key}-${c.id}`}>
+                <rect class="bound" x="-3" y="-13" width={cell * 3 + 6} height="26" rx="4" />
+                {c.text.split('').map((ch, i) => (
+                  <>
+                    <rect class="cell" x={i * cell} y="-10" width={cell} height="20" />
+                    <text x={i * cell + cell / 2} y="0">{ch}</text>
+                  </>
+                ))}
+              </g>
+            ))}
+            <text class={`note ${l.noteCls}`} x="354" y="26">{l.note}</text>
+          </g>
+        ))
+      }
+    </svg>
+    <div class="readout font-mono">
+      <span class="r r1">Send("AAA") · <b class="text-amber">TCP appends 3 bytes, UDP queues one datagram</b></span>
+      <span class="r r2a">Send("BBB") · <b class="text-amber">TCP appends 3 more bytes, UDP queues a second datagram</b></span>
+      <span class="r r2">both queued · TCP holds <b class="text-red">AAABBB, no boundary</b> · UDP holds [AAA] [BBB]</span>
+      <span class="r r3">TCP Receive(1024) · <b class="text-cyan">can return all 6 bytes: AAABBB</b></span>
+      <span class="r r4">UDP ReceiveFrom(1024) · <b class="text-green">returns exactly one datagram: AAA</b></span>
+      <span class="r r5">TCP delivers bytes, not messages · <b class="text-green">UDP delivers one datagram per read</b></span>
+    </div>
+  </div>
+</HeroFrame>
+
+<style is:inline>
+  .hero-tcp-and-udp {
+    --t: 14s;
+    width: 100%;
+    max-width: 390px;
+    animation: tcp-and-udp-stage var(--t) linear infinite both;
+  }
+  .hero-tcp-and-udp svg {
+    display: block;
+    width: 100%;
+    height: auto;
+    overflow: visible;
+  }
+  .hero-tcp-and-udp text {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    fill: var(--color-ink);
+    text-anchor: middle;
+    dominant-baseline: central;
+  }
+  .hero-tcp-and-udp .hd,
+  .hero-tcp-and-udp .lane {
+    fill: var(--color-muted);
+    font-size: 10px;
+    text-anchor: start;
+  }
+  .hero-tcp-and-udp .note {
+    font-size: 10px;
+    text-anchor: end;
+  }
+  .hero-tcp-and-udp .note-tcp {
+    fill: var(--color-ink);
+  }
+  .hero-tcp-and-udp .note-udp {
+    fill: var(--color-green);
+  }
+  .hero-tcp-and-udp .queue {
+    fill: var(--color-panel);
+    stroke: var(--color-line);
+    stroke-width: 1.5;
+  }
+  .hero-tcp-and-udp .slot {
+    fill: none;
+    stroke: var(--color-line);
+    stroke-width: 1.5;
+    stroke-dasharray: 4 3;
+  }
+  .hero-tcp-and-udp .cell {
+    fill: var(--color-panel2);
+    stroke: var(--color-line);
+    stroke-width: 1;
+  }
+  .hero-tcp-and-udp .bound {
+    fill: none;
+    stroke: var(--color-muted);
+    stroke-width: 1.5;
+  }
+
+  .hero-tcp-and-udp .tcp-a { transform: translateX(262px); }
+  .hero-tcp-and-udp .tcp-b { transform: translateX(304px); }
+  .hero-tcp-and-udp .udp-a { transform: translate(262px, 0px); }
+  .hero-tcp-and-udp .udp-b { transform: translateX(134px); }
+  .hero-tcp-and-udp .tcp-a .bound,
+  .hero-tcp-and-udp .tcp-b .bound {
+    opacity: 0;
+  }
+  .hero-tcp-and-udp .udp-a .bound {
+    stroke: var(--color-green);
+  }
+  .hero-tcp-and-udp .slot-tcp {
+    stroke: var(--color-muted);
+  }
+  .hero-tcp-and-udp .slot-udp {
+    stroke: var(--color-green);
+  }
+
+  .hero-tcp-and-udp .tcp-a { animation: tcp-and-udp-tcp-a var(--t) ease-in-out infinite both; }
+  .hero-tcp-and-udp .tcp-b { animation: tcp-and-udp-tcp-b var(--t) ease-in-out infinite both; }
+  .hero-tcp-and-udp .udp-a { animation: tcp-and-udp-udp-a var(--t) ease-in-out infinite both; }
+  .hero-tcp-and-udp .udp-b { animation: tcp-and-udp-udp-b var(--t) ease-in-out infinite both; }
+  .hero-tcp-and-udp .tcp-a .bound { animation: tcp-and-udp-bound-tcp-a var(--t) linear infinite both; }
+  .hero-tcp-and-udp .tcp-b .bound { animation: tcp-and-udp-bound-tcp-b var(--t) linear infinite both; }
+  .hero-tcp-and-udp .udp-a .bound { animation: tcp-and-udp-bound-udp-a var(--t) linear infinite both; }
+  .hero-tcp-and-udp .udp-b .bound { animation: tcp-and-udp-bound-udp-b var(--t) linear infinite both; }
+  .hero-tcp-and-udp .slot-tcp { animation: tcp-and-udp-slot-tcp var(--t) linear infinite both; }
+  .hero-tcp-and-udp .slot-udp { animation: tcp-and-udp-slot-udp var(--t) linear infinite both; }
+  .hero-tcp-and-udp .note-tcp { animation: tcp-and-udp-note-tcp var(--t) linear infinite both; }
+  .hero-tcp-and-udp .note-udp { animation: tcp-and-udp-note-udp var(--t) linear infinite both; }
+
+  .hero-tcp-and-udp .readout {
+    display: grid;
+    margin-top: 12px;
+    font-size: 0.76rem;
+    text-align: center;
+  }
+  .hero-tcp-and-udp .readout b {
+    font-weight: 600;
+  }
+  .hero-tcp-and-udp .r {
+    grid-area: 1 / 1;
+    opacity: 0;
+  }
+  .hero-tcp-and-udp .r5 { opacity: 1; }
+  .hero-tcp-and-udp .r1 { animation: tcp-and-udp-r1 var(--t) linear infinite both; }
+  .hero-tcp-and-udp .r2a { animation: tcp-and-udp-r2a var(--t) linear infinite both; }
+  .hero-tcp-and-udp .r2 { animation: tcp-and-udp-r2 var(--t) linear infinite both; }
+  .hero-tcp-and-udp .r3 { animation: tcp-and-udp-r3 var(--t) linear infinite both; }
+  .hero-tcp-and-udp .r4 { animation: tcp-and-udp-r4 var(--t) linear infinite both; }
+  .hero-tcp-and-udp .r5 { animation: tcp-and-udp-r5 var(--t) linear infinite both; }
+
+  @media (max-width: 420px) {
+    .hero-tcp-and-udp .readout {
+      font-size: 0.68rem;
+    }
+  }
+
+  @keyframes tcp-and-udp-stage {
+    0% { opacity: 0; }
+    3%, 95% { opacity: 1; }
+    99%, 100% { opacity: 0; }
+  }
+  @keyframes tcp-and-udp-tcp-a {
+    0%, 3% { opacity: 0; transform: translateX(40px); }
+    5%, 8% { opacity: 1; transform: translateX(40px); }
+    14%, 43% { transform: translateX(134px); }
+    49%, 100% { transform: translateX(262px); }
+  }
+  @keyframes tcp-and-udp-tcp-b {
+    0%, 19% { opacity: 0; transform: translateX(40px); }
+    21%, 23% { opacity: 1; transform: translateX(40px); }
+    29%, 43% { transform: translateX(176px); }
+    49%, 100% { transform: translateX(304px); }
+  }
+  @keyframes tcp-and-udp-udp-a {
+    0%, 3% { opacity: 0; transform: translate(40px, 0px); }
+    5%, 8% { opacity: 1; transform: translate(40px, 0px); }
+    14%, 62% { transform: translate(134px, 0px); }
+    63.5% { transform: translate(134px, 30px); }
+    66.5% { transform: translate(238px, 30px); }
+    68%, 100% { transform: translate(262px, 0px); }
+  }
+  @keyframes tcp-and-udp-udp-b {
+    0%, 19% { opacity: 0; transform: translateX(40px); }
+    21%, 23% { opacity: 1; transform: translateX(40px); }
+    29%, 67% { transform: translateX(184px); }
+    72%, 100% { transform: translateX(134px); }
+  }
+  @keyframes tcp-and-udp-bound-tcp-a {
+    0%, 7% { opacity: 1; stroke: var(--color-muted); }
+    8%, 14% { opacity: 1; stroke: var(--color-amber); }
+    17%, 100% { opacity: 0; stroke: var(--color-amber); }
+  }
+  @keyframes tcp-and-udp-bound-tcp-b {
+    0%, 22% { opacity: 1; stroke: var(--color-muted); }
+    23%, 29% { opacity: 1; stroke: var(--color-amber); }
+    32%, 100% { opacity: 0; stroke: var(--color-amber); }
+  }
+  @keyframes tcp-and-udp-bound-udp-a {
+    0%, 7% { stroke: var(--color-muted); }
+    8%, 14% { stroke: var(--color-amber); }
+    15%, 67% { stroke: var(--color-muted); }
+    69%, 100% { stroke: var(--color-green); }
+  }
+  @keyframes tcp-and-udp-bound-udp-b {
+    0%, 22% { stroke: var(--color-muted); }
+    23%, 29% { stroke: var(--color-amber); }
+    30%, 100% { stroke: var(--color-muted); }
+  }
+  @keyframes tcp-and-udp-slot-tcp {
+    0%, 40.5% { stroke: var(--color-line); }
+    41.5%, 49% { stroke: var(--color-cyan); }
+    51%, 100% { stroke: var(--color-muted); }
+  }
+  @keyframes tcp-and-udp-slot-udp {
+    0%, 59% { stroke: var(--color-line); }
+    60%, 68% { stroke: var(--color-cyan); }
+    70%, 100% { stroke: var(--color-green); }
+  }
+  @keyframes tcp-and-udp-note-tcp {
+    0%, 49.5% { opacity: 0; }
+    51%, 100% { opacity: 1; }
+  }
+  @keyframes tcp-and-udp-note-udp {
+    0%, 69% { opacity: 0; }
+    71%, 100% { opacity: 1; }
+  }
+
+  @keyframes tcp-and-udp-r1 {
+    0%, 3% { opacity: 0; }
+    5%, 18.5% { opacity: 1; }
+    19.5%, 100% { opacity: 0; }
+  }
+  @keyframes tcp-and-udp-r2a {
+    0%, 19% { opacity: 0; }
+    20%, 28.5% { opacity: 1; }
+    29.5%, 100% { opacity: 0; }
+  }
+  @keyframes tcp-and-udp-r2 {
+    0%, 29.5% { opacity: 0; }
+    30.5%, 40% { opacity: 1; }
+    41%, 100% { opacity: 0; }
+  }
+  @keyframes tcp-and-udp-r3 {
+    0%, 41% { opacity: 0; }
+    42%, 57% { opacity: 1; }
+    58%, 100% { opacity: 0; }
+  }
+  @keyframes tcp-and-udp-r4 {
+    0%, 58% { opacity: 0; }
+    60%, 77% { opacity: 1; }
+    79%, 100% { opacity: 0; }
+  }
+  @keyframes tcp-and-udp-r5 {
+    0%, 79% { opacity: 0; }
+    81%, 100% { opacity: 1; }
+  }
+</style>

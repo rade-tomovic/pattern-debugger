@@ -1,0 +1,244 @@
+---
+import HeroFrame from '../HeroFrame.astro';
+
+/**
+ * caller → add3 → ret, from the page's `gcc -O0` listing (x86-64, System V):
+ *   rip = 401178, the `call 401136 <add3>` in caller
+ *   call: push 0x40117d (the address of the next instruction), rsp −= 8, rip = 401136
+ *   add3 prologue at 40113a: push %rbp, rsp −= 8, rip = 40113b; rbp is callee-saved, so add3 saves it (register table)
+ *   pop %rbp at 401154, rsp += 8, rip = 401155: the return address is on top again
+ *   ret: pop 0x40117d into rip, rsp += 8, caller resumes at 40117d
+ * rip is cyan (the address the core reads from), rsp and the pushed values are amber (written);
+ * the ret slot is outlined amber while 0x40117d is the value just written, the saved rbp slot while push %rbp is.
+ * rip always points at the next instruction to run, so after each step it sits on the row that has not executed yet.
+ * Un-animated styles are the final frame (reduced motion); the rsp label moves above its line there so it does not sit in the popped slot.
+ */
+const code = [
+  { y: 14, head: 'caller:' },
+  { y: 32, addr: '401178', ins: 'call 401136 <add3>' },
+  { y: 50, addr: '40117d', ins: 'mov %eax,-0x4(%rbp)' },
+  { y: 72, head: 'add3:' },
+  { y: 90, addr: '401136', ins: 'endbr64' },
+  { y: 108, addr: '40113a', ins: 'push %rbp' },
+  { y: 126, addr: '40113b', ins: 'mov %rsp,%rbp' },
+  { y: 144, gap: true },
+  { y: 162, addr: '401154', ins: 'pop %rbp' },
+  { y: 180, addr: '401155', ins: 'ret' },
+];
+---
+
+<HeroFrame label="caller() → add3() → ret" caption="call pushes the next instruction's address and jumps; ret pops it back into rip, and that is the whole mechanism">
+  <div class="hero-cpu-execution">
+    <svg viewBox="0 0 340 194" role="img" aria-label="call pushes the return address 0x40117d and jumps to add3; ret pops it back into rip">
+      {
+        code.map((l) =>
+          l.head ? (
+            <text class="hd" x="28" y={l.y}>{l.head}</text>
+          ) : l.gap ? (
+            <text class="hd" x="72" y={l.y}>…</text>
+          ) : (
+            <text x="28" y={l.y}><tspan class="addr">{l.addr}</tspan>  {l.ins}</text>
+          ),
+        )
+      }
+
+      <g class="rip">
+        <rect x="24" y="-9" width="168" height="18" rx="3" />
+        <text x="0" y="0">rip</text>
+      </g>
+
+      <text class="hd" x="206" y="14">stack · grows down</text>
+      <rect class="frame" x="206" y="24" width="130" height="50" rx="5" />
+      <text class="hd" x="214" y="49">caller's frame</text>
+
+      <g class="slot-ret">
+        <rect class="slot ret" x="206" y="78" width="130" height="22" rx="4" />
+        <text x="214" y="89"><tspan class="lbl">ret</tspan> 0x40117d</text>
+      </g>
+      <g class="slot-rbp">
+        <rect class="slot rbp" x="206" y="104" width="130" height="22" rx="4" />
+        <text x="214" y="115"><tspan class="lbl">saved</tspan> rbp</text>
+      </g>
+
+      <g class="rsp">
+        <line x1="202" y1="0" x2="340" y2="0" />
+        <text x="336" y="9">rsp</text>
+      </g>
+    </svg>
+    <div class="readout font-mono">
+      <span class="r r0">rip = 401178 · <b class="text-cyan">next: call add3</b></span>
+      <span class="r r1">call: rsp −= 8, rip = 401136 · <b class="text-amber">pushed 0x40117d</b></span>
+      <span class="r r2">push %rbp, rsp −= 8, rip = 40113b · <b class="text-amber">rbp is callee-saved, so add3 saves it</b></span>
+      <span class="r r3">pop %rbp, rip = 401155 · <b class="text-cyan">ret reads the stack top</b></span>
+      <span class="r r4">ret pops 0x40117d into rip · <b class="text-green">caller resumes</b></span>
+    </div>
+  </div>
+</HeroFrame>
+
+<style is:inline>
+  .hero-cpu-execution {
+    --t: 13s;
+    width: 100%;
+    max-width: 400px;
+    animation: cpu-execution-stage var(--t) linear infinite both;
+  }
+  .hero-cpu-execution svg {
+    display: block;
+    width: 100%;
+    height: auto;
+    overflow: visible;
+  }
+  .hero-cpu-execution text {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    fill: var(--color-ink);
+    dominant-baseline: central;
+    white-space: pre;
+  }
+  .hero-cpu-execution .hd,
+  .hero-cpu-execution .addr,
+  .hero-cpu-execution .lbl {
+    fill: var(--color-muted);
+  }
+  .hero-cpu-execution .hd {
+    font-size: 9.5px;
+  }
+  .hero-cpu-execution .frame,
+  .hero-cpu-execution .slot {
+    fill: var(--color-panel2);
+    stroke: var(--color-line);
+    stroke-width: 1.5;
+  }
+  .hero-cpu-execution .slot.rbp {
+    stroke: var(--color-amber);
+  }
+  .hero-cpu-execution .rip rect {
+    fill: none;
+    stroke-width: 1.5;
+  }
+  .hero-cpu-execution .rip text {
+    font-size: 9px;
+  }
+  .hero-cpu-execution .rsp line {
+    stroke: var(--color-amber);
+    stroke-width: 2;
+  }
+  .hero-cpu-execution .rsp text {
+    fill: var(--color-amber);
+    font-size: 9px;
+    text-anchor: end;
+  }
+
+  /* final frame: ret has popped 0x40117d into rip, rsp back at caller's frame */
+  .hero-cpu-execution .rip { transform: translateY(50px); }
+  .hero-cpu-execution .rip rect { stroke: var(--color-green); }
+  .hero-cpu-execution .rip text { fill: var(--color-green); }
+  .hero-cpu-execution .rsp { transform: translateY(76px); }
+  .hero-cpu-execution .rsp text { transform: translate(-6px, -19px); }
+  .hero-cpu-execution .slot-ret { opacity: 0.4; }
+  .hero-cpu-execution .ret { stroke-dasharray: 4 3; }
+  .hero-cpu-execution .slot-rbp { opacity: 0; }
+
+  .hero-cpu-execution .rip { animation: cpu-execution-rip var(--t) ease-in-out infinite both; }
+  .hero-cpu-execution .rip rect { animation: cpu-execution-rip-stroke var(--t) linear infinite both; }
+  .hero-cpu-execution .rip text { animation: cpu-execution-rip-fill var(--t) linear infinite both; }
+  .hero-cpu-execution .rsp { animation: cpu-execution-rsp var(--t) ease-in-out infinite both; }
+  .hero-cpu-execution .rsp text { animation: cpu-execution-rsp-label var(--t) ease-in-out infinite both; }
+  .hero-cpu-execution .slot-ret { animation: cpu-execution-slot-ret var(--t) linear infinite both; }
+  .hero-cpu-execution .ret { animation: cpu-execution-ret var(--t) linear infinite both; }
+  .hero-cpu-execution .slot-rbp { animation: cpu-execution-slot-rbp var(--t) linear infinite both; }
+
+  .hero-cpu-execution .readout {
+    display: grid;
+    margin-top: 12px;
+    font-size: 0.76rem;
+    text-align: center;
+  }
+  .hero-cpu-execution .readout b {
+    font-weight: 600;
+  }
+  .hero-cpu-execution .r {
+    grid-area: 1 / 1;
+    opacity: 0;
+  }
+  .hero-cpu-execution .r4 { opacity: 1; }
+  .hero-cpu-execution .r0 { animation: cpu-execution-r0 var(--t) linear infinite both; }
+  .hero-cpu-execution .r1 { animation: cpu-execution-r1 var(--t) linear infinite both; }
+  .hero-cpu-execution .r2 { animation: cpu-execution-r2 var(--t) linear infinite both; }
+  .hero-cpu-execution .r3 { animation: cpu-execution-r3 var(--t) linear infinite both; }
+  .hero-cpu-execution .r4 { animation: cpu-execution-r4 var(--t) linear infinite both; }
+
+  /* timeline: at call 0-18 · call 18-22 · in add3 22-40 · push rbp 40-44 · 44-60 · pop rbp 60-64 · at ret 64-76 · ret 76-80 · settled 80-94 · fade 94-100 */
+  @keyframes cpu-execution-stage {
+    0% { opacity: 0; }
+    3%, 95% { opacity: 1; }
+    99%, 100% { opacity: 0; }
+  }
+  @keyframes cpu-execution-rip {
+    0%, 18% { transform: translateY(32px); }
+    22%, 40% { transform: translateY(90px); }
+    44%, 60% { transform: translateY(126px); }
+    64%, 76% { transform: translateY(180px); }
+    80%, 100% { transform: translateY(50px); }
+  }
+  @keyframes cpu-execution-rip-stroke {
+    0%, 78% { stroke: var(--color-cyan); }
+    80%, 100% { stroke: var(--color-green); }
+  }
+  @keyframes cpu-execution-rip-fill {
+    0%, 78% { fill: var(--color-cyan); }
+    80%, 100% { fill: var(--color-green); }
+  }
+  @keyframes cpu-execution-rsp {
+    0%, 18% { transform: translateY(76px); }
+    22%, 40% { transform: translateY(102px); }
+    44%, 60% { transform: translateY(128px); }
+    64%, 76% { transform: translateY(102px); }
+    80%, 100% { transform: translateY(76px); }
+  }
+  @keyframes cpu-execution-rsp-label {
+    0%, 18% { transform: translate(-6px, -19px); }
+    22%, 76% { transform: translate(0, 0); }
+    80%, 100% { transform: translate(-6px, -19px); }
+  }
+  @keyframes cpu-execution-slot-ret {
+    0%, 18% { opacity: 0; }
+    21%, 77% { opacity: 1; }
+    80%, 100% { opacity: 0.4; }
+  }
+  @keyframes cpu-execution-ret {
+    0%, 40% { stroke: var(--color-amber); stroke-dasharray: none; }
+    43%, 60% { stroke: var(--color-line); stroke-dasharray: none; }
+    64%, 78% { stroke: var(--color-cyan); stroke-dasharray: none; }
+    80%, 100% { stroke: var(--color-line); stroke-dasharray: 4 3; }
+  }
+  @keyframes cpu-execution-slot-rbp {
+    0%, 40% { opacity: 0; }
+    43%, 60% { opacity: 1; }
+    63%, 100% { opacity: 0; }
+  }
+
+  @keyframes cpu-execution-r0 {
+    0%, 18% { opacity: 1; }
+    20%, 100% { opacity: 0; }
+  }
+  @keyframes cpu-execution-r1 {
+    0%, 19% { opacity: 0; }
+    21%, 40% { opacity: 1; }
+    42%, 100% { opacity: 0; }
+  }
+  @keyframes cpu-execution-r2 {
+    0%, 41% { opacity: 0; }
+    43%, 60% { opacity: 1; }
+    62%, 100% { opacity: 0; }
+  }
+  @keyframes cpu-execution-r3 {
+    0%, 61% { opacity: 0; }
+    63%, 76% { opacity: 1; }
+    78%, 100% { opacity: 0; }
+  }
+  @keyframes cpu-execution-r4 {
+    0%, 77% { opacity: 0; }
+    79%, 100% { opacity: 1; }
+  }
+</style>

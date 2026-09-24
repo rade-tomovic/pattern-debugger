@@ -1,0 +1,272 @@
+---
+import HeroFrame from '../HeroFrame.astro';
+
+/**
+ * Four-tuple demultiplexing on server 203.0.113.10:443, client 198.51.100.7 (the page's example table).
+ * Three connected sockets A, B, C and one listener 0.0.0.0:443 exist.
+ *   segment from :52377 arrives, key (TCP, 198.51.100.7, 52377, 203.0.113.10, 443) matches B exactly
+ *   segment from :41102 matches A exactly
+ *   SYN from :49265 matches no connected socket, falls through to the listener, which begins a handshake
+ *   the handshake completes, accept() returns a new connected socket D, the listener is unchanged
+ *   settled: one server port, four connections, told apart only by the client port
+ * Each readout appears when the diagram shows its result (the segment lands, or A, B, C have all
+ * flashed red) and holds until the next segment arrives.
+ * Timeline (percent of the loop): seg 1 2-21 (lands 9) · seg 2 21-36 (lands 25.5) · SYN 36-62
+ * (A, B, C miss 37.5-44.5, lands on the listener 49.5) · accept 62-80 · settled 80-94 · fade 94-100.
+ * Un-animated styles are the final frame (reduced motion).
+ */
+const client = '198.51.100.7';
+const server = '203.0.113.10:443';
+const segY = 44;
+const sockets = [
+  { tag: 'A', port: 41102, y: 96 },
+  { tag: 'B', port: 52377, y: 122 },
+  { tag: 'C', port: 33914, y: 148 },
+  { tag: 'D', port: 49265, y: 174 },
+];
+const listenerY = 208;
+const segments = [
+  { cls: 'seg1', port: 52377, kind: 'data', to: sockets[1].y },
+  { cls: 'seg2', port: 41102, kind: 'data', to: sockets[0].y },
+  { cls: 'seg3', port: 49265, kind: 'SYN', to: listenerY },
+];
+---
+
+<HeroFrame label="demux · TCP to port 443" caption="the kernel keys every segment on the four-tuple, so one listening port serves any number of connections, told apart by the client's port">
+  <div class="hero-ports-and-sockets">
+    <svg viewBox="0 0 360 222" role="img" aria-label="three segments arrive at port 443 and are matched to sockets by the full four-tuple; a SYN with no match goes to the listener and accept creates socket D">
+      <text class="hd" x="44" y="14">client</text>
+      <text class="hd" x="196" y="14">server</text>
+      <text class="hd end" x="344" y="14">kind</text>
+      <rect class="slot" x="8" y={segY - 11} width="344" height="22" rx="5" />
+      <text class="hd" x="18" y={segY}>arriving segment</text>
+      <text class="hd" x="16" y="72">sockets in the kernel</text>
+
+      {
+        sockets.map((s) => (
+          <g class={`sock sock-${s.tag.toLowerCase()}`}>
+            <rect class="box" x="8" y={s.y - 11} width="344" height="22" rx="5" />
+            <text class="tag" x="18" y={s.y}>{s.tag}</text>
+            <text x="44" y={s.y}>
+              {client}:<tspan class="port">{s.port}</tspan>
+            </text>
+            <text class="arrow" x="178" y={s.y}>→</text>
+            <text x="196" y={s.y}>{server}</text>
+            <text class="kind end" x="344" y={s.y}>conn</text>
+          </g>
+        ))
+      }
+      <g class="sock sock-l">
+        <rect class="box" x="8" y={listenerY - 11} width="344" height="22" rx="5" />
+        <text class="tag" x="18" y={listenerY}>L</text>
+        <text x="44" y={listenerY}>*</text>
+        <text class="arrow" x="178" y={listenerY}>→</text>
+        <text x="196" y={listenerY}>0.0.0.0:443</text>
+        <text class="kind end" x="344" y={listenerY}>listen</text>
+      </g>
+
+      {
+        segments.map((g) => (
+          <g class={`seg ${g.cls}`}>
+            <rect class="box seg-box" x="8" y={segY - 11} width="344" height="22" rx="5" />
+            <text class="tag" x="18" y={segY}>in</text>
+            <text x="44" y={segY}>
+              {client}:<tspan class="port">{g.port}</tspan>
+            </text>
+            <text class="arrow" x="178" y={segY}>→</text>
+            <text x="196" y={segY}>{server}</text>
+            <text class={g.kind === 'SYN' ? 'kind end syn' : 'kind end'} x="344" y={segY}>{g.kind}</text>
+          </g>
+        ))
+      }
+    </svg>
+    <div class="readout font-mono">
+      <span class="r r1">src :52377 · <b class="text-green">exact four-tuple match → socket B</b></span>
+      <span class="r r2">src :41102 · <b class="text-green">exact four-tuple match → socket A</b></span>
+      <span class="r r3">SYN from :49265 · <b class="text-red">no connected socket matches</b></span>
+      <span class="r r3b">listener 0.0.0.0:443 matches the local half · <b class="text-green">a SYN, so a handshake begins</b></span>
+      <span class="r r4">handshake done · <b class="text-amber">accept() returns new socket D</b>, the listener is unchanged</span>
+      <span class="r r5">one server port, four connections · <b class="text-green">the client port tells them apart</b></span>
+    </div>
+  </div>
+</HeroFrame>
+
+<style is:inline>
+  .hero-ports-and-sockets {
+    --t: 14s;
+    width: 100%;
+    max-width: 390px;
+    animation: ports-and-sockets-stage var(--t) linear infinite both;
+  }
+  .hero-ports-and-sockets svg {
+    display: block;
+    width: 100%;
+    height: auto;
+    overflow: visible;
+  }
+  .hero-ports-and-sockets text {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    fill: var(--color-ink);
+    dominant-baseline: central;
+  }
+  .hero-ports-and-sockets .hd {
+    fill: var(--color-muted);
+    font-size: 10px;
+  }
+  .hero-ports-and-sockets .end {
+    text-anchor: end;
+  }
+  .hero-ports-and-sockets .tag,
+  .hero-ports-and-sockets .arrow,
+  .hero-ports-and-sockets .kind {
+    fill: var(--color-muted);
+  }
+  .hero-ports-and-sockets .port {
+    fill: var(--color-cyan);
+  }
+  .hero-ports-and-sockets .syn {
+    fill: var(--color-ink);
+  }
+  .hero-ports-and-sockets .box {
+    fill: var(--color-panel2);
+    stroke: var(--color-line);
+    stroke-width: 1.5;
+  }
+  .hero-ports-and-sockets .slot {
+    fill: none;
+    stroke: var(--color-line);
+    stroke-dasharray: 3 3;
+  }
+  .hero-ports-and-sockets .seg-box {
+    fill: var(--color-panel);
+    stroke: var(--color-muted);
+    stroke-dasharray: 4 3;
+  }
+  .hero-ports-and-sockets .seg {
+    opacity: 0;
+  }
+
+  .hero-ports-and-sockets .seg1 { animation: ports-and-sockets-seg1 var(--t) ease-in-out infinite both; }
+  .hero-ports-and-sockets .seg2 { animation: ports-and-sockets-seg2 var(--t) ease-in-out infinite both; }
+  .hero-ports-and-sockets .seg3 { animation: ports-and-sockets-seg3 var(--t) ease-in-out infinite both; }
+  .hero-ports-and-sockets .sock-a .box { animation: ports-and-sockets-box-a var(--t) linear infinite both; }
+  .hero-ports-and-sockets .sock-b .box { animation: ports-and-sockets-box-b var(--t) linear infinite both; }
+  .hero-ports-and-sockets .sock-c .box { animation: ports-and-sockets-box-c var(--t) linear infinite both; }
+  .hero-ports-and-sockets .sock-l .box { animation: ports-and-sockets-box-l var(--t) linear infinite both; }
+  .hero-ports-and-sockets .sock-d { animation: ports-and-sockets-sock-d var(--t) ease-out infinite both; }
+  .hero-ports-and-sockets .sock-d .box { animation: ports-and-sockets-box-d var(--t) linear infinite both; }
+
+  .hero-ports-and-sockets .readout {
+    display: grid;
+    margin-top: 12px;
+    font-size: 0.76rem;
+    text-align: center;
+  }
+  .hero-ports-and-sockets .readout b {
+    font-weight: 600;
+  }
+  .hero-ports-and-sockets .r {
+    grid-area: 1 / 1;
+    opacity: 0;
+  }
+  .hero-ports-and-sockets .r5 { opacity: 1; }
+  .hero-ports-and-sockets .r1 { animation: ports-and-sockets-r1 var(--t) linear infinite both; }
+  .hero-ports-and-sockets .r2 { animation: ports-and-sockets-r2 var(--t) linear infinite both; }
+  .hero-ports-and-sockets .r3 { animation: ports-and-sockets-r3 var(--t) linear infinite both; }
+  .hero-ports-and-sockets .r3b { animation: ports-and-sockets-r3b var(--t) linear infinite both; }
+  .hero-ports-and-sockets .r4 { animation: ports-and-sockets-r4 var(--t) linear infinite both; }
+  .hero-ports-and-sockets .r5 { animation: ports-and-sockets-r5 var(--t) linear infinite both; }
+
+  @media (max-width: 420px) {
+    .hero-ports-and-sockets .readout {
+      font-size: 0.68rem;
+    }
+  }
+
+  @keyframes ports-and-sockets-stage {
+    0% { opacity: 0; }
+    3%, 95% { opacity: 1; }
+    99%, 100% { opacity: 0; }
+  }
+  @keyframes ports-and-sockets-seg1 {
+    0%, 2% { opacity: 0; transform: translateY(0); }
+    3.5%, 5% { opacity: 1; transform: translateY(0); }
+    9% { opacity: 1; transform: translateY(78px); }
+    11%, 100% { opacity: 0; transform: translateY(78px); }
+  }
+  @keyframes ports-and-sockets-seg2 {
+    0%, 21% { opacity: 0; transform: translateY(0); }
+    22%, 22.5% { opacity: 1; transform: translateY(0); }
+    25.5% { opacity: 1; transform: translateY(52px); }
+    27.5%, 100% { opacity: 0; transform: translateY(52px); }
+  }
+  @keyframes ports-and-sockets-seg3 {
+    0%, 36% { opacity: 0; transform: translateY(0); }
+    37.5%, 44.5% { opacity: 1; transform: translateY(0); }
+    49.5% { opacity: 1; transform: translateY(164px); }
+    51.5%, 100% { opacity: 0; transform: translateY(164px); }
+  }
+  @keyframes ports-and-sockets-box-b {
+    0%, 8.5% { stroke: var(--color-line); fill: var(--color-panel2); }
+    9%, 20.5% { stroke: var(--color-green); fill: var(--color-green-dim); }
+    21%, 38% { stroke: var(--color-line); fill: var(--color-panel2); }
+    38.5%, 44% { stroke: var(--color-red); fill: var(--color-panel2); }
+    44.5%, 100% { stroke: var(--color-line); fill: var(--color-panel2); }
+  }
+  @keyframes ports-and-sockets-box-a {
+    0%, 25% { stroke: var(--color-line); fill: var(--color-panel2); }
+    25.5%, 35.5% { stroke: var(--color-green); fill: var(--color-green-dim); }
+    36%, 37% { stroke: var(--color-line); fill: var(--color-panel2); }
+    37.5%, 44% { stroke: var(--color-red); fill: var(--color-panel2); }
+    44.5%, 100% { stroke: var(--color-line); fill: var(--color-panel2); }
+  }
+  @keyframes ports-and-sockets-box-c {
+    0%, 39% { stroke: var(--color-line); }
+    39.5%, 44% { stroke: var(--color-red); }
+    44.5%, 100% { stroke: var(--color-line); }
+  }
+  @keyframes ports-and-sockets-box-l {
+    0%, 49% { stroke: var(--color-line); fill: var(--color-panel2); }
+    49.5%, 62% { stroke: var(--color-green); fill: var(--color-green-dim); }
+    63%, 100% { stroke: var(--color-line); fill: var(--color-panel2); }
+  }
+  @keyframes ports-and-sockets-sock-d {
+    0%, 62.5% { opacity: 0; transform: translateY(20px); }
+    67.5%, 100% { opacity: 1; transform: translateY(0); }
+  }
+  @keyframes ports-and-sockets-box-d {
+    0%, 79% { stroke: var(--color-amber); }
+    81%, 100% { stroke: var(--color-line); }
+  }
+
+  @keyframes ports-and-sockets-r1 {
+    0%, 9% { opacity: 0; }
+    10%, 20% { opacity: 1; }
+    21%, 100% { opacity: 0; }
+  }
+  @keyframes ports-and-sockets-r2 {
+    0%, 25.5% { opacity: 0; }
+    26.5%, 35.5% { opacity: 1; }
+    36.5%, 100% { opacity: 0; }
+  }
+  @keyframes ports-and-sockets-r3 {
+    0%, 40% { opacity: 0; }
+    41%, 49.5% { opacity: 1; }
+    50.5%, 100% { opacity: 0; }
+  }
+  @keyframes ports-and-sockets-r3b {
+    0%, 50.5% { opacity: 0; }
+    51.5%, 61.5% { opacity: 1; }
+    62.5%, 100% { opacity: 0; }
+  }
+  @keyframes ports-and-sockets-r4 {
+    0%, 62.5% { opacity: 0; }
+    63.5%, 79.5% { opacity: 1; }
+    80.5%, 100% { opacity: 0; }
+  }
+  @keyframes ports-and-sockets-r5 {
+    0%, 80.5% { opacity: 0; }
+    81.5%, 100% { opacity: 1; }
+  }
+</style>

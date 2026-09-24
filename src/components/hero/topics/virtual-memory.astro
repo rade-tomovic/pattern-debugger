@@ -1,0 +1,258 @@
+---
+import HeroFrame from '../HeroFrame.astro';
+
+/**
+ * Demand paging on the first four pages of a fresh new byte[256 MiB], the page's mental-model table:
+ *   new byte[256 MiB]: the kernel notes a range, every page-table entry is not present · 0 faults, nothing resident
+ *   read page 0: fault, the entry is pointed at the shared zero page · still nothing resident
+ *   write page 1: fault, the entry is pointed at a fresh frame · 4 KiB resident
+ *   write page 1 again: the entry already exists · 0 faults, same page
+ * Un-animated styles are the final frame (reduced motion).
+ *
+ * timeline: fresh 0-20 · read 22-44 · write 46-68 · write again 70-94 · fade 94-100
+ */
+const rowY = [40, 70, 100, 130];
+---
+
+<HeroFrame label="new byte[256 MiB] · first touch" caption="address space is free, physical pages are not: a read maps the shared zero page, only a write gets a real frame">
+  <div class="hero-virtual-memory">
+    <svg viewBox="0 0 340 176" role="img" aria-label="four pages of a fresh array: a read maps page 0 to the shared zero page, a write maps page 1 to a fresh frame, a second write faults nothing">
+      <text class="hd" x="10" y="14">virtual pages</text>
+      <text class="hd" x="126" y="14">page table</text>
+      <text class="hd" x="238" y="14">physical RAM</text>
+
+      {
+        rowY.map((y, i) => (
+          <>
+            <rect class:list={['vp', `vp${i}`]} x="10" y={y - 11} width="92" height="22" rx="5" />
+            <text class="lbl" x="18" y={y}>page {i}</text>
+            <rect class:list={['pte', `e${i}`]} x="126" y={y - 11} width="84" height="22" rx="5" />
+          </>
+        ))
+      }
+      <text class="tag read t-read" x="96" y={rowY[0]}>read</text>
+      <text class="tag write t-write" x="96" y={rowY[1]}>write</text>
+
+      <text class="absent e0-absent" x="168" y={rowY[0]}>not present</text>
+      <text class="mapped e0-zero" x="168" y={rowY[0]}>→ zero page</text>
+      <text class="absent e1-absent" x="168" y={rowY[1]}>not present</text>
+      <text class="mapped e1-frame" x="168" y={rowY[1]}>→ frame</text>
+      <text class="absent" x="168" y={rowY[2]}>not present</text>
+      <text class="absent" x="168" y={rowY[3]}>not present</text>
+      <text class="more" x="10" y="158">⋯ 65,532 more pages</text>
+
+      <rect class="zero" x="238" y={rowY[0] - 15} width="100" height="30" rx="5" />
+      <text class="oname" x="288" y={rowY[0] - 6}>zero page</text>
+      <text class="note" x="288" y={rowY[0] + 7}>shared, read-only</text>
+
+      <g class="arrow a0">
+        <line x1="210" y1={rowY[0]} x2="232" y2={rowY[0]} />
+        <polygon points={`238,${rowY[0]} 231,${rowY[0] - 4} 231,${rowY[0] + 4}`} />
+      </g>
+      <g class="arrow a1">
+        <line x1="210" y1={rowY[1]} x2="232" y2={rowY[1]} />
+        <polygon points={`238,${rowY[1]} 231,${rowY[1] - 4} 231,${rowY[1] + 4}`} />
+      </g>
+
+      <g class="frame-g">
+        <rect class="frame" x="238" y={rowY[1] - 11} width="100" height="22" rx="5" />
+        <text class="oname" x="288" y={rowY[1]}>frame · 4 KiB</text>
+      </g>
+    </svg>
+    <div class="readout font-mono">
+      <span class="r r0">new byte[256 MiB]: range noted · <b class="text-ink">0 faults, 0 KiB</b></span>
+      <span class="r r1">read page 0: fault → zero page · <b class="text-cyan">0 KiB resident</b></span>
+      <span class="r r2">write page 1: fault → fresh frame · <b class="text-amber">4 KiB resident</b></span>
+      <span class="r r3">write page 1 again: entry exists · <b class="text-green">0 faults, same page</b></span>
+    </div>
+  </div>
+</HeroFrame>
+
+<style is:inline>
+  .hero-virtual-memory {
+    --t: 13s;
+    width: 100%;
+    max-width: 400px;
+    animation: virtual-memory-stage var(--t) linear infinite both;
+  }
+  .hero-virtual-memory svg {
+    display: block;
+    width: 100%;
+    height: auto;
+    overflow: visible;
+  }
+  .hero-virtual-memory text {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    fill: var(--color-ink);
+    dominant-baseline: central;
+  }
+  .hero-virtual-memory .hd {
+    fill: var(--color-muted);
+    font-size: 10px;
+  }
+  .hero-virtual-memory .lbl {
+    fill: var(--color-ink);
+  }
+  .hero-virtual-memory .tag {
+    font-size: 9px;
+    text-anchor: end;
+  }
+  .hero-virtual-memory .tag.read {
+    fill: var(--color-cyan);
+  }
+  .hero-virtual-memory .tag.write {
+    fill: var(--color-amber);
+  }
+  .hero-virtual-memory .absent,
+  .hero-virtual-memory .mapped {
+    text-anchor: middle;
+    font-size: 10px;
+  }
+  .hero-virtual-memory .absent {
+    fill: var(--color-muted);
+  }
+  .hero-virtual-memory .more,
+  .hero-virtual-memory .note {
+    fill: var(--color-muted);
+    font-size: 9px;
+  }
+  .hero-virtual-memory .note,
+  .hero-virtual-memory .oname {
+    text-anchor: middle;
+  }
+  .hero-virtual-memory .oname {
+    font-size: 10px;
+  }
+  .hero-virtual-memory .vp,
+  .hero-virtual-memory .pte,
+  .hero-virtual-memory .zero,
+  .hero-virtual-memory .frame {
+    fill: var(--color-panel2);
+    stroke: var(--color-line);
+    stroke-width: 1.5;
+  }
+  .hero-virtual-memory .zero {
+    stroke-dasharray: 4 3;
+  }
+  .hero-virtual-memory .arrow line {
+    stroke: var(--color-muted);
+    stroke-width: 1.5;
+  }
+  .hero-virtual-memory .arrow polygon {
+    fill: var(--color-muted);
+  }
+
+  .hero-virtual-memory .vp1 {
+    stroke: var(--color-amber);
+  }
+  .hero-virtual-memory .e1,
+  .hero-virtual-memory .frame {
+    stroke: var(--color-green);
+  }
+  .hero-virtual-memory .frame {
+    fill: var(--color-green-dim);
+  }
+  .hero-virtual-memory .e0-absent,
+  .hero-virtual-memory .e1-absent {
+    opacity: 0;
+  }
+
+  .hero-virtual-memory .vp0 { animation: virtual-memory-vp0 var(--t) linear infinite both; }
+  .hero-virtual-memory .vp1 { animation: virtual-memory-vp1 var(--t) linear infinite both; }
+  .hero-virtual-memory .e0 { animation: virtual-memory-e0 var(--t) linear infinite both; }
+  .hero-virtual-memory .e1 { animation: virtual-memory-e1 var(--t) linear infinite both; }
+  .hero-virtual-memory .t-read,
+  .hero-virtual-memory .e0-zero,
+  .hero-virtual-memory .a0 { animation: virtual-memory-in-read var(--t) linear infinite both; }
+  .hero-virtual-memory .e0-absent { animation: virtual-memory-out-read var(--t) linear infinite both; }
+  .hero-virtual-memory .t-write,
+  .hero-virtual-memory .e1-frame,
+  .hero-virtual-memory .a1,
+  .hero-virtual-memory .frame-g { animation: virtual-memory-in-write var(--t) linear infinite both; }
+  .hero-virtual-memory .e1-absent { animation: virtual-memory-out-write var(--t) linear infinite both; }
+  .hero-virtual-memory .frame { animation: virtual-memory-frame var(--t) linear infinite both; }
+
+  .hero-virtual-memory .readout {
+    display: grid;
+    margin-top: 10px;
+    font-size: 0.76rem;
+    text-align: center;
+  }
+  .hero-virtual-memory .readout b {
+    font-weight: 600;
+  }
+  .hero-virtual-memory .r {
+    grid-area: 1 / 1;
+    opacity: 0;
+  }
+  .hero-virtual-memory .r3 { opacity: 1; }
+  .hero-virtual-memory .r0 { animation: virtual-memory-r0 var(--t) linear infinite both; }
+  .hero-virtual-memory .r1 { animation: virtual-memory-r1 var(--t) linear infinite both; }
+  .hero-virtual-memory .r2 { animation: virtual-memory-r2 var(--t) linear infinite both; }
+  .hero-virtual-memory .r3 { animation: virtual-memory-r3 var(--t) linear infinite both; }
+
+  @keyframes virtual-memory-stage {
+    0% { opacity: 0; }
+    3%, 95% { opacity: 1; }
+    99%, 100% { opacity: 0; }
+  }
+  @keyframes virtual-memory-vp0 {
+    0%, 20% { stroke: var(--color-line); }
+    22%, 44% { stroke: var(--color-cyan); }
+    46%, 100% { stroke: var(--color-line); }
+  }
+  @keyframes virtual-memory-vp1 {
+    0%, 44% { stroke: var(--color-line); }
+    46%, 100% { stroke: var(--color-amber); }
+  }
+  @keyframes virtual-memory-e0 {
+    0%, 20% { stroke: var(--color-line); }
+    22%, 44% { stroke: var(--color-cyan); }
+    46%, 100% { stroke: var(--color-line); }
+  }
+  @keyframes virtual-memory-e1 {
+    0%, 44% { stroke: var(--color-line); }
+    46%, 68% { stroke: var(--color-amber); }
+    70%, 100% { stroke: var(--color-green); }
+  }
+  @keyframes virtual-memory-in-read {
+    0%, 20% { opacity: 0; }
+    22%, 100% { opacity: 1; }
+  }
+  @keyframes virtual-memory-out-read {
+    0%, 20% { opacity: 1; }
+    22%, 100% { opacity: 0; }
+  }
+  @keyframes virtual-memory-in-write {
+    0%, 44% { opacity: 0; }
+    46%, 100% { opacity: 1; }
+  }
+  @keyframes virtual-memory-out-write {
+    0%, 44% { opacity: 1; }
+    46%, 100% { opacity: 0; }
+  }
+  @keyframes virtual-memory-frame {
+    0%, 68% { stroke: var(--color-amber); fill: var(--color-panel2); }
+    70%, 100% { stroke: var(--color-green); fill: var(--color-green-dim); }
+  }
+
+  @keyframes virtual-memory-r0 {
+    0%, 20% { opacity: 1; }
+    22%, 100% { opacity: 0; }
+  }
+  @keyframes virtual-memory-r1 {
+    0%, 21% { opacity: 0; }
+    23%, 43% { opacity: 1; }
+    45%, 100% { opacity: 0; }
+  }
+  @keyframes virtual-memory-r2 {
+    0%, 45% { opacity: 0; }
+    47%, 67% { opacity: 1; }
+    69%, 100% { opacity: 0; }
+  }
+  @keyframes virtual-memory-r3 {
+    0%, 69% { opacity: 0; }
+    71%, 100% { opacity: 1; }
+  }
+</style>

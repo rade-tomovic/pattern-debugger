@@ -1,0 +1,224 @@
+---
+import HeroFrame from '../HeroFrame.astro';
+
+/**
+ * One byte, 0xFF, and the readers that give it meaning. Every number below is computed here
+ * from the bits, so the picture cannot drift from the arithmetic:
+ *   read as byte:  top bit worth +128, 128 + 64 + ... + 1 = 255
+ *   read as sbyte: top bit worth −128, −128 + 64 + ... + 1 = −1
+ *   add 0x01: every column carries, the carry out of bit 7 is dropped, result 0x00,
+ *     which is 255 + 1 wrapping to 0 and −1 + 1 = 0 at once: one adder handles both
+ *   final: the same 8 bits, two readings side by side
+ * Frames crossfade with one shared keyframe and negative delays. Un-animated styles show the
+ * final frame (reduced motion).
+ */
+const width = 8;
+const value = 0xff;
+const one = 0x01;
+const bits = (x: number) => x.toString(2).padStart(width, '0').split('');
+const unsignedWeight = (c: number) => 2 ** (width - 1 - c);
+const signedWeight = (c: number) => (c === 0 ? -(2 ** (width - 1)) : unsignedWeight(c));
+const readAs = (x: number, weight: (c: number) => number) =>
+  bits(x).reduce((sum, b, c) => sum + (b === '1' ? weight(c) : 0), 0);
+const asByte = readAs(value, unsignedWeight);
+const asSbyte = readAs(value, signedWeight);
+const rawSum = value + one;
+const carryOut = rawSum >> width;
+const wrapped = rawSum & (2 ** width - 1);
+const fmt = (n: number) => (n < 0 ? `−${-n}` : `${n}`);
+const hex = (x: number) => `0x${x.toString(16).toUpperCase().padStart(2, '0')}`;
+const cols = [...Array(width).keys()];
+
+const frames = 4;
+const delay = (k: number) => `animation-delay: calc(var(--t) * ${(k / frames - 1).toFixed(4)})`;
+---
+
+<HeroFrame label={`${hex(value)} · byte vs sbyte`} caption="memory holds bits, not types: the load decides whether the top bit is worth +128 or −128, and one adder serves both">
+  <div class="hero-bits-and-memory font-mono" style={`--frames: ${frames}`}>
+    <div class="layers">
+      <div class="layer" style={delay(0)}>
+        <div class="row">
+          <span class="lbl">bits</span>
+          {bits(value).map((b, c) => <span class:list={['bit', b === '1' ? 'one' : 'zero', c === 0 && 'top']}>{b}</span>)}
+        </div>
+        <div class="row">
+          <span class="lbl">as byte</span>
+          {cols.map((c) => <span class:list={['w', c === 0 && 'top']}>{fmt(unsignedWeight(c))}</span>)}
+        </div>
+        <p class="note">
+          top bit +{unsignedWeight(0)} · <b class="text-cyan nw">read as byte = {fmt(asByte)}</b>
+        </p>
+      </div>
+
+      <div class="layer" style={delay(1)}>
+        <div class="row">
+          <span class="lbl">bits</span>
+          {bits(value).map((b, c) => <span class:list={['bit', b === '1' ? 'one' : 'zero', c === 0 && 'top']}>{b}</span>)}
+        </div>
+        <div class="row">
+          <span class="lbl">as sbyte</span>
+          {cols.map((c) => <span class:list={['w', c === 0 && 'top']}>{fmt(signedWeight(c))}</span>)}
+        </div>
+        <p class="note">
+          same bits, top bit {fmt(signedWeight(0))} · <b class="text-cyan nw">read as sbyte = {fmt(asSbyte)}</b>
+        </p>
+      </div>
+
+      <div class="layer" style={delay(2)}>
+        <div class="row">
+          <span class="lbl">{hex(value)}</span>
+          {bits(value).map((b) => <span class:list={['bit', b === '1' ? 'one' : 'zero']}>{b}</span>)}
+        </div>
+        <div class="row">
+          <span class="lbl">+ {hex(one)}</span>
+          {bits(one).map((b) => <span class:list={['bit', b === '1' ? 'one' : 'zero']}>{b}</span>)}
+        </div>
+        <div class="row">
+          <span class="lbl"><span class="carry">{carryOut}</span> {hex(wrapped)}</span>
+          {bits(wrapped).map((b) => <span class:list={['bit', 'sum', b === '1' ? 'one' : 'zero']}>{b}</span>)}
+        </div>
+        <p class="note">
+          carry out of bit 7 dropped · <b class="text-green"><span class="nw">{fmt(asByte)} + 1 = {wrapped}</span> and <span class="nw">{fmt(asSbyte)} + 1 = {wrapped}</span></b>
+        </p>
+      </div>
+
+      <div class="layer final" style={delay(3)}>
+        <div class="row">
+          <span class="lbl">bits</span>
+          {bits(value).map((b, c) => <span class:list={['bit', b === '1' ? 'one' : 'zero', c === 0 && 'top']}>{b}</span>)}
+        </div>
+        <div class="reads">
+          <span>byte load → <b class="text-cyan">{fmt(asByte)}</b></span>
+          <span>sbyte load → <b class="text-cyan">{fmt(asSbyte)}</b></span>
+        </div>
+        <p class="note">
+          one flat array of bytes · <b class="text-green">the bits never changed, the reader did</b>
+        </p>
+      </div>
+    </div>
+  </div>
+</HeroFrame>
+
+<style is:inline>
+  .hero-bits-and-memory {
+    --t: calc(var(--frames) * 3s);
+    --bit: 28px;
+    --lbl: 72px;
+    font-size: 0.8rem;
+  }
+  .hero-bits-and-memory .layers {
+    display: grid;
+  }
+  .hero-bits-and-memory .layer {
+    grid-area: 1 / 1;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    gap: 6px;
+    opacity: 0;
+    animation: bits-and-memory-frame var(--t) linear infinite both;
+  }
+  .hero-bits-and-memory .layer.final {
+    opacity: 1;
+  }
+  .hero-bits-and-memory .row {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 3px;
+  }
+  .hero-bits-and-memory .lbl {
+    width: var(--lbl);
+    color: var(--color-muted);
+    font-size: 0.72rem;
+    text-align: right;
+    padding-right: 8px;
+    white-space: nowrap;
+  }
+  .hero-bits-and-memory .bit {
+    width: var(--bit);
+    height: var(--bit);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border: 1px solid var(--color-line);
+    border-radius: 5px;
+    background: var(--color-panel2);
+  }
+  .hero-bits-and-memory .bit.zero {
+    color: var(--color-muted);
+  }
+  .hero-bits-and-memory .bit.top {
+    border-color: var(--color-cyan);
+  }
+  .hero-bits-and-memory .bit.sum {
+    border-color: var(--color-green);
+    background: var(--color-green-dim);
+  }
+  .hero-bits-and-memory .w {
+    width: var(--bit);
+    text-align: center;
+    color: var(--color-muted);
+    font-size: 0.64rem;
+    letter-spacing: -0.02em;
+    white-space: nowrap;
+  }
+  .hero-bits-and-memory .w.top {
+    color: var(--color-cyan);
+    font-weight: 600;
+  }
+  .hero-bits-and-memory .carry {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 20px;
+    height: 20px;
+    border: 1px dashed var(--color-red);
+    border-radius: 5px;
+    background: var(--color-red-dim);
+    color: var(--color-red);
+    text-decoration: line-through;
+  }
+  .hero-bits-and-memory .reads {
+    display: flex;
+    justify-content: center;
+    gap: 18px;
+    margin-top: 4px;
+    padding-left: var(--lbl);
+    color: var(--color-muted);
+    font-size: 0.75rem;
+  }
+  .hero-bits-and-memory .note {
+    margin: 6px 0 0;
+    padding-left: var(--lbl);
+    color: var(--color-muted);
+    font-size: 0.75rem;
+    text-align: center;
+  }
+  .hero-bits-and-memory b {
+    font-weight: 600;
+  }
+  .hero-bits-and-memory .nw {
+    white-space: nowrap;
+  }
+
+  @keyframes bits-and-memory-frame {
+    0% { opacity: 0; }
+    3%, 22% { opacity: 1; }
+    25%, 100% { opacity: 0; }
+  }
+
+  @media (max-width: 420px) {
+    .hero-bits-and-memory {
+      --bit: 25px;
+      --lbl: 58px;
+    }
+    .hero-bits-and-memory .lbl {
+      font-size: 0.64rem;
+      padding-right: 6px;
+    }
+    .hero-bits-and-memory .w {
+      font-size: 0.58rem;
+    }
+  }
+</style>

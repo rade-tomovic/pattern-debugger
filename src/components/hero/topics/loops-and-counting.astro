@@ -1,0 +1,237 @@
+---
+import HeroFrame from '../HeroFrame.astro';
+
+/**
+ * The `L = mid` infinite loop on a = [3, 4], branch `a[mid] < 5 → L = mid`. Frames are computed
+ * at build time by running both loops; the note text is built from the branch actually taken:
+ *   floor mid, iterations 1 to 3: L = 0, R = 1, mid = (0 + 1) / 2 = 0, a[0] = 3 < 5 → L = 0,
+ *     the state never changes (capped at 3 iterations, the real loop never exits)
+ *   ceil mid, iteration 1: mid = (0 + 1 + 1) / 2 = 1, a[1] = 4 < 5 → L = 1
+ *   L == R == 1, `L < R` is false, the loop exits
+ * One frame per iteration plus the exit frame, crossfaded; the ceil iteration and the exit
+ * frame each hold for two slots. Un-animated styles show the exit frame (reduced motion).
+ */
+const a = [3, 4];
+const cap = 3;
+
+type Step = { floor: boolean; iter: number; L: number; R: number; mid: number; nL: number; nR: number };
+const run = (floor: boolean, limit: number) => {
+  const steps: Step[] = [];
+  let L = 0;
+  let R = a.length - 1;
+  while (L < R && steps.length < limit) {
+    const mid = floor ? Math.floor((L + R) / 2) : Math.floor((L + R + 1) / 2);
+    const nL = a[mid] < 5 ? mid : L;
+    const nR = a[mid] < 5 ? R : floor ? mid : mid - 1;
+    steps.push({ floor, iter: steps.length + 1, L, R, mid, nL, nR });
+    L = nL;
+    R = nR;
+  }
+  return { steps, L, R };
+};
+const buggy = run(true, cap);
+const fixed = run(false, Infinity);
+
+const slotsOf = (s: Step) => (s.floor ? 1 : 2);
+const slotAt = (k: number) => steps.slice(0, k).reduce((sum, s) => sum + slotsOf(s), 0);
+const delay = (k: number) => `animation-delay: calc(var(--t) * ${(slotAt(k) / slots - 1).toFixed(4)})`;
+const formula = (s: Step) =>
+  s.floor ? `mid = (L + R) / 2 = (${s.L} + ${s.R}) / 2 = ${s.mid}` : `mid = (L + R + 1) / 2 = (${s.L} + ${s.R} + 1) / 2 = ${s.mid}`;
+const badges = (L: number, R: number, mid: number | null, i: number) =>
+  [
+    L === i && { t: 'L', c: 'amber' },
+    mid === i && { t: 'mid', c: 'purple' },
+    R === i && { t: 'R', c: 'cyan' },
+  ].filter((b): b is { t: string; c: string } => Boolean(b));
+const steps = [...buggy.steps, ...fixed.steps];
+const slots = slotAt(steps.length) + 2;
+const branch = (s: Step) =>
+  a[s.mid] < 5 ? `a[${s.mid}] = ${a[s.mid]} < 5 → L = mid = ${s.nL}` : `a[${s.mid}] = ${a[s.mid]} ≥ 5 → R = ${s.nR}`;
+---
+
+<HeroFrame label="while (L < R) · a = [3, 4]" caption="a branch that writes L = mid needs ceil-mid, or it can stall exactly when R == L + 1">
+  <div class="hero-loops-and-counting font-mono" style={`--slots: ${slots}`}>
+    <div class="layers">
+      {
+        steps.map((s, k) => (
+          <div class:list={['layer', !s.floor && 'held']} style={delay(k)}>
+            <p class="head">
+              <span class:list={[s.floor ? 'text-red' : 'text-green']}>{s.floor ? 'floor mid' : 'ceil mid'}</span> · iter {s.iter} · L = {s.L}, R ={' '}
+              {s.R}
+            </p>
+            <p class="code">{formula(s)}</p>
+            <div class="cells">
+              {a.map((v, i) => (
+                <div class="col">
+                  <div class="badges">
+                    {badges(s.L, s.R, s.mid, i).map((b) => (
+                      <span class={`badge ${b.c}`}>{b.t}</span>
+                    ))}
+                  </div>
+                  <div class:list={['cell', i === s.mid && 'mid']}>{v}</div>
+                  <div class="idx">{i}</div>
+                </div>
+              ))}
+            </div>
+            <p class="note">
+              {branch(s)} ·{' '}
+              {s.nL === s.L && s.nR === s.R ? (
+                <b class="text-red">{s.iter === cap ? 'same state, never exits' : 'L did not move'}</b>
+              ) : s.nL !== s.L ? (
+                <b class="text-amber">L moved to {s.nL}</b>
+              ) : (
+                <b class="text-cyan">R moved to {s.nR}</b>
+              )}
+            </p>
+          </div>
+        ))
+      }
+      <div class="layer final" style={delay(steps.length)}>
+        <p class="head">
+          <span class="text-green">ceil mid</span> · after iter {fixed.steps.length} · L = {fixed.L}, R = {fixed.R}
+        </p>
+        <p class="code">L == R → while (L &lt; R) is false</p>
+        <div class="cells">
+          {
+            a.map((v, i) => (
+              <div class="col">
+                <div class="badges">
+                  {badges(fixed.L, fixed.R, null, i).map((b) => (
+                    <span class={`badge ${b.c}`}>{b.t}</span>
+                  ))}
+                </div>
+                <div class:list={['cell', i === fixed.L && 'done']}>{v}</div>
+                <div class="idx">{i}</div>
+              </div>
+            ))
+          }
+        </div>
+        <p class="note">
+          floor mid stalls at L = 0 · <b class="text-green">ceil mid exits after {fixed.steps.length} iteration</b>
+        </p>
+      </div>
+    </div>
+  </div>
+</HeroFrame>
+
+<style is:inline>
+  .hero-loops-and-counting {
+    --t: calc(var(--slots) * 2s);
+    width: 100%;
+    max-width: 400px;
+    font-size: 0.78rem;
+  }
+  .hero-loops-and-counting .layers {
+    display: grid;
+  }
+  .hero-loops-and-counting .layer {
+    grid-area: 1 / 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
+    opacity: 0;
+    animation: loops-and-counting-frame var(--t) linear infinite both;
+  }
+  .hero-loops-and-counting .layer.held,
+  .hero-loops-and-counting .layer.final {
+    animation-name: loops-and-counting-held;
+  }
+  .hero-loops-and-counting .layer.final {
+    opacity: 1;
+  }
+  .hero-loops-and-counting p {
+    margin: 0;
+    text-align: center;
+  }
+  .hero-loops-and-counting .head {
+    color: var(--color-muted);
+    font-size: 0.72rem;
+  }
+  .hero-loops-and-counting .code {
+    color: var(--color-ink);
+    background: var(--color-code);
+    border: 1px solid var(--color-line);
+    border-radius: 6px;
+    padding: 3px 10px;
+    white-space: nowrap;
+  }
+  .hero-loops-and-counting .cells {
+    display: flex;
+    gap: 8px;
+  }
+  .hero-loops-and-counting .col {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 4px;
+  }
+  .hero-loops-and-counting .badges {
+    display: flex;
+    gap: 3px;
+    height: 18px;
+  }
+  .hero-loops-and-counting .badge {
+    font-size: 0.72rem;
+    font-weight: 700;
+    line-height: 18px;
+    padding: 0 5px;
+    border-radius: 4px;
+    color: var(--color-bg);
+  }
+  .hero-loops-and-counting .badge.amber {
+    background: var(--color-amber);
+  }
+  .hero-loops-and-counting .badge.cyan {
+    background: var(--color-cyan);
+  }
+  .hero-loops-and-counting .badge.purple {
+    background: var(--color-purple);
+  }
+  .hero-loops-and-counting .cell {
+    width: 44px;
+    height: 44px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 0.95rem;
+    color: var(--color-ink);
+    background: var(--color-panel2);
+    border: 1px solid var(--color-line);
+    border-radius: 8px;
+  }
+  .hero-loops-and-counting .cell.mid {
+    background: var(--color-purple-dim);
+    border-color: var(--color-purple);
+  }
+  .hero-loops-and-counting .cell.done {
+    background: var(--color-green-dim);
+    border-color: var(--color-green);
+  }
+  .hero-loops-and-counting .idx {
+    color: var(--color-muted);
+    font-size: 0.65rem;
+  }
+  .hero-loops-and-counting b {
+    font-weight: 600;
+    white-space: nowrap;
+  }
+
+  @media (max-width: 420px) {
+    .hero-loops-and-counting .code {
+      font-size: 0.66rem;
+      padding: 3px 6px;
+    }
+  }
+
+  @keyframes loops-and-counting-frame {
+    0% { opacity: 0; }
+    1.7%, 13% { opacity: 1; }
+    14.2%, 100% { opacity: 0; }
+  }
+  @keyframes loops-and-counting-held {
+    0% { opacity: 0; }
+    1.7%, 27.2% { opacity: 1; }
+    28.5%, 100% { opacity: 0; }
+  }
+</style>

@@ -1,0 +1,281 @@
+---
+import HeroFrame from '../HeroFrame.astro';
+
+/**
+ * Row walk vs column walk over an int[4096, 4096], 16 reads each, run in lockstep.
+ * Each strip below is the first 64-byte line of one row (16 ints); rows 0-15 are shown.
+ *   row walk    a[0, 0..15]: next int is +4 B, the first read fetches line 0, the other 15 reads hit it
+ *   column walk a[0..15, 0]: next int is +16 KB, every read fetches a new line and uses 1 int of its 16
+ * Frames are computed at build time by running both walks: address = (r × 4096 + c) × 4, line = address / 64,
+ * a read fetches when its line has not been fetched yet. Result: row 1 line, column 16 lines.
+ * Un-animated styles are the final frame (reduced motion).
+ *
+ * A fetched line's unread ints turn red once the walk moves past that line without reading them.
+ * timeline: fade in 0-3 · step k at 8 + 4.2k (k = 0..15, ends 71) · both totals 77-95 · fade 95-100
+ */
+const WIDTH = 4096;
+const INT = 4;
+const LINE = 64;
+const PER_LINE = LINE / INT;
+const READS = 16;
+const SHOWN_ROWS = 16;
+
+const at = (k: number) => 8 + k * 4.2;
+const pct = (x: number) => `${Math.min(100, x).toFixed(1)}%`;
+const walkEnd = at(READS - 1) + 4;
+
+type Read = { k: number; r: number; c: number; fetch: boolean; lines: number };
+const run = (cellOf: (k: number) => [number, number]) => {
+  const fetchedAt = new Map<number, number>();
+  const reads: Read[] = [];
+  for (let k = 0; k < READS; k++) {
+    const [r, c] = cellOf(k);
+    const line = Math.floor(((r * WIDTH + c) * INT) / LINE);
+    const fetch = !fetchedAt.has(line);
+    if (fetch) fetchedAt.set(line, k);
+    reads.push({ k, r, c, fetch, lines: fetchedAt.size });
+  }
+  const stripFetch = new Map<number, number>();
+  for (let r = 0; r < SHOWN_ROWS; r++) {
+    const k = fetchedAt.get((r * WIDTH * INT) / LINE);
+    if (k !== undefined) stripFetch.set(r, k);
+  }
+  const leftBehind = (r: number) => {
+    const last = Math.max(...reads.filter((x) => x.r === r).map((x) => x.k));
+    return last + 1 < READS ? last + 1 : READS;
+  };
+  const unread = [...stripFetch.keys()].flatMap((r) => {
+    const k = leftBehind(r);
+    const runs: { r: number; k: number; from: number; to: number }[] = [];
+    for (let c = 0; c < PER_LINE; c++) {
+      if (reads.some((x) => x.r === r && x.c === c)) continue;
+      const last = runs[runs.length - 1];
+      if (last && last.r === r && last.to === c - 1) last.to = c;
+      else runs.push({ r, k, from: c, to: c });
+    }
+    return runs;
+  });
+  return { reads, stripFetch, unread, total: fetchedAt.size };
+};
+
+const walks = [
+  { key: 'row', title: 'row walk', x0: 12, ...run((k) => [0, k]) },
+  { key: 'col', title: 'column walk', x0: 192, ...run((k) => [k, 0]) },
+];
+
+const PITCH_X = 8.5;
+const PITCH_Y = 10;
+const CELL = 7;
+const TOP = 26;
+const cx = (x0: number, c: number) => x0 + c * PITCH_X;
+const cy = (r: number) => TOP + r * PITCH_Y;
+const stripW = (PER_LINE - 1) * PITCH_X + CELL;
+
+const counterWindows = (reads: Read[]) => {
+  const windows: { v: number; from: number; to: number }[] = [{ v: 0, from: 0, to: at(0) }];
+  for (const x of reads) {
+    if (!x.fetch) continue;
+    windows[windows.length - 1].to = at(x.k);
+    windows.push({ v: x.lines, from: at(x.k), to: 100 });
+  }
+  return windows;
+};
+
+const kf = (name: string, body: string) => `@keyframes memory-hierarchy-${name} { ${body} }`;
+const use = (sel: string, name: string) =>
+  `.hero-memory-hierarchy ${sel} { animation: memory-hierarchy-${name} var(--t) linear infinite both; }`;
+const show = (from: number, to = 100) =>
+  to >= 100
+    ? `0%, ${pct(from)} { opacity: 0; } ${pct(from + 1)}, 100% { opacity: 1; }`
+    : `0%, ${pct(from)} { opacity: 0; } ${pct(from + 1)}, ${pct(to)} { opacity: 1; } ${pct(to + 1)}, 100% { opacity: 0; }`;
+
+const css: string[] = [];
+for (const w of walks) {
+  for (const x of w.reads) {
+    css.push(use(`.rd-${w.key}-${x.k}`, `rd-${w.key}-${x.k}`));
+    css.push(
+      kf(
+        `rd-${w.key}-${x.k}`,
+        `0%, ${pct(at(x.k))} { fill: var(--color-panel2); stroke: var(--color-line); } ${pct(at(x.k) + 1)}, 100% { fill: var(--color-green-dim); stroke: var(--color-green); }`,
+      ),
+    );
+  }
+  for (const [r, k] of w.stripFetch) {
+    css.push(use(`.ln-${w.key}-${r}`, `ln-${w.key}-${r}`));
+    css.push(kf(`ln-${w.key}-${r}`, show(at(k))));
+  }
+  w.unread.forEach((u, i) => {
+    css.push(use(`.ws-${w.key}-${i}`, `ws-${w.key}-${i}`));
+    css.push(kf(`ws-${w.key}-${i}`, show(at(u.k))));
+  });
+  const moves = w.reads
+    .map((x, i) => {
+      const next = i + 1 < w.reads.length ? at(i + 1) - 0.8 : 100;
+      const pos = `transform: translate(${cx(w.x0, x.c) - 1.5}px, ${cy(x.r) - 1.5}px);`;
+      return `${pct(at(x.k))}, ${pct(next)} { ${pos} }`;
+    })
+    .join(' ');
+  const first = w.reads[0];
+  css.push(use(`.cur-${w.key}`, `cur-${w.key}`));
+  css.push(kf(`cur-${w.key}`, `0% { transform: translate(${cx(w.x0, first.c) - 1.5}px, ${cy(first.r) - 1.5}px); } ${moves}`));
+  counterWindows(w.reads).forEach((win) => {
+    css.push(use(`.cnt-${w.key}-${win.v}`, `cnt-${w.key}-${win.v}`));
+    css.push(
+      kf(
+        `cnt-${w.key}-${win.v}`,
+        win.from === 0
+          ? `0%, ${pct(win.to - 0.5)} { opacity: 1; } ${pct(win.to + 0.5)}, 100% { opacity: 0; }`
+          : show(win.from - 0.5, win.to >= 100 ? 100 : win.to - 0.5),
+      ),
+    );
+  });
+}
+css.push(use('.cursors', 'cursors'));
+css.push(kf('cursors', `0%, ${pct(at(0) - 1)} { opacity: 0; } ${pct(at(0))}, ${pct(walkEnd)} { opacity: 1; } ${pct(walkEnd + 1.5)}, 100% { opacity: 0; }`));
+css.push(use('.r1', 'r1'));
+css.push(kf('r1', `0%, ${pct(walkEnd + 1)} { opacity: 1; } ${pct(walkEnd + 2)}, 100% { opacity: 0; }`));
+css.push(use('.r2', 'r2'));
+css.push(kf('r2', `0%, ${pct(walkEnd + 2)} { opacity: 0; } ${pct(walkEnd + 3)}, 100% { opacity: 1; }`));
+const dynamicCss = css.join('\n');
+
+const [row, col] = walks;
+---
+
+<HeroFrame label={`row vs column · ${READS} reads`} caption="you never load a byte, you load a 64-byte line: a row walk uses all 16 ints of every line it fetches, a column walk uses one">
+  <div class="hero-memory-hierarchy">
+    <svg viewBox="0 0 340 222" role="img" aria-label={`reading 16 ints along a row fetches ${row.total} cache line, reading 16 ints down a column fetches ${col.total}`}>
+      {
+        walks.map((w) => (
+          <>
+            <text class="hd" x={w.x0} y="12">{w.title}</text>
+            {counterWindows(w.reads).map((win) => (
+              <text class:list={['cnt', `cnt-${w.key}-${win.v}`, win.to >= 100 && 'final']} x={w.x0 + stripW} y="12">
+                lines {win.v}
+              </text>
+            ))}
+            {Array.from({ length: SHOWN_ROWS }, (_, r) =>
+              Array.from({ length: PER_LINE }, (_, c) => <rect class="cell" x={cx(w.x0, c)} y={cy(r)} width={CELL} height={CELL} rx="1.5" />),
+            )}
+            {w.unread.map((u, i) => (
+              <g class={`ws-${w.key}-${i}`}>
+                {Array.from({ length: u.to - u.from + 1 }, (_, j) => (
+                  <rect class="cell ws" x={cx(w.x0, u.from + j)} y={cy(u.r)} width={CELL} height={CELL} rx="1.5" />
+                ))}
+              </g>
+            ))}
+            {w.reads.map((x) => (
+              <rect class={`cell rd rd-${w.key}-${x.k}`} x={cx(w.x0, x.c)} y={cy(x.r)} width={CELL} height={CELL} rx="1.5" />
+            ))}
+            {[...w.stripFetch.keys()].map((r) => (
+              <rect class={`ln ln-${w.key}-${r}`} x={w.x0 - 1.5} y={cy(r) - 1.5} width={stripW + 3} height={CELL + 3} rx="2.5" />
+            ))}
+          </>
+        ))
+      }
+      <g class="cursors">
+        {walks.map((w) => <rect class={`cur cur-${w.key}`} width={CELL + 3} height={CELL + 3} rx="2" />)}
+      </g>
+
+      <text class="note" x="12" y="194">int[{WIDTH}, {WIDTH}] · one strip = a row's first 64 B line</text>
+      <rect class="cell rd" x="12" y="207" width={CELL} height={CELL} rx="1.5" />
+      <text class="key" x="23" y="210.5">read</text>
+      <rect class="ln" x="62" y="205.5" width="10" height="10" rx="2.5" />
+      <text class="key" x="77" y="210.5">line fetched</text>
+      <rect class="cell ws" x="162" y="207" width={CELL} height={CELL} rx="1.5" />
+      <text class="key" x="173" y="210.5">fetched, never read</text>
+    </svg>
+    <div class="readout font-mono">
+      <span class="r r1">row: next int <b class="text-green">+4&nbsp;B</b> · column: next int <b class="text-red">+16&nbsp;KB</b></span>
+      <span class="r r2">
+        same {READS} reads · row <b class="text-green">{row.total} line</b> · column <b class="text-red">{col.total} lines</b>
+      </span>
+    </div>
+  </div>
+</HeroFrame>
+
+<style is:inline>
+  .hero-memory-hierarchy {
+    --t: 13s;
+    width: 100%;
+    max-width: 400px;
+    animation: memory-hierarchy-stage var(--t) linear infinite both;
+  }
+  .hero-memory-hierarchy svg {
+    display: block;
+    width: 100%;
+    height: auto;
+    overflow: visible;
+  }
+  .hero-memory-hierarchy text {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    fill: var(--color-ink);
+    dominant-baseline: central;
+  }
+  .hero-memory-hierarchy .hd {
+    fill: var(--color-muted);
+  }
+  .hero-memory-hierarchy .cnt {
+    text-anchor: end;
+    fill: var(--color-ink);
+    opacity: 0;
+  }
+  .hero-memory-hierarchy .cnt.final {
+    opacity: 1;
+  }
+  .hero-memory-hierarchy .note,
+  .hero-memory-hierarchy .key {
+    fill: var(--color-muted);
+    font-size: 10px;
+  }
+  .hero-memory-hierarchy .cell {
+    fill: var(--color-panel2);
+    stroke: var(--color-line);
+    stroke-width: 0.75;
+  }
+  .hero-memory-hierarchy .rd {
+    fill: var(--color-green-dim);
+    stroke: var(--color-green);
+  }
+  .hero-memory-hierarchy .ws {
+    fill: var(--color-red-dim);
+    stroke: var(--color-red);
+  }
+  .hero-memory-hierarchy .ln {
+    fill: none;
+    stroke: var(--color-cyan);
+    stroke-width: 1;
+  }
+  .hero-memory-hierarchy .cur {
+    fill: none;
+    stroke: var(--color-cyan);
+    stroke-width: 1.5;
+  }
+  .hero-memory-hierarchy .cursors {
+    opacity: 0;
+  }
+
+  .hero-memory-hierarchy .readout {
+    display: grid;
+    margin-top: 10px;
+    font-size: 0.76rem;
+    text-align: center;
+  }
+  .hero-memory-hierarchy .readout b {
+    font-weight: 600;
+  }
+  .hero-memory-hierarchy .r {
+    grid-area: 1 / 1;
+    opacity: 0;
+  }
+  .hero-memory-hierarchy .r2 {
+    opacity: 1;
+  }
+
+  @keyframes memory-hierarchy-stage {
+    0% { opacity: 0; }
+    3%, 95% { opacity: 1; }
+    99%, 100% { opacity: 0; }
+  }
+</style>
+<style is:inline set:html={dynamicCss} />

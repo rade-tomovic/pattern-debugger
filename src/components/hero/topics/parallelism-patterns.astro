@@ -1,0 +1,275 @@
+---
+import HeroFrame from '../HeroFrame.astro';
+
+/**
+ * Four threads counting, two data layouts:
+ *   shared: every thread runs `lock inc` on one counter, so the counter's 64-byte line must be
+ *     held exclusively by one core at a time; it hops core 0 → 1 → 2 → 3 and the rest wait
+ *   partitioned: each thread counts in a register (`inc rax`), no memory is touched in the loop
+ *   publish: after the loop each thread issues one `lock add` into the total; the core text
+ *     switches from `inc rax` to `lock add` so the arrows carry the published instruction
+ * Shared issues one locked instruction per increment; partitioned issues one per thread.
+ * Un-animated styles are the final frame (reduced motion).
+ */
+const cores = [50, 130, 210, 290];
+const hop = 11;
+const delay = (k: number) => `animation-delay: calc(var(--t) * ${((k * hop) / 100 - 1).toFixed(2)})`;
+const f = (n: number) => n.toFixed(1);
+const publish = cores.map((x) => {
+  const x1 = x;
+  const y1 = 60;
+  const x2 = 170 + (x - 170) * 0.3;
+  const y2 = 150;
+  const len = Math.hypot(x2 - x1, y2 - y1);
+  const ux = (x2 - x1) / len;
+  const uy = (y2 - y1) / len;
+  const tip = `${f(x2)},${f(y2)} ${f(x2 - ux * 7 - uy * 3.5)},${f(y2 - uy * 7 + ux * 3.5)} ${f(x2 - ux * 7 + uy * 3.5)},${f(y2 - uy * 7 - ux * 3.5)}`;
+  return { x1: f(x1), y1: f(y1), x2: f(x2 - ux * 6), y2: f(y2 - uy * 6), tip };
+});
+---
+
+<HeroFrame label="4 cores · count++" caption="contention is a property of the data layout: a shared write queues every core for one line, a local count publishes once">
+  <div class="hero-parallelism-patterns">
+    <svg viewBox="0 0 340 188" role="img" aria-label="four cores take turns owning one shared counter's cache line; then each counts in a register and publishes once into a total">
+      <line class="bus" x1="12" y1="91" x2="328" y2="91" />
+
+      {
+        publish.map((a) => (
+          <g class="pub">
+            <line x1={a.x1} y1={a.y1} x2={a.x2} y2={a.y2} />
+            <polygon points={a.tip} />
+          </g>
+        ))
+      }
+      <g class="total">
+        <rect x="120" y="150" width="100" height="30" rx="6" />
+        <text x="170" y="165">total</text>
+      </g>
+
+      {
+        cores.map((x, k) => (
+          <g transform={`translate(${x} 0)`}>
+            <rect class="core" x="-36" y="10" width="72" height="50" rx="6" />
+            <text class="cname" y="24">core {k}</text>
+            <g class="own" style={delay(k)}>
+              <rect class="own-ring" x="-36" y="10" width="72" height="50" rx="6" />
+              <text class="op-w" y="44">lock inc</text>
+            </g>
+            <text class={`wait w${k}`} y="44">waits</text>
+            <text class="local" y="44">inc rax</text>
+            <text class="pubop" y="44">lock add</text>
+          </g>
+        ))
+      }
+
+      <g class="line">
+        <line class="tether" x1="0" y1="60" x2="0" y2="78" />
+        <rect x="-36" y="78" width="72" height="26" rx="6" />
+        {[1, 2, 3, 4].map((n, k) => <text class="cnt" y="91" style={delay(k)}>count = {n}</text>)}
+        <text class="line-lbl" y="113">one 64 B line</text>
+      </g>
+    </svg>
+    <div class="readout font-mono">
+      <span class="r r1">one shared counter · each lock inc needs its line exclusively · <b class="text-red">cores queue for it</b></span>
+      <span class="r r2">partitioned: each thread counts in its own register · <b class="text-green">no line moves in the loop</b></span>
+      <span class="r r3">after the loop, one lock add per thread · <b class="text-green">1 locked instruction per thread, not n</b></span>
+    </div>
+  </div>
+</HeroFrame>
+
+<style is:inline>
+  .hero-parallelism-patterns {
+    --t: 13s;
+    width: 100%;
+    max-width: 400px;
+    animation: parallelism-patterns-stage var(--t) linear infinite both;
+  }
+  .hero-parallelism-patterns svg {
+    display: block;
+    width: 100%;
+    height: auto;
+    overflow: visible;
+  }
+  .hero-parallelism-patterns text {
+    fill: var(--color-ink);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    text-anchor: middle;
+    dominant-baseline: central;
+  }
+  .hero-parallelism-patterns .cname,
+  .hero-parallelism-patterns .line-lbl {
+    fill: var(--color-muted);
+    font-size: 10px;
+  }
+  .hero-parallelism-patterns .core {
+    fill: var(--color-panel2);
+    stroke: var(--color-line);
+    stroke-width: 1.5;
+  }
+  .hero-parallelism-patterns .own-ring {
+    fill: none;
+    stroke: var(--color-amber);
+    stroke-width: 1.5;
+  }
+  .hero-parallelism-patterns .op-w,
+  .hero-parallelism-patterns .local {
+    fill: var(--color-amber);
+  }
+  .hero-parallelism-patterns .pubop {
+    fill: var(--color-green);
+  }
+  .hero-parallelism-patterns .wait {
+    fill: var(--color-muted);
+  }
+  .hero-parallelism-patterns .bus {
+    stroke: var(--color-line);
+    stroke-width: 1.5;
+    stroke-dasharray: 4 3;
+  }
+  .hero-parallelism-patterns .line rect {
+    fill: var(--color-panel2);
+    stroke: var(--color-amber);
+    stroke-width: 1.5;
+  }
+  .hero-parallelism-patterns .tether {
+    stroke: var(--color-amber);
+    stroke-width: 1.5;
+  }
+  .hero-parallelism-patterns .pub line {
+    stroke: var(--color-green);
+    stroke-width: 1.5;
+  }
+  .hero-parallelism-patterns .pub polygon {
+    fill: var(--color-green);
+  }
+  .hero-parallelism-patterns .total rect {
+    fill: var(--color-green-dim);
+    stroke: var(--color-green);
+    stroke-width: 1.5;
+  }
+  .hero-parallelism-patterns .total text {
+    fill: var(--color-green);
+  }
+
+  /* final frame: each core has published its local count with one lock add into the total */
+  .hero-parallelism-patterns .own,
+  .hero-parallelism-patterns .wait,
+  .hero-parallelism-patterns .cnt,
+  .hero-parallelism-patterns .line,
+  .hero-parallelism-patterns .local {
+    opacity: 0;
+  }
+  .hero-parallelism-patterns .bus {
+    opacity: 0.3;
+  }
+  .hero-parallelism-patterns .line { transform: translateX(50px); }
+
+  .hero-parallelism-patterns .own,
+  .hero-parallelism-patterns .cnt { animation: parallelism-patterns-own var(--t) linear infinite both; }
+  .hero-parallelism-patterns .w0 { animation: parallelism-patterns-w0 var(--t) linear infinite both; }
+  .hero-parallelism-patterns .w1 { animation: parallelism-patterns-w1 var(--t) linear infinite both; }
+  .hero-parallelism-patterns .w2 { animation: parallelism-patterns-w2 var(--t) linear infinite both; }
+  .hero-parallelism-patterns .w3 { animation: parallelism-patterns-w3 var(--t) linear infinite both; }
+  .hero-parallelism-patterns .line { animation: parallelism-patterns-line var(--t) ease-in-out infinite both; }
+  .hero-parallelism-patterns .bus { animation: parallelism-patterns-bus var(--t) linear infinite both; }
+  .hero-parallelism-patterns .local { animation: parallelism-patterns-local var(--t) linear infinite both; }
+  .hero-parallelism-patterns .pubop { animation: parallelism-patterns-pubop var(--t) linear infinite both; }
+  .hero-parallelism-patterns .pub,
+  .hero-parallelism-patterns .total { animation: parallelism-patterns-pub var(--t) linear infinite both; }
+
+  .hero-parallelism-patterns .readout {
+    display: grid;
+    margin-top: 10px;
+    font-size: 0.76rem;
+    text-align: center;
+  }
+  .hero-parallelism-patterns .readout b {
+    font-weight: 600;
+    white-space: nowrap;
+  }
+  .hero-parallelism-patterns .r {
+    grid-area: 1 / 1;
+    opacity: 0;
+  }
+  .hero-parallelism-patterns .r3 { opacity: 1; }
+  .hero-parallelism-patterns .r1 { animation: parallelism-patterns-r1 var(--t) linear infinite both; }
+  .hero-parallelism-patterns .r2 { animation: parallelism-patterns-r2 var(--t) linear infinite both; }
+  .hero-parallelism-patterns .r3 { animation: parallelism-patterns-r3 var(--t) linear infinite both; }
+
+  /* timeline: shared, line at core 0 4-13 · 1 15-24 · 2 26-35 · 3 37-46, count shown one step after the line lands · partitioned 49-70 · publish 71-95 · fade 95-100 */
+  @keyframes parallelism-patterns-stage {
+    0% { opacity: 0; }
+    3%, 95% { opacity: 1; }
+    99%, 100% { opacity: 0; }
+  }
+  /* core k's ownership window: 5-13 shifted by 11k via a negative delay, after the line has landed */
+  @keyframes parallelism-patterns-own {
+    0%, 4% { opacity: 0; }
+    5%, 13% { opacity: 1; }
+    14%, 100% { opacity: 0; }
+  }
+  @keyframes parallelism-patterns-w0 {
+    0%, 14% { opacity: 0; }
+    15%, 46% { opacity: 1; }
+    48%, 100% { opacity: 0; }
+  }
+  @keyframes parallelism-patterns-w1 {
+    0%, 2% { opacity: 0; }
+    3%, 14% { opacity: 1; }
+    15%, 25% { opacity: 0; }
+    26%, 46% { opacity: 1; }
+    48%, 100% { opacity: 0; }
+  }
+  @keyframes parallelism-patterns-w2 {
+    0%, 2% { opacity: 0; }
+    3%, 25% { opacity: 1; }
+    26%, 36% { opacity: 0; }
+    37%, 46% { opacity: 1; }
+    48%, 100% { opacity: 0; }
+  }
+  @keyframes parallelism-patterns-w3 {
+    0%, 2% { opacity: 0; }
+    3%, 36% { opacity: 1; }
+    37%, 100% { opacity: 0; }
+  }
+  @keyframes parallelism-patterns-line {
+    0%, 2% { transform: translateX(50px); opacity: 0; }
+    4%, 13% { transform: translateX(50px); opacity: 1; }
+    15%, 24% { transform: translateX(130px); opacity: 1; }
+    26%, 35% { transform: translateX(210px); opacity: 1; }
+    37%, 46% { transform: translateX(290px); opacity: 1; }
+    47%, 100% { transform: translateX(290px); opacity: 0; }
+  }
+  @keyframes parallelism-patterns-bus {
+    0%, 47% { opacity: 1; }
+    50%, 100% { opacity: 0.3; }
+  }
+  @keyframes parallelism-patterns-local {
+    0%, 48% { opacity: 0; }
+    51%, 69% { opacity: 1; }
+    71%, 100% { opacity: 0; }
+  }
+  @keyframes parallelism-patterns-pubop {
+    0%, 71% { opacity: 0; }
+    72%, 100% { opacity: 1; }
+  }
+  @keyframes parallelism-patterns-pub {
+    0%, 70% { opacity: 0; }
+    73%, 100% { opacity: 1; }
+  }
+
+  @keyframes parallelism-patterns-r1 {
+    0%, 47% { opacity: 1; }
+    49%, 100% { opacity: 0; }
+  }
+  @keyframes parallelism-patterns-r2 {
+    0%, 48% { opacity: 0; }
+    50%, 69% { opacity: 1; }
+    71%, 100% { opacity: 0; }
+  }
+  @keyframes parallelism-patterns-r3 {
+    0%, 70% { opacity: 0; }
+    72%, 100% { opacity: 1; }
+  }
+</style>

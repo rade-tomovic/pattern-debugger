@@ -1,0 +1,186 @@
+---
+import HeroFrame from '../HeroFrame.astro';
+
+/**
+ * The page's worked capacity arithmetic, computed here from its stated assumptions
+ * (50M DAU, 20 requests each, peak 3x, write:read 1:20, 200 B per write, RF 3, 5 years):
+ *   requests/day = 50M × 20                     = 1.00B
+ *   average QPS  = 1.00B ÷ 86,400               = 11,574/s  (never the number to size for)
+ *   peak QPS     = 11,574 × 3                   = 34,722/s
+ *   writes/day   = 1.00B ÷ 21                   = 47.6M
+ *   raw/day      = 47.6M × 200 B                = 9.52 GB
+ *   stored/day   = 9.52 GB × 3 replicas         = 28.57 GB
+ *   5 years      = 28.57 GB × 1,826 days        = 52.2 TB
+ * One row is written per step (amber while current); the rate group and the bytes group each
+ * get one readout, whose verdict appears only once the row it talks about is on screen. Un-animated styles are the final frame: every row shown, 52.2 TB in green.
+ */
+const dau = 50_000_000;
+const perUser = 20;
+const peakFactor = 3;
+const writeShare = 21;
+const bytesPerWrite = 200;
+const replicas = 3;
+const days = 1826;
+
+const perDay = dau * perUser;
+const avgQps = Math.round(perDay / 86_400);
+const peakQps = avgQps * peakFactor;
+const writesPerDay = perDay / writeShare;
+const rawPerDay = writesPerDay * bytesPerWrite;
+const storedPerDay = rawPerDay * replicas;
+const total = storedPerDay * days;
+
+const int = (x: number) => Math.round(x).toLocaleString('en-US');
+const billions = (x: number) => `${(x / 1e9).toFixed(2)}B`;
+const millions = (x: number) => `${(x / 1e6).toFixed(1)}M`;
+const gb = (x: number) => `${(x / 1e9).toFixed(2)} GB`;
+const tb = (x: number) => `${(x / 1e12).toFixed(1)} TB`;
+
+const rows = [
+  { label: 'req/day', expr: `${dau / 1e6}M × ${perUser}`, value: billions(perDay), group: 0 },
+  { label: 'avg QPS', expr: `${billions(perDay)} ÷ 86,400`, value: `${int(avgQps)}/s`, group: 0, reject: true },
+  { label: 'peak QPS', expr: `${int(avgQps)} × ${peakFactor}`, value: `${int(peakQps)}/s`, group: 0 },
+  { label: 'writes/day', expr: `${billions(perDay)} ÷ ${writeShare}`, value: millions(writesPerDay), group: 1 },
+  { label: 'raw/day', expr: `${millions(writesPerDay)} × ${bytesPerWrite} B`, value: gb(rawPerDay), group: 1 },
+  { label: 'stored/day', expr: `${gb(rawPerDay)} × ${replicas}`, value: gb(storedPerDay), group: 1 },
+  { label: '5 years', expr: `${gb(storedPerDay)} × ${int(days)}`, value: tb(total), group: 2 },
+];
+
+const first = 4;
+const span = 11;
+const start = rows.map((_, i) => first + i * span);
+const last = rows.length - 1;
+
+const keyframes = [
+  ...rows.map((_, i) => {
+    const s = start[i];
+    const rowIn = `@keyframes estimation-row-${i} { 0%, ${s - 1}% { opacity: 0; transform: translateY(4px); } ${s + 2}%, 100% { opacity: 1; transform: translateY(0); } }`;
+    const settled = i === last ? 'var(--color-green)' : rows[i].reject ? 'var(--color-red)' : 'var(--color-ink)';
+    const valColor = `@keyframes estimation-val-${i} { 0%, ${s + span - 2}% { color: var(--color-amber); } ${s + span}%, 100% { color: ${settled}; } }`;
+    const rowFrame =
+      i === last
+        ? `@keyframes estimation-row-${i} { 0%, ${s - 1}% { opacity: 0; transform: translateY(4px); } ${s + 2}%, ${s + span - 2}% { opacity: 1; transform: translateY(0); border-color: var(--color-line); background: var(--color-panel2); } ${s + span}%, 100% { opacity: 1; transform: translateY(0); border-color: var(--color-green); background: var(--color-green-dim); } }`
+        : rowIn;
+    return `${rowFrame}\n${valColor}\n.hero-estimation .line-${i} { animation: estimation-row-${i} var(--t) ease-out infinite both; }\n.hero-estimation .line-${i} .val { animation: estimation-val-${i} var(--t) linear infinite both; }`;
+  }),
+  `@keyframes estimation-r0 { 0%, ${start[0]}% { opacity: 0; } ${start[0] + 2}%, ${start[3] + 1}% { opacity: 1; } ${start[3] + 3}%, 100% { opacity: 0; } }`,
+  `@keyframes estimation-v0 { 0%, ${start[2] - 1}% { opacity: 0; } ${start[2] + 1}%, 100% { opacity: 1; } }`,
+  `@keyframes estimation-r1 { 0%, ${start[3] + 3}% { opacity: 0; } ${start[3] + 5}%, ${start[6]}% { opacity: 1; } ${start[6] + 2}%, 100% { opacity: 0; } }`,
+  `@keyframes estimation-v1 { 0%, ${start[5] - 1}% { opacity: 0; } ${start[5] + 1}%, 100% { opacity: 1; } }`,
+  `@keyframes estimation-r2 { 0%, ${start[6] + 2}% { opacity: 0; } ${start[6] + 4}%, 100% { opacity: 1; } }`,
+  ...['r0', 'v0', 'r1', 'v1', 'r2'].map((c) => `.hero-estimation .${c} { animation: estimation-${c} var(--t) linear infinite both; }`),
+].join('\n');
+---
+
+<HeroFrame label={`capacity · ${dau / 1e6}M DAU`} caption="write the assumptions down, then multiply them through: the peak factor and the replica count are the inputs that move the answer">
+  <div class="hero-estimation font-mono">
+    <div class="sheet">
+      {
+        rows.map((r, i) => (
+          <div class:list={['row', `line-${i}`, `g${r.group}`, i > 0 && rows[i - 1].group !== r.group && 'split', i === last && 'final']}>
+            <span class="lbl">{r.label}</span>
+            <span class="expr">{r.expr}</span>
+            <span class:list={['val', r.reject && 'reject', i === last && 'answer']}>{r.value}</span>
+          </div>
+        ))
+      }
+    </div>
+    <div class="readout">
+      <span class="r r0">requests per second from daily actives<span class="v v0"> · <b class="text-red">size off the peak, never the average</b></span></span>
+      <span class="r r1">bytes per day from bytes per write<span class="v v1"> · <b class="text-ink">{replicas} replicas triple it before any index</b></span></span>
+      <span class="r r2">5 years ≈ {int(days)} days · <b class="text-green">≈ {tb(total)}, good to roughly 2 to 3×</b></span>
+    </div>
+  </div>
+</HeroFrame>
+
+<style is:inline set:html={keyframes}></style>
+<style is:inline>
+  .hero-estimation {
+    --t: 13s;
+    width: 100%;
+    max-width: 360px;
+    font-size: 0.78rem;
+    animation: estimation-stage var(--t) linear infinite both;
+  }
+  .hero-estimation .sheet {
+    display: grid;
+    gap: 3px;
+  }
+  .hero-estimation .row {
+    display: grid;
+    grid-template-columns: 5.2rem 1fr auto;
+    align-items: center;
+    gap: 8px;
+    padding: 3px 8px;
+    border: 1px solid var(--color-line);
+    border-radius: 6px;
+    background: var(--color-panel2);
+  }
+  .hero-estimation .row.split {
+    margin-top: 7px;
+  }
+  .hero-estimation .lbl {
+    color: var(--color-muted);
+    font-size: 0.7rem;
+    white-space: nowrap;
+  }
+  .hero-estimation .expr {
+    color: var(--color-muted);
+    white-space: nowrap;
+  }
+  .hero-estimation .val {
+    color: var(--color-ink);
+    font-weight: 600;
+    text-align: right;
+    white-space: nowrap;
+  }
+  .hero-estimation .val.reject {
+    color: var(--color-red);
+    text-decoration: line-through;
+  }
+  .hero-estimation .val.answer {
+    color: var(--color-green);
+  }
+  .hero-estimation .row.final {
+    border-color: var(--color-green);
+    background: var(--color-green-dim);
+  }
+
+  .hero-estimation .readout {
+    display: grid;
+    margin-top: 12px;
+    font-size: 0.76rem;
+    text-align: center;
+    color: var(--color-muted);
+  }
+  .hero-estimation .readout b {
+    font-weight: 600;
+  }
+  .hero-estimation .r {
+    grid-area: 1 / 1;
+    opacity: 0;
+  }
+  .hero-estimation .r2 {
+    opacity: 1;
+  }
+
+  @keyframes estimation-stage {
+    0% { opacity: 0; }
+    3%, 95% { opacity: 1; }
+    99%, 100% { opacity: 0; }
+  }
+
+  @media (max-width: 420px) {
+    .hero-estimation {
+      font-size: 0.72rem;
+    }
+    .hero-estimation .row {
+      grid-template-columns: 4.4rem 1fr auto;
+      gap: 6px;
+      padding: 3px 6px;
+    }
+    .hero-estimation .lbl {
+      font-size: 0.64rem;
+    }
+  }
+</style>

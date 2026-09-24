@@ -1,0 +1,273 @@
+---
+import HeroFrame from '../HeroFrame.astro';
+
+/**
+ * One lost segment, the page's HTTP/2-over-TCP versus HTTP/3-over-QUIC picture. Streams A, B, C
+ * share one connection; their data arrives interleaved as A1 B1 C1 A2 B2 C2, and B1 is lost.
+ *   step 0: A1 arrives · both hand it to the app
+ *   step 1: B1 is lost on the path · a retransmit is pending
+ *   step 2: C1, A2 arrive · TCP holds them behind the gap (one ordered byte stream),
+ *           QUIC delivers them (loss recovery is per stream)
+ *   step 3: B2, C2 arrive · B2 waits for B1 on both; C2 waits only on TCP
+ * Every cell's state per step is computed below by running both delivery rules, and the build
+ * fails if the final frame stops being "TCP holds everything after the gap, QUIC holds only B".
+ * Timeline (13s): A1 0-18 · loss 18-36 · C1 A2 36-54 · B2 C2 54-72 · verdict 72-94 · fade 94-100.
+ * Un-animated styles are the final frame (reduced motion).
+ */
+type State = 'pending' | 'lost' | 'held' | 'delivered';
+const segs = ['A1', 'B1', 'C1', 'A2', 'B2', 'C2'];
+const lost = 'B1';
+const arrivals = [['A1'], ['B1'], ['C1', 'A2'], ['B2', 'C2']];
+
+const stepOf = (s: string) => arrivals.findIndex((batch) => batch.includes(s));
+const arrived = (s: string, step: number) => stepOf(s) <= step && s !== lost;
+const tcpDelivered = (s: string, step: number) => segs.slice(0, segs.indexOf(s) + 1).every((x) => arrived(x, step));
+const quicDelivered = (s: string, step: number) =>
+  segs.slice(0, segs.indexOf(s) + 1).filter((x) => x[0] === s[0]).every((x) => arrived(x, step));
+
+const stateOf = (s: string, step: number, delivered: (s: string, step: number) => boolean): State => {
+  if (stepOf(s) > step) return 'pending';
+  if (s === lost) return 'lost';
+  return delivered(s, step) ? 'delivered' : 'held';
+};
+
+const look: Record<State, [string, string, string, string, string]> = {
+  pending: ['var(--color-panel)', 'var(--color-line)', 'var(--color-muted)', '0.3', 'solid'],
+  lost: ['var(--color-red-dim)', 'var(--color-red)', 'var(--color-red)', '1', 'solid'],
+  held: ['var(--color-panel2)', 'var(--color-muted)', 'var(--color-muted)', '1', 'dashed'],
+  delivered: ['var(--color-green-dim)', 'var(--color-green)', 'var(--color-green)', '1', 'solid'],
+};
+const props = ['f', 'b', 'c', 'o', 's'];
+const cellStyle = (s: string, rule: (s: string, step: number) => boolean) =>
+  arrivals
+    .flatMap((_, step) => look[stateOf(s, step, rule)].map((v, k) => `--${props[k]}${step}: ${v}`))
+    .join('; ');
+
+const last = arrivals.length - 1;
+const rows = [
+  { name: 'HTTP/2', sub: 'over TCP', rule: tcpDelivered },
+  { name: 'HTTP/3', sub: 'over QUIC', rule: quicDelivered },
+];
+const finalOf = (rule: (s: string, step: number) => boolean) => segs.map((s) => stateOf(s, last, rule));
+const count = (states: State[], want: State) => states.filter((x) => x === want).length;
+const tcpHeld = count(finalOf(tcpDelivered), 'held');
+const quicHeld = count(finalOf(quicDelivered), 'held');
+if (finalOf(tcpDelivered).join() !== 'delivered,lost,held,held,held,held' || finalOf(quicDelivered).join() !== 'delivered,lost,delivered,delivered,held,delivered') {
+  throw new Error('networking hero: delivery rules no longer produce the drawn final frame');
+}
+---
+
+<HeroFrame label="HTTP/2 vs HTTP/3 · 1 loss" caption="TCP releases bytes only in order, so one loss stalls every stream; QUIC recovers loss per stream, so only the stream that lost data waits">
+  <div class="hero-networking">
+    <div class="axis"><span>send order →</span></div>
+    {
+      rows.map((row) => (
+        <div class="row">
+          <span class="lbl">
+            {row.name}
+            <br />
+            <span class="sub">{row.sub}</span>
+          </span>
+          {segs.map((s) => (
+            <span class="cell" style={cellStyle(s, row.rule)}>
+              {s}
+            </span>
+          ))}
+        </div>
+      ))
+    }
+    <div class="legend">
+      <span><i class="k delivered"></i>to the app</span>
+      <span><i class="k held"></i>held</span>
+      <span><i class="k lost"></i>lost</span>
+    </div>
+    <div class="readout">
+      <span class="r r0">streams A B C share one connection · <b class="text-green">A1 arrives, delivered</b></span>
+      <span class="r r1">{lost} is lost on the path · <b class="text-red">retransmit pending</b></span>
+      <span class="r r2">C1, A2 arrive · <b class="text-ink">TCP holds them</b> · <b class="text-green">QUIC delivers them</b></span>
+      <span class="r r3">B2, C2 arrive · <b class="text-ink">B2 waits for {lost} on both</b></span>
+      <span class="r r4">TCP holds {tcpHeld}, QUIC holds {quicHeld} · <b class="text-green">QUIC still delivers A and C</b></span>
+    </div>
+  </div>
+</HeroFrame>
+
+<style is:inline>
+  .hero-networking {
+    --t: 13s;
+    --cell: 38px;
+    font-family: var(--font-mono);
+    width: 100%;
+    max-width: 340px;
+    font-size: 0.78rem;
+    animation: networking-stage var(--t) linear infinite both;
+  }
+  .hero-networking .axis,
+  .hero-networking .row {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+  }
+  .hero-networking .axis {
+    padding-left: 79px;
+    margin-bottom: 6px;
+    color: var(--color-muted);
+    font-size: 0.66rem;
+  }
+  .hero-networking .row + .row {
+    margin-top: 10px;
+  }
+  .hero-networking .lbl {
+    width: 74px;
+    flex: none;
+    color: var(--color-ink);
+    font-size: 0.72rem;
+    line-height: 1.25;
+  }
+  .hero-networking .lbl .sub {
+    color: var(--color-muted);
+    font-size: 0.66rem;
+  }
+  .hero-networking .cell {
+    width: var(--cell);
+    height: 30px;
+    flex: none;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border: 1.5px solid;
+    border-radius: 5px;
+    background: var(--f3);
+    border-color: var(--b3);
+    color: var(--c3);
+    opacity: var(--o3);
+    border-style: var(--s3);
+    animation: networking-cell var(--t) linear infinite both;
+  }
+  .hero-networking .legend {
+    display: flex;
+    justify-content: center;
+    gap: 14px;
+    margin-top: 12px;
+    color: var(--color-muted);
+    font-size: 0.66rem;
+  }
+  .hero-networking .legend span {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+  }
+  .hero-networking .k {
+    width: 10px;
+    height: 10px;
+    border: 1.5px solid;
+    border-radius: 3px;
+  }
+  .hero-networking .k.delivered {
+    background: var(--color-green-dim);
+    border-color: var(--color-green);
+  }
+  .hero-networking .k.held {
+    background: var(--color-panel2);
+    border-color: var(--color-muted);
+    border-style: dashed;
+  }
+  .hero-networking .k.lost {
+    background: var(--color-red-dim);
+    border-color: var(--color-red);
+  }
+
+  .hero-networking .readout {
+    display: grid;
+    margin-top: 10px;
+    font-size: 0.76rem;
+    text-align: center;
+  }
+  .hero-networking .readout b {
+    font-weight: 600;
+  }
+  .hero-networking .r {
+    grid-area: 1 / 1;
+    opacity: 0;
+  }
+  .hero-networking .r4 { opacity: 1; }
+  .hero-networking .r0 { animation: networking-r0 var(--t) linear infinite both; }
+  .hero-networking .r1 { animation: networking-r1 var(--t) linear infinite both; }
+  .hero-networking .r2 { animation: networking-r2 var(--t) linear infinite both; }
+  .hero-networking .r3 { animation: networking-r3 var(--t) linear infinite both; }
+  .hero-networking .r4 { animation: networking-r4 var(--t) linear infinite both; }
+
+  @keyframes networking-stage {
+    0% { opacity: 0; }
+    3%, 94% { opacity: 1; }
+    99%, 100% { opacity: 0; }
+  }
+  @keyframes networking-cell {
+    0%, 3% { background: var(--f0); border-color: var(--b0); color: var(--c0); opacity: 0.3; border-style: solid; }
+    6%, 18% { background: var(--f0); border-color: var(--b0); color: var(--c0); opacity: var(--o0); border-style: var(--s0); }
+    21%, 36% { background: var(--f1); border-color: var(--b1); color: var(--c1); opacity: var(--o1); border-style: var(--s1); }
+    39%, 54% { background: var(--f2); border-color: var(--b2); color: var(--c2); opacity: var(--o2); border-style: var(--s2); }
+    57%, 100% { background: var(--f3); border-color: var(--b3); color: var(--c3); opacity: var(--o3); border-style: var(--s3); }
+  }
+
+  @keyframes networking-r0 {
+    0%, 18% { opacity: 1; }
+    19%, 100% { opacity: 0; }
+  }
+  @keyframes networking-r1 {
+    0%, 19% { opacity: 0; }
+    21%, 36% { opacity: 1; }
+    37%, 100% { opacity: 0; }
+  }
+  @keyframes networking-r2 {
+    0%, 37% { opacity: 0; }
+    39%, 54% { opacity: 1; }
+    55%, 100% { opacity: 0; }
+  }
+  @keyframes networking-r3 {
+    0%, 55% { opacity: 0; }
+    57%, 71% { opacity: 1; }
+    72%, 100% { opacity: 0; }
+  }
+  @keyframes networking-r4 {
+    0%, 72% { opacity: 0; }
+    74%, 100% { opacity: 1; }
+  }
+
+  @media (max-width: 420px) {
+    .hero-networking {
+      --cell: 32px;
+    }
+    .hero-networking .axis,
+    .hero-networking .row {
+      gap: 4px;
+    }
+    .hero-networking .axis {
+      padding-left: 64px;
+    }
+    .hero-networking .lbl {
+      width: 60px;
+      font-size: 0.66rem;
+    }
+    .hero-networking .lbl .sub {
+      font-size: 0.6rem;
+    }
+    .hero-networking .cell {
+      font-size: 0.72rem;
+    }
+  }
+  @media (max-width: 340px) {
+    .hero-networking {
+      --cell: 29px;
+    }
+    .hero-networking .axis,
+    .hero-networking .row {
+      gap: 3px;
+    }
+    .hero-networking .axis {
+      padding-left: 59px;
+    }
+    .hero-networking .lbl {
+      width: 56px;
+    }
+  }
+</style>

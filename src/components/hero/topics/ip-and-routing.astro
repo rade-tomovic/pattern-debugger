@@ -1,0 +1,235 @@
+---
+import HeroFrame from '../HeroFrame.astro';
+
+/**
+ * Longest-prefix match for dst 10.1.2.37 against the page's five candidate routes, listed in an
+ * arbitrary order, not sorted by length. Frames are computed here by running the lookup:
+ *   0.0.0.0/0       10.1.2.37 & /0  = 0.0.0.0   match, best = /0
+ *   10.0.0.0/8      10.1.2.37 & /8  = 10.0.0.0  match, best = /8
+ *   192.168.0.0/16  10.1.2.37 & /16 = 10.1.0.0  no match
+ *   10.1.2.0/24     10.1.2.37 & /24 = 10.1.2.0  match, best = /24
+ *   10.1.0.0/22     10.1.2.37 & /22 = 10.1.0.0  match, but /22 is shorter, best stays /24
+ *   winner: 10.1.2.0/24 via 10.1.0.1
+ * Timeline (percent of the loop): intro 0-13, one row per 13, winner 78-95, fade 95-100.
+ * Within a row: box and readout computation at +1, masked value at +2, verdict cell and the
+ * readout's verdict at +3, best pointer at +4, readout holds to +12, row ends at +13.
+ * Un-animated styles are the final frame (reduced motion).
+ */
+const toInt = (s: string) => s.split('.').reduce((a, o) => ((a << 8) | Number(o)) >>> 0, 0);
+const toDot = (n: number) => [24, 16, 8, 0].map((s) => (n >>> s) & 255).join('.');
+const maskOf = (len: number) => (len === 0 ? 0 : (0xffffffff << (32 - len)) >>> 0);
+
+const dst = '10.1.2.37';
+const table = [
+  { prefix: '0.0.0.0', len: 0, hop: 'via 192.0.2.1' },
+  { prefix: '10.0.0.0', len: 8, hop: 'via 192.0.2.1' },
+  { prefix: '192.168.0.0', len: 16, hop: 'dev eth2' },
+  { prefix: '10.1.2.0', len: 24, hop: 'via 10.1.0.1' },
+  { prefix: '10.1.0.0', len: 22, hop: 'dev eth1' },
+];
+
+let best = -1;
+const rows = table.map((r) => {
+  const masked = (toInt(dst) & maskOf(r.len)) >>> 0;
+  const match = masked === toInt(r.prefix);
+  const takesBest = match && (best === -1 || r.len > table[best].len);
+  const bestBefore = best;
+  const row = { ...r, masked: toDot(masked), match, takesBest, bestBefore };
+  if (takesBest) best = table.indexOf(r);
+  return row;
+});
+const winner = best;
+
+const intro = 13;
+const step = 13;
+const hold = step - 1;
+const verdictAt = 3;
+const ptrAt = 4;
+const settle = intro + step * rows.length;
+const at = (k: number, d: number) => +(intro + step * k + d).toFixed(2);
+const bestUntil = rows.map((_, i) => {
+  const next = rows.findIndex((r, k) => k > i && r.takesBest);
+  return next === -1 ? 100 : at(next, ptrAt);
+});
+
+const kf = (name: string, body: string) => `@keyframes ip-and-routing-${name} { ${body} }`;
+const timeline = rows
+  .map((r, k) => {
+    const out = [
+      `.hero-ip-and-routing .row${k} .box { animation: ip-and-routing-box${k} var(--t) linear infinite both; }`,
+      `.hero-ip-and-routing .row${k} .masked { animation: ip-and-routing-masked${k} var(--t) linear infinite both; }`,
+      `.hero-ip-and-routing .row${k} .verdict { animation: ip-and-routing-verdict${k} var(--t) linear infinite both; }`,
+      `.hero-ip-and-routing .rd${k} { animation: ip-and-routing-rd${k} var(--t) linear infinite both; }`,
+      `.hero-ip-and-routing .rd${k} .rv { animation: ip-and-routing-rv${k} var(--t) linear infinite both; }`,
+      kf(
+        `box${k}`,
+        k === winner
+          ? `0%, ${at(k, 0)}% { stroke: var(--color-line); fill: var(--color-panel2); } ${at(k, 1)}%, ${at(k, hold - 1)}% { stroke: var(--color-cyan); fill: var(--color-panel2); } ${at(k, hold)}%, ${settle}% { stroke: var(--color-line); fill: var(--color-panel2); } ${settle + 2}%, 100% { stroke: var(--color-green); fill: var(--color-green-dim); }`
+          : `0%, ${at(k, 0)}% { stroke: var(--color-line); } ${at(k, 1)}%, ${at(k, hold - 1)}% { stroke: var(--color-cyan); } ${at(k, hold)}%, 100% { stroke: var(--color-line); }`,
+      ),
+      kf(`masked${k}`, `0%, ${at(k, 1)}% { opacity: 0; } ${at(k, 2)}%, 100% { opacity: 1; }`),
+      kf(
+        `verdict${k}`,
+        k === winner
+          ? `0%, ${at(k, verdictAt - 1)}% { opacity: 0; fill: var(--color-ink); } ${at(k, verdictAt)}%, ${settle}% { opacity: 1; fill: var(--color-ink); } ${settle + 2}%, 100% { opacity: 1; fill: var(--color-green); }`
+          : `0%, ${at(k, verdictAt - 1)}% { opacity: 0; } ${at(k, verdictAt)}%, 100% { opacity: 1; }`,
+      ),
+      kf(`rd${k}`, `0%, ${at(k, 0)}% { opacity: 0; } ${at(k, 1)}%, ${at(k, hold)}% { opacity: 1; } ${at(k, step)}%, 100% { opacity: 0; }`),
+      kf(`rv${k}`, `0%, ${at(k, verdictAt - 1)}% { opacity: 0; } ${at(k, verdictAt)}%, 100% { opacity: 1; }`),
+    ];
+    if (r.takesBest) {
+      out.push(
+        `.hero-ip-and-routing .row${k} .ptr { animation: ip-and-routing-ptr${k} var(--t) linear infinite both; }`,
+        kf(
+          `ptr${k}`,
+          k === winner
+            ? `0%, ${at(k, ptrAt - 1)}% { opacity: 0; fill: var(--color-amber); } ${at(k, ptrAt)}%, ${settle}% { opacity: 1; fill: var(--color-amber); } ${settle + 2}%, 100% { opacity: 1; fill: var(--color-green); }`
+            : `0%, ${at(k, ptrAt - 1)}% { opacity: 0; } ${at(k, ptrAt)}%, ${bestUntil[k] - 1}% { opacity: 1; } ${bestUntil[k]}%, 100% { opacity: 0; }`,
+        ),
+      );
+    }
+    return out.join('\n');
+  })
+  .concat([
+    `.hero-ip-and-routing .row${winner} .box { stroke: var(--color-green); fill: var(--color-green-dim); }`,
+    `.hero-ip-and-routing .row${winner} .ptr { fill: var(--color-green); opacity: 1; }`,
+    `.hero-ip-and-routing .rd-intro { animation: ip-and-routing-rd-intro var(--t) linear infinite both; }`,
+    kf('rd-intro', `0%, ${intro - 1}% { opacity: 1; } ${intro}%, 100% { opacity: 0; }`),
+    `.hero-ip-and-routing .rd-final { animation: ip-and-routing-rd-final var(--t) linear infinite both; }`,
+    kf('rd-final', `0%, ${settle}% { opacity: 0; } ${settle + 1}%, 100% { opacity: 1; }`),
+  ])
+  .join('\n');
+
+const rowY = (k: number) => 58 + k * 26;
+---
+
+<HeroFrame label={`longest-prefix match · ${dst}`} caption="every route whose prefix matches is a candidate; the one with the most network bits wins, whatever order the table lists them in">
+  <div class="hero-ip-and-routing">
+    <svg viewBox="0 0 360 184" role="img" aria-label={`longest-prefix match of ${dst}: five routes checked, 10.1.2.0/24 wins`}>
+      <text class="dst" x="10" y="12">dst <tspan class="ink">{dst}</tspan></text>
+      <text class="hd" x="18" y="36">route</text>
+      <text class="hd" x="120" y="36">next hop</text>
+      <text class="hd" x="222" y="36">dst &amp; mask</text>
+      <text class="hd end" x="344" y="36">len</text>
+      {
+        rows.map((r, k) => (
+          <g class={`row row${k}`}>
+            <rect class="box" x="8" y={rowY(k) - 11} width="344" height="22" rx="5" />
+            <rect class="ptr" x="2" y={rowY(k) - 11} width="3" height="22" rx="1.5" />
+            <text x="18" y={rowY(k)}>{`${r.prefix}/${r.len}`}</text>
+            <text class="hop" x="120" y={rowY(k)}>{r.hop}</text>
+            <text class={r.match ? 'masked' : 'masked miss'} x="222" y={rowY(k)}>{r.masked}</text>
+            <text class={r.match ? (k === winner ? 'verdict end win' : 'verdict end') : 'verdict end miss'} x="344" y={rowY(k)}>
+              {r.match ? `/${r.len}` : 'no'}
+            </text>
+          </g>
+        ))
+      }
+    </svg>
+    <div class="readout font-mono">
+      <span class="r rd-intro">dst {dst} · <b class="text-cyan">check every route in the table</b></span>
+      {
+        rows.map((r, k) => (
+          <span class={`r rd${k}`}>
+            {dst} &amp; /{r.len} = {r.masked}
+            <span class="rv">
+              {r.match ? '' : ` ≠ ${r.prefix}`} ·{' '}
+              {!r.match ? (
+                <b class="text-red">no match</b>
+              ) : r.takesBest ? (
+                <b class="text-amber">match, best = /{r.len}</b>
+              ) : (
+                <b class="text-muted">
+                  /{r.len} is shorter, best stays /{table[r.bestBefore].len}
+                </b>
+              )}
+            </span>
+          </span>
+        ))
+      }
+      <span class="r rd-final">longest match is /{table[winner].len} · <b class="text-green">forward {table[winner].hop}</b></span>
+    </div>
+  </div>
+</HeroFrame>
+
+<style is:inline>
+  .hero-ip-and-routing {
+    --t: 14s;
+    width: 100%;
+    max-width: 380px;
+    animation: ip-and-routing-stage var(--t) linear infinite both;
+  }
+  .hero-ip-and-routing svg {
+    display: block;
+    width: 100%;
+    height: auto;
+    overflow: visible;
+  }
+  .hero-ip-and-routing text {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    fill: var(--color-ink);
+    dominant-baseline: central;
+  }
+  .hero-ip-and-routing .dst {
+    fill: var(--color-muted);
+    font-size: 12px;
+  }
+  .hero-ip-and-routing .dst .ink {
+    fill: var(--color-ink);
+  }
+  .hero-ip-and-routing .hd {
+    fill: var(--color-muted);
+    font-size: 10px;
+  }
+  .hero-ip-and-routing .end {
+    text-anchor: end;
+  }
+  .hero-ip-and-routing .hop {
+    fill: var(--color-muted);
+  }
+  .hero-ip-and-routing .box {
+    fill: var(--color-panel2);
+    stroke: var(--color-line);
+    stroke-width: 1.5;
+  }
+  .hero-ip-and-routing .ptr {
+    fill: var(--color-amber);
+    opacity: 0;
+  }
+  .hero-ip-and-routing .miss {
+    fill: var(--color-red);
+  }
+  .hero-ip-and-routing .win {
+    fill: var(--color-green);
+  }
+
+  .hero-ip-and-routing .readout {
+    display: grid;
+    margin-top: 12px;
+    font-size: 0.76rem;
+    text-align: center;
+  }
+  .hero-ip-and-routing .readout b {
+    font-weight: 600;
+  }
+  .hero-ip-and-routing .r {
+    grid-area: 1 / 1;
+    opacity: 0;
+  }
+  .hero-ip-and-routing .rd-final {
+    opacity: 1;
+  }
+  @media (max-width: 420px) {
+    .hero-ip-and-routing .readout {
+      font-size: 0.68rem;
+    }
+  }
+
+  @keyframes ip-and-routing-stage {
+    0% { opacity: 0; }
+    3%, 95% { opacity: 1; }
+    99%, 100% { opacity: 0; }
+  }
+</style>
+<style is:inline set:html={timeline}></style>

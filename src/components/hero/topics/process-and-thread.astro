@@ -1,0 +1,287 @@
+---
+import HeroFrame from '../HeroFrame.astro';
+
+/**
+ * One process, two threads, one core. Each thread is a stack plus a register set; the heap
+ * belongs to the process, so both threads reach the same bytes:
+ *   thread A holds the core (its rip/rsp are the core's registers) and writes arr[0] = 1
+ *   A's time slice ends: the kernel saves A's registers into A's kernel task structure, loads B's onto the core
+ *   thread B runs on its own stack and reads arr[0]: 1, the value A wrote
+ *   settled: two private stacks, one shared heap
+ * Saved register sets park in the top row beside the core, outside the process box: they live in the
+ * kernel's task structure, not in the process's address space. Chips slide along that row only.
+ * Un-animated styles are the final frame (reduced motion).
+ */
+const arrow = (x1: number, y1: number, x2: number, y2: number) => {
+  const len = Math.hypot(x2 - x1, y2 - y1);
+  const [ux, uy] = [(x2 - x1) / len, (y2 - y1) / len];
+  const [bx, by] = [x2 - ux * 7, y2 - uy * 7];
+  const [px, py] = [-uy * 3.5, ux * 3.5];
+  const f = (n: number) => n.toFixed(1);
+  return {
+    line: { x1, y1, x2: f(bx), y2: f(by) },
+    head: `${x2},${y2} ${f(bx + px)},${f(by + py)} ${f(bx - px)},${f(by - py)}`,
+  };
+};
+const aRef = arrow(100, 120, 124, 170);
+const bRef = arrow(240, 120, 216, 170);
+---
+
+<HeroFrame label="2 threads · 1 process · 1 core" caption="a thread is a stack plus registers; the heap belongs to the process, so every thread reaches the same bytes">
+  <div class="hero-process-and-thread">
+    <svg viewBox="0 0 340 214" role="img" aria-label="thread A writes a heap value, is switched off the core, and thread B reads the same value from its own stack">
+      <rect class="core" x="120" y="4" width="100" height="40" rx="6" />
+      <text class="hd mid" x="170" y="12">core</text>
+      <text class="hd mid saved-a" x="58" y="12">saved · kernel task</text>
+      <text class="hd mid saved-b" x="282" y="12">saved · kernel task</text>
+
+      <rect class="proc" x="4" y="54" width="332" height="156" rx="8" />
+      <text class="hd" x="12" y="66">process · one address space</text>
+
+      <rect class="stack sa" x="16" y="80" width="92" height="62" rx="6" />
+      <text class="hd" x="24" y="92">stack A</text>
+      <text x="24" y="120">local</text>
+      <circle class="ref" cx="100" cy="120" r="3" />
+
+      <rect class="stack sb" x="232" y="80" width="92" height="62" rx="6" />
+      <text class="hd" x="240" y="92">stack B</text>
+      <text x="250" y="120">local</text>
+      <circle class="ref" cx="240" cy="120" r="3" />
+
+      <g class="arrow ar-a">
+        <line {...aRef.line} />
+        <polygon points={aRef.head} />
+      </g>
+      <g class="arrow ar-b">
+        <line {...bRef.line} />
+        <polygon points={bRef.head} />
+      </g>
+
+      <rect class="heap" x="118" y="148" width="104" height="52" rx="6" />
+      <text class="hd" x="126" y="159">heap · shared</text>
+      <text class="mid v0" x="170" y="183">arr[0] = 0</text>
+      <text class="mid v1" x="170" y="183">arr[0] = 1</text>
+
+      <g class="chip chip-a">
+        <rect x="-38" y="-10" width="76" height="20" rx="4" />
+        <text class="mid" x="0" y="0">A: rip, rsp</text>
+      </g>
+      <g class="chip chip-b">
+        <rect x="-38" y="-10" width="76" height="20" rx="4" />
+        <text class="mid" x="0" y="0">B: rip, rsp</text>
+      </g>
+    </svg>
+    <div class="readout font-mono">
+      <span class="r r1">A runs on the core · <b class="text-amber">writes arr[0] = 1 on the heap</b></span>
+      <span class="r r2">time slice ends · <b class="text-ink">A's registers saved, B's loaded</b></span>
+      <span class="r r3">B runs on stack B · <b class="text-cyan">reads arr[0] = 1, A's write</b></span>
+      <span class="r r4">one process · <b class="text-green">threads share the heap, never the stack</b></span>
+    </div>
+  </div>
+</HeroFrame>
+
+<style is:inline>
+  .hero-process-and-thread {
+    --t: 13s;
+    width: 100%;
+    max-width: 400px;
+    animation: process-and-thread-stage var(--t) linear infinite both;
+  }
+  .hero-process-and-thread svg {
+    display: block;
+    width: 100%;
+    height: auto;
+    overflow: visible;
+  }
+  .hero-process-and-thread text {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    fill: var(--color-ink);
+    dominant-baseline: central;
+  }
+  .hero-process-and-thread .hd {
+    fill: var(--color-muted);
+    font-size: 9.5px;
+  }
+  .hero-process-and-thread .mid {
+    text-anchor: middle;
+  }
+  .hero-process-and-thread .chip text {
+    font-size: 10px;
+  }
+  .hero-process-and-thread .core {
+    fill: var(--color-panel2);
+    stroke: var(--color-line);
+    stroke-width: 1.5;
+  }
+  .hero-process-and-thread .proc {
+    fill: none;
+    stroke: var(--color-line);
+    stroke-width: 1.5;
+    stroke-dasharray: 4 3;
+  }
+  .hero-process-and-thread .stack,
+  .hero-process-and-thread .heap {
+    fill: var(--color-panel2);
+    stroke: var(--color-line);
+    stroke-width: 1.5;
+  }
+  .hero-process-and-thread .ref {
+    fill: var(--color-muted);
+  }
+  .hero-process-and-thread .arrow line {
+    stroke: var(--color-muted);
+    stroke-width: 1.5;
+  }
+  .hero-process-and-thread .arrow polygon {
+    fill: var(--color-muted);
+  }
+  .hero-process-and-thread .chip rect {
+    fill: var(--color-panel);
+    stroke-width: 1.5;
+  }
+  .hero-process-and-thread .chip-a rect {
+    stroke: var(--color-amber);
+  }
+  .hero-process-and-thread .chip-a text {
+    fill: var(--color-amber);
+  }
+  .hero-process-and-thread .chip-b rect {
+    stroke: var(--color-cyan);
+  }
+  .hero-process-and-thread .chip-b text {
+    fill: var(--color-cyan);
+  }
+
+  /* final frame: B holds the core, A's registers saved, arr[0] = 1 reached by both stacks */
+  .hero-process-and-thread .chip-a { transform: translate(58px, 31px); }
+  .hero-process-and-thread .chip-b { transform: translate(170px, 31px); }
+  .hero-process-and-thread .saved-b { opacity: 0; }
+  .hero-process-and-thread .v0 { opacity: 0; }
+  .hero-process-and-thread .heap { stroke: var(--color-green); fill: var(--color-green-dim); }
+
+  .hero-process-and-thread .chip-a { animation: process-and-thread-chip-a var(--t) ease-in-out infinite both; }
+  .hero-process-and-thread .chip-b { animation: process-and-thread-chip-b var(--t) ease-in-out infinite both; }
+  .hero-process-and-thread .saved-a { animation: process-and-thread-saved-a var(--t) linear infinite both; }
+  .hero-process-and-thread .saved-b { animation: process-and-thread-saved-b var(--t) linear infinite both; }
+  .hero-process-and-thread .sa { animation: process-and-thread-sa var(--t) linear infinite both; }
+  .hero-process-and-thread .sb { animation: process-and-thread-sb var(--t) linear infinite both; }
+  .hero-process-and-thread .ar-a { animation: process-and-thread-ar-a var(--t) linear infinite both; }
+  .hero-process-and-thread .ar-b { animation: process-and-thread-ar-b var(--t) linear infinite both; }
+  .hero-process-and-thread .ar-a line { animation: process-and-thread-ar-a-stroke var(--t) linear infinite both; }
+  .hero-process-and-thread .ar-a polygon { animation: process-and-thread-ar-a-fill var(--t) linear infinite both; }
+  .hero-process-and-thread .ar-b line { animation: process-and-thread-ar-b-stroke var(--t) linear infinite both; }
+  .hero-process-and-thread .ar-b polygon { animation: process-and-thread-ar-b-fill var(--t) linear infinite both; }
+  .hero-process-and-thread .heap { animation: process-and-thread-heap var(--t) linear infinite both; }
+  .hero-process-and-thread .v0 { animation: process-and-thread-v0 var(--t) linear infinite both; }
+  .hero-process-and-thread .v1 { animation: process-and-thread-v1 var(--t) linear infinite both; }
+
+  .hero-process-and-thread .readout {
+    display: grid;
+    margin-top: 12px;
+    font-size: 0.76rem;
+    text-align: center;
+  }
+  .hero-process-and-thread .readout b {
+    font-weight: 600;
+  }
+  .hero-process-and-thread .r {
+    grid-area: 1 / 1;
+    opacity: 0;
+  }
+  .hero-process-and-thread .r4 { opacity: 1; }
+  .hero-process-and-thread .r1 { animation: process-and-thread-r1 var(--t) linear infinite both; }
+  .hero-process-and-thread .r2 { animation: process-and-thread-r2 var(--t) linear infinite both; }
+  .hero-process-and-thread .r3 { animation: process-and-thread-r3 var(--t) linear infinite both; }
+  .hero-process-and-thread .r4 { animation: process-and-thread-r4 var(--t) linear infinite both; }
+
+  /* timeline: A runs + writes 0-28 · switch 28-46 · B runs + reads 46-70 · settled 72-94 · fade 94-100 */
+  @keyframes process-and-thread-stage {
+    0% { opacity: 0; }
+    3%, 95% { opacity: 1; }
+    99%, 100% { opacity: 0; }
+  }
+  @keyframes process-and-thread-chip-a {
+    0%, 30% { transform: translate(170px, 31px); }
+    35%, 100% { transform: translate(58px, 31px); }
+  }
+  @keyframes process-and-thread-chip-b {
+    0%, 38% { transform: translate(282px, 31px); }
+    43%, 100% { transform: translate(170px, 31px); }
+  }
+  @keyframes process-and-thread-saved-a {
+    0%, 33% { opacity: 0; }
+    35%, 100% { opacity: 1; }
+  }
+  @keyframes process-and-thread-saved-b {
+    0%, 38% { opacity: 1; }
+    40%, 100% { opacity: 0; }
+  }
+  @keyframes process-and-thread-sa {
+    0%, 29% { stroke: var(--color-amber); }
+    31%, 100% { stroke: var(--color-line); }
+  }
+  @keyframes process-and-thread-sb {
+    0%, 44% { stroke: var(--color-line); }
+    46%, 70% { stroke: var(--color-cyan); }
+    72%, 100% { stroke: var(--color-line); }
+  }
+  @keyframes process-and-thread-ar-a {
+    0%, 6% { opacity: 0; }
+    9%, 100% { opacity: 1; }
+  }
+  @keyframes process-and-thread-ar-a-stroke {
+    0%, 29% { stroke: var(--color-amber); }
+    31%, 100% { stroke: var(--color-muted); }
+  }
+  @keyframes process-and-thread-ar-a-fill {
+    0%, 29% { fill: var(--color-amber); }
+    31%, 100% { fill: var(--color-muted); }
+  }
+  @keyframes process-and-thread-ar-b {
+    0%, 48% { opacity: 0; }
+    51%, 100% { opacity: 1; }
+  }
+  @keyframes process-and-thread-ar-b-stroke {
+    0%, 70% { stroke: var(--color-cyan); }
+    72%, 100% { stroke: var(--color-muted); }
+  }
+  @keyframes process-and-thread-ar-b-fill {
+    0%, 70% { fill: var(--color-cyan); }
+    72%, 100% { fill: var(--color-muted); }
+  }
+  @keyframes process-and-thread-heap {
+    0%, 11% { stroke: var(--color-line); fill: var(--color-panel2); }
+    13%, 29% { stroke: var(--color-amber); fill: var(--color-panel2); }
+    31%, 51% { stroke: var(--color-line); fill: var(--color-panel2); }
+    53%, 70% { stroke: var(--color-cyan); fill: var(--color-panel2); }
+    73%, 100% { stroke: var(--color-green); fill: var(--color-green-dim); }
+  }
+  @keyframes process-and-thread-v0 {
+    0%, 13% { opacity: 1; }
+    16%, 100% { opacity: 0; }
+  }
+  @keyframes process-and-thread-v1 {
+    0%, 13% { opacity: 0; }
+    16%, 100% { opacity: 1; }
+  }
+
+  @keyframes process-and-thread-r1 {
+    0%, 27% { opacity: 1; }
+    29%, 100% { opacity: 0; }
+  }
+  @keyframes process-and-thread-r2 {
+    0%, 29% { opacity: 0; }
+    31%, 45% { opacity: 1; }
+    47%, 100% { opacity: 0; }
+  }
+  @keyframes process-and-thread-r3 {
+    0%, 47% { opacity: 0; }
+    49%, 70% { opacity: 1; }
+    72%, 100% { opacity: 0; }
+  }
+  @keyframes process-and-thread-r4 {
+    0%, 72% { opacity: 0; }
+    74%, 100% { opacity: 1; }
+  }
+</style>
