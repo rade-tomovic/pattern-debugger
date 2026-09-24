@@ -1,0 +1,157 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: bfs-dfs
+problem: number-of-islands
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+
+## task
+
+Given an `m × n` grid of `'1'` (land) and `'0'` (water), count the islands — maximal groups of land
+cells connected 4-directionally. LeetCode #200.
+
+```text
+grid = [
+  ['1','1','0','0'],
+  ['1','1','0','0'],
+  ['0','0','1','0'],
+  ['0','0','0','1'],
+]
+→ 3
+```
+
+## how to think
+
+Scan the grid; the first time you land on an unvisited `'1'`, you've found a new island — flood-fill
+everything connected to it (BFS or DFS, doesn't matter for correctness) so the rest of the scan
+passes right over it, and count once per flood-fill you had to start. There's no cleverness in the
+flood fill itself: it's exactly the [Flood Fill](/patterns/bfs-dfs/flood-fill/) DFS, generalized to
+count instead of recolor, run from a grid cell the scan found instead of a given start.
+
+The part that actually needs care is bookkeeping — a naive scan-and-flood-fill can enqueue the same
+cell more than once before it's ever processed, if you're not disciplined about exactly when a cell
+gets marked visited.
+
+<Callout kind="note" label="template instance">
+  **BFS** skeleton, run once per undiscovered island from an outer grid scan. Invariant: every cell
+  visited during one flood fill belongs to the same connected component of `'1'`s, and every cell
+  gets visited by exactly one flood fill. What varies: the BFS runs inside a loop over every grid
+  cell, and each fresh start increments `islands`.
+</Callout>
+
+<Callout kind="trap" label="mark visited when you enqueue">
+  Mark a cell visited the moment you enqueue it, not when you dequeue it. Wait until dequeue, and a
+  cell with two or three unvisited-so-far neighbors can be pushed onto the queue once by *each* of
+  them before any of those pushes gets processed. The island count still comes out right — the outer
+  scan only starts a new flood fill on a truly untouched cell — but the queue balloons with
+  duplicate work, and on a fully-flooded grid that duplication compounds every layer out. The fix is
+  one line: set `visited[nr, nc] = true` in the same breath as `queue.Enqueue((nr, nc))`, so once
+  something is in the queue, nothing can queue it again.
+</Callout>
+
+## solution
+
+```csharp
+public int NumIslands(char[][] grid)
+{
+    int rows = grid.Length, cols = grid[0].Length;
+    bool[,] visited = new bool[rows, cols];
+    int[] dRow = [-1, 1, 0, 0];
+    int[] dCol = [0, 0, -1, 1];
+    int islands = 0;
+
+    for (int r = 0; r < rows; r++)
+    {
+        for (int c = 0; c < cols; c++)
+        {
+            if (grid[r][c] != '1' || visited[r, c]) continue;
+
+            islands++;
+            Queue<(int R, int C)> queue = new();
+            queue.Enqueue((r, c));
+            visited[r, c] = true;                      // mark WHEN ENQUEUEING
+
+            while (queue.Count > 0)
+            {
+                var (cr, cc) = queue.Dequeue();
+
+                for (int d = 0; d < 4; d++)
+                {
+                    int nr = cr + dRow[d], nc = cc + dCol[d];
+                    if (nr < 0 || nr >= rows || nc < 0 || nc >= cols) continue;
+                    if (grid[nr][nc] != '1' || visited[nr, nc]) continue;
+
+                    visited[nr, nc] = true;              // before it ever sits in the queue
+                    queue.Enqueue((nr, nc));
+                }
+            }
+        }
+    }
+    return islands;
+}
+```
+
+## trace
+
+```text
+1 1 0 0
+1 1 0 0
+0 0 1 0
+0 0 0 1
+```
+
+| step | cell | trigger | queue after |
+| --- | --- | --- | --- |
+| 1 | `(0,0)` | outer scan: unvisited land → **island #1** begins | `[(0,0)]` |
+| 2 | dequeue `(0,0)` | enqueue `(1,0)`, `(0,1)` | `[(1,0), (0,1)]` |
+| 3 | dequeue `(1,0)` | enqueue `(1,1)` | `[(0,1), (1,1)]` |
+| 4 | dequeue `(0,1)` | `(1,1)` already visited — nothing new | `[(1,1)]` |
+| 5 | dequeue `(1,1)` | no unvisited land neighbors | `[]` — island #1 done, 4 cells |
+| 6 | `(2,2)` | outer scan: unvisited land → **island #2** begins | `[(2,2)]` |
+| 7 | dequeue `(2,2)` | no unvisited land neighbors | `[]` — island #2 done, 1 cell |
+| 8 | `(3,3)` | outer scan: unvisited land → **island #3** begins | `[(3,3)]` |
+| 9 | dequeue `(3,3)` | no unvisited land neighbors | `[]` — island #3 done, 1 cell |
+
+`islands = 3`:
+
+```text
+I I . .
+I I . .
+. . II .
+. . . III
+```
+
+## why it works
+
+Two invariants stack together. First, the flood-fill invariant: once a BFS starts from a land cell,
+it visits every cell 4-directionally reachable through land, and nothing else — so it clears one
+whole island per run. Second, the outer-scan invariant: because every cell of an island gets marked
+visited during that one BFS, the scan can never trigger a second flood fill from the same island —
+it only increments `islands` on a cell no previous flood fill has touched. Between the two,
+`islands` counts exactly the number of connected components of `'1'`s, once each.
+
+<Watch items={[['time', 'O(rows × cols)'], ['space', 'O(rows × cols) — the visited array and the queue, worst case']]} />
+
+## common bugs
+
+- Marking `visited[nr, nc] = true` on dequeue instead of enqueue — not wrong, but wasteful, and the
+  first thing to fix if this times out on a large grid (see the callout above).
+- Mutating `grid` in place (writing `'0'` over visited `'1'`s) instead of using a separate `visited`
+  array — works, but it destroys the input; only do it if the problem says you may.
+- Forgetting the `visited[r, c]` check in the outer scan's skip condition — every land cell inside an
+  island you already counted looks like a brand-new island, and the count comes out far too high.
+- Using 8-directional neighbors (including diagonals) when the problem means 4-directional, or the
+  reverse on a problem that actually wants 8 — read which one is specified.
+
+## variants you can now solve
+
+- [Flood Fill](/patterns/bfs-dfs/flood-fill/) (LC 733) — this problem's inner loop on its own,
+  starting from a single given cell instead of an outer scan.
+- **Max Area of Island** (LC 695) — same scan-and-flood-fill, but the flood fill returns a cell
+  count and you keep the max instead of incrementing a counter.
+- **Pacific Atlantic Water Flow** (LC 417) — flood-fill inward from two different border sets and
+  intersect what each one reaches.
+- **Surrounded Regions** (LC 130) — flood-fill from the border first to mark what's safe, then treat
+  everything else as capturable.

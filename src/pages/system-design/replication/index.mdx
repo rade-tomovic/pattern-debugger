@@ -1,0 +1,330 @@
+---
+layout: '@layouts/TopicLayout.astro'
+topic: replication
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+
+## the ground floor
+
+- **`N`, `W`, `R`** — replication factor (total copies, leader included), write quorum (how
+  many replicas must acknowledge a write), read quorum (how many replicas a read consults).
+  The vocabulary you need to say anything precise about quorums.
+- **log position** (LSN, offset, sequence number) — the ordinal position of an entry in the
+  leader's write-ahead log. "How far behind is this follower" is always a question about the
+  gap between its position and the leader's.
+- **network lag vs apply lag — two different numbers.** A follower can have *received* an
+  entry (it is durable on that follower's disk) well before it has *applied* it to queryable
+  state. People say "replication lag" for both and conflate them; a synchronous follower can
+  be caught up on the first and still stale on the second.
+- **fencing** — stopping a node that should no longer act as leader from acting as leader
+  anyway. Not the same as detecting the problem; detection tells you it happened, fencing
+  prevents the write.
+
+## core idea
+
+Replication exists to survive losing a machine without losing the data on it, and to let reads
+scale past what one machine can serve. Both benefits are real, and both are paid for with the
+same currency: the moment you have more than one copy, you must decide how far apart those
+copies are allowed to drift before someone notices, and what a caller is told while they are
+drifting. Everything below is that one decision, worked out in the places it actually bites.
+
+## how it actually works
+
+### the write path
+
+Single-leader replication — the default topology, and the one the rest of this page assumes
+unless it says otherwise: every write goes to one leader, which appends it to its own log and
+then ships that log to the followers. Followers are otherwise passive; they never originate a
+write, only replay one.
+
+```text
+client
+  │  write(id=42, name="Alex")
+  ▼
+LEADER
+  │  1. append to local WAL → LSN 1042
+  │  2. commit locally (durable on the leader now)
+  │  3. stream the entry to every follower
+  │
+  ├──async──► follower A   (leader does NOT wait; A applies whenever it gets to it)
+  │
+  └──sync───► follower B   (leader WAITS for B's ack before step 4)
+                 │
+                 ▼
+           B appends LSN 1042 to its own WAL, sends ack
+  ◄──────────────┘
+  │  4. ack the client
+  ▼
+client sees success
+```
+
+The leader's own commit (step 2) and the client's ack (step 4) are two different events. What
+"synchronous" changes is how much has to happen *between* them.
+
+### synchronous versus asynchronous: what synchronous actually buys
+
+Precisely: synchronous replication means the leader withholds its ack to the client until at
+least one follower has confirmed the entry is durable there too. That is the entire mechanism —
+one extra round trip on the write path, to whichever follower(s) you nominated as synchronous.
+If that follower is same-datacenter, the round trip is small; if it is cross-region, you are
+paying a published order-of-magnitude jump — a same-datacenter round trip is sub-millisecond,
+a cross-region one is tens of milliseconds — on every single write, not as a benchmark, as a
+structural fact about speed of light and distance.
+
+What synchronous does *not* change: the leader's own durability. The leader still depends on
+its own `fsync`. A synchronous follower protects you from losing an acknowledged write when the
+*leader* dies; it says nothing about the leader's local disk, which is a separate guarantee paid
+for separately.
+
+And the follower being unreachable is a real decision point, not an edge case you can ignore:
+the leader must either block writes until that follower comes back (durability wins, you just
+went unavailable) or silently fall back to asynchronous (availability wins, you just lost the
+guarantee you thought you had). Whichever a system does, it is a policy someone chose, and "we
+run synchronous replication" is not a complete sentence until you know which branch it takes
+under a partition.
+
+### replication lag and the read guarantees it breaks
+
+Asynchronous replication buys you availability and cheap writes at the price of a window where
+followers are behind. What that window breaks is not one thing called "eventual consistency" —
+it is three separate guarantees, each with its own mechanism, and a system that has one does
+not automatically have the others:
+
+- **read-your-writes** — after *you* write, your own subsequent reads see it. Async
+  replication alone does not give you this: your write lands on the leader, your next read
+  might land on a follower that has not caught up. The fix is a mechanism, not a hope — route
+  that read to the leader for a short window, or carry the write's log position forward (in a
+  cookie, a session token) and require whichever replica serves the read to be at least that
+  fresh.
+- **monotonic reads** — your *reads*, across calls, never move backward in time, even with no
+  write in between. Without pinning, two reads can land on two followers at different lag, and
+  the second can show you something older than the first. The fix is session affinity to one
+  replica, or the same log-position watermark used above, checked on every read regardless of
+  whether you wrote anything.
+- **consistent prefix** — if write B was causally after write A, nobody should see B without A.
+  This one bites multi-leader and partitioned setups more than simple leader-follower, because
+  causally related writes can take different paths and arrive out of order. The fix is
+  attaching causal metadata (or simply routing causally related writes through one path).
+
+Collapsing these three into "eventual consistency, it'll catch up" is the single most common
+inaccuracy in this area. They are different promises, they fail in different ways, and the
+diagram below is the first one — a read-your-writes violation, nothing more:
+
+```text
+t0   client ──write name="Alex"──► LEADER            (leader acks immediately, replication is async)
+t1   client ──read name─────────► FOLLOWER   → "old-name"   (hasn't applied t0 yet)
+t2                                 FOLLOWER applies the async entry from t0, now has "Alex"
+t3   client ──read name─────────► FOLLOWER   → "Alex"
+```
+
+Nothing here is broken in the sense of a bug — the follower did exactly what asynchronous
+replication promises. What broke is an assumption the caller was making for free.
+
+### quorums
+
+A quorum system spreads reads and writes across `N` replicas instead of pinning both to one
+leader: a write must be acknowledged by `W` replicas, a read must consult `R` replicas and
+reconcile what comes back. Choosing `W` and `R` so that `R + W > N` guarantees the read set and
+the write set overlap in at least one replica — the read is mathematically guaranteed to touch
+someone who saw the latest acknowledged write.
+
+<Watch items={[['N', '3'], ['W', '2'], ['R', '2'], ['overlap', 'guaranteed (2 + 2 > 3)']]} />
+
+<Callout kind="trap" label="overlap is not linearizability">
+  `R + W > N` guarantees you will *read back* the latest acknowledged write among the replicas
+  you consulted. It does not tell you which of the versions you got back *is* the latest — you
+  still need a way to order them (timestamps, version vectors) and resolve concurrent writes to
+  the same key, and without something that also serializes writes into one agreed order — a
+  single leader, or a consensus-backed log — the system has no total order to be linearizable
+  *with respect to*. Quorum overlap is a guarantee about intersection, not about time.
+</Callout>
+
+An unbalanced quorum is a legitimate, different design: `N=5, W=1, R=1` gives you no overlap at
+all — that is a system that chose pure availability and fast writes over any read consistency,
+and it is a valid choice as long as everyone building on top of it knows that is what it is.
+
+### failover: what it actually costs
+
+Promoting a follower to leader is not free, and it is not automatic just because replication
+exists — something has to *decide* which follower is promoted, which is a consensus problem
+([Consensus](/system-design/consensus/) is where that decision-making lives; this page only
+covers what the promotion costs once it happens).
+
+Two costs, and they are different failure modes:
+
+- **data loss**, under asynchronous replication: any write the leader acknowledged but had not
+  yet shipped to the follower that gets promoted is gone. Not delayed — gone. The newly
+  promoted leader has no record of it and no way to get it back. This is expected behavior
+  under async, not a bug in the failover.
+- **split-brain**: the old leader does not necessarily know it has been demoted. A network
+  partition can leave it isolated but still running, still accepting writes, while the rest of
+  the cluster has already promoted someone else. Two nodes now both believe they are the
+  leader.
+
+Split-brain is not fixed by a timeout alone. A lease or election timeout tells the *rest of the
+cluster* to stop waiting on the old leader; it does nothing to stop the old leader itself from
+acting, particularly if it was merely slow (a long GC pause, a stalled disk) rather than dead,
+and resumes exactly when everyone else has moved on. The fix is fencing: every leadership term
+gets a monotonically increasing epoch, and anything the leader writes to — storage, the
+replication stream — carries that epoch and rejects anything tagged with an older one. The old
+leader is not prevented from *trying*; it is prevented from *succeeding*.
+
+## the tradeoff
+
+| | asynchronous | synchronous (one follower) | quorum (`W` of `N`) |
+| --- | --- | --- | --- |
+| added write cost | none beyond the leader's local commit | one round trip to the sync follower | one round trip to the slowest of the `W` you wait for |
+| data loss if the leader dies right after acking | any unshipped write is gone | none, if that one follower survives and is promoted | none, if one of the `W` acking followers survives and is promoted |
+| availability when a follower is unreachable | unaffected — the leader never waited on it | must choose: block writes, or quietly degrade to async | writes still succeed while `W` replicas remain reachable |
+| what a caller can assume about a read | nothing, without extra mechanism (see above) | still nothing, by default — sync affects durability, not read routing | overlap with the last write, not ordering between writes (see quorum trap) |
+| operational shape | followers are best-effort; simplest to run | must alert specifically on the sync follower's health | must design explicitly for `W`-of-`N` reachability, not just "is it up" |
+
+For a typical service, asynchronous leader-follower is the right default: cheap writes, and
+followers that exist for read scaling and disaster recovery, not for a durability promise. Reach
+for synchronous or quorum-based replication only when the business has stated, specifically,
+that an acknowledged write is allowed to be lost never — a ledger entry, an inventory
+decrement, anything where "eventually consistent" is a different sentence from "correct." That
+guarantee is not free: you are trading availability during exactly the moment you need it least
+(a partition or an overloaded follower) for a promise about data you will hopefully never have
+to collect on.
+
+## how it fails
+
+- **A user's own update "reverts" seconds after they saved it.** Cause: the read after the
+  write landed on a follower that had not applied the write yet — a read-your-writes violation.
+  Looks like a support ticket saying the site is broken, not a replication ticket, because the
+  symptom is one user's screen, not a dashboard alert.
+- **The replication-lag metric climbs and does not come back down.** Cause is one of: a burst
+  of writes outrunning a single-threaded apply path on the follower, a long-running query or
+  lock on the follower blocking apply, or a degraded network link. The dashboard shows the gap
+  between leader and follower log position widening; nothing on the leader looks wrong, because
+  the leader is not the one falling behind.
+- **A failover happens and recent records are simply missing.** Cause: asynchronous replication
+  plus writes that had not reached the promoted follower. Not a corruption — a gap, and the
+  gap's edge is exactly the last log position the new leader had at promotion time.
+- **Two leaders, diverging data, sometimes a duplicate key that should have been impossible.**
+  Cause: split-brain — a partition left the old leader running and un-fenced. This is the
+  expensive failure: reconciling two histories that both happened is a manual, error-prone
+  process, and it is why fencing is worth the design effort before it happens rather than after.
+- **Writes start failing cluster-wide during a partial network event.** Cause, in a quorum
+  system: not enough reachable replicas to satisfy `W`. This is the quorum system behaving
+  correctly — refusing an unsafe write — but it presents to on-call as an outage, not as safety.
+
+## in practice
+
+- **SQL Server Always On Availability Groups** — you set each secondary's commit mode
+  individually to synchronous-commit or asynchronous-commit; synchronous-commit means the
+  primary waits for the secondary to *harden the log* (write it to disk), not for that
+  secondary's data pages to reflect the change. A readable secondary in sync-commit mode can
+  still serve stale reads, because "log-hardened" and "applied" are exactly the network-lag and
+  apply-lag from the ground floor, wearing this vendor's names. `ApplicationIntent=ReadOnly` in the
+  connection string routes a connection to a readable secondary via the AG's read-only routing
+  list — the read/write split EF Core does not do for you automatically.
+- **PostgreSQL streaming replication** is asynchronous by default. `synchronous_commit` has
+  more than an on/off switch: `remote_write` waits for the standby to have *written* the WAL
+  (not fsynced — a standby OS crash before its own fsync can still lose it), `on` waits for the
+  standby to fsync, and `remote_apply` waits for the standby to have applied it, which is the
+  only level that also protects a read issued to that standby immediately afterward. Picking
+  `remote_write` because it sounds safer than plain async, without reading what it actually
+  waits for, is a specific and common footgun.
+- **Redis replication is asynchronous, full stop**, and Redis is explicit that it is not
+  designed as a durability-first store on this axis. The `WAIT` command lets one caller block
+  until `N` replicas have acknowledged a given write, but it is an opt-in per command, not a
+  standing guarantee — nothing stops the next write on the same connection from going out
+  fire-and-forget again. Sentinel handles failover detection and promotion; it does not turn
+  the underlying replication synchronous.
+- **Kafka** implements a real quorum on the write path: each partition has an in-sync replica
+  set (ISR), `acks=all` means the leader waits for every replica currently in the ISR, and
+  `min.insync.replicas` is the floor — if the ISR shrinks below it, produces fail loudly instead
+  of silently losing the durability guarantee you thought you had. This is the queue-shaped
+  version of everything above; [Queues & Event Streams](/system-design/queues-and-streams/) is
+  where the delivery-guarantee half of Kafka lives.
+- **Cosmos DB** turns the read-guarantee split above into a literal configuration knob: its
+  five consistency levels are, in effect, named points on the replication-lag tradeoff, and
+  **Session** — the default — gives read-your-writes and monotonic reads specifically, by
+  attaching a session token (carrying a log-position-like watermark) to the client and requiring
+  the served replica to be at least that fresh. It is the read-your-writes fix from the "how it
+  actually works" section, shipped as a product feature instead of something you hand-roll.
+- **Polly retries against a lagging replica fix availability, not staleness.** Retrying a read
+  that hit a behind follower will, at best, hit the same follower again; it does not make the
+  data any fresher. If the requirement is read-your-writes, the fix is routing or a version
+  check, not a retry policy.
+
+## the same idea elsewhere
+
+| here | there | the trap |
+| --- | --- | --- |
+| the write-ahead log is the replication stream | [Storage Engines](/system-design/storage-engines/): the WAL that makes a crashed engine recoverable | it is the same log serving two jobs — assuming "replicated" implies "the leader's own copy is durable", or the reverse, is how the two get conflated |
+| a follower lagging behind the leader | [The Memory Model](/systems/memory-model/): one core's write reaching another core's cache | cache coherence is hardware-enforced and invisible to your code — a write on one core *will* become visible on another with no explicit mechanism. Replica visibility has no such hardware guarantee; every one of the guarantees above (read-your-writes, monotonic reads) has to be built, because nothing underneath is building it for you |
+| a leader that should have stepped down but is still acting | [Inside a Lock](/systems/locks-internals/): a thread that no longer holds a mutex but is still running past the check | a mutex is enforced by one hardware-atomic instruction on one memory location, so "only the holder proceeds" is guaranteed by the machine. A distributed leader has no equivalent atomic across machines — a lease timeout is a convention, not an enforcement, which is exactly why fencing has to exist here and does not need to for a single-process mutex |
+
+## interview drills
+
+**Q.** You added a read replica for scale. Users now report their own updates don't show up
+right after they save. What's happening, and how do you fix it?
+- *weak answer* — "It's eventual consistency, it'll catch up." True, but names no mechanism and
+  offers no fix; an interviewer will immediately ask "so what do you do about it."
+- *strong answer* — this is a read-your-writes violation: the write went to the leader, the
+  next read landed on a follower that had not applied it yet. Fix by routing that user's next
+  read to the leader for a short window, or by carrying the write's log position forward and
+  requiring whichever replica serves the read to be at least that fresh.
+- *follow-up* — "What if the next request lands on a different app server?" — session affinity
+  to a server doesn't help; the freshness requirement has to travel with the client (a token) or
+  be looked up server-side keyed by that client, not implied by which server happened to answer.
+
+**Q.** Your team wants synchronous replication for "zero data loss." What are you actually
+agreeing to pay?
+- *weak answer* — "It'll be slower." Correct but not an answer an interviewer can grade.
+- *strong answer* — every write now blocks on a round trip to at least one follower before the
+  client is acked, and you must decide, explicitly, what happens when that follower is
+  unreachable: block writes (keep the durability promise, lose availability) or fall back to
+  async (keep availability, quietly lose the promise). "We run synchronous replication" is
+  incomplete until you know which branch it takes.
+- *follow-up* — "Does that protect you if the leader's own disk fails before it flushes?" — no;
+  the leader's local durability is a separate guarantee, paid for by its own `fsync`, unrelated
+  to whether a follower is synchronous.
+
+**Q.** You configured `R + W > N` for your quorum store. Are your reads linearizable now?
+- *weak answer* — "Yes, that's the quorum condition for consistency."
+- *strong answer* — overlap guarantees your read set intersects the replicas that acknowledged
+  the latest write, so you will get that version back among the responses. It does not tell you
+  *which* returned version is latest, and without something that also puts all writes into one
+  agreed order — a single leader, or a consensus-backed log — there is no total order for the
+  reads to be linearizable with respect to. Overlap is necessary, not sufficient.
+- *follow-up* — "What's the missing piece?" — a mechanism that serializes writes into one order
+  and makes reads observe that order in real time, which quorum overlap alone does not provide.
+
+**Q.** A failover just happened and on-call says "we lost the last few writes." Is that a bug?
+- *weak answer* — "Yes, replication is supposed to prevent data loss."
+- *strong answer* — under asynchronous replication this is the expected cost, not a bug: any
+  write acknowledged before it reached the promoted follower is gone once the old leader is
+  fenced off. It's the tradeoff that was made when async was chosen over synchronous or quorum
+  replication for that data.
+- *follow-up* — "How would you have prevented it?" — require at least one follower (or a
+  quorum) to acknowledge before the client is acked — synchronous or quorum replication — and
+  accept the added round trip on every write in exchange.
+
+**Q.** After a network partition, the old leader and the newly elected leader are both
+accepting writes. How does that happen, and how do you stop it?
+- *weak answer* — "The old leader should notice it lost the cluster and step down."
+- *strong answer* — it may not notice in time, or it may have been merely paused (a long GC
+  pause, a stalled disk) and resume acting exactly when everyone else has already moved on —
+  split-brain is a structural risk of leader election over a network, not a bug in one
+  implementation. The fix is fencing: every term gets a monotonically increasing epoch, and
+  anything downstream rejects writes tagged with an epoch older than one it has already seen.
+- *follow-up* — "Isn't a lease timeout enough by itself?" — no; a timeout tells the rest of the
+  cluster to stop waiting, but does nothing to stop the old leader from trying. Only a check on
+  the receiving side (the epoch) stops it from succeeding.
+
+**Q.** Reads from a replica jump backward in time between two calls from the same user, with no
+write in between. What guarantee is missing?
+- *weak answer* — "That's just eventual consistency."
+- *strong answer* — name it precisely: this is a monotonic-reads violation. The first read hit a
+  more caught-up replica than the second did. Fix with session affinity to one replica, or the
+  same log-position watermark used for read-your-writes, checked on every read regardless of
+  whether this session wrote anything.
+- *follow-up* — "How is that different from read-your-writes?" — read-your-writes is about
+  seeing your own write; monotonic reads is about reads alone never regressing. Different
+  promise, same toolbox (routing or a watermark), but the trigger condition is different.

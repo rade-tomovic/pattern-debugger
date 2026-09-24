@@ -1,0 +1,129 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: bit-manipulation
+problem: missing-number
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import Cells from '@components/Cells.astro';
+
+## task
+
+Given an array `nums` containing `n` **distinct** numbers taken from the range `0..n` (inclusive,
+so `n + 1` possible values for `n` slots), find the one value that's missing.
+
+```text
+nums = [5, 3, 0, 1, 4, 6]  (n = 6)  →  2
+```
+
+## how to think
+
+Brute force: throw every value into a `HashSet<int>`, then walk `0..n` and return the first value
+not in the set — O(n) time, O(n) space. You can do the O(n) time part with no extra space at all,
+and there are two independent ways to see it.
+
+**XOR cancellation**, same move as [Single Number](/patterns/bit-manipulation/single-number/):
+every value that's *present* in `nums` also has a matching index somewhere in `0..n`. XOR the
+array's indices, the array's values, and `n` itself all together — every present value pairs with
+its own index and cancels, and the one index that never got a matching value (the missing number)
+survives. You just need to seed the accumulator with `n`, because the loop only walks indices
+`0..n-1`, one short of the full range.
+
+**Gauss-sum**, the arithmetic twin: the numbers `0..n` sum to `n * (n + 1) / 2` by the closed-form
+formula. Subtract the actual sum of `nums` from that expected sum, and whatever's left over is
+the missing value. Same O(n) time, same O(1) space, no bitwise operators at all — worth knowing
+because it's the one an interviewer expects you to produce even faster than the XOR trick.
+
+<Callout kind="note" label="template instance">
+  **XOR cancellation** skeleton, extended: instead of XORing the array against itself, you XOR it
+  against the index range `0..n-1` plus the seed `n`. Invariant: after processing the first `k`
+  indices, the running XOR equals `n` XORed with whichever of those `k` (index, value) pairs have
+  not yet cancelled. What varies: the "pairs" are (index, value), not (value, value).
+</Callout>
+
+## solution
+
+```csharp
+public int MissingNumber(int[] nums)
+{
+    int missing = nums.Length;              // seed with n — it has no matching index of its own
+    for (int i = 0; i < nums.Length; i++)
+        missing ^= i ^ nums[i];
+    return missing;
+}
+```
+
+## trace
+
+`nums = [5, 3, 0, 1, 4, 6]`, `n = 6`:
+
+| i | nums[i] | missing before | XOR | missing after |
+| --- | --- | --- | --- | --- |
+| seed | — | — | — | `6` |
+| 0 | 5 | 6 | `6 ^ 0 ^ 5` | 3 |
+| 1 | 3 | 3 | `3 ^ 1 ^ 3` | 1 |
+| 2 | 0 | 1 | `1 ^ 2 ^ 0` | 3 |
+| 3 | 1 | 3 | `3 ^ 3 ^ 1` | 1 |
+| 4 | 4 | 1 | `1 ^ 4 ^ 4` | 1 |
+| 5 | 6 | 1 | `1 ^ 5 ^ 6` | 2 |
+
+Final `missing = 2`.
+
+<Cells
+  data={[0, 1, 2, 3, 4, 5, 6]}
+  cells={{ 0: 'win', 1: 'win', 2: 'ok', 3: 'win', 4: 'win', 5: 'win', 6: 'win' }}
+  caption="values 0..6: every present value (win) cancels with its own index inside the XOR — only 2, the gap, survives"
+/>
+
+## why it works
+
+Line up every index `0..n-1` against every value actually in `nums`, plus the extra seed `n`.
+That's `2n + 1` numbers total XORed together (n indices, n values, one seed) against `n + 1`
+"slots" in the true range `0..n`. Every value that *is* present matches its own index exactly
+once and cancels via `x ^ x == 0` — that accounts for `n` of the `n + 1` slots in pairs. The one
+slot with no partner (because its value never appeared in `nums`) is the only thing left standing
+when the XOR settles, by the same `x ^ 0 == x` argument as Single Number.
+
+**The Gauss-sum alternative.** No bitwise argument needed, just arithmetic — `expected − actual`
+isolates the missing term directly, because every value that *is* present cancels out of the
+subtraction and only the gap's contribution to `expected` remains:
+
+```csharp
+public int MissingNumberSum(int[] nums)
+{
+    int n = nums.Length;
+    long expected = (long)n * (n + 1) / 2;   // long guards the multiply against overflow
+    long actual = 0;
+    foreach (int x in nums) actual += x;
+    return (int)(expected - actual);
+}
+```
+
+On the job you might just write `Enumerable.Range(0, n + 1).Sum() - nums.Sum()` — same idea, one
+line — but watch the `int` overflow that both versions guard against with `long`: for `n` near
+`10^4` the sum is still small, but the honest habit is to say so out loud.
+
+<Watch items={[['time', 'O(n)'], ['space', 'O(1)'], ['passes', '1']]} />
+
+## common bugs
+
+- Forgetting to seed with `n` (or with `0..n` inclusive on the value side) — without it you're
+  missing exactly one XOR term and the cancellation argument breaks.
+- Using `<=` in the loop (`i <= nums.Length`) — that walks `nums[nums.Length]`, which is out of
+  bounds; the range `0..n-1` is exactly `nums.Length` iterations, matched one-to-one with the
+  array.
+- Gauss-sum without `long` — fine for the sizes LeetCode tests, but say out loud that you know
+  `int` would overflow on a large enough `n`.
+- Reaching for a full sort to find the gap — it works (O(n log n)) but throws away the O(n) you
+  get for free from either trick above.
+
+## variants you can now solve
+
+- **[Single Number](/patterns/bit-manipulation/single-number/)** (LC 136) — the simpler XOR
+  cancellation this problem extends: pairs within the array itself, no index range involved.
+- **Find the Duplicate Number** (LC 287) — the mirror problem: `n + 1` values drawn from `1..n`,
+  so exactly one value repeats instead of one being missing. XOR doesn't isolate it cleanly here
+  (a repeat doesn't cancel against a missing slot); Floyd's cycle detection is the usual answer.
+- **First Missing Positive** (LC 41) — the hard sibling: no bounded range is given up front, so
+  the trick is placing each value at its own index in-place, then scanning for the first mismatch.

@@ -1,0 +1,109 @@
+---
+layout: '@layouts/TopicLayout.astro'
+topic: linked-lists
+---
+
+import Callout from '@components/Callout.astro';
+import ProblemList from '@components/ProblemList.astro';
+
+## core idea
+
+A linked list only moves forward, so the craft here is holding the right pointers at the right
+moment instead of indexing wherever you like. Three moves cover almost everything: run two
+pointers at different speeds to learn about the list's *structure* without knowing its length,
+park a throwaway node in front of the real head so "is this the first node?" stops being a
+special case, and reverse arrows in place instead of copying data. Every problem below is one
+or two of these chained together.
+
+| shape | pointers | typical trigger |
+| --- | --- | --- |
+| fast / slow | `slow` +1, `fast` +2 each step | middle element, cycle detection, "nth from the end" |
+| dummy head | one throwaway node in front of the real head | the head itself might move, get deleted, or not exist yet |
+| iterative reversal | `prev` / `curr` / `next` triple | reverse all or part of the list, in place |
+
+## when to reach for it
+
+- The question needs a **position** relative to the list's length (middle, kth-from-the-end)
+  without a length you're handed up front → fast/slow, or a fixed-gap pointer pair.
+- The **head might change** — you're deleting the first node, merging two lists, or building a
+  brand-new one → a dummy head erases that branch entirely.
+- The words **reverse**, **reorder**, or **"in groups of k"** show up → walk with
+  `prev`/`curr`/`next` and flip arrows as you go.
+- The problem looks like two of the above stacked — find the middle, then reverse, then compare
+  — that combo is common enough to be its own shape: palindrome-style.
+
+## universal templates
+
+All three skeletons below share one node type — the standard interview definition you'll see
+in every solution on this site:
+
+```csharp
+public class ListNode(int val = 0, ListNode? next = null)
+{
+    public int Val = val;
+    public ListNode? Next = next;
+}
+```
+
+Fast / slow — learns the list's shape in one pass:
+
+```csharp
+public ListNode? FastSlow(ListNode? head)
+{
+    ListNode? slow = head, fast = head;
+    while (fast != null && fast.Next != null)   // fast dies first — checked so slow never overruns
+    {
+        slow = slow!.Next;                       // one step
+        fast = fast.Next.Next;                   // two steps — the 2x gap is the whole trick
+    }
+    return slow;                                 // middle when it stops; meeting point if a cycle exists
+}
+```
+
+Dummy head — the workhorse for anything that builds or mutates a list:
+
+```csharp
+public ListNode? BuildOrMutate(ListNode? head)
+{
+    var dummy = new ListNode(0, head);   // one throwaway node erases "is this the first node?"
+    var tail = dummy;                    // walk and mutate from here — tail.Next is always writable
+
+    // ... build/merge/delete logic reads and writes through tail.Next ...
+
+    return dummy.Next;                   // the dummy itself is never part of the answer
+}
+```
+
+Iterative reversal — flip arrows instead of copying values:
+
+```csharp
+public ListNode? Reverse(ListNode? head)
+{
+    ListNode? prev = null;
+    ListNode? curr = head;
+    while (curr != null)
+    {
+        ListNode? next = curr.Next;   // save before you overwrite it
+        curr.Next = prev;             // flip the arrow
+        prev = curr;                  // advance prev
+        curr = next;                  // advance curr
+    }
+    return prev;                      // prev is the new head once curr runs off the end
+}
+```
+
+Every problem below is one of these three skeletons — or two of them, run back to back.
+
+<Callout kind="insight" label="pick the invariant before the pointer">
+  Before writing the loop, state what's true at the top of every iteration. Fast/slow: *"slow
+  has moved exactly half as far as fast."* Dummy head: *"`tail.Next` is always the next real slot
+  to fill."* Get the invariant right and the loop body writes itself — get it wrong and you'll
+  chase off-by-ones for an hour.
+</Callout>
+
+## problems
+
+Two warm-ups on fast/slow, two dummy-head workhorses, and three combo problems that chain this
+topic's pieces together — capped by the classic hashmap + linked-list design question.
+
+<ProblemList topic="linked-lists" />

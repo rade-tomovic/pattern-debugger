@@ -1,0 +1,69 @@
+---
+layout: '@layouts/TopicLayout.astro'
+topic: design-drills
+---
+
+import ProblemList from '@components/ProblemList.astro';
+
+## core idea
+
+A design-drill question is not testing whether you know the "right" architecture for a URL
+shortener — there isn't one. It's testing whether you can get to *an* architecture the same way
+every time: state your scope out loud, size it before you draw it, defend the box you drew, and
+know what would fall over first. The four drills below are different systems on the surface and
+the same exercise underneath.
+
+## the method
+
+Five moves, always in this order.
+
+```text
+clarify first  →  the numbers  →  the sketch  →  the tradeoffs  →  how it fails
+   (scope)         (assumptions)     (boxes)      (what you buy)    (what breaks)
+```
+
+### clarify first
+
+The most-skipped and highest-scoring part of the interview. A strong engineer who starts
+sketching boxes in the first thirty seconds is optimizing for the wrong signal — the interviewer
+already knows you can draw boxes. What they're checking is whether you know which questions
+change the design, because each of these four drills genuinely turns on a different one:
+read:write ratio for the URL shortener, where a counter lives once there's more than one
+instance for the rate limiter, the shape of the follow graph for the news feed, ordering scope
+for chat. Ask before you assume.
+
+### the numbers
+
+State your assumptions explicitly — daily actives, an average fan-out, a row size — then do the
+arithmetic in full: requests per second from daily actives, bytes per day from bytes per row,
+instances from a connection ceiling. The number itself is rarely the point; what it's for is
+telling you which side of the system is actually expensive, so you don't spend the rest of the
+interview optimizing the side that was never the bottleneck.
+[Back-of-envelope estimation](/system-design/estimation/) is the fuller version of this
+arithmetic, done once, for its own sake.
+
+### the sketch
+
+Boxes only after the first two moves are done, and drawn as two separate paths — write and read
+— because in every one of these drills they're asymmetric, and the interesting design decision
+usually lives in only one of them.
+
+### the tradeoffs
+
+Pick a default, say why it's right for the assumptions you stated, and say what would make you
+change it. "It depends" is a non-answer unless you finish the sentence with *on what*. This is
+also where most of the real content lives — a cache, a queue, a partitioning scheme
+([caching](/system-design/caching/) and [partitioning](/system-design/partitioning/) show up in
+some form in every drill below).
+
+### how it fails
+
+Name the failure mode in production terms — the symptom on a dashboard, the shape of the support
+ticket — not just the mechanism. Anyone can say "the queue could back up." Saying *what that
+looks like from the outside* is what separates having read about the system from having run one.
+
+## problems
+
+Same five moves, four different systems, each pushing on a different part of the method.
+
+<ProblemList topic="design-drills" />

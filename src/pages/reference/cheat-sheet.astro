@@ -1,0 +1,48 @@
+---
+import TopicLayout from '@layouts/TopicLayout.astro';
+import CheatCard from '@components/CheatCard.astro';
+import { sections, topicsInSection, topicPath } from '@data/curriculum';
+import { cheatFor } from '@data/cheats';
+
+// every learnable topic that has a cheat card, grouped by section
+const groups = sections
+  .filter((s) => !['deep-dives', 'reference'].includes(s.id))
+  .map((s) => ({
+    section: s,
+    topics: topicsInSection(s.id).filter((t) => cheatFor(t.slug)),
+  }))
+  .filter((g) => g.topics.length > 0);
+---
+
+<TopicLayout frontmatter={{ topic: 'cheat-sheet' }}>
+  <p>
+    Every pattern's recognition signals, key tricks, and known traps — the same cards that live
+    on each topic page, gathered for the night-before pass. Read
+    the <strong>recognize it</strong> lines cold; if one doesn't instantly conjure the template,
+    that topic page is where tonight goes. For the long-form version of the signal column,
+    see <a href="/deep-dives/pattern-recognition/">pattern recognition</a>.
+  </p>
+
+  {
+    groups.map((g) => (
+      <>
+        <h2>{g.section.title.toLowerCase()}</h2>
+        <div class="not-prose !mt-4 space-y-4">
+          {g.topics.map((t) => (
+            <div>
+              <a
+                href={topicPath(t)}
+                class="font-mono text-[0.85rem] font-semibold text-amber hover:underline"
+              >
+                {t.title} →
+              </a>
+              <div class="mt-2">
+                <CheatCard topic={t.slug} title={`cheat sheet — ${t.tab.replaceAll('_', ' ')}`} />
+              </div>
+            </div>
+          ))}
+        </div>
+      </>
+    ))
+  }
+</TopicLayout>

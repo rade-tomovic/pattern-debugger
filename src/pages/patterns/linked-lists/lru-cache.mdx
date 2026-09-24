@@ -1,0 +1,211 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: linked-lists
+problem: lru-cache
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+
+## task
+
+Design a Least Recently Used cache with a fixed `capacity`:
+
+- `Get(key)` — return the value if present (and mark it as just-used), else `-1`.
+- `Put(key, value)` — insert or update (marking it as just-used); if this pushes the cache over
+  `capacity`, evict the **least** recently used entry first.
+
+Both operations must run in O(1) average time.
+
+```text
+LRUCache(2); Put(1,1); Put(2,2); Get(1) → 1
+Put(3,3)  →  evicts key 2 (it's the least recently used)
+Get(2)    →  -1
+```
+
+## how to think
+
+O(1) lookup by key means a dictionary — that part's not in question. The hard part is O(1)
+"promote this entry to most-recently-used" and O(1) "evict whatever's least recently used",
+together. An array can't do either without shifting; a plain singly linked list can't remove an
+arbitrary node in O(1) because you'd need its predecessor, which you don't have. A **doubly**
+linked list can, because every node already stores its own predecessor — removing it is a
+four-pointer patch, no search required. So: a dictionary maps `key -> node`, and a doubly linked
+list keeps the nodes ordered most-recently-used to least. This is exactly why "LRU Cache" always
+pairs a hashmap with the doubly linked list this topic builds.
+
+<Callout kind="note" label="template instance">
+  **Dummy head** — twice over. A dummy node sits at each end (head *and* tail) so every real node
+  always has a real predecessor and successor to patch, with no "is this the first/last node?"
+  branch. Invariant: the dictionary always points straight at a key's node, and list order
+  left-to-right is most- to least-recently-used.
+</Callout>
+
+## solution
+
+Two implementations, because interviewers ask for both: build the mechanism by hand once to prove
+you understand *why* it's O(1), then know that .NET already ships the doubly linked list part.
+
+### hand-rolled: dictionary + doubly linked list
+
+```csharp
+public class LRUCache
+{
+    private class Node(int key, int value)
+    {
+        public int Key = key;
+        public int Value = value;
+        public Node? Prev;
+        public Node? Next;
+    }
+
+    private readonly int _capacity;
+    private readonly Dictionary<int, Node> _map = new();
+    private readonly Node _head = new(0, 0);   // dummy — MRU sits right after this
+    private readonly Node _tail = new(0, 0);   // dummy — LRU sits right before this
+
+    public LRUCache(int capacity)
+    {
+        _capacity = capacity;
+        _head.Next = _tail;
+        _tail.Prev = _head;
+    }
+
+    public int Get(int key)
+    {
+        if (!_map.TryGetValue(key, out var node)) return -1;
+        Remove(node);
+        InsertAtHead(node);       // touched → most recently used
+        return node.Value;
+    }
+
+    public void Put(int key, int value)
+    {
+        if (_map.TryGetValue(key, out var existing))
+        {
+            existing.Value = value;
+            Remove(existing);
+            InsertAtHead(existing);
+            return;
+        }
+
+        if (_map.Count == _capacity)
+        {
+            var lru = _tail.Prev!;        // node right before the dummy tail
+            Remove(lru);
+            _map.Remove(lru.Key);
+        }
+
+        var node = new Node(key, value);
+        _map[key] = node;
+        InsertAtHead(node);
+    }
+
+    private void Remove(Node node)
+    {
+        node.Prev!.Next = node.Next;
+        node.Next!.Prev = node.Prev;
+    }
+
+    private void InsertAtHead(Node node)
+    {
+        node.Next = _head.Next;
+        node.Prev = _head;
+        _head.Next!.Prev = node;
+        _head.Next = node;
+    }
+}
+```
+
+### idiomatic: `LinkedList<T>` and `LinkedListNode<T>`
+
+`System.Collections.Generic.LinkedList<T>` already *is* a doubly linked list with O(1)
+`AddFirst`, `Remove`, and `RemoveLast` — there's no reason to hand-roll the node plumbing above
+outside of an interview that specifically asks for it.
+
+```csharp
+public class LRUCacheBuiltin
+{
+    private readonly int _capacity;
+    private readonly LinkedList<(int Key, int Value)> _order = new();
+    private readonly Dictionary<int, LinkedListNode<(int Key, int Value)>> _map = new();
+
+    public LRUCacheBuiltin(int capacity) => _capacity = capacity;
+
+    public int Get(int key)
+    {
+        if (!_map.TryGetValue(key, out var node)) return -1;
+        _order.Remove(node);
+        _order.AddFirst(node);    // relinks the existing node — no allocation
+        return node.Value.Value;
+    }
+
+    public void Put(int key, int value)
+    {
+        if (_map.TryGetValue(key, out var existing))
+        {
+            _order.Remove(existing);
+        }
+        else if (_map.Count == _capacity)
+        {
+            var lru = _order.Last!;
+            _map.Remove(lru.Value.Key);
+            _order.RemoveLast();
+        }
+        _map[key] = _order.AddFirst((key, value));
+    }
+}
+```
+
+## trace
+
+`LRUCache(2)`, then the classic operation sequence — order shown most-recently-used first:
+
+| operation | result | order (MRU → LRU) |
+| --- | --- | --- |
+| `Put(1, 1)` | — | `1:1` |
+| `Put(2, 2)` | — | `2:2, 1:1` |
+| `Get(1)` | `1` | `1:1, 2:2` |
+| `Put(3, 3)` | — | `3:3, 1:1` (key `2` evicted — it was LRU) |
+| `Get(2)` | `-1` | `3:3, 1:1` (unchanged — nothing to promote) |
+| `Put(4, 4)` | — | `4:4, 3:3` (key `1` evicted — it was LRU) |
+| `Get(1)` | `-1` | `4:4, 3:3` |
+| `Get(3)` | `3` | `3:3, 4:4` |
+| `Get(4)` | `4` | `4:4, 3:3` |
+
+Watch `Get(1)` at the top: it doesn't just read the value, it moves key `1` to the front — that
+single promotion is why key `2`, not key `1`, is the one evicted by the very next `Put`.
+
+## why it works
+
+Every touch — `Get` on a hit, or `Put` — removes the node from wherever it sits and reinserts it
+at the head, so "most recently used" always means "closest to the head" by construction; no
+scanning is ever needed to find it. Eviction always takes the node just before the dummy tail,
+which by the same invariant is the one that has gone longest untouched. `Remove` and
+`InsertAtHead` only ever touch a fixed number of pointers — four, regardless of list size —
+because a doubly linked node already knows its own neighbors.
+
+<Watch items={[['time', 'O(1) average, both ops'], ['space', 'O(capacity)']]} />
+
+## common bugs
+
+- Updating `Get` without moving the node to the front — the whole point of LRU tracking is lost;
+  a "recently used" read that doesn't promote makes eviction order wrong.
+- Forgetting the sentinel dummies at *both* ends — without a dummy tail, evicting when the list
+  has exactly one real node means patching a `null` predecessor.
+- Evicting `_head.Next` (the MRU end) instead of `_tail.Prev` (the LRU end) — a one-line typo that
+  inverts the entire cache's eviction policy.
+- With `LinkedListNode<T>`: `node.Value.Value = x` won't compile (CS1612 — the tuple comes back
+  as a copy); assign a whole new tuple with `node.Value = (key, value)`, or remove-and-re-add as
+  the code above does since you need to promote the node anyway.
+
+## variants you can now solve
+
+- [Insert Delete GetRandom O(1)](/patterns/hashmap/insert-delete-getrandom/) (LC 380) — the
+  sibling design question: dictionary + list again, but swap-remove replaces doubly-linked
+  splicing because order doesn't matter here.
+- **LFU Cache** (LC 460) — same shape, one dimension harder: evict by *frequency* first, recency
+  second, which needs a dictionary of doubly linked lists (one per frequency) instead of one.
+- [Merge K Sorted Lists](/patterns/heap-top-k/merge-k-sorted-lists/) (LC 23) — a different
+  structure entirely, but the same lesson: know when a specialized structure (here, a heap) beats
+  hand-rolling one from linked-list parts.

@@ -1,0 +1,141 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: greedy
+problem: gas-station
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import Cells from '@components/Cells.astro';
+
+## task
+
+`n` gas stations sit in a circle. `gas[i]` is the fuel you gain at station `i`; `cost[i]` is the
+fuel it takes to drive from station `i` to station `i + 1`. Starting with an empty tank at some
+station, find a starting index that lets you complete the full circuit exactly once — or return
+`-1` if no starting station works. If a solution exists, it's guaranteed unique.
+
+```text
+gas  = [1, 2, 3, 4, 5]
+cost = [3, 4, 5, 1, 2]   →  3   (start at station 3)
+```
+
+## how to think
+
+Checking every starting station by simulating the whole loop is O(n²). Two observations
+collapse it to one pass.
+
+First: a solution exists **iff** total gas ≥ total cost — if the whole circuit runs a deficit,
+no starting point can rescue it, and if it runs a surplus, one is guaranteed to exist.
+
+Second, the part that actually finds *which* station: scan left to right accumulating a running
+tank (`gas[i] - cost[i]`) from a candidate `start`. The moment the tank goes negative at index
+`i`, **no station between `start` and `i` can be the answer either** — every one of them would
+arrive at `i` with an equal or smaller tank than starting at `start` did (`start` was the best
+of that bunch by construction), and `start` itself already failed. So jump the candidate
+straight to `i + 1` and reset the tank to `0` — you never need to re-check anything you just
+proved impossible.
+
+<Callout kind="note" label="template instance">
+  **Track & decide** skeleton, with the "decide" step firing a *reset* instead of a return.
+  Invariant: `tank` is the running total of `gas[i] - cost[i]` since the current candidate
+  `start`; whenever `tank` goes negative, every index in `[start, i]` is provably not the
+  answer, so `start` jumps past all of them at once. A second running total, `total`, tracks
+  whether a solution exists at all.
+</Callout>
+
+## solution
+
+```csharp
+public int CanCompleteCircuit(int[] gas, int[] cost)
+{
+    int total = 0, tank = 0, start = 0;
+
+    for (int i = 0; i < gas.Length; i++)
+    {
+        int diff = gas[i] - cost[i];
+        total += diff;
+        tank += diff;
+
+        if (tank < 0)              // no station in [start, i] can reach i+1 either — restart-past-failure
+        {
+            start = i + 1;
+            tank = 0;
+        }
+    }
+    return total >= 0 ? start : -1;
+}
+```
+
+## trace
+
+`gas = [1, 2, 3, 4, 5]`, `cost = [3, 4, 5, 1, 2]`, `total`/`tank` start at `0`, `start = 0`:
+
+| i | gas[i] | cost[i] | diff | total | tank | `tank < 0`? |
+| --- | --- | --- | --- | --- | --- | --- |
+| 0 | 1 | 3 | -2 | -2 | -2 | yes → `start = 1`, `tank = 0` |
+| 1 | 2 | 4 | -2 | -4 | -2 | yes → `start = 2`, `tank = 0` |
+| 2 | 3 | 5 | -2 | -6 | -2 | yes → `start = 3`, `tank = 0` |
+| 3 | 4 | 1 | 3 | -3 | 3 | no |
+| 4 | 5 | 2 | 3 | 0 | 6 | no |
+
+Three restarts in a row (`i = 0, 1, 2`) each fail immediately — the deficit-heavy early stations
+can't even reach their own next stop. Station `3` is the first with a real surplus, the tank
+never dips below zero again, and `total = 0 >= 0` at the end confirms a solution exists: return
+`start = 3`.
+
+The diff array (`gas[i] - cost[i]`) makes the three eliminations and the surviving candidate
+visible at a glance:
+
+<Cells
+  data={[-2, -2, -2, 3, 3]}
+  pointers={{ 3: [{ t: 'start', c: 'green' }] }}
+  cells={{ 0: 'warn', 1: 'warn', 2: 'warn', 3: 'ok', 4: 'ok' }}
+  caption="indices 0-2 each drive the tank negative and get eliminated; start settles at 3, where the tank stays non-negative through the rest of the pass"
+/>
+
+## why it works
+
+The feasibility check is the easy half: the total surplus/deficit around the whole loop doesn't
+depend on where you start, so `total < 0` rules out every station at once, and the classic
+(unproved here, but standard) result is that `total >= 0` guarantees *some* station works.
+
+The restart argument is the interesting half. Suppose `start` reaches index `i` with a negative
+tank, and let `j` be any station with `start <= j < i`. Because `start` never failed before `i`,
+the running tank from `start` was `>= 0` at every point up to `j - 1` — in particular,
+`sum(diff[start..j-1]) >= 0`. Then:
+
+```text
+sum(diff[j..i]) = sum(diff[start..i]) - sum(diff[start..j-1])
+                <= sum(diff[start..i])          (subtracting something >= 0 can't increase it)
+                <  0                             (that's exactly why start failed at i)
+```
+
+So `j` fails at `i` too — every candidate between `start` and `i` is eliminated in one shot,
+which is why jumping straight to `i + 1` loses nothing.
+
+<Watch items={[['time', 'O(n)'], ['space', 'O(1)'], ['passes', '1']]} />
+
+## common bugs
+
+- Checking only `total >= 0` and returning `0` (or skipping the scan) — feasibility tells you
+  *that* a station exists, not *which* one; you still need the restart scan to find it.
+- Forgetting the final `total >= 0 ? start : -1` guard — after an infeasible run, `start` still
+  holds whatever index the last restart landed on, which is meaningless garbage, not `-1`.
+- Not resetting `tank = 0` (or not advancing `start`) on a failure — carrying a negative tank
+  across the restart poisons every station scanned afterward.
+- Assuming you must handle wraparound explicitly (e.g. with `% n`) — the feasibility check
+  covers the wrap: if `total >= 0`, the candidate left standing after one straight pass is
+  guaranteed valid — every segment before it has a negative sum, so the surplus must live in
+  the tail. One straight pass from `0` to `n - 1` is enough; you never need to simulate past
+  the array's end.
+
+## variants you can now solve
+
+- **Candy** (LC 135) — same exchange-argument family, but needs two greedy passes (left-to-
+  right, then right-to-left) because satisfying both neighbors at once can't be done in one
+  direction.
+- [Jump Game](/patterns/greedy/jump-game/) (LC 55) — same topic, a different greedy proof
+  shape: frontier-monotonicity instead of restart-past-failure. Worth comparing side by side.
+- **Circular Array Loop** (LC 457) — another circular-indexing greedy/cycle problem, this time
+  detecting a cycle of consistent direction rather than finding a valid start.

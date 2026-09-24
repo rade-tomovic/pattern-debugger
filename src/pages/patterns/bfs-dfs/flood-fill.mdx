@@ -1,0 +1,139 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: bfs-dfs
+problem: flood-fill
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+
+## task
+
+You're given an image as a 2D grid of integers (`image[r][c]`), a starting pixel `(sr, sc)`, and a
+`newColor`. Recolor the starting pixel, then keep recoloring every 4-directionally connected pixel
+that shares the starting pixel's *original* color. Return the modified image. LeetCode #733.
+
+```text
+image = [[1,1,1],[1,1,0],[1,0,1]], sr = 1, sc = 1, newColor = 2
+  →     [[2,2,2],[2,2,0],[2,0,1]]
+```
+
+## how to think
+
+There's no brute force to beat here — flood fill *is* the algorithm, and the whole exercise is
+recognizing that a grid is a graph: each cell is a node, connected to a neighbor iff they're
+4-directionally adjacent and share the same value. The color you compare against has to be captured
+*once*, before you start overwriting cells — otherwise every check after the first recolor compares
+against the wrong thing.
+
+The edge case that bites in interviews: what if `newColor` equals the color already there?
+Recoloring becomes a no-op, so a cell's value never actually changes — and if "does this cell still
+have the start color" is your visited check (instead of a separate `bool` grid), a cell can get
+revisited forever on any cycle of same-colored cells in the grid. Guard it before you ever recurse.
+
+<Callout kind="note" label="template instance">
+  **DFS** skeleton, on a grid. Invariant: every cell reachable from `(sr, sc)` through cells of the
+  *original* color gets recolored exactly once. What varies: there's no separate `visited` array —
+  the recolor itself doubles as the visited marker, since a cell that's already been set to
+  `newColor` will never again equal `startColor`.
+</Callout>
+
+## solution
+
+```csharp
+public int[][] FloodFill(int[][] image, int sr, int sc, int newColor)
+{
+    int startColor = image[sr][sc];
+    if (startColor == newColor) return image;   // no-op guard — without it, a color cycle recurses forever
+
+    Dfs(image, sr, sc, startColor, newColor);
+    return image;
+}
+
+private static readonly int[] DRow = [-1, 1, 0, 0];
+private static readonly int[] DCol = [0, 0, -1, 1];
+
+private void Dfs(int[][] image, int r, int c, int startColor, int newColor)
+{
+    if (r < 0 || r >= image.Length || c < 0 || c >= image[0].Length) return;
+    if (image[r][c] != startColor) return;       // wrong color, OR already recolored — same check covers both
+
+    image[r][c] = newColor;                      // recolor on entry: this doubles as the visited marker
+
+    for (int d = 0; d < 4; d++)
+        Dfs(image, r + DRow[d], c + DCol[d], startColor, newColor);
+}
+```
+
+## trace
+
+`image = [[1,1,1],[1,1,0],[1,0,1]]`, `sr = 1, sc = 1, newColor = 2`. Neighbors are tried in
+up, down, left, right order (`DRow`/`DCol`), and DFS commits fully to each recursive call before
+trying the next one:
+
+```text
+1 1 1
+1 1 0
+1 0 1
+```
+
+| step | call | from | image[cell] before | verdict | recolor to |
+| --- | --- | --- | --- | --- | --- |
+| 1 | `(1,1)` | start | 1 | == startColor | 2 |
+| 2 | `(0,1)` | up from `(1,1)` | 1 | == startColor | 2 |
+| 3 | `(0,0)` | left from `(0,1)` | 1 | == startColor | 2 |
+| 4 | `(1,0)` | down from `(0,0)` | 1 | == startColor | 2 |
+| 5 | `(2,0)` | down from `(1,0)` | 1 | == startColor | 2 |
+| 6 | `(0,2)` | right from `(0,1)`, after `(0,0)`'s whole subtree returned | 1 | == startColor | 2 |
+
+Every other neighbor tried along the way — `(2,1)` and `(1,2)`, both original color `0`, plus every
+out-of-bounds probe — fails the color check immediately and returns without recoloring; that's why
+only 6 of the 9 cells appear above.
+
+Midway (after step 4, `(1,1)`, `(0,1)`, `(0,0)`, `(1,0)` recolored, before the DFS reaches `(2,0)`
+and `(0,2)`):
+
+```text
+2 2 1
+2 2 0
+1 0 1
+```
+
+Final, after all 6 recolors:
+
+```text
+2 2 2
+2 2 0
+2 0 1
+```
+
+## why it works
+
+A cell only ever equals `startColor` until the moment it's recolored, and recoloring happens on
+entry, before any neighbor is explored — so the visited check and the actual work are the same
+line, and no cell can be visited twice. Bounds and color checks reject everything outside the
+starting color's connected component before any recursive work happens on it, and everything inside
+that component stops looking interesting to future calls the instant it's been handled. The result
+is exactly the connected component of `startColor` reachable from `(sr, sc)`, recolored once each.
+
+<Watch items={[['time', 'O(rows × cols)'], ['space', 'O(rows × cols) worst case — the recursion stack on a fully-connected grid']]} />
+
+## common bugs
+
+- Reading `image[sr][sc]` for `startColor` *after* recoloring has already started (or recomputing it
+  inside the recursive call) — the comparison silently uses `newColor` instead of the original.
+- Forgetting the `newColor == startColor` guard — on any grid with a cycle of the same color, this
+  recurses forever, or blows the stack on a large one.
+- Reaching for a separate `visited` array here — not wrong, but dead weight; the color check already
+  does the job, for exactly one reason: recoloring is irreversible.
+- Swapping rows and columns in the bounds check (`c >= image[0].Length` vs `r >= image.Length`) — an
+  easy mistake on a non-square grid, and one that only shows up on rectangular test cases.
+
+## variants you can now solve
+
+- [Number of Islands](/patterns/bfs-dfs/number-of-islands/) (LC 200) — the same connected-component
+  idea, but flood-fill from *every* unvisited land cell instead of one given start, and count how
+  many times you had to start over.
+- **Max Area of Island** (LC 695) — flood fill that returns a cell count instead of just recoloring.
+- **Surrounded Regions** (LC 130) — flood-fill from the border inward, then flip everything the
+  flood fill *didn't* reach.

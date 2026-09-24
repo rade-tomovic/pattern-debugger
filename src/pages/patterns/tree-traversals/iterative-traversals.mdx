@@ -1,0 +1,213 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: tree-traversals
+problem: iterative-traversals
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+
+## task
+
+Produce preorder (LC 144), inorder (LC 94), and postorder (LC 145) traversals of a binary tree
+**without recursion** — an explicit `Stack<TreeNode>` standing in for the call stack.
+
+```text
+        5
+       / \
+      3   8
+     / \   \
+    1   4   9
+```
+
+inorder = `[1,3,4,5,8,9]` · preorder = `[5,3,1,4,8,9]` · postorder = `[1,4,3,9,8,5]`
+
+## how to think
+
+Every recursive call the JIT would make — "go left, remember to come back, go right, remember to
+come back, then return to your caller" — is a frame on the call stack holding exactly one thing:
+which node to resume from. An explicit `Stack<TreeNode>` is that call stack, made visible. Once
+you see it that way, the three traversals stop needing three different tricks:
+
+- **Inorder** needs the *most* care, because "visit" happens **between** the two recursive
+  calls — you have to walk all the way left, pushing every node along the way, before you're
+  allowed to pop and visit anything.
+- **Preorder** is the easy one: visit happens *before* either recursive call, so you can visit a
+  node the instant you pop it, then push its children for later.
+- **Postorder** looks like it needs the same care as inorder — visit happens *last* — but there's
+  a shortcut: run the preorder algorithm with the push order flipped (`left` before `right`
+  instead of `right` before `left`), which visits **node, right, left**. Reverse that list and
+  you get **left, right, node** — postorder, for free.
+
+<Callout kind="note" label="template instance">
+  All three are the same **same-direction pointer walk** from
+  [Two Pointers](/patterns/two-pointers/) wearing a stack instead of two indices: one variable
+  (`current`, or the stack itself) tracks "where am I," and every node enters and leaves the
+  stack exactly once. Invariant for inorder: at any point, the stack holds exactly the ancestors
+  of `current` whose right subtree hasn't been explored yet. What varies: preorder and postorder
+  push both children eagerly and rely on stack order to sequence them; inorder pushes only
+  while descending left.
+</Callout>
+
+## solution
+
+```csharp
+public IList<int> InorderTraversal(TreeNode? root)
+{
+    var result = new List<int>();
+    var stack = new Stack<TreeNode>();
+    var current = root;
+
+    while (current is not null || stack.Count > 0)
+    {
+        while (current is not null)          // walk all the way left, stacking as we go
+        {
+            stack.Push(current);
+            current = current.Left;
+        }
+
+        current = stack.Pop();               // leftmost unvisited node
+        result.Add(current.Val);
+        current = current.Right;             // now explore its right subtree
+    }
+
+    return result;
+}
+
+public IList<int> PreorderTraversal(TreeNode? root)
+{
+    var result = new List<int>();
+    if (root is null) return result;
+
+    var stack = new Stack<TreeNode>();
+    stack.Push(root);
+
+    while (stack.Count > 0)
+    {
+        var node = stack.Pop();
+        result.Add(node.Val);
+
+        if (node.Right is not null) stack.Push(node.Right);   // push right first...
+        if (node.Left is not null) stack.Push(node.Left);     // ...so left pops first
+    }
+
+    return result;
+}
+
+public IList<int> PostorderTraversal(TreeNode? root)
+{
+    var result = new List<int>();
+    if (root is null) return result;
+
+    var stack = new Stack<TreeNode>();
+    stack.Push(root);
+
+    while (stack.Count > 0)
+    {
+        var node = stack.Pop();
+        result.Add(node.Val);
+
+        if (node.Left is not null) stack.Push(node.Left);     // push left first...
+        if (node.Right is not null) stack.Push(node.Right);   // ...so right pops first -> node,right,left
+    }
+
+    result.Reverse();          // reverse "node, right, left" -> "left, right, node"
+    return result;
+}
+
+// standard interview definition
+public class TreeNode(int val = 0, TreeNode? left = null, TreeNode? right = null)
+{
+    public int Val = val;
+    public TreeNode? Left = left;
+    public TreeNode? Right = right;
+}
+```
+
+## trace
+
+```text
+        5
+       / \
+      3   8
+     / \   \
+    1   4   9
+```
+
+**Inorder** — every push/pop, in order:
+
+| step | action | node | stack after (top first) | output so far |
+| --- | --- | --- | --- | --- |
+| 1 | push (descend) | 5 | `[5]` | — |
+| 2 | push (descend) | 3 | `[3,5]` | — |
+| 3 | push (descend) | 1 | `[1,3,5]` | — |
+| 4 | pop + visit | 1 | `[3,5]` | `1` |
+| 5 | pop + visit | 3 | `[5]` | `1,3` |
+| 6 | push (descend) | 4 | `[4,5]` | `1,3` |
+| 7 | pop + visit | 4 | `[5]` | `1,3,4` |
+| 8 | pop + visit | 5 | `[]` | `1,3,4,5` |
+| 9 | push (descend) | 8 | `[8]` | `1,3,4,5` |
+| 10 | pop + visit | 8 | `[]` | `1,3,4,5,8` |
+| 11 | push (descend) | 9 | `[9]` | `1,3,4,5,8` |
+| 12 | pop + visit | 9 | `[]` | `1,3,4,5,8,9` |
+
+Node `1` has no right child, so after visiting it (step 4) `current` becomes `null` and the
+outer loop immediately pops the next ancestor (`3`) instead of descending — that's the "leftmost
+unvisited node" rule doing its job.
+
+**Preorder**, the same tree, push/pop only:
+
+| step | action | node | stack after | output so far |
+| --- | --- | --- | --- | --- |
+| 1 | push root | 5 | `[5]` | — |
+| 2 | pop + visit | 5 | `[]` | `5` |
+| 3 | push R, push L | 8, 3 | `[3,8]` | `5` |
+| 4 | pop + visit | 3 | `[8]` | `5,3` |
+| 5 | push R, push L | 4, 1 | `[1,4,8]` | `5,3` |
+| 6 | pop + visit | 1 | `[4,8]` | `5,3,1` |
+| 7 | pop + visit | 4 | `[8]` | `5,3,1,4` |
+| 8 | pop + visit | 8 | `[]` | `5,3,1,4,8` |
+| 9 | push R only (no L) | 9 | `[9]` | `5,3,1,4,8` |
+| 10 | pop + visit | 9 | `[]` | `5,3,1,4,8,9` |
+
+Postorder reuses this exact loop with the two push lines swapped, visiting in
+**node,right,left** order — `[5,8,9,3,4,1]` — then `.Reverse()` flips it to
+`[1,4,3,9,8,5]`, which matches the recursive definition of postorder.
+
+## why it works
+
+The stack only ever needs to remember "what to come back to," which is exactly what a recursive
+call's stack frame remembers — nothing more. For inorder, the invariant is: whatever's on the
+stack is precisely the chain of ancestors still owed a visit to their right subtree, ordered
+closest-first. Popping and visiting, then descending into `.Right`, resolves exactly one of
+those debts per iteration, so every node is pushed once and popped once — O(n) work, O(h) extra
+space for the stack itself.
+
+<Watch items={[['time', 'O(n) each'], ['space', 'O(h) stack — O(n) worst case, O(log n) balanced']]} />
+
+## common bugs
+
+- Inorder: popping and visiting *before* fully descending left — you'll visit a node before its
+  entire left subtree, which is preorder's behavior, not inorder's.
+- Preorder: pushing left before right — pops come out right-first, so the output is mirrored
+  (`node, right, left` instead of `node, left, right`).
+- Postorder: forgetting the final `.Reverse()` (or reversing the wrong list) — without it you've
+  built `node, right, left`, which isn't postorder at all.
+- Inorder's loop condition: `while (current is not null || stack.Count > 0)` — using only one
+  half of that `||` drops nodes. If you check just `stack.Count > 0`, you exit before ever
+  descending into the root's left spine; if you check just `current is not null`, you exit the
+  moment you pop a node whose `.Right` is `null`, abandoning whatever's still on the stack.
+- Null-checking before pushing in preorder/postorder (`if (node.Right is not null) stack.Push(...)`)
+  — skip this and you push `null`s that crash on the next `.Val` access.
+
+## variants you can now solve
+
+- **Kth Smallest Element in a BST** (LC 230) — the payoff: run the inorder loop above but stop
+  early, the moment you've popped the *k*-th node, instead of draining the whole stack. Inorder
+  on a BST visits nodes in sorted order, so the k-th pop *is* the k-th smallest value — no
+  sorting required.
+- **[Validate Binary Search Tree](/patterns/tree-traversals/validate-bst/)** — the recursive
+  bounds-passing solution there has an inorder cousin: run this loop and check each popped value
+  is strictly greater than the previous one.
+- **Binary Search Tree Iterator** (LC 173) — this exact inorder stack, packaged behind
+  `HasNext()`/`Next()` instead of draining into a list all at once.

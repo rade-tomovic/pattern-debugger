@@ -1,0 +1,368 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: stack-and-heap
+problem: does-this-allocate
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import Solution from '@components/Solution.astro';
+
+## the question
+
+Eight snippets. Every one of them is a line you have written this year, and each is paired with
+a twin that differs by something that looks cosmetic.
+
+```csharp
+1   Sink += TakeStruct(new Point(i, 2));                 // struct passed by value
+2   object o = i; Sink += (int)o;                        // boxing
+2b  Sink += Unbox(i);                                    //   ...the same box, inside a method
+3   var h = new Holder(new Point(i, 2)); Sink += h.P.X;  // class holding a struct
+4   int captured = i; Func<int> f = () => captured + 1;  // lambda over a local
+4b  Func<int> f = static () => 7;                        //   ...capturing nothing
+5   Span<int> buf = stackalloc int[64];                  // scratch on the frame
+5b  var buf = new int[64];                               //   ...scratch on the heap
+6   foreach (var v in List) s += v;                      // List<int>
+6b  foreach (var v in Sequence) s += v;                  //   ...the same list, as IEnumerable<int>
+7   Sink += SumArray(i, 2, 3);                           // params int[]
+7b  Sink += SumSpan(i, 2, 3);                            // params ReadOnlySpan<int>
+8   Sink += AreaOf(new Square(i));                       // struct via a generic constraint
+8b  Sink += AreaOf((IShape)new Square(i));                //   ...the same struct via its interface
+```
+
+<Callout kind="insight" label="predict first">
+  Write down **fourteen numbers** before you scroll: heap bytes allocated per call, for each
+  line. Zero is an allowed answer and is the right one more often than people expect.
+
+  Then a second prediction, about a trio that gets treated as interchangeable: `stackalloc`,
+  `new int[64]`, and `ArrayPool<int>.Shared.Rent(64)`. From the rules you already know — not from
+  guessing — predict which of the three has a marginal heap-byte cost of zero once it has been
+  called a few times, and which zero, if either, exists only because something upstream is
+  keeping a buffer around for reuse rather than because that code path never touches the heap at
+  all.
+
+  Four of the fourteen are the ones people miss: 2b, 5b, 7 and 8b. One of those four gives a
+  different answer depending on a build flag that has nothing to do with your code.
+</Callout>
+
+## the code
+
+One file. It measures allocation with `GC.GetAllocatedBytesForCurrentThread`, which is an exact
+per-thread byte counter the runtime already maintains — no sampling, no profiler, no timer
+involved.
+
+<Solution>
+
+```csharp
+// Evidence for /systems/stack-and-heap/does-this-allocate/ — run with:
+//   dotnet run bench/stack-and-heap/does-this-allocate.cs -c Release
+//   dotnet run bench/stack-and-heap/does-this-allocate.cs
+// (the second run is the same file with the JIT optimiser off: `dotnet run file.cs`
+//  defaults to Debug, which stamps DebuggableAttribute(DisableOptimizations) on the assembly.)
+using System.Buffers;
+using System.Diagnostics;
+using System.Runtime.CompilerServices;
+
+struct Point { public int X, Y; public Point(int x, int y) { X = x; Y = y; } }
+class Holder { public Point P; public Holder(Point p) { P = p; } }
+interface IShape { int Area(); }
+struct Square : IShape { public int Side; public Square(int s) { Side = s; } public int Area() => Side * Side; }
+
+static class Probe
+{
+    public static long Sink;
+    static readonly List<int> List = [1, 2, 3, 4, 5];
+    static readonly IEnumerable<int> Sequence = List;
+
+    // NoInlining on the callees: otherwise the JIT can fold a whole case away and
+    // we would be measuring the optimiser rather than the language rule.
+    [MethodImpl(MethodImplOptions.NoInlining)] static int TakeStruct(Point p) => p.X + p.Y;
+    [MethodImpl(MethodImplOptions.NoInlining)] static int SumArray(params int[] xs)          { int s = 0; foreach (var x in xs) s += x; return s; }
+    [MethodImpl(MethodImplOptions.NoInlining)] static int SumSpan(params ReadOnlySpan<int> xs){ int s = 0; foreach (var x in xs) s += x; return s; }
+    [MethodImpl(MethodImplOptions.NoInlining)] static int AreaOf<T>(T shape) where T : IShape => shape.Area();
+    [MethodImpl(MethodImplOptions.NoInlining)] static int AreaOf(IShape shape) => shape.Area();
+    [MethodImpl(MethodImplOptions.NoInlining)] static int Scratch(int i) { Span<int> buf = stackalloc int[64]; buf[3] = i; int s = 0; foreach (var v in buf) s += v; return s; }
+
+    // ── the eight snippets ───────────────────────────────────────────────────
+    [MethodImpl(MethodImplOptions.NoInlining)] static void S1 (int n) { for (int i = 0; i < n; i++) Sink += TakeStruct(new Point(i, 2)); }
+    [MethodImpl(MethodImplOptions.NoInlining)] static void S2 (int n) { for (int i = 0; i < n; i++) { object o = i; Sink += (int)o; } }
+    [MethodImpl(MethodImplOptions.NoInlining)] static int  Unbox(int i) { object o = i; return (int)o; }
+    [MethodImpl(MethodImplOptions.NoInlining)] static void S2b(int n) { for (int i = 0; i < n; i++) Sink += Unbox(i); }
+    [MethodImpl(MethodImplOptions.NoInlining)] static void S3 (int n) { for (int i = 0; i < n; i++) { var h = new Holder(new Point(i, 2)); Sink += h.P.X; } }
+    [MethodImpl(MethodImplOptions.NoInlining)] static void S4 (int n) { for (int i = 0; i < n; i++) { int captured = i; Func<int> f = () => captured + 1; Sink += f(); } }
+    [MethodImpl(MethodImplOptions.NoInlining)] static void S4b(int n) { for (int i = 0; i < n; i++) { Func<int> f = static () => 7; Sink += f(); } }
+    [MethodImpl(MethodImplOptions.NoInlining)] static void S5 (int n) { for (int i = 0; i < n; i++) Sink += Scratch(i); }
+    [MethodImpl(MethodImplOptions.NoInlining)] static void S5b(int n) { for (int i = 0; i < n; i++) { var buf = new int[64]; buf[3] = i; int s = 0; foreach (var v in buf) s += v; Sink += s; } }
+    [MethodImpl(MethodImplOptions.NoInlining)] static void S6 (int n) { for (int i = 0; i < n; i++) { int s = 0; foreach (var v in List) s += v; Sink += s; } }
+    [MethodImpl(MethodImplOptions.NoInlining)] static void S6b(int n) { for (int i = 0; i < n; i++) { int s = 0; foreach (var v in Sequence) s += v; Sink += s; } }
+    [MethodImpl(MethodImplOptions.NoInlining)] static void S7 (int n) { for (int i = 0; i < n; i++) Sink += SumArray(i, 2, 3); }
+    [MethodImpl(MethodImplOptions.NoInlining)] static void S7b(int n) { for (int i = 0; i < n; i++) Sink += SumSpan(i, 2, 3); }
+    [MethodImpl(MethodImplOptions.NoInlining)] static void S8 (int n) { for (int i = 0; i < n; i++) Sink += AreaOf(new Square(i)); }
+    [MethodImpl(MethodImplOptions.NoInlining)] static void S8b(int n) { for (int i = 0; i < n; i++) Sink += AreaOf((IShape)new Square(i)); }
+
+    // ── the harness ──────────────────────────────────────────────────────────
+    // Marginal bytes per operation: run n, then 2n, subtract. Anything paid once
+    // (JIT, first-call statics, the delegate cache) is in both and cancels out.
+    static long BytesPerOp(Action<int> body, int n = 20_000)
+    {
+        body(n); body(n); body(n);                                  // warm: tier-0 -> tier-1
+        long a0 = GC.GetAllocatedBytesForCurrentThread(); body(n);
+        long a1 = GC.GetAllocatedBytesForCurrentThread(); body(2 * n);
+        long a2 = GC.GetAllocatedBytesForCurrentThread();
+        return ((a2 - a1) - (a1 - a0)) / n;
+    }
+
+    static void Row(string name, Action<int> body) => Console.WriteLine($"  {name,-52} {BytesPerOp(body),4} B/op");
+
+    // ── the same question for a 64-int scratch buffer, three ways ─────────────
+    const int Calls = 1_000_000;
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    static int Rented(int i)
+    {
+        int[] buf = ArrayPool<int>.Shared.Rent(64);
+        buf.AsSpan(0, 64).Clear();                                  // Rent does not zero
+        buf[3] = i; int s = 0; for (int k = 0; k < 64; k++) s += buf[k];
+        ArrayPool<int>.Shared.Return(buf);
+        return s;
+    }
+    [MethodImpl(MethodImplOptions.NoInlining)] static void BufStack(int n) { for (int i = 0; i < n; i++) Sink += Scratch(i); }
+    [MethodImpl(MethodImplOptions.NoInlining)] static void BufHeap (int n) { for (int i = 0; i < n; i++) { var b = new int[64]; b[3] = i; int s = 0; for (int k = 0; k < 64; k++) s += b[k]; Sink += s; } }
+    [MethodImpl(MethodImplOptions.NoInlining)] static void BufPool (int n) { for (int i = 0; i < n; i++) Sink += Rented(i); }
+
+    public static void Main()
+    {
+        Console.WriteLine($"JIT optimiser disabled: {typeof(Probe).Assembly.GetCustomAttributes(typeof(DebuggableAttribute), false) is [DebuggableAttribute d] && d.IsJITOptimizerDisabled}");
+        Console.WriteLine("=== heap bytes per operation ===");
+        Row("1  struct local, passed by value",                 S1);
+        Row("2  object o = i          (boxing, in this loop)",  S2);
+        Row("2b the same box inside a method that unboxes it",  S2b);
+        Row("3  new Holder(new Point(i, 2))",                   S3);
+        Row("4  lambda capturing a local",                      S4);
+        Row("4b lambda capturing nothing",                      S4b);
+        Row("5  stackalloc int[64] in a called method",         S5);
+        Row("5b new int[64]",                                   S5b);
+        Row("6  foreach over List<int>",                        S6);
+        Row("6b foreach over the same list as IEnumerable<int>",S6b);
+        Row("7  params int[]",                                  S7);
+        Row("7b params ReadOnlySpan<int>",                      S7b);
+        Row("8  struct through a generic constraint",           S8);
+        Row("8b the same struct through its interface",         S8b);
+
+        Console.WriteLine("\n=== a 64-int scratch buffer, three ways: heap bytes per call ===");
+        Row("stackalloc int[64]",                    BufStack);
+        Row("new int[64]",                           BufHeap);
+        Row("ArrayPool<int>.Shared.Rent(64)",         BufPool);
+
+        Console.WriteLine($"\n=== gen0 collections provoked by {Calls:N0} calls ===");
+        int g0 = GC.CollectionCount(0); BufHeap(Calls);
+        int gcHeap = GC.CollectionCount(0) - g0;
+        g0 = GC.CollectionCount(0); BufStack(Calls);
+        int gcStack = GC.CollectionCount(0) - g0;
+        g0 = GC.CollectionCount(0); BufPool(Calls);
+        int gcPool = GC.CollectionCount(0) - g0;
+        Console.WriteLine($"  new int[64] {gcHeap}   stackalloc {gcStack}   ArrayPool {gcPool}");
+        Console.WriteLine($"  checksum {Sink}");
+    }
+}
+```
+
+</Solution>
+
+**The counter is exact, so this is not a timing measurement at all.** Every managed allocation on this
+thread adds its size to a counter the runtime already maintains; reading it before and after
+costs nothing and misses nothing. Run this file a hundred times and every byte column comes back
+identical.
+
+**Marginal, not absolute.** Each case runs at `n` calls and then at `2n`, and the answer is the
+difference divided by `n`. Anything paid once — JIT compilation, the first touch of a static, the
+cached delegate in case 4b — appears identically in both halves and cancels. Without that
+subtraction, one-time costs would smear across every operation as a fake per-call number.
+
+**The callees are `NoInlining` on purpose.** If the JIT can see through `TakeStruct` or `AreaOf`
+it may prove the whole computation dead and delete it, and a deleted loop allocates nothing. The
+attribute keeps each case a real call, which is what the language rule is actually about. Case
+2b is the deliberate exception: it exists precisely to show what the optimiser does when it
+*can* see everything.
+
+## work it out
+
+Fourteen predictions, four groups. Reason each one out from what you already know about value
+types, references, and what a delegate has to be.
+
+**A struct passed by value (1) is a copy into the callee's own frame slot.** Nobody needs to
+identify its runtime type — the bytes just move — so there is no reason for a header, and no
+reason for the heap. Predict **0**.
+
+**Boxing (2, 8b) happens whenever a value type is handed to code that can no longer see its
+concrete type.** Assigning an `int` to `object`, or casting a `Square` to `IShape`, means the
+receiver only knows it is holding *something*, and finding out what requires a self-describing
+object — a method-table pointer plus the payload. That is a new heap allocation every time:
+16 bytes of header plus the payload, rounded up. Predict a nonzero number for both — and predict
+the *same* number for both, because a cast to an interface is exactly the same event as an
+assignment to `object`, just spelled differently.
+
+**Case 2b is the same two lines with one difference: nothing outside the method ever sees the
+box.** A value is boxed and immediately unboxed, and the result is used right there. If the JIT's
+optimiser can prove that no other code could possibly observe whether a real object existed, it
+does not need to build one — it can just keep the four bytes in a register the whole time. That
+prediction genuinely depends on whether an optimiser is running at all: with it on, predict **0**;
+with it off, predict the same number as case 2, because there is no analysis left to remove the
+box. That is the build-flag case the callout warned about.
+
+**A capturing lambda (4) needs its captured variable to outlive the method that declared it** —
+the delegate can be called any time after the method returns, so the compiler cannot leave
+`captured` on the frame, which is destroyed the instant `S4` returns. Its only option is to move
+the variable into a field of a compiler-generated class, allocate one instance of that class, and
+build a delegate that points at it — every single time through the loop, because a fresh
+`captured` needs a fresh home. Predict nonzero, made of two objects: the closure and the
+delegate. **A non-capturing lambda (4b) needs none of that.** With nothing to carry, the compiler
+builds exactly one delegate the first time it is needed and hands back that same instance forever
+after. Predict **0**.
+
+**`stackalloc` (5) is the C cameo's `sub rsp`, reachable from C#.** It moves the frame pointer and
+nothing else, so predict **0** regardless of how many times you call it. **`new int[64]` (5b)**
+asks the real allocator for a real object — the same shape as every other array: a 24-byte header
+(method table plus length) ahead of the payload. Predict nonzero: 24 plus 256 bytes of `int`
+storage.
+
+**`List<int>.Enumerator` is declared as a `struct` specifically so `foreach` does not have to
+allocate one.** When the loop variable is typed `List<int>`, the compiler can call directly into
+that struct sitting on the frame. Predict **0** for case 6. Type the *same* variable as
+`IEnumerable<int>` instead, and `foreach` can only see the interface — which promises an
+`IEnumerator<int>`, a reference type. The only way to satisfy that promise with a struct is to box
+it. Predict nonzero for 6b, and predict it small: just that one struct's own size plus a header.
+
+**A `params int[]` call site (7) has always had to build a real array to hand to the callee**,
+one fresh array per call. Predict nonzero. **The C# 13 `params ReadOnlySpan<int>` overload (7b)**
+does not need an object at all — a span is a pointer and a length, and the compiler can point it
+at an inline buffer it builds directly on the caller's own frame. Predict **0**.
+
+**A generic method constrained to an interface, `AreaOf<T>(T shape) where T : IShape` (8), gets
+a separate compiled body per concrete value type.** The JIT knows `Square`'s exact layout at that
+call site, so it can call `Area()` directly on the struct sitting in a register — no box needed.
+Predict **0**. **The non-generic overload taking `IShape` itself (8b)** has erased which concrete
+type it is; a struct can only satisfy an interface reference by being boxed first. Predict
+nonzero — this is the second half of the pair already predicted above.
+
+**Now the buffer trio's real question: not the first call, the *marginal* one, once each path has run a few times.**
+`stackalloc`'s zero is structural — it never touches the heap, on the first call or the
+millionth. `new int[64]`'s nonzero is unconditional — every call is a fresh object, forever.
+`ArrayPool<int>.Shared.Rent`'s answer is different in kind from both: the pool holds onto arrays
+you return to it, so once it has enough buffers sitting in its bucket to satisfy whatever is
+currently rented, a `Rent`/`Return` pair touches no *new* heap bytes — but that zero is a property
+of the pool's current state, not of the code path itself. Predict stackalloc and ArrayPool both at
+**0** once warm, for two different reasons, and `new int[64]` still nonzero.
+
+## the answer
+
+The real output, byte-for-byte, with the optimiser on and with it forced off by the second run:
+
+| snippet | optimiser on | optimiser off | what the bytes are |
+| --- | --- | --- | --- |
+| 1 struct local, by value | **0** | 0 | copied into the callee's frame |
+| 2 `object o = i` in this loop | **24** | 24 | 16 header + 4 payload, rounded to 8 |
+| 2b the same box inside a method that unboxes it | **0** | 24 | the optimiser removed it — see below |
+| 3 `new Holder(new Point(i, 2))` | **24** | 24 | 16 header + the 8-byte `Point`, on the heap |
+| 4 lambda capturing a local | **88** | 88 | 24 closure object + 64 delegate |
+| 4b lambda capturing nothing | **0** | 0 | one instance, cached in a static field |
+| 5 `stackalloc int[64]` in a called method | **0** | 0 | 256 bytes of frame, freed by `ret` |
+| 5b `new int[64]` | **280** | 280 | 24 array header + 256 |
+| 6 `foreach` over `List<int>` | **0** | 0 | `List<T>.Enumerator` is a struct |
+| 6b `foreach` over the same list as `IEnumerable<int>` | **40** | 40 | that struct enumerator, boxed |
+| 7 `params int[]` | **40** | 40 | 24 array header + 3 ints, rounded to 8 |
+| 7b `params ReadOnlySpan<int>` | **0** | 0 | the args go in an inline array on the frame |
+| 8 struct through a generic constraint | **0** | 0 | the JIT compiles a `Square`-specific body |
+| 8b the same struct through its interface | **24** | 24 | the cast boxes it |
+
+The second prediction — the buffer trio, heap bytes per call once warm, same both ways:
+
+| 64-int scratch buffer | heap bytes/call |
+| --- | --- |
+| `stackalloc int[64]` | **0** |
+| `new int[64]` | **280** |
+| `ArrayPool<int>.Shared.Rent(64)` + `Clear` + `Return` | **0** |
+
+And the count that tells the two zeros apart: across one million calls, `new int[64]` provokes
+**17** gen0 collections. `stackalloc` and `ArrayPool` provoke **0** — not "very few", zero, because
+neither one ever asked the collector for anything after the pool warmed up.
+
+## why it works that way
+
+Every one of the fourteen cases is an instance of one rule: **the runtime allocates a heap object
+exactly when something needs a lifetime longer than the current frame, needs to be reached
+through a reference rather than held by value, or needs to be handed to code that can no longer
+see its concrete type.** Miss all three and the compiler keeps you on the frame or, for the JIT's
+specific case, proves the object was never observable and keeps you in a register.
+
+Case 2b is worth staring at because of what it says about isolated measurements generally: a
+small isolated method can report zero allocations for a pattern that allocates in your service, purely because the
+isolated method makes the value provably unobservable, and production code puts that same box into
+a list, a field, a closure, or a `Task` — which makes it observable, which removes the optimisation.
+**Never conclude "boxing is free" from a method that does nothing else with the result.** The
+general story of what the optimiser can and cannot see is
+[what the JIT did to your code](/systems/il-jit-codegen/).
+
+The buffer trio makes the same point about zero having more than one cause. `stackalloc`'s zero is
+guaranteed by the language — it is not a heap object and never becomes one, so nothing can ever
+make that number change. `ArrayPool`'s zero is a cache hit: start from a cold pool, or rent more
+buffers concurrently than it currently holds, and the count goes back to nonzero while it grows
+its buckets. Reading "zero bytes" off a counter tells you what happened, not why — you still have to
+know the mechanism to know whether that zero is a promise or a coincidence of the current load.
+
+<Watch items={[['boxed int', '24 B'], ['closure + delegate', '88 B'], ['boxed enumerator', '40 B'], ['params int[3]', '40 B'], ['int[64]', '280 B'], ['stackalloc', '0 B'], ['ArrayPool, warm', '0 B (until the pool grows)']]} />
+
+## what this looks like in prod
+
+The allocation profile of a busy ASP.NET service is rarely dominated by the objects you meant to
+create. It is dominated by these: a `params object[]` on every log call in a hot path, a closure
+per request because someone wrote `items.Where(x => x.Id == id)` inside a loop, a boxed
+enumerator per iteration because a repository returns `IEnumerable<T>` and the caller foreaches
+it a million times, a `DateTime` boxed into a dictionary of `object`.
+
+None of that shows up in a CPU profile as anything but "GC". The tool that finds it is an
+allocation profile — or, cheaper and available in production, the counter this page uses: wrap the
+suspect operation in `GC.GetAllocatedBytesForCurrentThread` before and after and log the delta.
+Exact, no sampling, no overhead worth measuring. When you fix something, the number moves by the
+amount you predicted or your model of the code is wrong.
+
+The rewrite that pays, in order: stop boxing (generic overloads, `ReadOnlySpan<T>` params,
+concrete collection types in signatures); stop capturing (hoist the lambda, use a `static` lambda,
+pass state as an argument to the overloads that accept it); then, only in the hot loops that are
+left, reach for `stackalloc` under a size cap and `ArrayPool` above it.
+
+## the same idea in other languages
+
+| language | what it's called | the trap |
+| --- | --- | --- |
+| Java | autoboxing — an `int` becomes an `Integer` object whenever a generic or an `Object` parameter is involved | `List<Integer>` is the only kind of int list Java has, so the boxed layout measured here is unavoidable there; and boxed `Integer` values between −128 and 127 come from a cache, so `==` compares equal for small numbers and not for large ones |
+| Go | escape analysis decides between the frame and the heap for every allocation; a value put in an `interface{}` usually escapes | `go build -gcflags=-m` prints the decision per line, which is the tool C# does not have — in .NET you measure bytes instead of reading the compiler's mind |
+| C++ | `std::vector` on a local is a stack object whose buffer is heap; `alloca` and C99 VLAs are the `stackalloc` equivalents | there is no boxing, so the failure mode inverts: instead of hidden allocations you get hidden *copies*, because passing by value copies the whole object graph a container owns |
+| Python | everything is a heap object and `int` is no exception | there is no non-allocating path at all, which is why the numeric stack is built on `numpy` arrays — one contiguous buffer of raw values, the same win as `List<int>` over `List<object>` |
+
+## common bugs
+
+- **Concluding "it doesn't allocate" from a method where the object cannot escape.** Case 2b
+  reports 0 bytes only because the JIT can see the whole story. Put the same object into a list, a
+  field, a closure or a `Task` — as production code does — and the allocation comes back.
+- **Measuring with a timer instead of the counter.** Allocation cost is not paid where you
+  allocate; it is paid later, in somebody else's collection. A stopwatch around the allocating
+  line sees a pointer bump and reports "cheap", which tells you nothing about what it costs
+  downstream.
+- **Trusting an allocation count taken from a Debug build.** `dotnet run file.cs` is Debug by
+  default, and Debug disables the JIT optimiser. It changed exactly one byte count on this page —
+  case 2b, where the optimiser was the whole point — but that one case is a stand-in for every
+  "the JIT proved this was unobservable" optimisation the codebase relies on. An allocation profile
+  taken from an unoptimised build will show boxes that production never pays for, and will hide
+  none that it does.
+- **Forgetting that `ArrayPool.Rent` returns a dirty buffer, and that it may be larger than you
+  asked for.** The shared pool's buckets are powers of two, so `Rent(65)` hands back a
+  128-element array — verified here, where `Rent(64)` returns exactly 64 and `Rent(65)`,
+  `Rent(100)` and `Rent(128)` all return 128. The length you must respect is the one you asked
+  for, not `buf.Length`.
+- **`stackalloc` inside a loop.** Each iteration takes another slice of the *same* frame and none
+  of it is released until the method returns, so a loop that stack-allocates overflows the stack —
+  the analyzer warns (CA2014) and it is right. Put the `stackalloc` in the called method, as case
+  5 does, or hoist it above the loop.
+- **Assuming a struct is always cheaper.** A large struct passed by value is copied at every call
+  boundary. Past a few words, `in` or a class costs less, and a `struct` big enough to matter is
+  usually one that should have been a `ref struct` over a buffer.

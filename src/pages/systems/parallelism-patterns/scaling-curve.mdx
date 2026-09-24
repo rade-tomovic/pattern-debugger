@@ -1,0 +1,334 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: parallelism-patterns
+problem: scaling-curve
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import Solution from '@components/Solution.astro';
+
+## the question
+
+Four ways for four threads to add up to the same total. The total is identical in every one, the
+loop body is the same shape in every one, and the only thing that changes is **where the count is
+kept**:
+
+```csharp
+Interlocked.Increment(ref shared);          // 1. one long, shared by every thread
+Interlocked.Increment(ref tight[id]);       // 2. one long PER THREAD, packed adjacent in an array
+Interlocked.Increment(ref padded[id * 8]);  // 3. one long per thread, 64 bytes apart
+c++; /* once at the end: */ Interlocked.Add(ref shared, c);  // 4. a private local, published once
+```
+
+The work per thread is identical across all four shapes — same number of increments, same number
+of threads. Nothing here is timed. Every question below is checkable by reasoning about
+addresses and instructions, not by a stopwatch.
+
+<Callout kind="insight" label="predict first">
+  Four questions. Write down an answer to each before reading on.
+
+  **One.** Shape 1 — every thread hammering the same `long` with `Interlocked.Increment`. Four
+  threads instead of one: does the *coherence* traffic between the threads grow, shrink, or stay
+  flat as you add threads? (Not "is it faster or slower" — what happens to the amount of
+  cross-core traffic.)
+
+  **Two.** Shape 2 — every thread increments its own private counter, `tight[id]`. No shared
+  variable anywhere in the source: thread 3 never reads or writes anything thread 0 touches.
+  Does this behave like an embarrassingly parallel workload, or like shape 1?
+
+  **Three.** Shape 3 differs from shape 2 by exactly one thing: the index expression,
+  `id * 8` instead of `id`. Does that change anything about which cache lines the four counters
+  land on, and if so, in which direction?
+
+  **Four.** Not about contention this time — about a *single* thread, no other thread running at
+  all, nothing to fight over. Does a `lock`-prefixed instruction that never has to wait for
+  another core still cost something a plain register operation does not, or does the absence of
+  contention make it free?
+</Callout>
+
+## the code
+
+<Solution>
+
+```csharp
+// Evidence for /systems/parallelism-patterns/scaling-curve/ — run with:
+//   dotnet run bench/parallelism-patterns/scaling-curve.cs -c Release
+// Four ways for four threads to add up to the same total. Correctness is checked by
+// assertion, not eyeballed. The addresses printed at the end are the real layout the
+// CLR chose for THIS run — they move between runs, but which cache line each one lands
+// in relative to its neighbours does not.
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
+
+static class Scaling
+{
+    const int PerThread = 250_000;
+    const int Threads = 4;
+
+    static long shared;
+    static readonly long[] tight = new long[4];      // 4 per-thread counters, packed adjacent
+    static readonly long[] padded = new long[4 * 8]; // 4 per-thread counters, 64 bytes apart
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    static void SharedAtomic(int n) { for (int i = 0; i < n; i++) Interlocked.Increment(ref shared); }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    static void TightSlot(int n, int id) { for (int i = 0; i < n; i++) Interlocked.Increment(ref tight[id]); }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    static void PaddedSlot(int n, int id) { for (int i = 0; i < n; i++) Interlocked.Increment(ref padded[id * 8]); }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    static void LocalThenPublish(int n)
+    {
+        long c = 0;
+        for (int i = 0; i < n; i++) c++;          // the loop: a register, nothing else
+        Interlocked.Add(ref shared, c);           // ONE atomic for the whole thread's work
+    }
+
+    static void RunOn(Action<int> body)
+    {
+        var ts = new Thread[Threads];
+        for (int t = 0; t < Threads; t++) { int id = t; ts[t] = new Thread(() => body(id)); ts[t].Start(); }
+        foreach (var th in ts) th.Join();
+    }
+
+    public static void Main()
+    {
+        long expect = (long)PerThread * Threads;
+
+        shared = 0;
+        RunOn(_ => SharedAtomic(PerThread));
+        if (shared != expect) throw new Exception($"FAIL shared: {shared} != {expect}");
+
+        Array.Clear(tight);
+        RunOn(id => TightSlot(PerThread, id));
+        long tightTotal = tight.Sum();
+        if (tightTotal != expect) throw new Exception($"FAIL tight: {tightTotal} != {expect}");
+
+        Array.Clear(padded);
+        RunOn(id => PaddedSlot(PerThread, id));
+        long paddedTotal = 0;
+        for (int i = 0; i < 4; i++) paddedTotal += padded[i * 8];
+        if (paddedTotal != expect) throw new Exception($"FAIL padded: {paddedTotal} != {expect}");
+
+        shared = 0;
+        RunOn(_ => LocalThenPublish(PerThread));
+        if (shared != expect) throw new Exception($"FAIL local-then-publish: {shared} != {expect}");
+
+        // Pin both arrays and print where they actually landed this run.
+        var h1 = GCHandle.Alloc(tight, GCHandleType.Pinned);
+        var h2 = GCHandle.Alloc(padded, GCHandleType.Pinned);
+        long b1 = h1.AddrOfPinnedObject().ToInt64(), b2 = h2.AddrOfPinnedObject().ToInt64();
+        for (int i = 0; i < 4; i++) Console.WriteLine($"tight[{i}]      0x{b1 + i * 8:X}  line {(b1 + i * 8) / 64}");
+        for (int i = 0; i < 4; i++) Console.WriteLine($"padded[{i * 8,2}]  0x{b2 + i * 64:X}  line {(b2 + i * 64) / 64}");
+        h1.Free();
+        h2.Free();
+
+        Console.WriteLine("PASS all four totals correct");
+    }
+}
+```
+
+</Solution>
+
+## work it out
+
+**Shape 1 — one shared `long`.** `Interlocked.Increment` compiles to a single `lock inc`
+instruction against the counter's address, and the way the CPU makes it atomic is to hold that
+64-byte cache line in *exclusive* state for the instruction. Only one core can hold a line
+exclusively at a time. With four threads all hammering the same address, every single increment
+requires whichever core is about to run one to first have the line — which means taking it away
+from whoever had it last:
+
+```text
+   time ──▶
+
+   core 0: [owns line]──inc──▶ hands off
+   core 1:                     ◀──gets line──[owns line]──inc──▶ hands off
+   core 2:                                                       ◀──gets line──...
+   core 3:                                                                     ◀──...
+
+   every hand-off is a message on the inter-core interconnect. with N cores taking
+   turns, the number of possible (owner, next-owner) pairs is N(N-1) — this is the
+   Universal Scalability Law's coherence term, βN(N-1), counting exactly this traffic.
+```
+
+Going from one thread to four does not just add workers — it adds three more claimants for a
+resource only one core can hold, and the traffic between them grows with the *square* of the
+thread count, not linearly. **Answer to question one: the coherence traffic grows, and it grows
+faster than the thread count.**
+
+**Shape 2 — `tight[id]`, no shared variable.** Four `long`s are 32 bytes; a cache line is 64. The
+real addresses from one run (yours will differ — the argument does not):
+
+```text
+tight[0]      0x7FCDA6C09F28  line 2195644416636
+tight[1]      0x7FCDA6C09F30  line 2195644416636
+tight[2]      0x7FCDA6C09F38  line 2195644416636
+tight[3]      0x7FCDA6C09F40  line 2195644416637
+```
+
+`tight[0]` sits at an offset of `0x28` (40) bytes into its 64-byte line, `tight[1]` at `0x30`
+(48), `tight[2]` at `0x38` (56) — all three inside the same line, which runs out at offset 63.
+`tight[3]` starts at `0x40`, exactly the first byte of the *next* line. Three of the four
+counters share one cache line; the fourth is on its own. The source code has no shared variable
+— thread 0 writes only `tight[0]`, thread 2 writes only `tight[2]` — but the *hardware* does not
+see variables, it sees 64-byte lines, and three of those four addresses are inside one of them.
+Threads 0, 1 and 2 are doing exactly what shape 1's threads do: taking a line away from each
+other, over and over. **Answer to question two: it behaves like shape 1 for three of the four
+threads, because the coherence protocol tracks lines, not variables.**
+
+Whether it is three-in-one-line-and-one-alone or some other split is not something the source
+code controls — it is decided by wherever the allocator happened to place the array, mod 64. A
+different run could just as easily put `tight[0]` alone and the other three together. What is
+guaranteed is that four adjacent 8-byte values can never span more than two 64-byte lines, so at
+least two of the four threads are always sharing one — the exact split is an accident of
+allocation, the sharing itself is not.
+
+**Shape 3 — `padded[id * 8]`, 64 bytes apart.** The same run's addresses for the padded array:
+
+```text
+padded[ 0]  0x7FEC8C6004B0  line 2197717876754
+padded[ 8]  0x7FEC8C6004F0  line 2197717876755
+padded[16]  0x7FEC8C600530  line 2197717876756
+padded[24]  0x7FEC8C600570  line 2197717876757
+```
+
+Each address is exactly `0x40` (64) more than the last, and `line = address / 64`, so adding 64
+to an address always advances the line number by exactly one — **for any starting address,
+aligned or not.** That is arithmetic, not luck: `⌊(a + 64) / 64⌋ = ⌊a / 64⌋ + 1` always. Shape 2's
+outcome depended on where the allocator put the array; shape 3's outcome is guaranteed by the
+stride regardless of where the allocator puts it. Four threads, four lines, zero hand-offs.
+**Answer to question three: striding by exactly the cache-line size turns an accident-of-layout
+into a guarantee, and the guarantee is "nobody shares," which is the opposite direction from
+shape 2.**
+
+**Shape 4 — local accumulator, one publish.** `SharedAtomic`'s loop body is `lock inc` on every
+single iteration, whether or not another thread is running: the instruction is compiled once and
+executed the same way regardless of contention. `LocalThenPublish`'s loop body is a plain
+register increment — real disassembly of both, one thread, `DOTNET_TieredCompilation=0
+DOTNET_JitDisasm`:
+
+```text
+; SharedAtomic — one lock-prefixed instruction PER ITERATION, always
+G_M000_IG04:
+       lock
+       inc      qword ptr [rax]
+       dec      edi
+       jne      SHORT G_M000_IG04
+
+; LocalThenPublish — the loop touches no memory and has no lock prefix at all
+G_M000_IG04:
+       inc      rax
+       dec      edi
+       jne      SHORT G_M000_IG04
+G_M000_IG05:
+       mov      rcx, 0x7F1E0364B028
+       lock
+       add      qword ptr [rcx], rax   ; ONE locked instruction, after the loop, not in it
+```
+
+A `lock`-prefixed instruction cannot be deferred to the store buffer the way a plain store can —
+it has to complete as a read-modify-write against the cache, in order, whether or not any other
+core wants the line. That is unconditional: it is paid on a single thread with nobody else
+running, exactly as it is paid under four-way contention. What contention adds on top is whether
+the line has to be *fetched from another core* first. **Answer to question four: no, it is not
+free — the instruction shape itself, not just the contention, is what a plain register op avoids.
+Contention decides how far the line has to travel to get to you; it does not decide whether you
+pay for atomicity at all.**
+
+## the answer
+
+Real output from the program above:
+
+```text
+tight[0]      0x7FCDA6C09F28  line 2195644416636
+tight[1]      0x7FCDA6C09F30  line 2195644416636
+tight[2]      0x7FCDA6C09F38  line 2195644416636
+tight[3]      0x7FCDA6C09F40  line 2195644416637
+padded[ 0]  0x7FEC8C6004B0  line 2197717876754
+padded[ 8]  0x7FEC8C6004F0  line 2197717876755
+padded[16]  0x7FEC8C600530  line 2197717876756
+padded[24]  0x7FEC8C600570  line 2197717876757
+PASS all four totals correct
+```
+
+All four shapes compute the same correct total — the exercise was never about correctness, all
+four are correct. The predictions above hold: shape 1's coherence traffic grows with the square
+of the thread count because every increment needs the line from whoever had it last; shape 2
+shares a line for three of its four "private" counters, by accident of where the array landed;
+shape 3 guarantees zero sharing, by arithmetic, regardless of where the array lands; and shape
+4's single `lock add` pays the fixed cost of atomicity once instead of once per increment,
+independent of whether anything was ever contended.
+
+## why it works that way
+
+A scaling curve bends for up to three separate reasons, and they stack:
+
+1. **Amdahl's serial fraction.** Any part of the work that only one thread can do caps the
+   ceiling at `1 / s`. This exercise has `s = 0`, deliberately — none of the four shapes has a
+   serial section, so this force contributes nothing here and every bit of the behaviour above
+   comes from the next one.
+2. **Coherence traffic.** The mechanism worked out above: a cache line has exactly one owner at
+   a time, and every hand-off is a message between cores. This is the Universal Scalability
+   Law's `βN(N-1)` term, and it is the only one of the three forces that can make a curve fall
+   *below* one thread's throughput — Amdahl's floor is 1.0, coherence has no floor.
+3. **SMT siblings.** Not demonstrated by four threads on four physical cores, but real: two
+   logical processors sharing one physical core share that core's execution pipeline. Pushing a
+   contended workload like shape 1 past the physical core count onto SMT siblings does not add
+   independent throughput the way a genuinely idle physical core would — the sibling is
+   competing for the same pipeline, on top of already competing for the same cache line.
+
+The general rule shape 2 versus shape 3 teaches: **"per-thread" in the source is not "per cache
+line" in the hardware until you make it so.** The fix is either physical separation (padding to
+64 bytes, which is arithmetic you can verify, not a hope) or removing the shared write entirely
+(a local accumulator published once, which is what shape 4 does).
+
+<Watch items={[['cache line', '64 B'], ['line = address / 64', 'floor division — exact, not approximate'], ['padding stride that GUARANTEES separation', '64 B, by arithmetic, regardless of base alignment'], ['what a packed array only GUARANTEES', 'at most two lines for four adjacent 8-byte values'], ['locked instructions per loop, shared counter', 'one per increment'], ['locked instructions per loop, local accumulator', 'one, total']]} />
+
+## what this looks like in prod
+
+A static counter, a metrics field, or a cache entry updated on every request is shape 1: it looks
+like an ordinary field write in a code review, and it behaves like every core queueing for one
+resource. Two hot fields of the same object updated by different request-handling threads —
+`RequestCount` and `ErrorCount` sitting next to each other in a class — is shape 2: no shared
+variable, full sharing anyway, because the two fields are almost certainly inside one cache line
+together. Neither shows up as a lock in a profiler, because there is no lock; both show up as
+CPU-bound threads that are somehow not making proportional progress as more of them run, and as
+high cache-line-invalidation counts in whatever tool exposes coherence traffic (`perf c2c` on
+Linux, VTune's memory-access analysis).
+
+## the same idea in other languages
+
+| language | what it's called | the trap |
+| --- | --- | --- |
+| Java | `AtomicLong` for an exact counter, `LongAdder` for a hot one | `LongAdder` is shape 3 and shape 4 of this page, built into the standard library: a striped, padded array of cells summed by `sum()`. Reaching for `AtomicLong` on a hot counter because it is "the atomic one" reproduces shape 1 exactly — and `sum()` is not atomic with respect to concurrent updates, which is the price of the speed |
+| Go | `sync/atomic` on an `int64`, or a per-goroutine value combined at the end | Go's alignment rule bites before the cache line does: a 64-bit atomic field must be 8-byte aligned, and on 32-bit platforms only the first word of a struct is guaranteed aligned. Padding for cache lines is manual there too — `_ [56]byte` between counters is idiomatic |
+| C/C++ | `std::atomic<long>`, and `alignas(64)` or `hardware_destructive_interference_size` for the padding | C++ names the problem in the language: `hardware_destructive_interference_size` exists precisely to size shape 3's padding portably. There is no GC to relocate your objects, so an `alignas(64)` really does stay aligned — in .NET the GC can move objects, so padding by *stride within one array*, as shape 3 does, is the technique that survives a collection, not `alignas` on a standalone field |
+| Python | `threading.Lock` around an `int`, or `multiprocessing.Value` once real parallelism is needed | the global interpreter lock means CPU-bound threads never run at once, so this page's mechanism cannot occur at all under `threading` — a shared counter costs the lock but never coherence traffic. The moment you switch to `multiprocessing` for real parallelism, the counter has to live in shared memory or a manager process, and false sharing becomes possible again, across process boundaries this time |
+
+## common bugs
+
+- **Believing "no shared variable" means "no sharing".** Shape 2 has no shared variable and
+  shares a cache line for three of its four counters. Per-thread state has to be per-thread *and*
+  a cache line apart before it is actually private — check the stride, not just the index.
+- **Padding with an attribute you did not verify against an array.** `[StructLayout(LayoutKind.Explicit)]`
+  and `FieldOffset` give you control over one struct's internal layout, but an *array* of those
+  structs is still packed end to end unless the struct's own total size is a multiple of 64
+  bytes. Striding within one array of primitives — index `id * 8` for `long` — is what shape 3
+  does, and it is the technique that survives the GC moving the array.
+- **Assuming an uncontended atomic is free because nothing is fighting over it.** The instruction
+  is compiled the same way regardless of who else is running; a `lock`-prefixed instruction always
+  forgoes the store buffer, whether or not any other core wants the line. What contention removes
+  is the cross-core fetch, not the instruction.
+- **Treating SMT siblings as free extra cores.** Two logical processors on one physical core share
+  that core's execution pipeline. A workload already limited by coherence traffic on the physical
+  cores gets no independent relief from filling the sibling logical processors — they compete for
+  the same pipeline on top of the same cache line.
+- **Trusting the direction without checking the correctness.** A shape that "scales" but silently
+  loses updates along the way is not a win — [the counter that counted
+  wrong](/systems/atomics-and-cas/lost-updates/) is what happens when the atomic gets dropped
+  instead of padded. The program above asserts every total before it prints anything, for exactly
+  this reason.

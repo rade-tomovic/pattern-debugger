@@ -1,0 +1,151 @@
+---
+import Base from '@layouts/Base.astro';
+import TracePlayer from '@components/viz/TracePlayer';
+import { registry } from '@components/viz/registry';
+import { sections, topics, topicsInSection, topicPath } from '@data/curriculum';
+
+const hero = registry['two-pointers-sum'];
+const heroSteps = hero.buildSteps();
+
+const patternTopics = topics.filter((t) =>
+  ['core', 'structures', 'advanced'].includes(t.section),
+);
+const stats: [string, string | number][] = [
+  ['patterns', patternTopics.length],
+  ['problems', topics.reduce((n, t) => n + t.problems.length, 0)],
+  ['players', Object.keys(registry).length],
+  ['language', 'C#'],
+];
+
+const mapSections = sections.filter((s) => s.id !== 'reference');
+---
+
+<Base
+  title="Algorithm Patterns in C#"
+  description="Step through every coding-interview pattern like a debugger — templates, hand-verified traces, and interactive visualizers, all in modern C#."
+>
+  <!-- hero -->
+  <section class="mt-4">
+    <h1 class="font-mono text-2xl leading-tight font-semibold tracking-tight sm:text-3xl">
+      <span class="text-muted">//</span> algorithm pattern debugger
+    </h1>
+    <p class="text-muted mt-3 max-w-[58ch] text-[1.02rem]">
+      Coding-interview patterns the way a debugger teaches them: a universal template, then
+      a <strong class="text-ink">step-by-step trace of real state</strong> — pointers,
+      dictionaries, windows — at every iteration. All solutions in modern C#, every snippet
+      compiled and behavior-checked.
+    </p>
+    <div class="mt-4 flex flex-wrap gap-1.5">
+      {
+        stats.map(([k, v]) => (
+          <div class="watch-chip">
+            <b>{k}</b> = {v}
+          </div>
+        ))
+      }
+    </div>
+    <div class="mt-6 flex flex-wrap items-center gap-3">
+      <a
+        href="/reference/study-plan/"
+        class="bg-amber text-bg hover:bg-amber/90 rounded-lg px-4 py-2 font-mono text-sm font-bold transition-colors"
+      >
+        start day_01 ▶
+      </a>
+      <a
+        href="/deep-dives/pattern-recognition/"
+        class="border-line bg-panel text-ink hover:border-amber hover:text-amber rounded-lg border px-4 py-2 font-mono text-sm transition-colors"
+      >
+        see x, think y
+      </a>
+    </div>
+  </section>
+
+  <!-- live player -->
+  <section class="mt-10" aria-label="Live demo: Two Sum II with opposite-end pointers">
+    <p class="text-muted font-mono text-[0.75rem]">
+      live: two_pointers on a sorted array — click the player, then <kbd>◀</kbd>
+      <kbd>▶</kbd> keys step
+    </p>
+    <div class="mt-3">
+      <TracePlayer client:load kind={hero.kind} steps={heroSteps} />
+    </div>
+  </section>
+
+  <!-- how it teaches -->
+  <section class="mt-12 grid gap-4 sm:grid-cols-3">
+    {
+      [
+        {
+          label: 'template first',
+          body: 'Each pattern is one skeleton; every problem is that skeleton with a different comparison in the middle. A required "template instance" note on every problem keeps the mapping honest.',
+        },
+        {
+          label: 'traces are the product',
+          body: 'Every problem carries a full iteration table — real pointer values, real dictionary contents — derived from actually executing the verified solution. No hand-waving, no "…".',
+        },
+        {
+          label: 'verified C#',
+          body: 'Every snippet is compiled and behavior-checked on .NET with edge cases (0, 1, 2 elements) before it reaches the page. The .NET-specific traps get called out where they bite.',
+        },
+      ].map((c) => (
+        <div class="bg-panel border-line rounded-[10px] border p-4">
+          <p class="font-mono text-[0.7rem] tracking-[0.1em] text-amber uppercase">{c.label}</p>
+          <p class="text-muted mt-2 text-[0.85rem]">{c.body}</p>
+        </div>
+      ))
+    }
+  </section>
+
+  <!-- the map -->
+  <div class="mt-14 space-y-10">
+    {
+      mapSections.map((s) => (
+        <section>
+          <h2 class="font-mono text-sm tracking-[0.1em] text-amber uppercase">{s.title}</h2>
+          <p class="text-muted mt-1 text-sm">{s.blurb}</p>
+          <ul class="mt-3 grid gap-2 sm:grid-cols-2">
+            {topicsInSection(s.id).map((t) => {
+              const players = t.problems.filter((p) => p.visualizer).length;
+              return (
+                <li class="bg-panel border-line hover:border-muted rounded-[10px] border p-4 transition-colors">
+                  <div class="flex items-baseline justify-between gap-2">
+                    <a
+                      href={topicPath(t)}
+                      class="font-mono text-[0.9rem] font-semibold text-ink hover:text-amber"
+                    >
+                      {t.tab}
+                    </a>
+                    <span class="text-muted font-mono text-[0.68rem] whitespace-nowrap">
+                      {t.problems.length > 0 && `${t.problems.length} problems`}
+                      {players > 0 && <span class="text-cyan"> · {players} ▶</span>}
+                    </span>
+                  </div>
+                  <p class="text-muted mt-1 text-[0.82rem]">{t.summary}</p>
+                </li>
+              );
+            })}
+          </ul>
+        </section>
+      ))
+    }
+
+    <section>
+      <h2 class="font-mono text-sm tracking-[0.1em] text-amber uppercase">Reference</h2>
+      <ul class="mt-3 grid gap-2 sm:grid-cols-2">
+        {
+          topicsInSection('reference').map((t) => (
+            <li class="bg-panel border-line hover:border-muted rounded-[10px] border p-4 transition-colors">
+              <a
+                href={topicPath(t)}
+                class="font-mono text-[0.9rem] font-semibold text-ink hover:text-amber"
+              >
+                {t.tab}
+              </a>
+              <p class="text-muted mt-1 text-[0.82rem]">{t.summary}</p>
+            </li>
+          ))
+        }
+      </ul>
+    </section>
+  </div>
+</Base>

@@ -1,0 +1,131 @@
+---
+layout: '@layouts/TopicLayout.astro'
+topic: bfs-dfs
+---
+
+import Callout from '@components/Callout.astro';
+import ProblemList from '@components/ProblemList.astro';
+
+## core idea
+
+BFS and DFS both visit every reachable node exactly once — the only difference is the order you
+commit to, and that order is the whole story. BFS advances one full frontier at a time through a
+FIFO queue, so the *first* time it reaches any node is via the shortest possible path. DFS commits
+to one path and rides it as deep as it goes via recursion (or an explicit stack) — simpler to
+write, but it knows nothing about distance. Multi-source BFS is the exact same queue, just seeded
+with every starting point before the first round runs: the levels stop meaning "steps from one
+node" and start meaning "minutes since anything started."
+
+| engine | mechanism | typical trigger |
+| --- | --- | --- |
+| BFS | FIFO queue, one full level per round (`queue.Count` snapshot) | shortest path / fewest steps / level-by-level output |
+| DFS | recursion or an explicit stack, commit-then-backtrack | reachability, "does a path exist", connected components |
+| multi-source BFS | queue seeded with *every* source before the first round | many things spreading at once — rot, fire, gates, infection |
+
+```text
+minute 0        minute 1        minute 2
+. . .           . R .           R R R
+. R .    -->    R R R   -->     R R R
+. . .           . R .           R R R
+```
+
+One rotten cell, two rounds of a queue seeded with a single source — every cell within BFS-distance
+`m` is rotten after round `m`. Seed the same queue with two rotten cells instead of one and nothing
+about the loop changes; only the starting frontier does.
+
+## when to reach for it
+
+- The problem says "shortest path", "fewest steps", or "minimum number of moves" on **unweighted**
+  edges → BFS. The first arrival at any node is provably the shortest one.
+- The problem says "reachable from", "connected", or "does a path/cycle exist" and doesn't care
+  about distance → DFS (BFS also works, but DFS is usually less code).
+- Several starting points act **simultaneously** — rot, fire, gates, infection, multiple exits →
+  multi-source BFS. Seed the queue with all of them before round one, don't loop BFS once per
+  source.
+- The input is a grid → neighbors come from a direction array. The input is a tree or graph →
+  neighbors come from `.Left`/`.Right` or an adjacency list. Same two engines either way.
+- The structure has cycles (a graph, not a tree) and you need to avoid revisiting a node — carry a
+  `visited` set, or a `Dictionary` if a revisit needs to hand back something you already built.
+
+## universal templates
+
+BFS — the level-by-level engine every shortest-path and multi-source problem builds on:
+
+```csharp
+public int Bfs(int[][] grid, int startRow, int startCol)
+{
+    int rows = grid.Length, cols = grid[0].Length;
+    bool[,] visited = new bool[rows, cols];
+    int[] dRow = [-1, 1, 0, 0];
+    int[] dCol = [0, 0, -1, 1];
+
+    Queue<(int R, int C)> queue = new();
+    queue.Enqueue((startRow, startCol));
+    visited[startRow, startCol] = true;        // mark WHEN ENQUEUEING — never mark on dequeue
+
+    int steps = 0;
+    while (queue.Count > 0)
+    {
+        int size = queue.Count;                // snapshot: this round IS one BFS level
+        for (int i = 0; i < size; i++)
+        {
+            var (r, c) = queue.Dequeue();
+            // Visit(r, c) here — this is where you'd count or record
+
+            for (int d = 0; d < 4; d++)
+            {
+                int nr = r + dRow[d], nc = c + dCol[d];
+                if (nr < 0 || nr >= rows || nc < 0 || nc >= cols) continue;
+                if (visited[nr, nc] || !Passable(grid, nr, nc)) continue;
+
+                visited[nr, nc] = true;        // claim it before it ever sits in the queue
+                queue.Enqueue((nr, nc));
+            }
+        }
+        steps++;
+    }
+    return steps;
+}
+```
+
+DFS — the exhaustive-exploration engine, one recursive call per unvisited node:
+
+```csharp
+public void Dfs(int[][] grid, int r, int c, bool[,] visited)
+{
+    if (r < 0 || r >= grid.Length || c < 0 || c >= grid[0].Length) return;
+    if (visited[r, c] || !Passable(grid, r, c)) return;
+
+    visited[r, c] = true;                      // mark on entry, before recursing
+    // Visit(r, c) here
+
+    int[] dRow = [-1, 1, 0, 0];
+    int[] dCol = [0, 0, -1, 1];
+    for (int d = 0; d < 4; d++)
+        Dfs(grid, r + dRow[d], c + dCol[d], visited);
+}
+```
+
+Multi-source BFS is not a third template — it's the BFS template with the seeding step replaced.
+Instead of `queue.Enqueue((startRow, startCol))` once, you scan the whole grid first and enqueue
+*every* source, marking each visited before the first round runs. Everything after that line is
+identical. On a tree, both templates look the same but simpler: neighbors are `.Left`/`.Right`
+instead of a direction array, and there's no `visited` array to maintain — a tree has no cycles.
+
+<Callout kind="insight" label="the one question to ask">
+  Do I need the shortest number of steps, or just whether something is reachable? Shortest → BFS.
+  Reachability or enumeration → DFS, usually less code. If multiple starting points act at the same
+  time, that's multi-source BFS, not one BFS call per source — queue everything up front so a
+  "round" still means one minute, one level, one step.
+</Callout>
+
+## problems
+
+Five problems, each adding one thing to track alongside the traversal: color propagation, tree
+levels, a global counter, minutes across simultaneous sources, and a clone map. Two closely-related
+variants worth knowing even without their own page here: **Pacific Atlantic Water Flow** (LC 417)
+reverses the direction — run BFS/DFS inward from both oceans' border cells and intersect the two
+reachable sets — and **Max Area of Island** (LC 695) is Number of Islands with the flood fill
+returning a size instead of just incrementing a counter.
+
+<ProblemList topic="bfs-dfs" />

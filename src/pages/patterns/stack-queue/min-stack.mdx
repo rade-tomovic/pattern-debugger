@@ -1,0 +1,120 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: stack-queue
+problem: min-stack
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+
+## task
+
+Design a stack that supports `Push(val)`, `Pop()`, `Top()`, and `GetMin()` — all in `O(1)`.
+`GetMin()` returns the current minimum value in the stack.
+
+```text
+Push(-2); Push(0); Push(-3); GetMin() → -3; Pop(); Top() → 0; GetMin() → -2
+```
+
+## how to think
+
+`GetMin()` in `O(1)` rules out scanning the stack, and it rules out keeping a single running
+minimum too — a plain `int _min` breaks the moment you `Pop()` the element that *was* the
+minimum, because you'd have no idea what the minimum was one level down.
+
+The fix: don't keep one minimum, keep one minimum **per depth**. A second stack, pushed and
+popped in exact lockstep with the first, where each slot holds "the minimum of everything at or
+below this depth." Push always knows that minimum — it's `Math.Min(newValue, previousMin)` — and
+popping the data stack and popping the min-stack together means the min-stack's new top is
+automatically correct for whatever's now on top of the data stack.
+
+<Callout kind="note" label="template instance">
+  **Stack-backed design** skeleton, with the side channel made concrete: a second `Stack<int>`
+  that mirrors the data stack one-for-one. Invariant: `_mins.Peek()` always equals the minimum of
+  every element currently in `_data`. The "update the side channel" step is `Math.Min` on push,
+  a matching pop on pop.
+</Callout>
+
+## solution
+
+```csharp
+public class MinStack
+{
+    private readonly Stack<int> _data = new();
+    private readonly Stack<int> _mins = new();          // _mins[top] = min of _data[0.._data.top]
+
+    public void Push(int val)
+    {
+        _data.Push(val);
+        int currentMin = _mins.Count == 0 ? val : Math.Min(val, _mins.Peek());
+        _mins.Push(currentMin);                           // one min recorded per depth, in lockstep
+    }
+
+    public void Pop()
+    {
+        _data.Pop();
+        _mins.Pop();                                       // depths stay in lockstep on the way down too
+    }
+
+    public int Top() => _data.Peek();
+
+    public int GetMin() => _mins.Peek();                   // O(1): always the top of the mins stack
+}
+```
+
+## trace
+
+`Push(-2); Push(0); Push(-3); GetMin(); Pop(); Top(); GetMin()`:
+
+| step | call | `_data` (top-to-bottom) | `_mins` (top-to-bottom) | result |
+| --- | --- | --- | --- | --- |
+| 1 | `Push(-2)` | `-2` | `-2` | — |
+| 2 | `Push(0)` | `0, -2` | `-2, -2` | — |
+| 3 | `Push(-3)` | `-3, 0, -2` | `-3, -2, -2` | — |
+| 4 | `GetMin()` | `-3, 0, -2` | `-3, -2, -2` | `-3` |
+| 5 | `Pop()` | `0, -2` | `-2, -2` | — |
+| 6 | `Top()` | `0, -2` | `-2, -2` | `0` |
+| 7 | `GetMin()` | `0, -2` | `-2, -2` | `-2` |
+
+Step 2 is the "in lockstep" moment: pushing `0` doesn't lower the minimum, so `_mins` pushes `-2`
+again rather than `0` — a *duplicate* of the value below it, not a new minimum:
+
+```text
+_data: [0, -2]     (top -> bottom)
+_mins: [-2, -2]    same depth, same value: 0 didn't beat -2
+```
+
+Step 5's pop removes `-3` from both stacks at once, so `_mins.Peek()` snaps back to `-2` — exactly
+the minimum of what's left — with zero rescanning.
+
+## why it works
+
+`_mins` and `_data` always have equal length and are popped together, so `_mins[k]` and
+`_data[k]` refer to the same push event for every depth `k`. By construction, `_mins[k]` is
+`Math.Min(_data[k], _mins[k-1])`, which by induction is the minimum of `_data[0..k]`. So
+`_mins.Peek()` is the minimum of everything currently in the stack — no matter how many pops
+happened to get there — because popping never leaves the two stacks out of sync.
+
+<Watch items={[['time', 'O(1) per op'], ['space', 'O(n)']]} />
+
+## common bugs
+
+- Storing one `int _min` field instead of a stack of them — works until the minimum gets popped,
+  then `GetMin()` has no way to recover the previous minimum.
+- Only pushing to `_mins` when the new value is *smaller* than the current min — then `Pop()` and
+  `_mins` fall out of sync in length, and later pops read the wrong depth.
+- Using `<` instead of `<=` (or vice versa) when deciding whether to push a duplicate minimum —
+  irrelevant here since `Math.Min` always pushes *something* every time, but a common bug when
+  people try to "optimize" by skipping ties.
+- Calling `Pop()` on `_data` without popping `_mins` too (or vice versa) on some code path — any
+  desync corrupts every `GetMin()` after it, often silently.
+
+## variants you can now solve
+
+- [Implement Queue using Stacks](/patterns/stack-queue/implement-queue-using-stacks/) — a
+  different stack-backed design, trading a lockstep side-channel for a second stack that trades
+  roles with the first.
+- **Max Stack** (LC 716) — identical idea with `Math.Max`; the harder part is supporting
+  `PopMax()`, which needs a second structure to find *and remove* an arbitrary element.
+- **Design a stack that also supports `Mode()`** (most frequent element) — same lockstep idea,
+  but the side channel is a frequency count instead of a running min.

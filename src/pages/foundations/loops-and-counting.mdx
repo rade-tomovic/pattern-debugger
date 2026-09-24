@@ -1,0 +1,378 @@
+---
+layout: '@layouts/TopicLayout.astro'
+topic: loops-and-counting
+---
+
+import Callout from '@components/Callout.astro';
+import Cells from '@components/Cells.astro';
+
+## core idea
+
+Every pattern on this site compiles down to a loop, and interviews are rarely lost on the
+algorithm idea — they're lost on the boundary. `for` vs `while`, `<` vs `<=`, where the middle
+sits, whether `%` wrapped the way you assumed: get these automatic and your working memory stays
+free for the actual problem.
+
+None of this is a pattern by itself. It's the vocabulary every pattern page on this site assumes
+you already have — two pointers, sliding window, binary search, and grid BFS all lean on the
+tricks below without re-explaining them.
+
+## when to reach for it
+
+- You're about to write a loop that must terminate **on its own** (`while`, not `for`) — check
+  that every path through the body actually moves toward the exit condition.
+- Two indices converge, chase, or wrap — decide `<` vs `<=` before you write the body, not after
+  a bug report.
+- You're computing an index from a formula (`mid`, `n - 1 - i`, `(i + 1) % n`) — plug in the
+  smallest and largest legal input by hand before you trust it.
+- A grid problem says "look at the 4 (or 8) neighbors" — reach for direction arrays, not four
+  copy-pasted `if` blocks.
+- You're about to submit — trace the function on 0, 1, and 2 elements before you trust it on
+  anything bigger.
+
+## `for` vs `while`
+
+Use `for` when the iteration count is knowable before the loop starts — you're walking an array,
+a fixed range, a known number of levels. Use `while` when the exit condition can only be
+evaluated from inside the loop — two pointers converging, a BFS frontier draining, a linked list
+walk that stops at `null`. Reaching for `for` out of habit on a `while` problem is how people end
+up hand-rolling a counter they didn't need; reaching for `while` on a `for` problem is how people
+forget the increment and hang the loop.
+
+```csharp
+public void PrintAll(int[] arr)
+{
+    for (int i = 0; i < arr.Length; i++)   // the count is known: 0..arr.Length-1
+        Console.WriteLine(arr[i]);
+}
+```
+
+```csharp
+public int[] TwoSumOppositeEnds(int[] nums, int target)
+{
+    int left = 0, right = nums.Length - 1;
+
+    while (left < right)                   // the count depends on the data, not the index
+    {
+        int sum = nums[left] + nums[right];
+        if (sum == target) return [left, right];
+        if (sum < target) left++; else right--;
+    }
+    return [];
+}
+```
+
+We'll trace this exact function on 0, 1, and 2 elements further down.
+
+## `<` vs `<=`: it depends what you're comparing
+
+There's no universal rule — the right operator falls out of what "no more work to do" means for
+that specific loop.
+
+| context | operator | why |
+| --- | --- | --- |
+| plain array scan | `i < n` | index `n` is one past the last valid slot |
+| opposite-end two pointers | `left < right` | at `left == right` you'd compare an element with itself |
+| binary search, exact match | `while (L <= R)` | the last valid range is a single element (`L == R`), and it must still be checked |
+| binary search, boundary form | `while (L < R)` | you're narrowing onto one surviving index, not proving one is absent |
+
+The two binary-search forms aren't interchangeable — mixing an exact-match update rule into a
+`L < R` loop (or vice versa) is exactly how the infinite loop below happens. The full pairing of
+loop shape to update rule lives on the [binary search](/patterns/binary-search/) page; this page
+only owns the boundary reasoning.
+
+## middle element: odd, even, left-mid, right-mid
+
+For a range `[L, R]` there are two candidate midpoints: floor-mid biases toward `L`, ceil-mid
+biases toward `R`. On an odd-length range they're the same index — there's only one middle. On an
+even-length range they're neighbors, and which one you pick decides which half of the array a tie
+lands in.
+
+```csharp
+(int leftMid, int rightMid) Middles(int L, int R)
+{
+    int leftMid = (L + R) / 2;         // floor — biases toward L
+    int rightMid = (L + R + 1) / 2;    // ceil  — biases toward R
+    return (leftMid, rightMid);
+}
+```
+
+| `L` | `R` | elements | `leftMid = (L+R)/2` | `rightMid = (L+R+1)/2` |
+| --- | --- | --- | --- | --- |
+| 0 | 3 | 4 (even) | 1 | 2 |
+| 0 | 4 | 5 (odd) | 2 | 2 |
+
+Which one you want depends on the update rule: if a branch sets `L = mid`, you need `rightMid`
+(ceil), or `L` can get stuck — that's the whole [`L = mid` bug](#the-l--mid-infinite-loop) below.
+If a branch sets `R = mid`, `leftMid` (floor) is safe.
+
+Sometimes the middle never needs a formula at all. Fast/slow pointers finding the
+[middle of a linked list](/patterns/linked-lists/middle-of-linked-list/) advance `fast` two steps
+for every one step of `slow`; on an odd-length list, `slow` lands exactly on the single middle
+node the moment `fast.Next` is `null` — no index arithmetic, the geometry does it for you.
+
+## ceiling division
+
+`Math.Ceiling(a / (double)b)` works but drags floating point into a problem that's entirely
+integers. The integer idiom is one line and never rounds the wrong way at the boundary:
+
+```csharp
+int CeilDiv(int a, int b) => (a + b - 1) / b;
+```
+
+| `a` | `b` | `CeilDiv(a, b)` |
+| --- | --- | --- |
+| 7 | 2 | 4 |
+| 8 | 2 | 4 |
+| 0 | 5 | 0 |
+| 1 | 5 | 1 |
+| 9 | 3 | 3 |
+
+Note `(8, 2)` and `(7, 2)` land on the same answer — 8 divides evenly, 7 rounds up — and `CeilDiv`
+gets both right without a special case for the evenly-divisible input. Any "minimum number of
+X to cover Y" phrasing (minimum days, minimum buckets, minimum speed) is a ceiling-division
+question wearing a costume — [Koko Eating Bananas](/patterns/binary-search/koko-eating-bananas/)
+uses it to bound the search space.
+
+## circular indexing and negative modulo
+
+C#'s `%` is a **remainder** operator, not a mathematical modulo — the sign of the result follows
+the *dividend*, not the divisor. That's a surprise if you learned modulo from a language that
+normalizes it (Python's `%` always matches the divisor's sign).
+
+```csharp
+int Mod(int a, int m) => ((a % m) + m) % m;
+
+// -1 % 5 in C# is -1, not 4
+```
+
+| `a` | `m` | `a % m` (C#) | `((a % m) + m) % m` |
+| --- | --- | --- | --- |
+| -1 | 5 | -1 | 4 |
+| -7 | 5 | -2 | 3 |
+| 3 | 5 | 3 | 3 |
+| -5 | 5 | 0 | 0 |
+
+Once wrapped through the idiom, the result is always in `[0, m)` — safe to use as an array index.
+Apply it directly to circular indexing (rotating array walks, ring buffers, "the element `k`
+before this one, wrapping around"):
+
+```csharp
+int Circular(int i, int m) => ((i % m) + m) % m;
+```
+
+`buf = [10, 20, 30, 40, 50]`, `m = buf.Length = 5`:
+
+| `i` | `Circular(i, 5)` | `buf[index]` |
+| --- | --- | --- |
+| 0 | 0 | 10 |
+| 4 | 4 | 50 |
+| 5 | 0 | 10 |
+| 6 | 1 | 20 |
+| -1 | 4 | 50 |
+| -2 | 3 | 40 |
+| -6 | 4 | 50 |
+
+`i = 5` wraps forward past the end back to index 0; `i = -1` wraps backward to the last element.
+This is the same rule the [array toolbox](/patterns/array-techniques/) leans on wherever a walk
+needs to treat the array as a ring instead of a line.
+
+## direction arrays
+
+Every grid problem eventually asks "what are this cell's neighbors?" Four copy-pasted `if`
+blocks (`if (r > 0) ...`, `if (r < rows - 1) ...`, ...) work, but they don't scale to 8-directional
+moves and they hide the one piece of logic that actually matters: the bounds check. A pair of
+parallel arrays turns four blocks into one loop:
+
+```csharp
+int[] dRow = [-1, 1, 0, 0];
+int[] dCol = [0, 0, -1, 1];   // up, down, left, right — same order in both arrays
+
+int sum = 0;
+for (int d = 0; d < 4; d++)
+{
+    int nr = row + dRow[d], nc = col + dCol[d];
+    if (nr >= 0 && nr < grid.Length && nc >= 0 && nc < grid[0].Length)
+        sum += grid[nr][nc];
+}
+```
+
+`grid = [[1,2,3],[4,5,6],[7,8,9]]`. Neighbors of the center cell `(1,1)` — every direction is in
+bounds:
+
+| `d` | direction | `(nr, nc)` | in bounds | value |
+| --- | --- | --- | --- | --- |
+| 0 | up | (0, 1) | yes | 2 |
+| 1 | down | (2, 1) | yes | 8 |
+| 2 | left | (1, 0) | yes | 4 |
+| 3 | right | (1, 2) | yes | 6 |
+
+`sum = 20`. Neighbors of the corner cell `(0, 0)` — two of the four fall outside the grid:
+
+| `d` | direction | `(nr, nc)` | in bounds | value |
+| --- | --- | --- | --- | --- |
+| 0 | up | (-1, 0) | no | — |
+| 1 | down | (1, 0) | yes | 4 |
+| 2 | left | (0, -1) | no | — |
+| 3 | right | (0, 1) | yes | 2 |
+
+`sum = 6`. Same loop, no special-cased corner logic — this is the exact mechanic behind
+[Number of Islands and Rotting Oranges](/patterns/bfs-dfs/).
+
+## mirror iteration
+
+Comparing a sequence with itself reversed doesn't need two separate cursors. One index `i`
+climbing from the front is enough — the mirror position is always `n - 1 - i`.
+
+```csharp
+bool IsPalindrome(string s)
+{
+    for (int i = 0; i < s.Length / 2; i++)
+    {
+        int j = s.Length - 1 - i;
+        if (s[i] != s[j]) return false;
+    }
+    return true;
+}
+```
+
+`IsPalindrome("level")` — length 5, so `i` only runs `0, 1` (`s.Length / 2 == 2`); the middle
+character at index 2 is never compared, because it only needs to equal itself:
+
+| `i` | `j = s.Length - 1 - i` | `s[i]` | `s[j]` | equal |
+| --- | --- | --- | --- | --- |
+| 0 | 4 | `l` | `l` | yes |
+| 1 | 3 | `e` | `e` | yes |
+
+Loop ends, no mismatch found → `true`.
+
+<Cells
+  data={['l', 'e', 'v', 'e', 'l']}
+  pointers={{ 1: [{ t: 'i', c: 'amber' }], 3: [{ t: 'j', c: 'cyan' }] }}
+  cells={{ 0: 'win', 4: 'win', 1: 'ok', 3: 'ok', 2: 'dim' }}
+  caption="i=1, j=3: the last pair mirror iteration checks — index 2, the middle, is never touched"
+/>
+
+`IsPalindrome("radar!")` — the first comparison already fails:
+
+| `i` | `j = s.Length - 1 - i` | `s[i]` | `s[j]` | equal |
+| --- | --- | --- | --- | --- |
+| 0 | 5 | `r` | `!` | no |
+
+Returns `false` immediately — this is the same mirror-inward shape as
+[Valid Palindrome](/patterns/two-pointers/valid-palindrome/), generalized past skipping
+non-alphanumeric characters.
+
+## the three bug classes
+
+Nearly every loop bug that survives to a bad answer (instead of a compile error) is one of these
+three.
+
+### off-by-one
+
+```csharp
+int[] arr = [10, 20, 30];
+
+// bug: the last valid index is arr.Length - 1, not arr.Length
+for (int i = 0; i <= arr.Length; i++)
+    Console.WriteLine(arr[i]);
+```
+
+Actual run: prints `10`, `20`, `30`, then throws on the fourth iteration —
+
+```text
+10
+20
+30
+IndexOutOfRangeException: Index was outside the bounds of the array.
+```
+
+`arr` has three elements, valid indices `0, 1, 2`; at `i = 3` there is no `arr[3]`. The fix is the
+`for` loop from the section above: `i < arr.Length`, not `i <= arr.Length`.
+
+### the `L = mid` infinite loop
+
+This is the loop-mechanics bug specific to binary search's boundary form, and it's the single most
+common way a correct-looking binary search hangs.
+
+```csharp
+// buggy — floor mid, and a branch that keeps mid as a candidate
+int L = 0, R = a.Length - 1;
+while (L < R)
+{
+    int mid = (L + R) / 2;         // floor mid
+    if (a[mid] < 5) L = mid;       // BUG: when R == L + 1, mid == L — L never moves
+    else R = mid;
+}
+```
+
+Trace on `a = [3, 4]` (both values are `< 5`), capped at 6 iterations to prove it never converges
+on its own:
+
+| iter | `L` | `R` | `mid = (L+R)/2` | `a[mid]` | branch | new `L` |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | 0 | 1 | 0 | 3 | `3 < 5` → `L = mid` | 0 |
+| 2 | 0 | 1 | 0 | 3 | `3 < 5` → `L = mid` | 0 |
+| 3 | 0 | 1 | 0 | 3 | `3 < 5` → `L = mid` | 0 |
+| 4 | 0 | 1 | 0 | 3 | `3 < 5` → `L = mid` | 0 |
+| 5 | 0 | 1 | 0 | 3 | `3 < 5` → `L = mid` | 0 |
+| 6 | 0 | 1 | 0 | 3 | `3 < 5` → `L = mid` | 0 |
+
+`L` and `R` are identical on every iteration — the real loop never exits. The fix pairs a branch
+that keeps `L` as a candidate with **ceil-mid**, which is exactly the `rightMid` formula from the
+middle-element section:
+
+```csharp
+// fixed — ceil mid guarantees mid > L whenever L < R
+int L = 0, R = a.Length - 1;
+while (L < R)
+{
+    int mid = (L + R + 1) / 2;     // ceil mid
+    if (a[mid] < 5) L = mid;
+    else R = mid - 1;
+}
+```
+
+Same input, `a = [3, 4]`:
+
+| iter | `L` | `R` | `mid = (L+R+1)/2` | `a[mid]` | branch | new `L` | new `R` |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | 0 | 1 | 1 | 4 | `4 < 5` → `L = mid` | 1 | 1 |
+
+`L == R == 1` after one iteration — loop condition `L < R` is false, done. The rule: if a branch
+ever writes `L = mid`, that loop needs ceil-mid or it can stall exactly when `R == L + 1`.
+
+### negative modulo, reprised
+
+The modulo table above isn't just a curiosity — it's the third bug class. Compute a bucket or an
+array index with a raw `a % m` where `a` can be negative (a hash, a "step back from index 0"
+calculation, a difference of two indices) and C# hands you a negative result. Used as an index,
+that's the same `IndexOutOfRangeException` from the off-by-one bug above, just from the other
+end of the array. The fix is the one-liner from the circular-indexing section:
+`((a % m) + m) % m`, not a raw `%`.
+
+## the trace-with-0-1-2-elements technique
+
+Before trusting any loop, run it by hand on the smallest inputs that could exist: empty, one
+element, two elements. Boundary bugs live exactly there — a loop that "obviously" works on a
+7-element array can still be wrong about what happens when there's nothing, or one thing, to
+compare.
+
+Take `TwoSumOppositeEnds` from the top of this page:
+
+| input | `target` | start | result | why |
+| --- | --- | --- | --- | --- |
+| `[]` | 5 | `left=0, right=-1` | `[]` | `left < right` is `0 < -1` — false immediately, the loop body never runs |
+| `[5]` | 5 | `left=0, right=0` | `[]` | `left < right` is `0 < 0` — false, the single element never pairs with itself |
+| `[2, 3]` | 5 | `left=0, right=1` | `[0, 1]` | one comparison: `2 + 3 == 5`, hit |
+
+The empty and single-element cases both terminate without ever entering the loop body — if you'd
+written `while (left <= right)` instead, the single-element case would compare `nums[0]` with
+itself and could return a false match. Three lines of by-hand tracing catches that before a judge
+does.
+
+<Callout kind="tip" label="before you submit">
+  Trace 0, 1, and 2 elements by hand. Say out loud which operator you're using and why (`<` for
+  "these can't be equal", `<=` for "equal is still valid"). If any branch sets `L = mid`, confirm
+  you're using ceil-mid. That's the whole checklist — it catches the bugs that cost interviews.
+</Callout>

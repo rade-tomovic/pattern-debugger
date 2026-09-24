@@ -1,0 +1,157 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: two-pointers
+problem: trapping-rain-water
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import Cells from '@components/Cells.astro';
+
+## task
+
+Given `height[0..n)` representing an elevation map (each bar has width 1), compute how much
+water it traps after raining. Water sits above index `i` only up to
+`min(maxLeft(i), maxRight(i)) - height[i]`, where `maxLeft`/`maxRight` are the tallest bars to
+the left/right of `i`, inclusive of `i` itself.
+
+```text
+height = [4,2,0,3,2,5]  →  9
+```
+
+## how to think
+
+The direct formula — for every index, find the max to its left and the max to its right, take
+the smaller, subtract the bar — is correct but naively O(n) per index, O(n²) total (or O(n)
+time with two precomputed arrays, O(n) space). [Container With Most
+Water](/patterns/two-pointers/container-with-most-water/) already showed that converging
+pointers can replace "look arbitrarily far in one direction" with "track the max seen so far" —
+the same move applies here, just with two invariants running at once instead of one.
+
+The insight that collapses the space cost: at any moment, whichever side's *pointer* is standing
+on the lower running max is the side whose water level is already fully decided. Say
+`maxLeft <= maxRight` — then for the bar at `left`, the water above it is capped by `maxLeft`
+regardless of what's further right, because there's already a wall at least `maxRight >= maxLeft`
+waiting on the other side. You don't need the *exact* `maxRight` value to resolve `left`'s water;
+you only need to know it's at least as tall as `maxLeft`, which the comparison `height[left] <
+height[right]` already tells you.
+
+<Callout kind="note" label="template instance">
+  **Opposite ends** skeleton, carrying two running invariants (`maxLeft`, `maxRight`) instead of
+  one. What varies: the move rule advances whichever side has the smaller running max, and each
+  step directly adds water rather than comparing to a target. Invariant: the side that moves
+  always has a taller-or-equal wall already confirmed on the *other* side, so its water level is
+  fully determined by its own running max.
+</Callout>
+
+## solution
+
+```csharp
+public int Trap(int[] height)
+{
+    if (height.Length == 0) return 0;
+
+    int left = 0, right = height.Length - 1;
+    int maxLeft = 0, maxRight = 0;
+    int water = 0;
+
+    while (left < right)
+    {
+        if (height[left] < height[right])
+        {
+            // a wall of at least height[right] > height[left] already stands on the right — left is the limiter here
+            maxLeft = Math.Max(maxLeft, height[left]);
+            water += maxLeft - height[left];
+            left++;
+        }
+        else
+        {
+            maxRight = Math.Max(maxRight, height[right]);
+            water += maxRight - height[right];
+            right--;
+        }
+    }
+    return water;
+}
+```
+
+## trace
+
+`height = [4,2,0,3,2,5]`, starting `maxLeft = maxRight = 0`, `water = 0`:
+
+| step | L | R | h[L] | h[R] | branch | maxLeft | add | water |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | 0 | 5 | 4 | 5 | `h[L] < h[R]` | 4 | 4 − 4 = 0 | 0 |
+| 2 | 1 | 5 | 2 | 5 | `h[L] < h[R]` | 4 | 4 − 2 = 2 | 2 |
+| 3 | 2 | 5 | 0 | 5 | `h[L] < h[R]` | 4 | 4 − 0 = 4 | 6 |
+| 4 | 3 | 5 | 3 | 5 | `h[L] < h[R]` | 4 | 4 − 3 = 1 | 7 |
+| 5 | 4 | 5 | 2 | 5 | `h[L] < h[R]` | 4 | 4 − 2 = 2 | 9 |
+
+Every step this run takes the left branch, because `height[5] = 5` is the tallest bar in the
+array — `right` never has to move at all; it's already the guaranteed wall for every index left
+of it.
+
+Step 3 — the deepest single-step gain: index 2 is a 0 between two taller bars, so it holds the
+full `maxLeft = 4` units:
+
+<Cells
+  data={[4, 2, 0, 3, 2, 5]}
+  pointers={{ 2: [{ t: 'L', c: 'amber' }], 5: [{ t: 'R', c: 'cyan' }] }}
+  cells={{ 0: 'dim', 2: 'ok' }}
+  caption="maxLeft=4, height[2]=0 → 4 units trapped here alone"
+/>
+
+Final state — every bar from index 0 to 4 has been resolved against `maxLeft`, `right` never
+had to move:
+
+<Cells
+  data={[4, 2, 0, 3, 2, 5]}
+  pointers={{ 5: [{ t: 'R', c: 'cyan' }] }}
+  cells={{ 0: 'dim', 1: 'win', 2: 'win', 3: 'win', 4: 'win', 5: 'dim' }}
+  caption="water=9 total, accumulated entirely from the left side"
+/>
+
+## why it works
+
+The branch condition is the whole proof — but the argument runs on the *true* maximum height
+still standing in `[right..n-1]`, not on the running `maxRight` variable, which only reflects
+bars the right pointer has already visited (and can sit at 0 for the entire run, as it does in
+this trace, since `right` never moves). When `height[left] < height[right]`, that true maximum
+is at least `height[right] > height[left]`. It's also `>= maxLeft`: every time `maxLeft` was
+last raised, the branch that raised it required `height[right] > maxLeft` at that exact moment,
+and because `right` only ever moves inward, that same tall bar is still inside `[right..n-1]` no
+matter how far `right` has advanced since. So the true right-side maximum dominates both
+`height[left]` and `maxLeft`, which means `left`'s water is exactly `maxLeft - height[left]` —
+decided entirely by the left side, with no need to ever know `maxRight`'s real value.
+
+<Watch items={[['time', 'O(n)'], ['space', 'O(1)'], ['passes', '1']]} />
+
+## common bugs
+
+- Using `Math.Min(maxLeft, maxRight)` at every index instead of trusting the branch — the whole
+  point of the invariant is that you don't need the true minimum, just which side is smaller;
+  reaching for `Min` directly usually means falling back to the O(n) space two-array version.
+- Adding a negative amount when `height[i]` exceeds the running max on its own side — the max
+  update (`maxLeft = Math.Max(maxLeft, height[left])`) must happen *before* computing the add,
+  not after, or a new tallest bar looks like it traps negative water.
+- Branching on `height[left] <= height[right]` vs `<` — both are actually safe here (ties can go
+  either way since the invariant only needs "at least as tall"), but mixing up which pointer
+  advances on the branch you didn't intend to take is a real bug, not just a style choice.
+- Reaching for this before [Container With Most
+  Water](/patterns/two-pointers/container-with-most-water/) — the maxLeft/maxRight invariant is
+  much easier to trust once you've internalized the simpler one-invariant "discard the shorter
+  wall" argument first.
+- Trying to solve it with a single left-to-right pass and one running max, no second pointer —
+  without knowing whether a taller wall exists further right, a lone `maxSoFar` can't tell if a
+  low point ahead will actually hold water. The two-pointer version works specifically because
+  `height[left] < height[right]` tells you which side's answer is already locked in.
+
+## variants you can now solve
+
+- **[Container With Most Water](/patterns/two-pointers/container-with-most-water/)** (LC 11) —
+  the simpler sibling: one invariant instead of two, area instead of accumulated volume.
+- **Trapping Rain Water II** (LC 407) — the grid version; the two-pointer walls become a
+  min-heap frontier expanding inward from the border.
+- **Daily Temperatures** ([monotonic stack](/patterns/stack-queue/daily-temperatures/), LC 739)
+  — a different way to reason about "what's the nearest taller thing," useful when you need the
+  *distance* to the resolving wall rather than just its height.

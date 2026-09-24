@@ -1,0 +1,152 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: heap-top-k
+problem: kth-largest-element
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import Cells from '@components/Cells.astro';
+
+## task
+
+Given an integer array `nums` and an integer `k`, return the kth largest element **in sorted
+order** — not the kth distinct value, duplicates count individually. LeetCode #215.
+
+```text
+nums = [3, 2, 1, 5, 6, 4], k = 2  →  5
+```
+
+## how to think
+
+Sorting fully answers this in `O(n log n)`, but it computes the order of the bottom `n − k`
+elements too, and you never asked for that. A heap capped at size K answers it in `O(n log k)`:
+push every element once; the moment the heap holds more than K, evict the smallest. After the
+last element, the K survivors are exactly the K largest values in the array, and the smallest of
+*those* — the heap's root — is the kth largest.
+
+There's a second option worth knowing cold: **quickselect**, the partition step from quicksort
+with one recursive branch pruned. Partitioning around a pivot puts it at its final sorted
+position; if that position is the one you want, you're done — otherwise recurse into only the
+half that contains it. No full sort, `O(n)` average. See
+[Sorting for Interviews](/foundations/sorting/) for the partition mechanics themselves.
+
+<Callout kind="note" label="template instance">
+  **Bounded min-heap (size K)** — the same template as
+  [Kth Largest in a Stream](/patterns/heap-top-k/kth-largest-in-stream/), run once over a fixed
+  array instead of across incremental calls. Invariant: after every element has been processed,
+  the heap holds exactly the K largest values seen; its root is the kth largest.
+</Callout>
+
+## solution
+
+```csharp
+public int FindKthLargest(int[] nums, int k)
+{
+    var heap = new PriorityQueue<int, int>();   // min-heap: root is the smallest of the current top-K club
+
+    foreach (var n in nums)
+    {
+        heap.Enqueue(n, n);
+        if (heap.Count > k) heap.Dequeue();      // evict the smallest — it can't be in the top K
+    }
+    return heap.Peek();
+}
+```
+
+## trace
+
+`nums = [3, 2, 1, 5, 6, 4]`, `k = 2`:
+
+| push | heap after push | evicted | heap after evict |
+| --- | --- | --- | --- |
+| 3 | `{3}` | — | `{3}` |
+| 2 | `{2,3}` | — | `{2,3}` |
+| 1 | `{1,2,3}` | 1 | `{2,3}` |
+| 5 | `{2,3,5}` | 2 | `{3,5}` |
+| 6 | `{3,5,6}` | 3 | `{5,6}` |
+| 4 | `{4,5,6}` | 4 | `{5,6}` |
+
+Final heap `{5, 6}` — `Peek()` returns 5, the smaller of the two, i.e. the 2nd largest:
+
+<Cells
+  data={[3, 2, 1, 5, 6, 4]}
+  cells={{ 0: 'warn', 1: 'warn', 2: 'warn', 3: 'win', 4: 'win', 5: 'warn' }}
+  caption="after all six pushes, only 5 and 6 remain in the top-2 club"
+/>
+
+## why it works
+
+By induction on the prefix processed so far: after `m` elements, the heap holds `min(m, k)`
+elements, and they're the `k` largest of that prefix. The first `k` pushes trivially satisfy
+this (nothing evicted yet). Every push after that either doesn't belong in the top K — it's
+evicted immediately — or does, forcing out the current smallest member, which by the induction
+hypothesis was correctly the weakest of the previous top K. The root of a min-heap over "the K
+largest so far" is, by definition, the Kth largest so far — and at the end, "so far" means
+"total".
+
+**The quickselect alternative.** `target = nums.Length - k` converts "kth largest" into "the
+`target`th smallest, 0-indexed" — quickselect naturally finds the `i`th smallest via partitioning:
+
+```csharp
+public int FindKthLargestQuickselect(int[] nums, int k)
+{
+    int target = nums.Length - k;
+    int lo = 0, hi = nums.Length - 1;
+    var rng = new Random();
+
+    while (true)
+    {
+        int p = Partition(nums, lo, hi, rng);
+        if (p == target) return nums[p];
+        if (p < target) lo = p + 1;    // the answer is further right — the left side is settled and irrelevant
+        else hi = p - 1;               // the answer is further left
+    }
+}
+
+private static int Partition(int[] nums, int lo, int hi, Random rng)
+{
+    int pivotPos = rng.Next(lo, hi + 1);
+    (nums[pivotPos], nums[hi]) = (nums[hi], nums[pivotPos]);   // move a random pivot to the end
+    int pivot = nums[hi];
+
+    int store = lo;
+    for (int i = lo; i < hi; i++)
+    {
+        if (nums[i] < pivot)
+        {
+            (nums[i], nums[store]) = (nums[store], nums[i]);
+            store++;
+        }
+    }
+    (nums[store], nums[hi]) = (nums[hi], nums[store]);
+    return store;
+}
+```
+
+Each partition call costs `O(size)`, but only one recursive branch survives, so the total work
+is `O(n + n/2 + n/4 + …) = O(n)` on average — a geometric series that sums to `O(n)`. A random
+pivot is what keeps that average honest; see the common bugs below for what happens without it.
+The heap approach above stays the one worth defaulting to, since its worst case is airtight:
+
+<Watch items={[['time', 'O(n log k)'], ['space', 'O(k)']]} />
+
+## common bugs
+
+- Deduplicating before sorting or heaping — "kth largest" counts duplicates individually
+  (`[3,2,3,1,2,4,5,5,6]` with `k = 4` is 4, not whatever a dedupe-first approach would find).
+- Building a max-heap over the *entire* array and popping k times — correct, but `O(n + k log n)`
+  is strictly worse than the bounded min-heap's `O(n log k)` once k is small relative to n.
+- Quickselect with a fixed pivot (always `hi`, say) instead of a random one — degrades to
+  `O(n²)` on sorted or reverse-sorted input, which interview test suites love to include.
+- Quickselect off-by-one: using `k` directly as the target index instead of `nums.Length - k` —
+  the kth largest is the `(n - k)`th smallest, 0-indexed, not the `k`th.
+
+## variants you can now solve
+
+- [Kth Largest Element in a Stream](/patterns/heap-top-k/kth-largest-in-stream/) (LC 703) — the
+  same heap, kept alive across calls instead of rebuilt once.
+- **K Closest Points to Origin** (LC 973) — identical shape, keyed by squared distance instead
+  of raw value; max-heap of size K, evict the farthest point.
+- [Top K Frequent Elements](/patterns/heap-top-k/top-k-frequent/) (LC 347) — the heap key
+  becomes a derived count instead of the element's own value.

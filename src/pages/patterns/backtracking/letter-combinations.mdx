@@ -1,0 +1,145 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: backtracking
+problem: letter-combinations
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+
+## task
+
+Given a string `digits` of digits `2`-`9`, return every possible letter combination the number
+could represent, using the standard telephone keypad mapping (`2` → `abc`, `3` → `def`, ...,
+`9` → `wxyz`). Order doesn't matter; an empty `digits` returns no combinations at all.
+
+```text
+digits = "23"  →  ["ad","ae","af","bd","be","bf","cd","ce","cf"]
+```
+
+## how to think
+
+The brute force is nested loops — one per digit. That doesn't compile as written, because the
+number of loops depends on `digits.Length` at runtime; you can't hard-code "3 nested loops" when
+the input might have 2 digits or 5. Recursion is the fix: one function handles *one* digit
+position and calls itself for the rest, so "however many loops you'd need" collapses into
+"however many times this function calls itself."
+
+Each call owns exactly one digit index. It looks up that digit's letters, and for each letter it
+commits the letter to the path and hands the *next* digit off to a recursive call. There's no way
+to go wrong partway through — every letter is legal for its digit, so nothing needs pruning. That
+absence of pruning is what makes this the gentlest entry point into backtracking: the only two
+moving parts are "when do I stop" (path length equals `digits.Length`) and "what do I undo"
+(remove the last character before trying the next letter).
+
+<Callout kind="note" label="template instance">
+  **Fixed positions, fixed choices** shape: depth `index` always corresponds to digit
+  `digits[index]`, and every letter that digit maps to is always a valid choice — there is no
+  `IsValid` check, only `IsComplete` (`index == digits.Length`). Invariant: `path` always holds a
+  string of exactly `index` letters, one per digit processed so far.
+</Callout>
+
+## solution
+
+```csharp
+public IList<string> LetterCombinations(string digits)
+{
+    if (digits.Length == 0) return [];
+
+    string[] map = ["", "", "abc", "def", "ghi", "jkl", "mno", "pqrs", "tuv", "wxyz"];
+    var result = new List<string>();
+    var path = new StringBuilder();
+
+    void Backtrack(int index)
+    {
+        if (index == digits.Length)
+        {
+            result.Add(path.ToString());
+            return;
+        }
+
+        foreach (char c in map[digits[index] - '0'])
+        {
+            path.Append(c);           // choose
+            Backtrack(index + 1);     // explore
+            path.Length--;            // un-choose
+        }
+    }
+
+    Backtrack(0);
+    return result;
+}
+```
+
+## trace
+
+`digits = "23"` — `'2'` maps to `"abc"`, `'3'` maps to `"def"`:
+
+```text
+""
+├─ 'a' → "a"
+│    ├─ 'd' → "ad"   (index 2 == digits.Length → ADD)
+│    ├─ 'e' → "ae"   (ADD)
+│    └─ 'f' → "af"   (ADD)
+├─ 'b' → "b"
+│    ├─ 'd' → "bd"   (ADD)
+│    ├─ 'e' → "be"   (ADD)
+│    └─ 'f' → "bf"   (ADD)
+└─ 'c' → "c"
+     ├─ 'd' → "cd"   (ADD)
+     ├─ 'e' → "ce"   (ADD)
+     └─ 'f' → "cf"   (ADD)
+```
+
+Every choose event in that tree, in the order the recursion actually visits them:
+
+| call | digit index | char tried | path after choose | result |
+| --- | --- | --- | --- | --- |
+| 1 | 0 (`'2'`) | `'a'` | `"a"` | recurse into index 1 |
+| 2 | 1 (`'3'`) | `'d'` | `"ad"` | complete → **add "ad"** |
+| 3 | 1 (`'3'`) | `'e'` | `"ae"` | complete → **add "ae"** |
+| 4 | 1 (`'3'`) | `'f'` | `"af"` | complete → **add "af"**; back out to index 0 |
+| 5 | 0 (`'2'`) | `'b'` | `"b"` | recurse into index 1 |
+| 6 | 1 (`'3'`) | `'d'` | `"bd"` | complete → **add "bd"** |
+| 7 | 1 (`'3'`) | `'e'` | `"be"` | complete → **add "be"** |
+| 8 | 1 (`'3'`) | `'f'` | `"bf"` | complete → **add "bf"**; back out to index 0 |
+| 9 | 0 (`'2'`) | `'c'` | `"c"` | recurse into index 1 |
+| 10 | 1 (`'3'`) | `'d'` | `"cd"` | complete → **add "cd"** |
+| 11 | 1 (`'3'`) | `'e'` | `"ce"` | complete → **add "ce"** |
+| 12 | 1 (`'3'`) | `'f'` | `"cf"` | complete → **add "cf"**; done |
+
+Every one of the 12 rows is a real call to `Backtrack`; after each `add`, `path.Length--` fires
+before the loop tries the next letter — that's why row 5 starts from `"b"` and not `"ab"`.
+
+## why it works
+
+Every path from the root to a leaf of depth `digits.Length` picks exactly one letter per digit,
+and every combination of "one letter per digit" is reachable by exactly one such path — the
+recursion tree's leaves are in one-to-one correspondence with the answer set. `StringBuilder`
+makes the choose/un-choose pair O(1): `Append` commits a letter, `path.Length--` removes it
+without reallocating, so undoing is as cheap as choosing.
+
+<Watch items={[['time', 'O(4^n · n)'], ['space', 'O(n) auxiliary (+ O(n · 4^n) for the output)']]} />
+
+## common bugs
+
+- Returning `[""]` instead of `[]` when `digits` is empty — LeetCode wants an empty list, and
+  the guard `if (digits.Length == 0) return [];` has to be explicit; without it the recursion
+  starts at `index == 0 == digits.Length` and immediately adds one empty string.
+- Using `path += c` (string concatenation) instead of a mutable `StringBuilder` — strings are
+  immutable, so there's no O(1) undo; you'd have to slice the string back down, which works but
+  throws away the whole point of choose/un-choose being cheap.
+- Indexing the map with the raw character — `map[digits[index]]` instead of
+  `map[digits[index] - '0']` — throws `IndexOutOfRangeException`, since `digits[index]` implicitly
+  converts to an `int` in the 50s (its ASCII value), and `map` only has 10 elements.
+- Forgetting `path.Length--` after the recursive call: leftover characters from one branch bleed
+  into the next sibling, and every combination after the first gets longer than it should.
+
+## variants you can now solve
+
+- **[Subsets](/patterns/backtracking/subsets/)** (LC 78) — the next rung up: instead of a fixed
+  choice per position, every element gets a binary include/skip decision.
+- **[Permutations](/patterns/backtracking/permutations/)** (LC 46) — the choice list isn't a
+  fixed per-digit lookup anymore; it's "whatever's still unused," so it shrinks every level.
+- **Combinations** (LC 77) — pick `k` numbers from `1..n`; same fixed-depth shape as this
+  problem, but the "digit map" becomes a shrinking numeric range instead of a keypad lookup.

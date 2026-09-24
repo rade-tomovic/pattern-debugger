@@ -1,0 +1,182 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: trie
+problem: word-search-ii
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+
+## task
+
+Given an `m x n` grid of letters and a list of `words`, return every word that can be built by
+walking sequentially adjacent cells (up/down/left/right, no cell reused twice within one word).
+
+```text
+board = [['o','a','a','n'],
+         ['e','t','a','e'],
+         ['i','h','k','r'],
+         ['i','f','l','v']]
+words  = ["oath", "pea", "eat", "rain"]
+→ ["eat", "oath"]
+```
+
+## how to think
+
+<Callout kind="trap" label="prerequisite">
+  This problem assumes the grid-backtracking mechanics from
+  [Word Search](/patterns/backtracking/word-search/) (LC 79) are already automatic: bounds
+  checking, marking a cell visited *before* recursing and un-marking it on the way back, walking
+  four directions. If any of that feels unfamiliar, solve LC 79 first — this page only adds the
+  trie on top of it.
+</Callout>
+
+Word Search's DFS answers "does this one word exist in the grid?" Run it once per word here and
+you get `O(words × rows × cols × 4^L)` — with dozens of words that's too slow. But notice: DFS
+from a cell for `"oath"` and DFS from the same cell for `"oat"` (if it were in the list) would
+retrace the *identical first three steps*. Searching each word independently throws that shared
+work away.
+
+The fix is the trie again: build one trie from every word up front, then run **one** DFS pass
+over the grid, descending into the trie as you descend into the grid. At each cell, `board[r][c]`
+either matches a child of the current trie node — meaning some word could still complete along
+this path — or it doesn't, and you prune immediately, before touching a single further cell.
+Every word that shares a prefix shares the pruning too.
+
+<Callout kind="note" label="template instance">
+  **Dictionary-based node**, same as every page in this topic — but now the walk is driven by
+  the grid, not by a string. Invariant: at cell `(r, c)` holding the current trie `node`, `node`
+  is reachable exactly when the path walked so far spells a prefix of some word in the
+  dictionary. When `node.Word` is non-null, that path spells a complete word — record it, then
+  **null the field out** so the same trie leaf can never contribute a duplicate, even if a
+  different grid path reaches it later.
+</Callout>
+
+## solution
+
+```csharp
+public class TrieNode
+{
+    public Dictionary<char, TrieNode> Children { get; } = [];
+    public string? Word;              // set at the node completing a dictionary word
+}
+
+public class Solution
+{
+    private static readonly (int dr, int dc)[] Dirs = [(-1, 0), (1, 0), (0, -1), (0, 1)];
+
+    public IList<string> FindWords(char[][] board, string[] words)
+    {
+        var root = new TrieNode();
+        foreach (var w in words)
+        {
+            var node = root;
+            foreach (char c in w)
+            {
+                if (!node.Children.TryGetValue(c, out var next))
+                {
+                    next = new TrieNode();
+                    node.Children[c] = next;
+                }
+                node = next;
+            }
+            node.Word = w;             // build the trie once, up front — not per word searched
+        }
+
+        int rows = board.Length, cols = board[0].Length;
+        var found = new List<string>();
+
+        for (int r = 0; r < rows; r++)
+            for (int c = 0; c < cols; c++)
+                Dfs(board, r, c, root, found);
+
+        return found;
+    }
+
+    private void Dfs(char[][] board, int r, int c, TrieNode node, List<string> found)
+    {
+        int rows = board.Length, cols = board[0].Length;
+        if (r < 0 || r >= rows || c < 0 || c >= cols) return;
+
+        char ch = board[r][c];
+        if (ch == '#' || !node.Children.TryGetValue(ch, out var next)) return;   // prune: no such prefix
+
+        if (next.Word is not null)
+        {
+            found.Add(next.Word);
+            next.Word = null;          // claimed — never add this word twice
+        }
+
+        board[r][c] = '#';             // mark visited by defacing the cell
+        foreach (var (dr, dc) in Dirs)
+            Dfs(board, r + dr, c + dc, next, found);
+        board[r][c] = ch;              // un-choose: restore for other paths
+    }
+}
+```
+
+## trace
+
+Small board on purpose, chosen to show a word that's in the dictionary but **never found**:
+`board = [['a', 'b', 'c']]` (one row), `words = ["ab", "abc", "ac"]`.
+
+```text
+board:  a b c
+
+trie:
+root
+ └─ a
+     ├─ b ● "ab"
+     │   └─ c ● "abc"
+     └─ c ● "ac"        ← no 'a' cell in this board neighbors a 'c' cell
+```
+
+| step | start cell | visiting | char | path so far | trie child? | action |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | (0,0) | (0,0) | `a` | `"a"` | yes | descend, mark `(0,0)` visited |
+| 2 | (0,0) | (0,1) | `b` | `"ab"` | yes | **match "ab"** — record, null the leaf; descend, mark `(0,1)` |
+| 3 | (0,0) | (0,0) | `#` | — | — | already `#` on this path — skip |
+| 4 | (0,0) | (0,2) | `c` | `"abc"` | yes | **match "abc"** — record, null the leaf; descend |
+| 5 | (0,0) | (0,1) | `#` | — | — | already `#` on this path — skip; backtrack fully to `(0,0)` |
+| 6 | (0,1) | (0,1) | `b` | `"b"` | no — root has no `b` child | prune, no further cells touched |
+| 7 | (0,2) | (0,2) | `c` | `"c"` | no — root has no `c` child | prune, no further cells touched |
+
+Result: `["ab", "abc"]`. Step 2 and step 4 are the finds. `"ac"` is a real dictionary word that
+**never appears** in the result — the only neighbor of the `'a'` at `(0,0)` is the `'b'` at
+`(0,1)`, so no grid path ever reaches a `'c'` directly after an `'a'`. Being in the dictionary
+guarantees a trie node exists; it says nothing about whether the grid can reach it.
+
+## why it works
+
+The trie invariant carries over unchanged from the rest of this topic: reachability in the trie
+tracks "is this a prefix of some dictionary word," and `Word != null` marks "this exact path is a
+complete one." The new ingredient is that the walk is driven by the grid's adjacency instead of a
+string's characters, so a path that runs out of trie children is pruned **immediately** — the DFS
+never wastes a recursive call on a grid path no word could complete. Nulling `Word` after a match
+keeps every found word reported exactly once, no matter how many different grid paths could spell
+it.
+
+<Watch items={[['build trie', 'O(sum of word lengths)'], ['grid search', 'O(rows · cols · 4^L)'], ['space', 'O(trie nodes + L recursion depth)']]} />
+
+## common bugs
+
+- Building a fresh trie (or re-running `Insert`) per starting cell instead of once before the
+  grid scan — build it once from `words`, then reuse it for every cell.
+- Matching a word but not nulling `next.Word` afterward — the same word gets appended to the
+  result once per grid path that reaches it, instead of once.
+- Indexing `node.Children[ch]` directly instead of guarding with `TryGetValue` — a cell whose
+  letter isn't a valid next character throws instead of pruning cleanly.
+- Marking cells visited with a separate `bool[,]` grid and forgetting to reset it between DFS
+  starts — defacing `board[r][c]` in place and restoring it on the way back avoids that entirely.
+- Skipping [Word Search](/patterns/backtracking/word-search/) first: if the mark/unmark and
+  bounds-check reflexes aren't automatic yet, the trie on top makes debugging much harder.
+
+## variants you can now solve
+
+- [Word Search](/patterns/backtracking/word-search/) (LC 79) — the prerequisite: this exact grid
+  DFS, searching one word instead of a whole dictionary.
+- [Implement Trie](/patterns/trie/implement-trie/) (LC 208) and
+  [Design Add and Search Words](/patterns/trie/design-add-search-words/) (LC 211) — the trie
+  driving this search, studied on its own.
+- **Concatenated Words** (LC 472) — a different "share work across many words with a trie"
+  problem, DP-flavored instead of grid-flavored.

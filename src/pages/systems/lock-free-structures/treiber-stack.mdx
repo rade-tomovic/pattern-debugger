@@ -1,0 +1,377 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: lock-free-structures
+problem: treiber-stack
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import Solution from '@components/Solution.astro';
+
+## the question
+
+A stack has one piece of mutable state: the head. That makes it the smallest structure that can
+be built out of a single compare-and-swap, and the standard first thing anybody writes when they
+decide locks are too slow. Build it, and prove — under real contention, not by inspection — that
+it never loses or duplicates an item.
+
+Then reason about two things a CAS loop does that a single-threaded reading of the code will not
+tell you.
+
+<Callout kind="insight" label="predict first">
+  Two predictions, both checkable by working through the mechanism rather than by running
+  anything.
+
+  **1.** At one thread, `Push` and `TryPop` are the only thing touching `_head` — nothing else
+  can move it between your read and your `CompareExchange`. How many times, on average, does a
+  single-threaded call have to retry the CAS before it succeeds? Now say two, then four threads
+  are all doing the same thing at once. Does the retry rate have to *increase* as threads are
+  added, and can you say why from what a CAS failure actually means — without putting a number
+  on it?
+
+  **2.** Say you decide to dodge all of this by partitioning: one `TreiberStack<T>` per thread,
+  so no two threads ever touch the same `_head` field. Four threads means four `TreiberStack`
+  objects, allocated back to back with `new TreiberStack<T>()` in a loop. A `TreiberStack<T>`
+  object is an object header plus one reference field. Work out its size, then predict how many
+  64-byte cache lines those four objects land on. Does "one stack per thread" definitely mean
+  "one cache line per thread"?
+</Callout>
+
+## the code
+
+The verification pass runs first and throws if a single integer is lost or duplicated, because a
+structure that has not been checked under real contention is not verified at all. The second
+part counts CAS attempts directly, by incrementing a counter on every try — success or failure —
+before the `CompareExchange` runs.
+
+<Solution>
+
+```csharp
+// Evidence for /systems/lock-free-structures/treiber-stack/ — run with:
+//   dotnet run bench/lock-free-structures/treiber-stack.cs
+
+// ── the thing being built ────────────────────────────────────────────────────
+// A Treiber stack: one mutable field, and every change to it goes through one
+// CompareExchange. No lock, no wait queue, no parking.
+public sealed class TreiberStack<T>
+{
+    sealed class Node(T value) { public readonly T Value = value; public Node? Next; }
+
+    Node? _head;
+
+    public void Push(T value)
+    {
+        var node = new Node(value);
+        Node? head = Volatile.Read(ref _head);
+        while (true)
+        {
+            node.Next = head;                                   // wire it up BEFORE publishing
+            Node? seen = Interlocked.CompareExchange(ref _head, node, head);
+            if (seen == head) return;                            // won: the node is now the head
+            head = seen;                                         // lost: retry from what is really there
+        }
+    }
+
+    public bool TryPop(out T value)
+    {
+        Node? head = Volatile.Read(ref _head);
+        while (head is not null)
+        {
+            Node? seen = Interlocked.CompareExchange(ref _head, head.Next, head);
+            if (seen == head) { value = head.Value; return true; }
+            head = seen;
+        }
+        value = default!;                                        // empty
+        return false;
+    }
+}
+
+public static class Bench
+{
+    // ── 1. correctness under real contention ────────────────────────────────
+    // Every thread pushes a disjoint block of integers, then four more threads
+    // pop until empty. A lost update shows up as a missing or duplicated integer.
+    static void VerifyUnderContention()
+    {
+        const int Threads = 4, PerThread = 200_000;
+        var stack = new TreiberStack<int>();
+        var producers = new Thread[Threads];
+        var start = new Barrier(Threads);
+        for (int t = 0; t < Threads; t++)
+        {
+            int id = t;
+            producers[t] = new Thread(() =>
+            {
+                start.SignalAndWait();
+                for (int i = 0; i < PerThread; i++) stack.Push(id * PerThread + i);
+            });
+            producers[t].Start();
+        }
+        foreach (var th in producers) th.Join();
+
+        var seen = new int[Threads * PerThread];
+        int popped = 0;
+        var consumers = new Thread[Threads];
+        var start2 = new Barrier(Threads);
+        for (int t = 0; t < Threads; t++)
+        {
+            consumers[t] = new Thread(() =>
+            {
+                start2.SignalAndWait();
+                while (stack.TryPop(out int v)) { Interlocked.Increment(ref seen[v]); Interlocked.Increment(ref popped); }
+            });
+            consumers[t].Start();
+        }
+        foreach (var th in consumers) th.Join();
+
+        int missing = 0, duplicated = 0;
+        foreach (int c in seen) { if (c == 0) missing++; else if (c > 1) duplicated++; }
+        Console.WriteLine($"  pushed {Threads * PerThread:N0} by {Threads} threads, popped {popped:N0} by {Threads} threads");
+        Console.WriteLine($"  missing {missing}, duplicated {duplicated}, stack empty: {!stack.TryPop(out _)}");
+        if (missing != 0 || duplicated != 0 || popped != Threads * PerThread) throw new Exception("FAIL: the stack lost or duplicated items");
+    }
+
+    // ── 2. how often does the CAS actually go round? ─────────────────────────
+    // Every attempt — whether it succeeds or not — increments a counter before
+    // trying the CAS. attempts / successful-operations is how many times a
+    // thread had to retry on average. The counter is itself a contended
+    // Interlocked.Increment, so it widens the very window it is measuring —
+    // read these as an upper bound on the retry rate, not an exact one.
+    sealed class CountingStack
+    {
+        sealed class Node(int value) { public readonly int Value = value; public Node? Next; }
+        Node? _head;
+        public long Attempts;
+        public void Push(int value)
+        {
+            var node = new Node(value);
+            Node? head = Volatile.Read(ref _head);
+            while (true)
+            {
+                node.Next = head;
+                Interlocked.Increment(ref Attempts);
+                Node? seen = Interlocked.CompareExchange(ref _head, node, head);
+                if (seen == head) return;
+                head = seen;
+            }
+        }
+        public bool TryPop(out int value)
+        {
+            Node? head = Volatile.Read(ref _head);
+            while (head is not null)
+            {
+                Interlocked.Increment(ref Attempts);
+                Node? seen = Interlocked.CompareExchange(ref _head, head.Next, head);
+                if (seen == head) { value = head.Value; return true; }
+                head = seen;
+            }
+            value = 0; return false;
+        }
+    }
+
+    static double AttemptsPerOp(int threads)
+    {
+        var s = new CountingStack();
+        int per = 200_000 / threads;
+        var ths = new Thread[threads];
+        var start = new Barrier(threads);
+        for (int t = 0; t < threads; t++)
+        {
+            ths[t] = new Thread(() =>
+            {
+                start.SignalAndWait();
+                for (int i = 0; i < per; i++) { s.Push(i); s.TryPop(out _); }
+            });
+            ths[t].Start();
+        }
+        foreach (var th in ths) th.Join();
+        return s.Attempts / (double)(per * threads * 2);
+    }
+
+    public static void Main()
+    {
+        Console.WriteLine("=== 1. correctness under contention ===");
+        VerifyUnderContention();
+
+        Console.WriteLine("\n=== 2. attempts per successful operation, three trials at each thread count ===");
+        foreach (int t in new[] { 1, 2, 4 })
+            Console.WriteLine($"  {t} thread(s): {AttemptsPerOp(t):F3}  {AttemptsPerOp(t):F3}  {AttemptsPerOp(t):F3}");
+    }
+}
+```
+
+</Solution>
+
+## work it out
+
+**Prediction 1 — the retry rate.** At one thread, walk what a CAS failure would even require:
+some other thread would have to write `_head` between your `Volatile.Read` and your
+`CompareExchange`. With one thread, nothing else ever runs `Push` or `TryPop`, so `_head` cannot
+move underneath you. `seen == head` is true on the first try, every time — the CAS never fails,
+which is the definition of "uncontended". Attempts per successful operation at one thread is
+exactly 1.000, not approximately — it is a fact about the algorithm, not a measurement with a
+margin.
+
+At two or more threads, the same argument runs backward. Between your `Volatile.Read` and your
+`CompareExchange`, any of the *other* threads can complete a `Push` or `TryPop` of its own — and
+if one does, your `head` is now stale, your CAS returns something that is not `head`, and you
+retry. More threads racing on the same field means more opportunities for exactly that to happen
+in the window between your read and your CAS, so the attempts-per-op ratio has to be
+non-decreasing in thread count as a matter of what a CAS failure *means*, even before you run
+anything. The exact number is not — it depends on how the scheduler interleaves those reads and
+writes, which is not under the algorithm's control.
+
+**Prediction 2 — the cache-line layout of "one stack per thread".** A `TreiberStack<T>` object
+has one field: the `Node? _head` reference, 8 bytes. On the 64-bit CLR every object also carries
+a header — a sync-block index and a method-table pointer, 8 bytes each, 16 bytes total — before
+its fields start. 16 + 8 = 24 bytes, which is also the minimum object size the runtime uses on
+64-bit (the GC needs room to leave a forwarding pointer during a compacting collection), so a
+`TreiberStack<T>` object is 24 bytes whichever way you arrive at the number.
+
+The allocator is a pointer bump: sequential `new TreiberStack<T>()` calls on the same thread
+land at sequential addresses, 24 bytes apart. A cache line is 64 bytes. 64 ÷ 24 is 2.67, so the
+*second* object you allocate already shares a line with the first — objects 0 and 1 fit in one
+64-byte line together (0 and 24 are both within the first 64 bytes), object 2 starts at 48 and
+crosses into the next line at 64, and object 3 at 72 sits fully in that second line alongside
+half of object 2. Four 24-byte objects, allocated back to back, land on **two** 64-byte lines,
+not four. "One stack per thread" is a claim about the algorithm; it says nothing about the
+allocator, and the allocator is what decides whether those four `_head` fields are actually
+independent for the hardware's purposes.
+
+```text
+addresses (relative)   0        24       48       72
+                        │0│1│2       │2│3│         │
+line 0: bytes 0-63   ───┴─┴─┴────────┴─┘
+line 1: bytes 64-127                    └──────────┴───
+                        stack 0, 1 fully in line 0
+                        stack 2 straddles the boundary — half in each line
+                        stack 3 fully in line 1
+```
+
+Four threads each CASing their own `_head` would still be generating cache-line-ownership
+traffic between line 0 and line 1, exactly the traffic partitioning was supposed to remove — this
+is [false sharing](/systems/atomics-and-cas/false-sharing/), and it is invisible from reading the partitioned
+design's code, because the code genuinely never touches another thread's field. The fix is to
+force each stack onto its own line: allocate a spacer object after each one large enough that the
+next `TreiberStack` starts past the 64-byte boundary. A 128-byte spacer pushes the stride from 24
+bytes to 176, which clears a full line every time.
+
+## the answer
+
+Real output. Correctness first — four threads pushing 200,000 disjoint integers each, then four
+threads popping until empty:
+
+```text
+=== 1. correctness under contention ===
+  pushed 800,000 by 4 threads, popped 800,000 by 4 threads
+  missing 0, duplicated 0, stack empty: True
+```
+
+Attempts per successful operation, three trials at each thread count, from two separate runs of
+the file above:
+
+```text
+run 1 — 1 thread(s): 1.000  1.000  1.000     2 thread(s): 1.818  1.701  1.800     4 thread(s): 3.240  3.485  3.071
+run 2 — 1 thread(s): 1.000  1.000  1.000     2 thread(s): 1.789  1.837  1.766     4 thread(s): 3.359  3.564  3.285
+```
+
+Prediction 1 lands exactly: 1.000 at one thread, in both runs and all six trials — not "close to
+one", exactly one, because the reasoning above is a fact about the algorithm, not a tendency. At
+two threads the ratio sits in the 1.7-1.8 range across both runs; at four it sits in the 3.1-3.6
+range. The direction the reasoning predicted — more threads, more retries — holds in every trial
+here. The exact number is not a constant of the algorithm; a different core count, a different
+scheduler, or a different container would move it, which is exactly why the code comments call
+it an upper bound and not a rate.
+
+Prediction 2, from `bench/lock-free-structures/stack-layout.cs`, which allocates four
+`TreiberStack<int>` objects and reads their addresses directly (an object reference *is* an
+address the runtime manages):
+
+```text
+bytes per TreiberStack object: 24.0
+back to back: address deltas 24 24 24   64-byte lines touched by the 4 stacks: 2
+with a spacer: address deltas 176 176 176   64-byte lines touched by the 4 stacks: 4
+```
+
+24 bytes per object, exactly as worked out above. Four objects allocated back to back land on
+two cache lines, not four — the prediction was right to doubt "one stack per thread" as a
+synonym for "one cache line per thread". The 128-byte spacer clears every stack onto its own
+line, at the cost of 128 bytes of unused memory per thread.
+
+## why it works that way
+
+**A CAS failure is not corruption — it is information.** `Interlocked.CompareExchange` always
+tells the truth about what is currently in the field, whether it succeeds or not. That is why
+the retry needs no extra read: `seen` *is* the current value the moment the instruction ran. The
+general rule a Treiber stack is one instance of: **any CAS loop's retry rate is bounded below by
+1 and has no fixed upper bound**, because "more threads means more windows for a write to land
+between your read and your CAS" is true of every CAS loop on every shared field, not just this
+one.
+
+**Partitioning removes contention only if the partition is real to the hardware, not just to the
+algorithm.** The unit the hardware serializes writes to is the 64-byte line, not the field and
+not the object. A design can give every thread its own object, its own field, and still have two
+threads fighting over the same line, if the allocator happened to pack those objects close
+together — which a bump allocator does by default, because packing tightly is exactly what it is
+for. "Partition the data" is necessary; "partition the *cache lines*" is the actual requirement,
+and small objects need help to get there.
+
+<Watch items={[['attempts/op at 1 thread', '1.000, exactly'], ['attempts/op at 2 threads', '≈1.7-1.8'], ['attempts/op at 4 threads', '≈3.1-3.6'], ['TreiberStack object size', '24 B'], ['cache line', '64 B'], ['4 packed stacks touch', '2 lines'], ['4 spaced stacks touch', '4 lines'], ['spacer needed', '128 B']]} />
+
+## what this looks like in prod
+
+Nobody merges a hand-rolled Treiber stack. What does get merged is its shape: a field holding an
+immutable-ish object, updated with a CAS loop — a cached snapshot, a "current configuration"
+reference, a batch being accumulated, an interlocked linked list of pending work. Everything on
+this page applies to those, including the retry rate and the fact that the loop body must be
+pure.
+
+The production symptom that sends you here is a **latency tail with a flat mean and flat CPU**.
+A lock in a request path is a queue, and queues are where p99 lives; the profiler shows time in
+`Monitor.Enter` or, more often, shows nothing at all because the threads are parked and parked
+threads do not burn CPU. `dotnet-counters` on `System.Runtime` plus a contention profile (or
+`Monitor.LockContentionCount`) tells you whether the tail is contention before you redesign
+anything.
+
+When it is, the order of attempts that pays: **partition**, so the threads stop meeting at all —
+not "meet less often", meet *never*, which is a different order of fix than tuning the
+synchronization primitive, and the false-sharing trap above is the one detail that determines
+whether a partitioned design actually delivers that. Then **use the BCL concurrent type** if the
+data genuinely must be shared; then, only if profiling says the remaining cost is the
+synchronization itself and not the work inside it, consider a CAS loop over a single field. A
+hand-rolled multi-word lock-free structure is the last thing on the list and is almost never the
+right answer, because its correctness cannot be established by testing — this page's own
+verification pass proves the *common* case; it says nothing about the interleaving it did not
+happen to hit.
+
+## the same idea in other languages
+
+| language | what it's called | the trap |
+| --- | --- | --- |
+| Java | `AtomicReference.compareAndSet`, and `ConcurrentLinkedQueue` for the ready-made version | the JVM's GC gives you the same reclamation guarantee .NET's does, so the algorithm is the same — but `compareAndSet` on a reference compares by identity, exactly like `Interlocked.CompareExchange`, so a class with a value-based `equals` gives you no protection you might be expecting |
+| C++ | `std::atomic<Node*>` and `compare_exchange_weak` in a loop | the pop is a use-after-free waiting to happen: another thread may hold the node you are about to `delete`. Hazard pointers or epoch reclamation are not optional extras, they are most of the implementation. `compare_exchange_weak` can also fail spuriously, so the loop is mandatory even without contention |
+| Go | `atomic.Pointer[T].CompareAndSwap`, with channels as the idiomatic alternative | Go's GC removes reclamation the same way, but the Go answer to this problem is usually a buffered channel — the language pushes you toward handing work off rather than sharing a structure, which is the partitioning advice above, enforced by style |
+| Rust | `AtomicPtr` plus `crossbeam`'s epoch-based `Atomic<T>` | safe Rust cannot express the raw version at all: the borrow checker rejects a pointer two threads can free. You either use `crossbeam`, which brings epoch reclamation with it, or you write `unsafe` and own exactly the C++ problem |
+
+## common bugs
+
+- **Reading `_head` again after a failed CAS.** `CompareExchange` already returned the current
+  value; loading the field a second time costs another trip to the cache line and can read a
+  *third* value, which does not break correctness but does waste an attempt. The loop above
+  assigns `head = seen` for that reason.
+- **Building the node after the CAS, or mutating it after publishing.** The node must be
+  complete before the compare-and-swap, because the CAS is the publication and its ordering is
+  what makes the node's fields visible to the popping thread. A field written after the swap is a
+  data race with no lock to save you — see [the memory model](/systems/memory-model/).
+- **Pooling the nodes "to avoid the allocation".** That reintroduces ABA in managed code: a
+  recycled node can be back at the head by the time your stale CAS runs, so the swap succeeds
+  against a head that means something different. 32 bytes per node is rarely worth chasing, and
+  if it were, the fix is a version stamp, not a pool.
+- **Assuming a shared design partitioned by data is partitioned by hardware.** "One object per
+  thread" and "one cache line per thread" are different claims, and the gap between them is
+  exactly the allocator's packing behaviour — see the worked-out prediction above. Verify layout,
+  do not assume it from the design.
+- **Assuming "no lock" means "no waiting".** Every thread sharing a `TreiberStack` can spend real
+  time retrying — for ownership of a cache line rather than for a monitor. Lock-free removes
+  blocking (no thread can be stalled *by another thread's schedule*), not contention for the
+  line itself; only a genuinely partitioned design removes that.

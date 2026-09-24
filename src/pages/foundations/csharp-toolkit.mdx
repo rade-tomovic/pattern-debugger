@@ -1,0 +1,362 @@
+---
+layout: '@layouts/TopicLayout.astro'
+topic: csharp-toolkit
+---
+
+import Callout from '@components/Callout.astro';
+
+## core idea
+
+This isn't a pattern — it's the muscle memory underneath all of them. Every problem on this site
+reaches for one of the collections below, and the gap between a clean accepted solution and a
+slow, buggy one is usually *which member you called*, not which algorithm you picked. The exact
+costs for each of these live on the [Big-O page](/foundations/big-o/); this page is the API
+surface — the calls that avoid a double lookup, a thrown exception, or an accidental `O(n^2)`.
+
+| type | reach for it when | the member that matters |
+| --- | --- | --- |
+| `Dictionary<TKey, TValue>` | value keyed by something arbitrary | `TryGetValue`, `GetValueOrDefault` |
+| `HashSet<T>` | membership only, no value attached | `Add` (returns `bool`) |
+| `List<T>` | indexed access, occasional stack use | indexer, `Add` |
+| `Stack<T>` | LIFO, no indexed access needed | `TryPop`, `TryPeek` |
+| `Queue<T>` | FIFO, no indexed access needed | `TryDequeue`, `TryPeek` |
+| `PriorityQueue<TElement, TPriority>` | "give me the current min/max" repeatedly | `Enqueue`, `TryDequeue` |
+| `LinkedList<T>` | `O(1)` insert/remove given a node you hold | `AddFirst`/`AddLast`, `Remove(node)` |
+| `StringBuilder` | building a string across many steps | `Append`, `ToString` |
+
+## when to reach for it
+
+- Need `O(1)` lookup keyed by an arbitrary value → `Dictionary<TKey, TValue>`.
+- Need "have I seen this?" with no value to attach → `HashSet<T>`.
+- Need last-in-first-out order — matching, undo, hand-rolled DFS → `Stack<T>`.
+- Need first-in-first-out order — BFS, multi-source expansion → `Queue<T>`.
+- Need the current smallest (or largest) of a growing set, repeatedly → `PriorityQueue<TElement, TPriority>`.
+- Need `O(1)` insert/remove given a reference you already hold, not a search → `LinkedList<T>` +
+  `LinkedListNode<T>`.
+- Building a string across many loop iterations → `StringBuilder`, never `+=` in the loop.
+
+## the collections
+
+### `Dictionary<TKey, TValue>`
+
+Two members do almost all the work under pressure. `TryGetValue` checks membership *and* fetches
+the value in one call — no separate `ContainsKey` before the indexer, which would hash the key
+twice. `GetValueOrDefault` collapses "fetch, or a fallback if missing" into one expression with
+no branch.
+
+```csharp
+public static Dictionary<char, int> CountChars(string s)
+{
+    Dictionary<char, int> counts = [];                    // collection expression, empty dict
+    foreach (char c in s)
+        counts[c] = counts.GetValueOrDefault(c) + 1;       // "0 if new, else current" — no if
+    return counts;
+}
+```
+
+`CountChars("banana")` returns `{a→3, b→1, n→2}`.
+
+```csharp
+public static int? FirstRepeatIndex(int[] nums)
+{
+    Dictionary<int, int> firstSeen = [];                  // value -> first index it appeared at
+    for (int i = 0; i < nums.Length; i++)
+    {
+        if (firstSeen.TryGetValue(nums[i], out int j))    // found + fetched in one call
+            return j;
+        firstSeen[nums[i]] = i;
+    }
+    return null;
+}
+```
+
+`FirstRepeatIndex([1, 3, 5, 3, 7])` returns `1` — the second `3` (index 3) finds the first one,
+which was recorded at index `1`. This exact "value → index" idiom, run to completion on Two Sum,
+lives on the [hashmap topic](/patterns/hashmap/).
+
+<Callout kind="trap" label="the double lookup">
+  `if (d.ContainsKey(k)) { var v = d[k]; ... }` hashes `k` twice — once to check, once to fetch.
+  `TryGetValue` does both in a single hash. It's not just shorter, it's the correct instinct once
+  you're doing it in a hot loop.
+</Callout>
+
+### `HashSet<T>`
+
+Membership only — no value payload. The member that saves a branch: `Add` returns `bool`, `false`
+exactly when the value was already present. That's "have I seen this?" and "record it" in one
+call, instead of `Contains` followed by a separate `Add`.
+
+```csharp
+public static bool HasDuplicate(int[] nums)
+{
+    HashSet<int> seen = [];
+    foreach (int n in nums)
+    {
+        if (!seen.Add(n)) return true;      // Add returns false when n was already in the set
+    }
+    return false;
+}
+```
+
+`HasDuplicate([1, 2, 3, 2])` is `true`; `HasDuplicate([1, 2, 3])` is `false`.
+
+### `List<T>`, `Stack<T>`, `Queue<T>`
+
+`List<T>` is your default array with room to grow — `O(1)` indexer, amortized `O(1)` `Add`. It
+doubles as a stack via `Add`/`RemoveAt(Count - 1)` when you *also* need indexed access; the full
+cost table and the amortized-growth argument live on the
+[Big-O page](/foundations/big-o/).
+
+When you don't need the indexer, `Stack<T>` and `Queue<T>` say so in the type. Under pressure,
+reach for `TryPop`/`TryPeek` and `TryDequeue`/`TryPeek` over `Pop`/`Peek`/`Dequeue` — they return
+`false` on empty instead of throwing, so there's no separate `Count > 0` guard to remember.
+
+```csharp
+public static (bool popped, int value) SafePop(Stack<int> stack) =>
+    (stack.TryPop(out int value), value);
+
+public static (bool dequeued, int value) SafeDequeue(Queue<int> queue) =>
+    (queue.TryDequeue(out int value), value);
+```
+
+On a stack holding `[1, 2]` (top is `2`), `SafePop` returns `(True, 2)`; on an empty stack it
+returns `(False, 0)` instead of throwing `InvalidOperationException`. On a queue holding
+`[10, 20]`, `SafeDequeue` returns `(True, 10)`. Matching, monotonic stacks, and the amortized
+two-stack queue live on the [stack & queue topic](/patterns/stack-queue/).
+
+### `PriorityQueue<TElement, TPriority>`
+
+Min-heap by `TPriority` by default — the smallest priority dequeues first. There's no separate
+max-heap type: flip a comparer instead.
+
+```csharp
+public static List<int> KSmallest(int[] nums, int k)
+{
+    // max-heap of size k: flip the comparer so the *largest* kept value sits on top
+    PriorityQueue<int, int> maxHeap = new(Comparer<int>.Create((a, b) => b.CompareTo(a)));
+    foreach (int n in nums)
+    {
+        maxHeap.Enqueue(n, n);
+        if (maxHeap.Count > k) maxHeap.Dequeue();     // evict whatever is currently largest
+    }
+    List<int> result = [];
+    while (maxHeap.TryDequeue(out int val, out _)) result.Add(val);
+    result.Reverse();                                 // heap drained largest-of-the-k first
+    return result;
+}
+```
+
+`KSmallest([7, 2, 9, 4, 1, 8], 3)` returns `[1, 2, 4]`. `KSmallest([5, 1], 5)` — `k` bigger than
+the input — returns `[1, 5]`, the heap just never evicts. This exact "heap of size k" shape is
+the spine of the [heap & top-K topic](/patterns/heap-top-k/).
+
+<Callout kind="note" label="no DecreaseKey">
+  `PriorityQueue<TElement, TPriority>` has no `DecreaseKey` — you cannot cheapen an entry already
+  inside it. The workaround is lazy deletion: enqueue a fresh `(element, priority)` pair when you
+  find a better one, and skip stale pops by checking the popped priority against the best known
+  one. [Network Delay Time](/patterns/advanced-graphs/network-delay-time/) builds Dijkstra on
+  exactly this idiom.
+</Callout>
+
+### `LinkedList<T>` and `LinkedListNode<T>`
+
+The one .NET collection that hands you a real node reference. `AddFirst`/`AddLast`/`AddBefore`/
+`AddAfter` all return a `LinkedListNode<T>`; hold onto it and `Remove(node)` plus re-insertion are
+`O(1)` — no search, because you already know exactly where the node lives.
+
+```csharp
+public static void MoveToFront(LinkedList<int> list, LinkedListNode<int> node)
+{
+    if (node == list.First) return;
+    list.Remove(node);        // O(1) — we hold the node, nothing to search for
+    list.AddFirst(node);
+}
+```
+
+Given the list `[1, 2, 3, 4]` and the node holding `3`, `MoveToFront` leaves it `[3, 1, 2, 4]`.
+That's the entire mechanism behind LRU Cache — a dictionary of value → node sitting next to this
+list. Both the hand-rolled version and the `LinkedList<T>` one are on the
+[LRU Cache](/patterns/linked-lists/lru-cache/) page.
+
+### `StringBuilder`
+
+`string` is immutable — `s += part` inside a loop allocates a new, longer string every iteration
+and copies the old contents in first. `StringBuilder.Append` mutates a backing buffer in place;
+call `ToString()` once, at the end. The full `O(n^2)` argument (and the trace that proves it)
+lives on the [Big-O page](/foundations/big-o/).
+
+```csharp
+public static string Repeated(string s, int times)
+{
+    StringBuilder sb = new();
+    for (int i = 0; i < times; i++) sb.Append(s);
+    return sb.ToString();
+}
+```
+
+`Repeated("ab", 3)` returns `"ababab"`.
+
+## tuples, pattern matching, collection expressions
+
+Modern C# turns a lot of hand-rolled boilerplate into one line — interview code reads faster and
+has fewer places to hide an off-by-one.
+
+**Tuples** return more than one value without a throwaway class, and named elements make the call
+site self-documenting:
+
+```csharp
+public static (int Min, int Max) MinMax(int[] nums)
+{
+    int min = nums[0], max = nums[0];
+    foreach (int n in nums)
+    {
+        if (n < min) min = n;
+        if (n > max) max = n;
+    }
+    return (min, max);
+}
+```
+
+`MinMax([5, 1, 9, 3])` returns `(1, 9)`; deconstruct it at the call site with
+`var (lo, hi) = MinMax(nums);`.
+
+**Pattern matching** replaces `if`/`else if` chains with a `switch` expression, and list patterns
+destructure an array or span by shape:
+
+```csharp
+public static string Describe(int[] arr) => arr switch
+{
+    [] => "empty",
+    [var only] => $"single: {only}",
+    [var first, .., var last] => $"first {first}, last {last}",
+};
+```
+
+`Describe([])` is `"empty"`, `Describe([5])` is `"single: 5"`, `Describe([1, 2, 3, 4])` is
+`"first 1, last 4"`. Relational patterns fold range checks into the same `switch`:
+
+```csharp
+public static string Bucket(int n) => n switch
+{
+    < 0 => "negative",
+    0 => "zero",
+    < 10 => "small",
+    _ => "large",
+};
+```
+
+`Bucket(-5)` is `"negative"`, `Bucket(0)` is `"zero"`, `Bucket(5)` is `"small"`, `Bucket(50)` is
+`"large"`. `is not null` and `is [_, ..]` (non-empty) guard clauses lean on the same machinery.
+
+**Collection expressions** replace `new int[] { ... }` / `new List<int> { ... }` with a target-typed
+`[...]` literal, and the spread element `..` flattens another collection in place:
+
+```csharp
+public static int[] Combined(int[] a, int[] b) => [.. a, .. b];
+```
+
+`Combined([1, 2], [3, 4])` returns `[1, 2, 3, 4]`.
+
+## index, range, and char arithmetic
+
+**Index and range operators** slice arrays, spans, and strings without a manual loop: `^1` counts
+back from the end, `a..b` is a half-open range.
+
+```csharp
+public static (char last, string tail, string allButLast) Slices(string s) =>
+    (s[^1], s[1..], s[..^1]);
+```
+
+`Slices("hello")` returns `('o', "ello", "hell")`. Watch what that costs, though: a `string`
+range like `s[1..]` calls `Substring` under the hood and allocates a new string. Slicing in a hot
+loop without needing to keep the piece? Slice a `ReadOnlySpan<char>` instead with `s.AsSpan(1)` —
+zero allocation, and most `string`-shaped logic still works against it. `Span<T>` gives the same
+zero-copy view over `int[]` and friends.
+
+**Char arithmetic** works because characters are integers underneath — `c - 'a'` is a branch-free
+bucket index for a lowercase-only alphabet. Reach for `int[26]` instead of
+`Dictionary<char, int>` whenever the alphabet is fixed and small: an array index skips the hash
+entirely.
+
+```csharp
+public static int[] LetterCounts(string s)
+{
+    int[] counts = new int[26];
+    foreach (char c in s) counts[c - 'a']++;    // char arithmetic as a bucket index
+    return counts;
+}
+```
+
+`LetterCounts("banana")` has `counts[0] = 3` (`a`), `counts[1] = 1` (`b`), `counts[13] = 2` (`n`),
+everything else `0`. Widen to `int[128]` for full ASCII once case or punctuation is in play, and
+fall back to `Dictionary<char, int>` only once the alphabet is Unicode-sized or sparse —
+[Valid Anagram](/patterns/hashmap/valid-anagram/) is the canonical `int[26]`-beats-`Dictionary`
+problem.
+
+## overflow and long
+
+C#'s default arithmetic context is *unchecked* — `int` overflow doesn't throw, it silently wraps.
+
+```csharp
+public static long SumAsLong(int[] nums)
+{
+    long total = 0;                    // int total would wrap silently past ~2.1B
+    foreach (int n in nums) total += n;
+    return total;
+}
+```
+
+Summing `[int.MaxValue, int.MaxValue, 10]` into an `int` accumulator (the naive version, not the
+one above) gives `8` — it wrapped around. `SumAsLong` on the same input correctly returns
+`4294967304`. Any running total over an array of `int` — sums, products, accumulated distances —
+should default to `long` unless you've proven it fits. The same instinct shows up in binary
+search: compute the midpoint as `left + (right - left) / 2`, not `(left + right) / 2`, so `left`
+and `right` never get summed directly. Full loop templates are on the
+[binary search topic](/patterns/binary-search/).
+
+## implementation strings
+
+A cluster of interview questions is really "translate a string into a number, or another string,
+by hand" — Roman to Integer (13), Longest Common Prefix (14), String to Integer / atoi (8). None
+of them is a named pattern; all three fall to the same discipline: build the lookup table (or
+starting candidate) first, then walk the string exactly once.
+
+**Roman to Integer**: a `Dictionary<char, int>` literal for the seven symbols, then one pass with
+one-symbol lookahead — subtract instead of add exactly when a smaller symbol precedes a bigger
+one (`IV`, `IX`, `XL`, ...).
+
+```csharp
+public static int RomanToInt(string s)
+{
+    Dictionary<char, int> value = new()
+    {
+        ['I'] = 1, ['V'] = 5, ['X'] = 10, ['L'] = 50,
+        ['C'] = 100, ['D'] = 500, ['M'] = 1000,
+    };
+
+    int total = 0;
+    for (int i = 0; i < s.Length; i++)
+    {
+        int curr = value[s[i]];
+        int next = i + 1 < s.Length ? value[s[i + 1]] : 0;
+        total += curr < next ? -curr : curr;   // IV: I is subtracted — a bigger symbol follows it
+    }
+    return total;
+}
+```
+
+`RomanToInt("III")` is `3`, `RomanToInt("LVIII")` is `58`, `RomanToInt("MCMXCIV")` is `1994`.
+
+**Longest Common Prefix** needs no dictionary — scan column by column (character index `0`, `1`,
+`2`, ...) across every string at once. The first mismatch, or the first string that runs out,
+is where the prefix ends. Start the candidate at the first string and shrink it in place rather
+than rebuilding it.
+
+**atoi** is a small state machine, not a recursive parse: skip leading whitespace, consume an
+optional `+`/`-`, then consume digits into a `long` accumulator — the overflow trap from above
+applies directly here — clamping to `int.MinValue`/`int.MaxValue` the moment the running total
+would exceed them.
+
+None of these three has its own page on this site. The C# *is* the exercise, and the discipline
+that carries — table first, single pass, mind the overflow — is what these three are really
+testing.

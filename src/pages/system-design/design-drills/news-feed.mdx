@@ -1,0 +1,151 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: design-drills
+problem: news-feed
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+
+## the brief
+
+"Design a news feed: users follow other users, and see a feed of posts from who they follow,
+ordered roughly by recency."
+
+## clarify first
+
+- **Chronological, or ranked?** Ranking adds a scoring step and changes *when* work has to
+  happen relative to a read. Assume chronological unless told otherwise — it's the harder part
+  to dodge, and the actual point of this drill.
+- **What does the follow graph look like — symmetric, or a heavy tail?** A directed follow graph
+  where a handful of accounts have orders of magnitude more followers than everyone else is the
+  celebrity problem, and it's the whole exercise.
+- **How fresh does a feed need to be?** Decides whether fan-out can happen asynchronously after
+  the post is accepted, or has to happen before the post is acknowledged.
+- **Can a post be edited or deleted after it's already fanned out?** If so, every fanned-out copy
+  is now something that can go stale, not just the source.
+- **Does the feed need pagination / infinite scroll?** Decides whether it's a real-time merge or
+  a materialized, paginatable list.
+
+## the numbers
+
+Assumptions, stated as assumptions:
+
+- 100 million daily active users.
+- Each user posts an average of once/day and follows an average of 200 others — a typical,
+  non-celebrity account — but a small number of accounts have followers numbering in the tens of
+  millions.
+- Each user opens their feed 10 times/day.
+
+**Post writes:** `100,000,000 × 1 / 86,400 ≈ 1,157` writes/sec average.
+
+**Feed reads:** `100,000,000 × 10 / 86,400 ≈ 11,570` reads/sec average.
+
+**Fan-out-on-write cost** (push every post into every follower's inbox at write time): each post
+generates one inbox write per follower. At the stated average, that's
+`100,000,000 × 1 × 200 = 20` billion inbox writes/day, `≈ 231,000` writes/sec — roughly 200x the
+raw post-write rate, purely from the fan-out multiplier. That multiplier is *why*
+fan-out-on-write is a write-amplification strategy: it turns one rare, cheap event into
+(follower count) writes.
+
+The celebrity case makes that arithmetic pathological rather than merely expensive: one post
+from an account with 20 million followers is 20 million inbox writes from a single API call —
+several orders of magnitude more work than a typical post, arriving as one burst instead of
+smoothing out the way the average-case number suggests.
+
+**Fan-out-on-read cost** (merge each followee's recent posts at read time): each of the 11,570
+reads/sec now does work proportional to how many accounts that reader follows — 200, on
+average — so roughly `11,570 × 200 ≈ 2,300,000` timeline-fetch-and-merge operations/sec. The
+cost moved to the read path, and it scales with read frequency, not follower count — no
+celebrity problem, but every read pays a merge cost, on the single hottest path in the app.
+
+<Watch items={[['fan-out', 'hybrid — push for regular accounts, pull for celebrities'], ['celebrity threshold', 'a follower-count cutoff'], ['delivery guarantee', 'at-least-once; dedup at write']]} />
+
+## the sketch
+
+```text
+  write (post) ──▶ post store (durable) ──▶ fan-out worker (async, off a queue)
+                                                    │
+                            for each follower ──────┤ (skipped if author is over the celebrity threshold)
+                                                    ▼
+                                          per-user inbox (cache/store)
+
+  read (feed) ──▶ regular case: read the inbox directly
+               └▶ any followed celebrities: merge inbox + their posts, pulled live at read time
+```
+
+**Write path:** a post lands in a durable post store first — this is the source of truth, and
+what you'd replay from if fan-out fails. A fan-out job, dispatched via a queue (Kafka, Azure
+Service Bus, RabbitMQ) rather than done inline in the write request, reads the author's follower
+list and writes a reference to the post into each follower's inbox — the thing a feed read
+serves from directly.
+
+**Read path, common case:** just "read my inbox" — cheap and fast regardless of how many
+accounts I follow, because the work already happened on write.
+
+**Hybrid for celebrities:** an account above a follower-count threshold is flagged, and its
+posts are never fanned out. Every feed read instead merges the reader's regular inbox with a
+live pull of posts from the (small number of) celebrities they follow. This bounds the
+worst-case write cost — no more 20-million-write bursts — at the cost of a small, *bounded* extra
+read cost, since the number of celebrities any one person follows is small even for very online
+users.
+
+Fan-out-on-write is fundamentally a work-partitioning problem: one event (a post) becomes N
+independent units of work (one inbox write per follower) with no ordering dependency between
+them. That's the exact shape
+[parallelism patterns](/systems/parallelism-patterns/) covers for splitting work across cores in
+one process — the difference here is the workers are separate machines pulling off a durable
+queue instead of threads pulling off a work-stealing queue, so a crashed fan-out worker resumes
+rather than losing a follower's copy.
+
+## the tradeoffs
+
+| | fan-out-on-write | fan-out-on-read | hybrid |
+| --- | --- | --- | --- |
+| write cost | proportional to follower count — pathological for celebrities | `O(1)` — append to the post store | `O(1)` for everyone; celebrities never fan out |
+| read cost | `O(1)` — read your own inbox | proportional to follow count, on every read | `O(1)` plus a small, bounded celebrity merge |
+| freshness | as fresh as the fan-out worker's lag | always current | current for celebrities; fan-out lag for everyone else |
+| post edit/delete | must be applied to every fanned-out copy | trivial — one copy, at the source | only the fanned-out copies need it |
+
+For a heavy-tailed follow graph — nearly every real social product — the hybrid is the right
+default, and this is one of the few drills where "it depends" genuinely isn't the honest
+answer: pure fan-out-on-write has a known arithmetic failure mode (the celebrity write burst),
+and pure fan-out-on-read pays a merge cost on the single hottest path in the product. Depart
+toward pure fan-out-on-read only if the graph has no heavy tail at all — a flat, small follow
+graph with no accounts that dominate it.
+[Partitioning](/system-design/partitioning/) is what inbox and post stores lean on once either
+side outgrows a single shard.
+
+## how it fails
+
+- **Fan-out lag under load.** Under ten times the write load, fan-out workers fall behind the
+  queue. The symptom is a support ticket that says "I posted five minutes ago and my friend
+  can't see it yet" — not an error; the write succeeded, fan-out just hasn't caught up. The
+  dashboard signal is consumer lag / queue depth, not an error rate.
+- **A misconfigured celebrity threshold.** Set too high, a large-but-not-quite-celebrity account
+  still gets fanned out and produces a smaller but real write burst — a tuning parameter that
+  has to track the actual shape of the graph, not a constant set once at launch.
+- **Partial fan-out on a worker crash.** If a worker dies mid-job, some followers got the post
+  and some didn't, until the queue's retry redelivers it — which is why fan-out writes have to
+  be idempotent (writing the same inbox entry twice is a no-op, not a duplicate). The queue's
+  guarantee here is at-least-once, not exactly-once, and the design has to own the difference
+  itself.
+- **The celebrity-merge read path gets slow** when many users open their feed right after a
+  celebrity posts — now a read-latency problem on the hottest path in the app. Push notification
+  fan-out to offline followers' devices (over `HttpClient` to a third-party push service,
+  wrapped in Polly retries) shouldn't block that read either — it's a separate, best-effort
+  side-path, not part of the feed request.
+
+## what they ask next
+
+- **"A user follows a celebrity right before they post — do they see it?"** The merge read path
+  handles this naturally — it just re-pulls the celebrity's recent posts on the next load. It's
+  the fan-out path that would need to backfill, and most systems don't bother: a new follow
+  starts seeing posts from that point forward.
+- **"A user unfollows someone whose posts are already in their inbox."** Lazily filter at read
+  time (the inbox entry stays; the read query excludes it) rather than eagerly removing it —
+  cheaper, since unfollows are rare relative to reads.
+- **"How would ranking change this?"** Ranking needs per-candidate signals (recency, engagement,
+  affinity) computed close to read time, which pushes scoring toward the fan-out-on-read side of
+  this tradeoff even for the fanned-out portion — a rank score is far more likely to need
+  recomputing than the post content itself.

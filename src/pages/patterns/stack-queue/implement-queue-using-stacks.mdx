@@ -1,0 +1,127 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: stack-queue
+problem: implement-queue-using-stacks
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+
+## task
+
+Implement a FIFO queue using only stack operations (`Push`, `Pop`, `Peek`, `Empty` on a
+`Stack<T>`). Your queue needs `Push(x)`, `Pop()`, `Peek()`, and `Empty()` with the usual queue
+semantics.
+
+```text
+Push(1); Push(2); Push(3); Peek() → 1; Pop() → 1; Push(4); Pop() → 2; Pop() → 3; Pop() → 4
+```
+
+## how to think
+
+One stack alone can't do it — popping a stack gives you the *last* thing pushed, and a queue
+needs the *first*. But reverse a stack's contents once, and last-pushed becomes first-out: that's
+exactly what a second stack does for free. Pour everything from an "in" stack into an "out" stack
+one at a time, and the order flips.
+
+The trick that makes this fast is *when* you pour: only when the out-stack is empty. As long as
+anything is sitting in the out-stack, it's already in the correct FIFO order and popping from it
+is free — you don't re-pour on every operation, only when you've fully drained what was already
+flipped.
+
+<Callout kind="note" label="template instance">
+  **Stack-backed design** skeleton. The primary stack is really two stacks (`_in`, `_out`) instead
+  of one. Invariant: `_out` is always in FIFO order relative to what's currently in it, and
+  everything in `_in` is strictly newer than everything in `_out`. The "update the side channel"
+  step is the conditional transfer.
+</Callout>
+
+## solution
+
+```csharp
+public class MyQueue
+{
+    private readonly Stack<int> _in = new();
+    private readonly Stack<int> _out = new();
+
+    public void Push(int x) => _in.Push(x);              // always push to in-stack
+
+    public int Pop()
+    {
+        Transfer();
+        return _out.Pop();
+    }
+
+    public int Peek()
+    {
+        Transfer();
+        return _out.Peek();
+    }
+
+    public bool Empty() => _in.Count == 0 && _out.Count == 0;
+
+    private void Transfer()
+    {
+        if (_out.Count == 0)                              // only refill when out-stack is dry
+        {
+            while (_in.TryPop(out int v)) _out.Push(v);    // reverses order: FIFO restored
+        }
+    }
+}
+```
+
+## trace
+
+```text
+Push(1); Push(2); Push(3); Peek(); Pop(); Push(4); Pop(); Pop(); Pop()
+```
+
+| step | call | `_in` (top-to-bottom) | `_out` (top-to-bottom) | transfer? | result |
+| --- | --- | --- | --- | --- | --- |
+| 1 | `Push(1)` | `1` | *(empty)* | no | — |
+| 2 | `Push(2)` | `2, 1` | *(empty)* | no | — |
+| 3 | `Push(3)` | `3, 2, 1` | *(empty)* | no | — |
+| 4 | `Peek()` | *(empty)* | `1, 2, 3` | yes — `_out` was empty | `1` |
+| 5 | `Pop()` | *(empty)* | `2, 3` | no — `_out` had `1, 2, 3` | `1` |
+| 6 | `Push(4)` | `4` | `2, 3` | no | — |
+| 7 | `Pop()` | `4` | `3` | no — `_out` had `2, 3` | `2` |
+| 8 | `Pop()` | `4` | *(empty)* | no — `_out` had `3` | `3` |
+| 9 | `Pop()` | *(empty)* | *(empty)* | yes — `_out` was empty, flips `4` | `4` |
+
+Step 4 is the interesting one: three pushes never touched `_out`, then one `Peek()` pours all
+three across in a single loop, and steps 5-8 spend that work down for free before step 9 pays for
+`4` the same way.
+
+## why it works
+
+Every element is pushed to `_in` exactly once and popped from `_in` exactly once (when it
+transfers to `_out`), then pushed to `_out` exactly once and popped from `_out` exactly once (when
+the caller consumes it). That's four stack operations total across the element's entire lifetime,
+no matter how many `Peek()`/`Pop()` calls happen to land before or after it transfers. Spread that
+constant cost over the sequence of calls and each operation is **amortized O(1)** — any single
+`Pop()` might do O(n) work if it triggers a full transfer, but it can only do that once per
+element, ever.
+
+<Watch items={[['time', 'O(1) amortized per op'], ['space', 'O(n)'], ['worst single call', 'O(n)']]} />
+
+## common bugs
+
+- Transferring while `_out` still holds elements — this is not just slower, it's wrong: the poured
+  elements land on top of older ones and leapfrog them. `Push(1); Push(2); Pop()` correctly returns
+  `1`, but if the next `Push(3); Pop()` pours `_in` into `_out` unconditionally, `3` lands on top of
+  the `2` already sitting in `_out` and comes out first — a queue must return `2`. The only correct
+  always-transfer variant pours everything across, takes the front, and pours it all back — O(n)
+  per op. The `_out.Count == 0` guard is what makes the design both correct and amortized O(1).
+- Pushing directly to `_out` — breaks the invariant that `_out` is always fully-reversed relative
+  to what's still in `_in`, and now newer elements can leapfrog older ones.
+- Checking `_in.Count == 0` for `Empty()` instead of both stacks — an element sitting in `_out`
+  is still logically in the queue.
+- Forgetting `Peek()` needs the same transfer as `Pop()` — it's easy to only guard `Pop()` and
+  leave `Peek()` reading a stale (or wrong-order) `_out`.
+
+## variants you can now solve
+
+- **Implement Stack using Queues** (LC 225) — the mirror problem: you must simulate LIFO out of
+  `Queue<T>`. The clean solve rotates the queue after every push instead of batching a reversal.
+- [Min Stack](/patterns/stack-queue/min-stack/) — a different "wrap `Stack<T>` behind an
+  invariant" design, this time carrying derived state instead of a second raw copy.

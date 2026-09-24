@@ -1,0 +1,562 @@
+---
+layout: '@layouts/TopicLayout.astro'
+topic: locks-internals
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import ProblemList from '@components/ProblemList.astro';
+import Solution from '@components/Solution.astro';
+
+## the ground floor
+
+- **atomic operation** — one read-modify-write that no other core can observe half-finished.
+  [Atomics and compare-and-swap](/systems/atomics-and-cas/) builds it from `count++`.
+- **compare-and-swap (CAS)** — "write this value, but only if the current value is still that
+  one, and tell me what you saw". One instruction. Every lock on this page is made of it.
+- **cache line** — the 64-byte block that moves between cores. Two cores writing the same line
+  take turns owning it, and that turn-taking is most of what contention costs —
+  [the memory hierarchy](/systems/memory-hierarchy/) has the ladder.
+- **kernel / syscall** — the OS half of the process and the only door into it. Crossing that
+  door costs, and [processes, threads and the kernel](/systems/process-and-thread/) says why.
+- **park** — a thread the OS has taken off the CPU because it has nothing to do. It stops
+  consuming a core and cannot run again until somebody wakes it.
+- **"thread-safe"** — three separate guarantees (atomicity, visibility, ordering) crushed into
+  one word. [The memory model](/systems/memory-model/) separates them. This page says which one
+  it means every time.
+
+## core idea
+
+A mutex is three things: **an atomic word that says who owns it, a queue of threads waiting
+for it, and a way to put a thread to sleep and wake it up again.** That is the whole object.
+Everything else — reentrancy counting, timeouts, fairness policy — is bookkeeping stacked on
+top of those three.
+
+The design that follows is the only one that makes sense: if nobody else holds the lock, one
+CAS on the word is enough and nothing else is touched. If somebody does, the loser has to
+either spin for a while or ask the kernel to park it. So a lock has two completely different
+cost regimes, and the difference between them is not "a bit slower" — it is the difference
+between touching one cache line you already own and asking the OS scheduler to get involved.
+
+| | fast path (uncontended) | slow path (contended) |
+| --- | --- | --- |
+| what runs | one atomic read-modify-write on the lock word | spin (bounded), then a syscall to park; another to wake |
+| kernel involved | no | yes, once the spin budget runs out |
+| what decides the cost | whether the line is already in your core's own L1 | how many cores are pulling that line back and forth, and whether anyone has to be scheduled |
+| how often it runs | almost always, in healthy code | the thing your incident is about |
+
+## how it actually works
+
+### the lock word is one instruction
+
+Here is a complete spinlock in C — the smallest thing that is still a real mutual-exclusion
+lock. Compiled here with `gcc -O2 -c -ffreestanding` and disassembled with
+`objdump -d --no-show-raw-insn`. x86-64, AT&T syntax, real output, comments added:
+
+```c
+static int lock_word;                      /* 0 = free, 1 = held */
+
+void acquire(void) {
+    int expected = 0;
+    while (!__atomic_compare_exchange_n(&lock_word, &expected, 1, 1,
+                                        __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+        expected = 0;
+}
+
+void release(void) {
+    __atomic_store_n(&lock_word, 0, __ATOMIC_RELEASE);
+}
+```
+
+```text
+0000000000000000 <acquire>:
+   0:   endbr64                            ; CET landing pad — required at every
+                                            ; indirect-call target on this toolchain,
+                                            ; nothing to do with the lock itself
+   4:   xor    %eax,%eax                   ; %eax = 0 — the value we expect to find
+   6:   mov    $0x1,%ecx                   ; the value we want to write
+   b:   lock cmpxchg %ecx,0x0(%rip)        ; ← THE LOCK. if lock_word == %eax, write %ecx
+  13:   jne    4 <acquire+0x4>             ; it wasn't 0 — go round again
+  15:   ret                                ; we own it
+  16:   cs nopw 0x0(%rax,%rax,1)           ; alignment padding, not executed
+
+0000000000000020 <release>:
+  20:   endbr64
+  24:   movl   $0x0,0x0(%rip)              ; ← THE UNLOCK. an ordinary store
+  2e:   ret
+```
+
+Two instructions do all the work. `lock cmpxchg` compares the lock word against `%eax`, writes
+`%ecx` if they match, and leaves what it actually saw in `%eax` — and the `lock` prefix makes
+the whole compare-and-write indivisible by taking exclusive ownership of that cache line for
+the duration. Not the memory bus: on any CPU from this millennium it is the coherence protocol
+doing it, one 64-byte line at a time, which is why the line the lock word sits on matters as
+much as the lock itself.
+
+`release` is the surprise. It is a plain `mov` with no `lock` prefix and no fence, because on
+x86-64 every store already has release semantics. That is an **x86 fact, not a universal one.**
+ARM's ISA has no such guarantee for a plain store: it needs an explicit load-acquire-exclusive
+pair (`ldaxr`/`stxr`) to build the CAS and a distinct store-release instruction (`stlr`) to
+build the unlock — a different instruction from an ordinary store, because on ARM an ordinary
+store carries no ordering promise at all. (This page's cameos are x86-64 only, compiled and
+disassembled here; the ARM shape above is architecture, stated as reasoning, not pasted
+output.) [The memory model](/systems/memory-model/) is where that difference stops being
+cosmetic.
+
+### the fast path never enters the kernel
+
+The claim that an uncontended lock costs no syscall is easy to check, so check it. `strace`
+counts every syscall a process makes; this is glibc's `pthread_mutex`, ten million lock/unlock
+pairs, from `bench/locks-internals/mutex.c`, traced for exactly the futex family:
+
+```text
+$ strace -f -c -e trace=futex ./mutex 1 10000000 0 0
+% time     seconds  usecs/call     calls    errors syscall
+------ ----------- ----------- --------- --------- ----------------
+100.00    0.000674         674         1           futex
+------ ----------- ----------- --------- --------- ----------------
+100.00    0.000674         674         1           total
+```
+
+**One futex call for ten million uncontended acquisitions.** `futex` is the Linux syscall that
+means "park this thread until the value at this address changes" and its partner "wake threads
+waiting on this address" — Windows has the same shape in `WaitOnAddress`/`WakeByAddressSingle`.
+That one call is thread startup, not the lock: the loop itself never asks the kernel about
+anything, because it never has to.
+
+Add threads sharing the same lock and the picture changes — same ten million acquisitions
+total, split across the threads instead of run by one:
+
+| threads (10,000,000 acquisitions total, same file) | futex syscalls |
+| --- | --- |
+| 1 | 1 |
+| 2 | 10,078 |
+| 4 | 18,735 |
+
+Thousands, not millions — most acquisitions still resolve without ever reaching the kernel,
+because the spin budget below usually covers the wait. The count that does reach the kernel
+grows with the number of threads sharing the line, which is the whole story of contention: it
+is not "the lock is slow", it is "more cores are now fighting over the same 64 bytes, and
+eventually one of them gives up and asks to be put to sleep." The kernel is only ever asked
+about the *waiting*, never about the lock itself — which is why the fast path can be four
+instructions and stay four instructions no matter how many threads exist, as long as none of
+them are actually in your way.
+
+### spin, then park
+
+Parking is expensive and correct; spinning is cheap and wasteful. Every real lock does both, in
+that order:
+
+```text
+   Enter()
+      │
+      ▼
+   ┌──────────────────────────┐   succeeds  ┌──────────────────┐
+   │ CAS lock word 0 → owner  │────────────▶│ in the critical  │
+   └──────────────────────────┘             │ section          │
+      │ fails (someone owns it)             └──────────────────┘
+      ▼                                              │ Exit()
+   ┌──────────────────────────┐                      ▼
+   │ SPIN: pause; re-read     │  bounded    ┌──────────────────┐
+   │ the word; retry the CAS  │  escalating │ store 0 to the   │
+   └──────────────────────────┘  backoff    │ lock word        │
+      │ still held after the spin budget    └──────────────────┘
+      ▼                                              │ if anyone parked
+   ┌──────────────────────────┐                      ▼
+   │ PARK: enqueue self,      │             ┌──────────────────┐
+   │ futex-wait  → KERNEL     │◀────────────│ futex-wake one   │
+   └──────────────────────────┘             │        → KERNEL  │
+      │ woken                               └──────────────────┘
+      └──────────────────▶ back to the CAS (it may lose again)
+```
+
+The spin budget exists because the common critical section is a handful of instructions: by the
+time a syscall would even return, the lock has usually been free for a while. The `pause`
+instruction inside the spin is not a delay loop — it tells the CPU that this is a spin-wait so
+it can stop speculating past the load and stop starving its sibling hardware thread. And the
+spin itself is not a flat busy-loop: it escalates. `SpinWait`, the type .NET's own spinning
+primitives are built on, starts with a handful of `pause`-based iterations, then switches to
+`Thread.Yield()`, then `Thread.Sleep(0)`, then `Thread.Sleep(1)` — each one a real request to
+the OS scheduler to run something else for a while, repeated for as long as the wait continues.
+That escalation is the difference between "spinning" and "burning a core forever", and it is
+checkable: watching one thread hold a lock while a second thread waits on
+`System.Threading.SpinLock`, and counting only the waiting thread's own context switches —
+
+```text
+=== one waiter, one holder ===
+  SpinLock               voluntary context switches during the wait:    6   involuntary:    2
+```
+
+— the waiter gives up its core, voluntarily, more than once during a single wait. A voluntary
+switch means the thread itself asked to stop running (the signature of a yield or a short
+sleep); an involuntary one means the scheduler took the core away from it. Six voluntary
+switches during one wait is direct evidence against "never gives up its core": `SpinLock`
+degrades gracefully into short, repeated hand-backs of the CPU rather than holding it for the
+entire wait — it just does not park through the kernel wait/wake pair the way `Monitor` does,
+so it never leaves the run queue entirely.
+
+Note the last arrow in the diagram above: a woken thread **races for the lock again**. It is
+not handed the lock. A thread that has just been running has its cache warm and often wins, so
+the woken thread can lose repeatedly. That unfairness is not a bug — it is a throughput
+optimisation, and [build a spinlock](/systems/locks-internals/build-a-spinlock/) works out how
+uneven it gets by counting who actually gets each turn.
+
+### what `lock` is, in .NET
+
+C#'s `lock (obj)` compiles to `Monitor.Enter`/`Monitor.Exit` in a `try`/`finally`. The lock word
+is not a field you can see: it is the **object header**, four bytes that live *behind* every
+reference, at offset −4 from where the type pointer sits:
+
+```text
+                     -8              -4        0                  8
+object reference →   │  padding (4B) │ header  │ MethodTable ptr  │ fields...
+                      │               │ word(4B)│      (8B)       │
+```
+
+That word is overloaded, and you can read it. `bench/locks-internals/object-header.cs` takes the
+address of an object with `__makeref` and prints the header in each state:
+
+```text
+  this thread's managed id = 1
+  fresh object, never locked                   0x00000000
+  depth 1                                      0x00000001
+  depth 2                                      0x00010001
+  depth 3                                      0x00020001
+  after every release                          0x00000000
+  held by thread 4                             0x00000004
+  c.GetHashCode() = 54267293 = 0x033C0D9D
+  after GetHashCode(), never locked            0x0F3C0D9D
+  ...then locked: inflated to a sync block     0x08000002
+  ...and it stays inflated after release       0x08000002
+  a second thread is blocked on it             0x08000003
+  after the waiter got in and out              0x08000003
+```
+
+Every field of that word is visible in those twelve lines, without reading a single line of
+runtime source:
+
+| state | header word | what changed |
+| --- | --- | --- |
+| unlocked, untouched | `0x00000000` | nothing has ever needed this word |
+| locked by thread 1 | `0x00000001` | the low bits hold the owning thread's id |
+| locked by thread 4 | `0x00000004` | same field, different owner |
+| locked three times over | `0x00020001` | bit 16 upward is a recursion count — 2 extra levels |
+| after `GetHashCode()` | `0x0F3C0D9D` | the low 26 bits are the hash, plus two flag bits |
+| hashed, then locked | `0x08000002` | the hash had to move out; this is now a sync block index |
+| contended | `0x08000003` | so did this one, and it never goes back |
+
+This is the whole "thin lock" story, read straight off a real object. An uncontended,
+non-recursive, never-hashed lock is **just those bits**: a CAS that writes your thread id into a
+word you were going to touch anyway. It is called a thin lock because it has no other object
+behind it.
+
+The word can only hold one thing at a time, so anything that needs it for another purpose
+forces **inflation**: the runtime allocates a *sync block* — a real structure with a wait list, a
+recursion count, and the parking primitive — puts its index in the header, and from then on the
+lock goes through that. Asking for a hash code does it. Contention does it. `Monitor.Wait` does
+it. And as the last two rows show, **inflation is permanent for that object**.
+
+<Callout kind="trap" label="what inflation does and does not cost">
+  It is tempting to conclude "never lock an object whose hash code you took". That fear
+  overstates what inflation actually changes: an inflated acquire is still one atomic operation
+  on the header word, it just checks a different bit pattern (a sync-block index instead of a
+  thin-lock owner id) before doing the same kind of CAS on the same word. There is no reason
+  for that dispatch to cost meaningfully more per acquire, and the header states above confirm
+  it is still a single word either way. What inflation genuinely costs is memory and lifetime: a
+  sync block is a real heap allocation, and every inflated object carries it for as long as the
+  object lives. Note that locking an object once, uncontended, does *not* inflate it — the
+  header row above stays at a thin lock. It takes contention, a hash code, or a `Monitor.Wait`.
+  A million per-object locks that each get contended once is a million permanent sync blocks.
+</Callout>
+
+### the fast path pays for exactly what it does
+
+Read the object-header states again as an ingredients list. `Interlocked.Increment` is one
+`lock`-prefixed instruction and nothing else — the JIT knows it as an intrinsic and emits it
+directly, the same way the C spinlock's `cmpxchg` was emitted above. `lock`/`Monitor` does that
+same kind of CAS on the header word, but the word it writes also has to record *which* thread
+owns it (so a second `lock` from the same thread can recognise itself and just bump the
+recursion count instead of deadlocking) and, once inflated, carry a pointer to the wait-queue
+machinery that a contended acquire needs. `SemaphoreSlim` is a counting object with its own
+internal `Monitor`, an async waiter list, and cancellation support — you get all of that even
+when you only ever use it as a plain mutex. Every rung above `Interlocked` is buying a specific
+guarantee `Interlocked` does not have, in exchange for a few more instructions on the fast path.
+[The fast path and the slow path](/systems/locks-internals/lock-cost-ladder/) works that ladder
+through in full, including the two rungs — `SpinLock` and `ReaderWriterLockSlim` — that manage
+to skip `Monitor` entirely.
+
+### contention is not the kernel — it is the cache line
+
+The obvious model of contention is "threads block, blocking is a syscall, syscalls are slow".
+That model is wrong about *where the time goes first*. Before any thread ever reaches the park
+step in the diagram above, every failed CAS in the spin loop is itself a coherence event: the
+core that wants to write the lock word has to pull that 64-byte line out of whichever core last
+had it, and that pull happens even for the thread that eventually wins.
+
+```text
+core A: holds line "L" (Modified) ── writes lock_word, releases
+                                    │
+                                    ▼  A's write invalidates every other
+                                       copy of L across the machine
+core B: spins, CAS fails ─────┐
+core C: spins, CAS fails ─────┼── all three now miss on L, each pulls it
+core D: spins, CAS fails ─────┘   in turn to retry — one line, one owner
+                                   at a time, no matter how many cores ask
+```
+
+Two threads on separate cores updating the same 64 bytes pay this even with **no lock, no
+atomic, and no kernel anywhere in sight** — sharing a cache line is what costs, and a lock word
+is just the most common thing two threads share. That is the same physics as
+[false sharing](/systems/atomics-and-cas/false-sharing/): the line, not the primitive, is doing
+the damage.
+
+Which regime dominates a given lock is a direct function of how the critical section's length
+compares to the spin budget:
+
+- **Section shorter than the spin budget:** almost every acquisition resolves inside the spin.
+  The cost is coherence traffic — the line bouncing between cores — and the futex-syscall table
+  above stays in the thousands out of millions of acquisitions.
+- **Section longer than the spin budget:** the spin exhausts before the lock frees, threads
+  start parking, and the cost shifts to scheduler round trips — a futex-wait, a context switch
+  onto some other runnable thread, later a futex-wake and a switch back.
+
+Neither regime is "the lock being slow". Both are the predictable cost of more than one core
+wanting the same 64 bytes, paid on a different bill depending on how long the wait lasts.
+
+### granularity: the fix is more locks, not a faster lock
+
+Nothing above changes if you swap `lock` for a different primitive — every lock this page
+covers is a CAS on some word, and a CAS on a *shared* word pays the coherence cost in the
+diagram above no matter which type wraps it. The only lever that actually helps is sharing the
+word with fewer threads.
+
+**Lock striping** does exactly that: instead of one lock word protecting sixty-four unrelated
+counters, allocate N lock words — each on its own cache line — and map each counter to one of
+them by `hash % N` or its low bits. Two threads working on counters that land in different
+stripes now touch different lock words on different cache lines, and the coherence protocol
+never has to move anything between their cores for that access. `ConcurrentDictionary` is
+exactly this internally, which is the honest reason it beats a plain `Dictionary` behind one
+`lock` — [lock-free structures](/systems/lock-free-structures/) takes that apart in full.
+
+The trade is real: N locks is N times the memory for the lock words themselves, and any
+operation that has to span two stripes now needs two locks — in a fixed order, forever, or you
+have built a deadlock. That ordering discipline is
+[the hazards page](/systems/concurrency-hazards/).
+
+### lock convoys
+
+A convoy is what happens when a lock's throughput collapses because the queue never drains. The
+shape: a lock is held slightly too long for the spin budget to absorb, waiters start parking,
+and every release now wakes a parked thread that has to be scheduled back onto a core — a
+context switch — before it can take the lock and do its short amount of work. The lock sits
+idle while that handoff happens, so the queue does not shrink, so the next release wakes another
+parked waiter into the same delay. Throughput falls even though CPU utilisation looks fine and
+no individual operation is slow — the time is spent between operations, in scheduler latency,
+which does not show up as time *inside* anything a profiler samples.
+
+The fixes are all about not queueing in the first place: shorten the hold time (do the I/O and
+the allocation outside the lock), stripe the lock so fewer threads ever compete for the same
+word, or replace the shared resource with per-thread state that gets merged at the end — which
+is [the partitioning story](/systems/parallelism-patterns/).
+
+### measuring contention instead of guessing
+
+.NET keeps an exact counter of how many times a thread failed to take a `Monitor` on the first
+try and had to wait:
+
+<Solution>
+
+```csharp
+// Exact, always on, no profiler. Process-wide and monotonic, so take deltas.
+long before = Monitor.LockContentionCount;
+DoTheSuspectWork();
+long contentions = Monitor.LockContentionCount - before;
+```
+
+</Solution>
+
+Three things make it the right first tool. It is exact rather than sampled. It costs nothing to
+read. And it is already published as `monitor-lock-contention-count` under `System.Runtime`, so
+`dotnet-counters monitor --process-id <pid> System.Runtime` shows it live on a production
+process with no restart and no attach.
+
+What it does *not* cover is everything that is not a `Monitor` — and which primitives quietly
+route through one anyway is not always obvious from the API surface. In
+[the fast path and the slow path](/systems/locks-internals/lock-cost-ladder/), watch this
+counter while you swap `lock` for `SemaphoreSlim` doing the identical job: it moves, even though
+that code path never writes a `lock` statement — because `SemaphoreSlim` takes a `Monitor`
+internally to protect its own count and waiter list. For everything else, the OS-level signal is
+`voluntary_ctxt_switches` in `/proc/<pid>/task/<tid>/status`, which counts the times a thread
+gave up its core to wait. A thread with a high voluntary switch rate and low CPU is blocked on
+something; a thread with high *involuntary* switches is being preempted, which is a different
+problem.
+
+### which lock, and when
+
+| primitive | fast path | use it when | the catch |
+| --- | --- | --- | --- |
+| `lock` / `Monitor` | CAS on the header word | the default, for short critical sections | reentrant, which hides double-acquire bugs; cannot be held across `await` |
+| `System.Threading.Lock` (.NET 9+) | same CAS, same header mechanics | the same, in new code | same semantics, better types — `lock` on it cannot be confused with locking a string |
+| `Interlocked` | one `lock`-prefixed instruction, nothing else | the whole critical section is one word | only one word; three `Interlocked` calls are not one atomic operation |
+| `SpinLock` | CAS, escalating to `Thread.Yield`/`Sleep` if it keeps failing | provably nanosecond-scale sections, no allocation, no true kernel park needed | it degrades by yielding its slice, not by parking through a wait handle — so it still keeps the thread runnable between hand-backs; never on a thread-pool thread that might be preempted while holding it |
+| `ReaderWriterLockSlim` | CAS on a state word that tracks reader/writer counts | many readers, rare writers, and the section is long enough to matter | pointless for short sections — the bookkeeping costs more than the exclusion saves |
+| `SemaphoreSlim(1)` | CAS-guarded count plus an internal `Monitor` | you need to hold it across `await`, or you need N-at-a-time | pays for an internal `Monitor` and async plumbing even when used as a plain mutex; not reentrant, so re-entering deadlocks |
+
+## the mental model
+
+**A lock is a cache line with a state machine drawn on it.**
+
+1. **The fast path is a CAS on one word.** No kernel, no queue. If your lock is uncontended, it
+   is not your problem, and no amount of "optimising the lock" will help.
+2. **Contention is coherence traffic first and the kernel second.** Threads start paying the
+   moment they share the line, long before anybody blocks. `LockContentionCount` measures the
+   blocking half; it says nothing about the coherence half.
+3. **You cannot make a shared lock faster. You can only make it shared by fewer threads** —
+   shorter hold, striped keys, or per-thread state merged at the end.
+
+| symptom | what it means | the move |
+| --- | --- | --- |
+| threads scaling worse than the work suggests, few contentions | cache-line ping-pong on the lock word | stripe it or partition the data |
+| `LockContentionCount` climbing with CPU below 100% | threads parking and waking | shorten the critical section, remove I/O from it |
+| throughput collapses past a thread count, CPU looks fine | convoy: the queue never drains | fewer threads on that lock, or no shared lock at all |
+| one core pinned near 100% doing nothing useful | a spin lock spinning while its owner is descheduled | do not spin on a preemptible thread |
+
+<Watch items={[['object header size', '4 bytes, at offset -4'], ['recursion count field', 'starts at bit 16 of the header'], ['futex calls, 10M uncontended acquisitions', '1'], ['SpinWait escalation', 'pause → Yield → Sleep(0) → Sleep(1)'], ['inflation', 'one-time allocation, permanent for that object'], ['spin budget', 'bounded — dozens of iterations before parking']]} />
+
+## why you should care
+
+**The metric that moves is `monitor-lock-contention-count`, and the incident shape is a service
+whose throughput stops rising when you add instances of anything.** You scale out the pods, you
+raise the thread-pool minimum, you buy bigger machines, and the request rate does not move.
+Somewhere there is one lock — a cache, a metrics registry, a connection pool, a `Dictionary`
+behind a `lock` — that every request touches. The lock does not appear in a CPU profile as a
+hot method, because the time is spent in a coherence stall or parked in the kernel, which is
+not attributed to your code at all.
+
+**The second shape is p99 latency with a healthy mean and healthy CPU.** Most requests take the
+fast path and pay almost nothing. The unlucky ones arrive while the lock is held, exhaust the
+spin budget, park, and wait for a scheduler round trip — and then more if the queue is deep.
+That is a tail-latency generator that no amount of "the code looks fine" review will find. It is
+also why the fix is usually structural: the same p99 comes back if you only trim the critical
+section a little, because the parked-waiter queue was already building faster than it drains.
+
+**The third is the one that gets misdiagnosed the most.** A blocked thread is a parked stack
+holding megabytes of reserved address space and, if it is a thread-pool thread, a unit of the
+pool's very limited supply. Blocking on a lock inside a request handler is how a lock problem
+turns into [thread-pool starvation](/systems/threads-and-scheduling/threadpool-starvation/),
+which presents as "the service stopped responding" rather than as "a lock is contended". The
+tell is that CPU is low, the thread count is climbing, and every stack in the dump is in
+`Monitor.Wait` or `.Result`.
+
+**The code review you can now do.** Flag any lock held across an `await`, an HTTP call, a
+database round trip, or a `Console.WriteLine` — the hold time is now measured in something far
+longer than the spin budget covers, and every other thread queues behind it. Flag a
+`static readonly object` lock guarding a dictionary that every request reads: that is a striping
+candidate, or a `ConcurrentDictionary`, or an immutable snapshot swapped with
+`Interlocked.Exchange`. Flag `lock (this)` and `lock (typeof(T))` and `lock ("some string")` —
+you are sharing a lock with code you have never seen, since strings can be interned and types
+are process-wide. Flag `SemaphoreSlim` used purely as a mutex on a synchronous path, where it
+holds an internal `Monitor` and async plumbing you are not using, for nothing. And stop flagging
+`lock` on the grounds that it is slow — the uncontended fast path is a handful of instructions,
+and the fix for the contended case is never a different keyword.
+
+**Where this page hands off.** Everything here is built on one primitive —
+[compare-and-swap](/systems/atomics-and-cas/) is where that instruction comes from, and where
+you learn when to skip the lock entirely and use it directly. The ordering guarantees a lock
+gives you for free (everything you wrote before releasing is visible to whoever acquires next)
+are the subject of [the memory model](/systems/memory-model/), and they are the reason most C#
+code never needs `volatile`. And once you have more than one lock, the failure modes stop being
+about performance and start being about correctness —
+[races, deadlock and friends](/systems/concurrency-hazards/) is that page.
+
+## the same idea in other languages
+
+| language | what it's called | the trap |
+| --- | --- | --- |
+| Java | `synchronized` on any object, backed by the JVM's mark word in the object header — the same thin-lock-then-inflate design; `ReentrantLock` for the explicit version | `synchronized` is reentrant like C#'s `lock`, but `Object.wait`/`notify` are not `Monitor.Wait`/`Pulse` lookalikes you can guess at: `notify` wakes one *arbitrary* waiter, and a spurious wakeup is legal, so a `wait` that is not inside a `while` loop re-checking the condition is a bug in both languages |
+| Go | `sync.Mutex`, and `sync.RWMutex` for the reader/writer version | it is **not reentrant** — a goroutine that locks a mutex it already holds deadlocks itself immediately, where the same code in C# is legal. Go's mutex also switches to a fair FIFO handoff once a waiter has been starved for long enough, so its behaviour under sustained contention differs from `Monitor`'s barging-allowed default |
+| C / pthreads | `pthread_mutex_t`, parked with `futex` on Linux — the syscall counted above | the default mutex type is not recursive and locking it twice is undefined behaviour, not an error; and nothing releases it for you, so an early `return` or a `longjmp` out of a critical section leaks the lock forever. `lock`'s compiler-generated `finally` is doing more work than it looks |
+| C++ | `std::mutex` plus `std::lock_guard`/`std::scoped_lock` for RAII release | `std::mutex` is likewise non-recursive (`std::recursive_mutex` exists and is a design smell), and `std::scoped_lock` with two mutexes uses a deadlock-avoiding acquisition algorithm, which is a guarantee C# gives you nowhere — two `lock` statements in the wrong order deadlock |
+| Python | `threading.Lock`, `threading.RLock` for the reentrant one | the GIL makes people think they do not need a lock. It only guarantees that one thread runs Python bytecode at a time, and `x += 1` is several bytecodes with a switch point between them, so it races exactly like C#'s `count++`. And `threading.Lock` is not reentrant, so the C# habit of re-entering your own lock deadlocks |
+
+## exercises
+
+The first works out what each rung between an uncontended CAS and a full kernel park actually
+does, by mechanism rather than by a stopwatch; the second builds one out of a single CAS so the
+fast path stops being a black box.
+
+<ProblemList topic="locks-internals" />
+
+## interview drills
+
+**Q.** What actually happens when a thread hits a `lock` that is already held?
+
+- *weak answer* — "It blocks until the lock is released." True and empty; it is the answer that
+  gets a follow-up you cannot answer.
+- *strong answer* — It first spins: a bounded, escalating retry loop, because the typical
+  critical section is shorter than a syscall round trip would cost. If the spin budget runs out
+  it enqueues itself and parks — a `futex` wait on Linux, `WaitOnAddress` on Windows — and stops
+  consuming a core. On release the owner wakes one waiter, which then *races* for the lock again
+  rather than being handed it.
+- *follow-up* — "Why race rather than hand off?" Because the waking thread's cache is cold and
+  it needs a scheduler round trip; letting a running thread barge in is faster in aggregate.
+  The price is unfairness and, at the extreme, starvation.
+
+**Q.** We added threads and the service got slower. There is no deadlock and CPU is not pegged.
+What is your hypothesis?
+
+- *weak answer* — "Context switching overhead." Possible, and usually not it. It also does not
+  tell you what to measure.
+- *strong answer* — A shared lock. I would check `monitor-lock-contention-count` in
+  `dotnet-counters` first, but I would not stop there — most of the cost of a short contended
+  lock is not blocking at all, it is the lock's cache line moving between cores every time a
+  spinning thread retries its CAS. Four cores hammering one empty critical section can lose to
+  one core doing the same total work alone, while blocking almost never — because the whole
+  cost was coherence traffic, not the kernel.
+- *follow-up* — "So how do you fix it?" Not by making the lock faster. Reduce the sharing:
+  shorten the hold, stripe the lock by key, or give each thread its own state and merge at the
+  end — none of which change what the lock primitive is.
+
+**Q.** When is `lock` the wrong primitive?
+
+- *weak answer* — "When performance matters, use `SpinLock` or lock-free code." That reasoning
+  produces bugs; neither is generally faster.
+- *strong answer* — Three cases. When the critical section is a single word — use `Interlocked`,
+  which is one instruction with no ownership bookkeeping at all. When you have to hold it across
+  an `await` — `lock` cannot, because the Monitor is owned by a thread and the continuation may
+  resume on a different one, so it has to be `SemaphoreSlim`. And when the resource allows N
+  concurrent holders rather than one. Beyond those, `lock` is the default and `SpinLock` in
+  particular is a foot-gun on a thread-pool thread that can be preempted while holding it.
+- *follow-up* — "Why can't `lock` cross an `await`?" `Monitor` tracks the owning thread and is
+  reentrant per thread; a continuation can resume on any pool thread, so releasing would
+  either fail or release a lock this thread never took. The compiler rejects `await` inside
+  `lock` outright.
+
+**Q.** Is `lock (this)` a problem? What about `lock ("mykey")`?
+
+- *weak answer* — "It's a style thing, use a private object." The right conclusion with no
+  mechanism behind it — and it will not survive "why".
+- *strong answer* — Both are locks on objects that code outside your class can also reach, and
+  the lock word is the object's own header. Anyone holding a reference to your instance can
+  `lock` it too, so an unrelated library can deadlock you. String literals are worse: they are
+  interned, so `lock ("mykey")` in two unrelated assemblies locks the *same* object
+  process-wide. A `private static readonly object` — or a `System.Threading.Lock`, which cannot
+  be aliased by accident — is not a style preference, it is the only version whose contention
+  set you can enumerate.
+- *follow-up* — "What does locking an object cost it permanently?" Contention inflates the
+  header into a sync block, and it stays inflated for the object's lifetime. Per-instance locks
+  on a million objects means a million sync blocks.
+
+**Q.** Your profiler shows almost no time inside the critical section. Can lock contention
+still be your bottleneck?
+
+- *weak answer* — "No, if the section is fast the lock isn't the problem."
+- *strong answer* — Yes, and it is the usual case. The time is not spent inside the section; it
+  is spent getting in. It goes to coherence traffic that a sampling profiler attributes to
+  whatever instruction stalled, and to parked time that is attributed to nothing at all because
+  the thread is not running. What shows it is the contention counter, the thread-state
+  distribution, and the scaling shape — one thread against N doing the same total work.
+- *follow-up* — "How would you prove it?" Run the same total work on one thread instead of N. If
+  N threads are not visibly better than one, the serialized section is your ceiling, and
+  Amdahl's law gives you the best case before you write any code —
+  [parallelism patterns](/systems/parallelism-patterns/) does that arithmetic.

@@ -1,0 +1,413 @@
+---
+layout: '@layouts/TopicLayout.astro'
+topic: queues-and-streams
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+
+## the ground floor
+
+- **message vs. event** — a message is an instruction addressed to whoever picks it up next
+  ("charge this card"); an event is a fact that already happened ("this card was charged"), and
+  a fact can have any number of independent readers. Real systems blur the two constantly, but
+  the distinction is why a queue and a log behave so differently once you push on them.
+- **broker** — the durable intermediary process (or cluster) that holds the message or event
+  after the producer hands it off and before a consumer has finished with it.
+- **partition** (Kafka's term; Event Hubs calls it the same thing) — the unit a topic is split
+  into for parallelism. Each partition is its own independently appended, independently ordered
+  log. [Partitioning & sharding](/system-design/partitioning/) is the general version of this
+  idea; a Kafka partition is that idea specialised to one append-only structure.
+- **offset** — a partition-local, monotonically increasing position. A consumer's "how far I've
+  read" bookmark is nothing more than an offset it has chosen to commit.
+- **consumer group** — a set of consumer instances that divide a topic's partitions between
+  them, so that each partition is owned by exactly one member of the group at a time. This is
+  the mechanism the rest of this page keeps coming back to.
+
+## core idea
+
+A queue or event stream exists to decouple a producer's timeline from a consumer's: the
+producer's work is done the moment the broker durably has the message, and the consumer
+processes it whenever it is ready, at its own pace, and can crash and retry without the
+producer ever knowing. That decoupling buys you load leveling — a burst is absorbed by the
+broker instead of falling straight through to whatever the consumer talks to — and it lets more
+than one independent consumer read the same event history. It is also the durable version of a
+pattern [reliability](/system-design/reliability/) covers in-process: retrying with a queue
+behind you means the retry survives a process restart, where an in-memory retry loop does not.
+
+The one sentence a staff engineer uses to summarise the whole topic: the guarantee you actually
+get, underneath every broker's marketing page, is **at-least-once delivery**, and ordering,
+effectively-once processing, and dead-lettering are all things you build on top of that with
+idempotency and careful acknowledgment — not things the broker hands you for free.
+
+## how it actually works
+
+### the write path and consumer groups
+
+A producer sends a record with a partition key; the broker hashes the key to pick a partition,
+appends the record to that partition's log, and only acknowledges the producer once the
+durability bar it was configured for is met. A consumer group then divides the topic's
+partitions across its members — one partition, one owner, at any given moment:
+
+```text
+producer                                broker — topic "orders", 3 partitions
+   │                                     ┌─────────────────────────────────────┐
+   │ key = orderId "A17"                 │ partition 0   [ ... already there ] │
+   ├── hash(key) % 3 = 1 ─────────────▶  │ partition 1   [ ...  msg  msg  ] ◀──┼── leader here,
+   │                                     │ partition 2   [ ... already there ] │   replicated to
+   ▼                                     └─────────────────────────────────────┘   2 followers
+ ack returned to the producer once
+ acks=all AND min.insync.replicas=2
+ followers have the write
+
+                                          consumer group "billing"
+                                          ┌───────────────┬───────────────────┐
+                                          │ consumer A     │ consumer B         │
+                                          │ owns partition │ owns partitions    │
+                                          │ 0              │ 1 and 2            │
+                                          └───────────────┴───────────────────┘
+                                          each tracks its own committed offset,
+                                          per partition it owns
+```
+
+Two things worth noticing about that picture. First, `acks=all` with `min.insync.replicas=2`
+means the producer's ack waits for the write to land on the leader and at least one follower —
+it says nothing about whether the leader has `fsync`ed to its own disk. Kafka's durability model
+leans on replication, not on a synchronous `fsync` per record; a broker that flushes lazily and
+loses its unflushed tail can still be made whole from a follower, and that is the design choice,
+not an oversight. Second, all three partitions in this topic have a leader on a possibly
+different broker — a partition, not a topic, is the thing that gets replicated and the thing a
+consumer is assigned.
+
+### delivery guarantees, precisely
+
+This is the part worth reading twice, because the vocabulary gets abused constantly.
+
+- **At-most-once**: commit the offset, then process. A crash between the two loses the message.
+  Nobody designs for this on purpose; it falls out of getting the order backwards.
+- **At-least-once**: process, then commit the offset. A crash between the two means the message
+  is redelivered and processed again. This is the default posture of every broker on this page,
+  and it is not a flaw — it is the only thing you can build over an unreliable network without
+  also making the consumer block on the producer.
+- **Effectively-once**: at-least-once delivery plus a processing step that is idempotent, so
+  redelivery is harmless. This is the guarantee you actually want, and the broker cannot give it
+  to you — your handler has to.
+
+<Callout kind="trap" label="the folklore, corrected">
+  "Kafka gives you exactly-once" is the sentence that gets people in trouble in an interview.
+  Exactly-once *delivery* over a network that can drop acknowledgments is not achievable in
+  general — the producer cannot tell "the broker got it but the ack was lost" apart from "the
+  broker never got it", so it must either risk a duplicate or risk a loss. What Kafka's
+  transactional producer plus `isolation.level=read_committed` actually gives you is
+  **effectively-once, scoped to Kafka's own boundary**: an idempotent producer dedupes retried
+  writes to a partition using a producer ID and a per-partition sequence number, and a
+  transaction can bundle a consume-transform-produce step with its own offset commit so that
+  either all of it lands or none of it does. The instant you write to a database, call an HTTP
+  API, or send an email from inside that handler, you have stepped outside Kafka's transaction,
+  and you are back to at-least-once — your write to that external system has to be the thing
+  that is idempotent.
+</Callout>
+
+Here is that gap made concrete — a consumer that sends an email, then dies before it commits:
+
+```text
+partition 7, offset 104 — "send order-confirmation email"
+
+t0   consumer polls the batch containing offset 104
+t1   handler sends the confirmation email                    ← the side effect happens here
+t2   consumer process is killed (deploy, OOM, node drain)    ← crash BEFORE the offset commit
+t3   the group rebalances; a different consumer is assigned partition 7
+t4   the new consumer resumes from the last COMMITTED offset — 103, not 104
+t5   offset 104 is redelivered
+t6   handler sends the confirmation email AGAIN               ← duplicate. not a Kafka bug.
+```
+
+Nothing in that trace violates a guarantee Kafka made. At-least-once means exactly this can
+happen, and the only fix lives in the handler: persist a dedup key (the message's partition and
+offset, or a business idempotency key) with a unique constraint *before* the email actually
+goes, and skip sending if the key is already there.
+
+### ordering lives in the partition, not the topic
+
+**Kafka orders records within a partition. It makes no ordering promise across partitions of
+the same topic.** Two events for `orderId "A17"` land in partition 1 and are delivered to
+whichever consumer owns partition 1, in the order they were written — because they share a key.
+An event for `orderId "B4"` might land in partition 2 and be delivered by a different consumer
+at a completely unrelated time. If your correctness depends on "the cancellation is processed
+after the creation," the creation and the cancellation must share a partition key; there is no
+global sequence number that rescues you if they do not.
+
+This is the same shape of guarantee — and the same shape of surprise — as
+[the memory model](/systems/memory-model/) one layer down: a single core has a total order over
+its own instruction stream, but two cores have no combined order without an explicit
+synchronization point. A Kafka partition is that one core's program order; the partition key is
+the synchronization point that decides which events are required to agree on an order at all.
+[Consistency models](/system-design/consistency-models/) is the same argument again, stated as
+"what does the system promise," rather than "where is the log."
+
+### dead letters and the poison-message trap
+
+A dead-letter queue (DLQ) is where a message goes after it has failed processing more times
+than you are willing to retry — a separate destination the handler can inspect, replay, or
+alert on, instead of the message vanishing or looping forever.
+
+<Callout kind="trap" label="head-of-line blocking">
+  If you have only ever worked with RabbitMQ or Azure Service Bus, dead-lettering feels like a
+  per-message thing: one bad message gets nacked and shunted aside, its neighbours are
+  unaffected. **Kafka does not work that way.** A partition is a strictly ordered log with one
+  commit position; a consumer cannot skip offset 104 and commit offset 105 without deciding to
+  skip 104 forever. A handler that throws on every attempt at offset 104 freezes that partition
+  — lag climbs, nothing after 104 is ever delivered — until the code explicitly catches the
+  poison record, routes it to a DLQ topic itself, and advances past it. The dead-letter behaviour
+  RabbitMQ and Service Bus give you for free is something a Kafka consumer has to build.
+</Callout>
+
+### change data capture and the outbox pattern
+
+Change data capture (CDC) reads a database's own write-ahead log or binlog and turns it into a
+stream of events — SQL Server's Change Data Capture feature and Debezium reading a Postgres
+logical replication slot or a MySQL binlog are the common shapes of this in a .NET shop. It is
+the same log [replication](/system-design/replication/) already reads and the same log
+[storage engines](/system-design/storage-engines/) describes as the durability boundary — CDC is
+just another reader of it, alongside the database's own replicas.
+
+CDC is also how you solve the dual-write problem: a service cannot atomically write to its own
+database *and* publish to a broker, because those are two different systems and nothing coordinates
+them for you — a crash between the two calls, in either order, leaves one done and the other not.
+[Two-phase commit](/system-design/consensus/) is the textbook fix for exactly this, and it
+is also the reason nobody reaches for it here: the coordinator blocks the resources holding
+locks until it recovers, and most brokers do not speak 2PC with your database anyway. The outbox
+pattern sidesteps the whole problem by writing the event as a row in the *same local
+transaction* as the business change, then letting something else — a poller, or CDC on the
+outbox table itself — publish it afterwards:
+
+```text
+one local ACID transaction, one commit
+┌───────────────────────────────────────────────┐
+│ UPDATE orders SET status = 'paid' WHERE id=... │
+│ INSERT INTO outbox (id, type, payload) ...     │   ← same transaction, same fsynced log
+└───────────────────────────────────────────────┘
+                        │ commit
+                        ▼
+     relay — a poller, or CDC reading the outbox table's own log entry
+                        │  at-least-once: can duplicate, can lag; never loses the row
+                        ▼
+                  message broker
+```
+
+The DB write and the publish are still never in the same transaction — the relay step is
+still at-least-once, and a consumer downstream of the outbox still needs to be idempotent. What
+the outbox buys you is narrower and cheaper than it sounds: it guarantees the event is *never
+silently lost* relative to the business change, because both are the same `fsync`. It converts
+"did the publish happen" from "maybe, and I can't tell" into "eventually, guaranteed" — see
+[ACID durability](/system-design/transactions/) for what that `fsync` is actually promising.
+
+### sizing it: partitions and retention, worked
+
+Assume — genuinely assumed, not measured — a topic carrying 50 million events a day, an average
+record size of 1 KB, a 7-day retention window, and a replication factor of 3 (the common
+default, tolerating one broker loss without data loss given `min.insync.replicas=2`).
+
+- average rate: `50,000,000 / 86,400 ≈ 580` events/sec — the same "divide the daily figure by
+  the seconds in a day" move [estimation](/system-design/estimation/) uses for request rates.
+- raw bytes/day: `50,000,000 × 1,000 B = 50,000,000,000 B ≈ 50 GB/day` (decimal GB throughout).
+- 7-day footprint, one copy: `50 GB × 7 = 350 GB`.
+- with replication factor 3: `350 GB × 3 = 1.05 TB` of disk across the cluster — not per broker,
+  across all of them, and that is before any compaction or compression.
+
+Partition count is a separate question from any of that arithmetic, and it is easy to answer it
+with the wrong number. A partition is the unit of parallel *assignment*, not a throughput knob:
+if you want up to 12 consumer instances processing this topic concurrently at peak, you need at
+least 12 partitions, full stop, regardless of how small each event is. Provisioning some
+headroom above today's consumer count (so scaling out later does not require adding partitions)
+is worth the extra bookkeeping, because adding partitions later changes `hash(key) % partitionCount`
+for every existing key — see the interview drills below for exactly what that breaks.
+
+<Watch items={[['replication factor', '3'], ['min.insync.replicas', '2'], ['retention', '7 days'], ['delivery guarantee', 'at-least-once + idempotent consumer'], ['ordering scope', 'per partition only']]} />
+
+## the tradeoff
+
+| axis | queue (RabbitMQ, SQS, Azure Service Bus) | log / stream (Kafka, Event Hubs, Kinesis) |
+| --- | --- | --- |
+| consumption | destructive — acked messages are gone (or dead-lettered) | non-destructive — retained for a configured window regardless of who has read it |
+| fan-out to independent readers | needs a fan-out topology (a topic plus a subscription per reader) | free — every consumer group tracks its own offsets over the same log |
+| ordering | FIFO per queue, or per session (Service Bus sessions) | per partition only, none across partitions |
+| replay | generally not possible once acked | replay any offset inside the retention window |
+| retry unit | per message — visibility timeout / `PeekLock`, a redelivery count | per partition — a stuck offset blocks everything behind it |
+| natural fit | background jobs, "do this exactly once, on one worker" | event sourcing, CDC, audit trail, several independent downstream consumers |
+
+Default for a typical service: reach for a **queue** when the job is "one worker does this
+task once" — a background job, an outbound email, a payment capture — because per-message ack,
+visibility timeouts, and a built-in DLQ are exactly the primitives that shape needs, and you do
+not want replay. Reach for a **log/stream** when more than one independent consumer needs the
+same event history, or when you need to reprocess history (a new consumer joining late, a bug
+fix that needs a replay, an analytics pipeline reading the same events production reads). Do not
+pick a stream because it sounds more scalable — a queue with competing consumers scales
+horizontally too, and it hands you dead-lettering you would otherwise have to build yourself.
+
+## how it fails
+
+- **Growing consumer lag on one partition, flat everywhere else.** A poison message the handler
+  cannot get past, or one partition's owner starved of CPU. On a dashboard this is lag climbing
+  on a single partition while its siblings sit flat — the tell that this is a stuck consumer,
+  not a broker problem.
+- **A rebalance storm.** Deploys, autoscaling, or flapping health checks keep adding and
+  removing group members; each membership change triggers a rebalance, and the group's older
+  ("eager") rebalance protocol revokes every partition from every member before reassigning —
+  briefly stopping the whole group, not just the member that changed. Cooperative/incremental
+  rebalancing narrows that pause to the partitions actually moving, but it still shows up as a
+  periodic dip in group-wide throughput correlated with deploy timestamps.
+- **Duplicate side effects.** At-least-once plus a non-idempotent handler: a customer gets two
+  confirmation emails, or is charged twice. The support ticket says "charged twice"; the fix is
+  never "make delivery exactly-once" — it is a dedup key with a unique constraint, checked
+  before the side effect runs.
+- **A zombie producer.** A producer that lost its leader connection during a network blip keeps
+  believing it is still talking to the leader and keeps writing after a new leader has already
+  taken over, unless it is fenced off. This is the queue-world version of the same problem a
+  [distributed lock](/systems/locks-internals/) has: a lease can expire while its holder is
+  still working, and only a fencing token — a monotonically increasing number the downstream
+  resource checks and rejects if it goes backwards — closes the gap. A mutex never has this
+  problem, because the OS revokes it atomically with the thread that held it; a lease over a
+  network cannot make that same promise.
+- **Retention outrunning consumption.** A consumer down for longer than the retention window
+  loses the backlog outright — not an error, just gone once the broker's retention janitor
+  reclaims the segment. It shows up as a downstream dataset with an unexplained gap that lines
+  up with an incident window, not as an alert of its own.
+
+## in practice
+
+- **RabbitMQ** — manual acknowledgment (`basic.ack` / `basic.nack`) with a prefetch count that
+  bounds how many unacked messages a consumer can hold at once; a dead-letter exchange (DLX)
+  catches nacked or expired messages and routes them somewhere you can inspect, no extra code
+  required.
+- **Azure Service Bus** — the default receive mode is `PeekLock`: the message is invisible to
+  other receivers for a lock duration you can renew while processing, and a message that hits
+  `MaxDeliveryCount` is dead-lettered automatically. Sessions give you FIFO ordering scoped to a
+  session ID — the direct analogue of a Kafka partition key.
+- **Kafka / Azure Event Hubs** — set `enable.idempotence=true` so retried producer writes are
+  deduped by the broker; if you need the transactional consume-transform-produce guarantee, that
+  is a `transactional.id` on the producer plus `isolation.level=read_committed` on every
+  consumer downstream, and it is worth the ceremony only when a step genuinely reads and writes
+  Kafka in the same operation.
+- **SQL Server / PostgreSQL CDC, Debezium** — SQL Server's native Change Data Capture reads the
+  transaction log via a capture job, distinct from (and heavier than) Change Tracking, which
+  only tells you *that* a row changed, not the values. Debezium reads Postgres's logical
+  replication slot or MySQL's binlog directly — this is the same log
+  [replication](/system-design/replication/) reads, just consumed by something other than a
+  replica.
+- **EF Core and the outbox** — EF Core has no built-in outbox; you build it by inserting an
+  `Outbox` row inside the same `SaveChanges` call as the business entity, then a hosted-service
+  poller (or CDC on that table) publishes and marks the row processed. The subscriber on the
+  other end is not exempt from idempotency just because the publish side is careful.
+- **Polly and `HttpClient`** — a retry policy wrapped around a consumer's outbound call is a
+  second source of duplication layered on top of the broker's own at-least-once delivery: derive
+  the idempotency key from something stable across retries — the partition-and-offset, or a
+  business key — never regenerate it per attempt, or the retry defeats the idempotency check it
+  was supposed to satisfy.
+
+## the same idea elsewhere
+
+| here | elsewhere | the trap |
+| --- | --- | --- |
+| consumer group partition assignment | in-process work partitioning — see [parallelism patterns](/systems/parallelism-patterns/) | the same "exactly one owner per shard of work" problem; a partition count fixed too low idles consumers the same way an undersized `Parallel.ForEach` degree of parallelism idles cores |
+| ordering guaranteed per partition, not per topic | ordering guaranteed per core (program order), not across cores — see [the memory model](/systems/memory-model/) | assuming an order you never actually synchronized for, one layer up or one layer down |
+| visibility timeout / `PeekLock` lease | a mutex or a distributed lock — see [locks internals](/systems/locks-internals/) | a lease can expire mid-processing without revoking the holder's belief that it still holds it; only a fencing token closes that gap, and a real OS mutex never needs one |
+| the write-ahead log CDC reads | the log a database replica streams — see [replication](/system-design/replication/) | thinking of CDC as a separate feature, when it is usually the same log a replica already reads |
+| the outbox's single local transaction | the durability guarantee of a commit — see [transactions](/system-design/transactions/) | assuming the outbox makes the *publish* atomic with the write; it only makes the write and the *intent to publish* atomic |
+
+## interview drills
+
+**Q.** You added retries to a consumer, and now support is fielding complaints about duplicate
+confirmation emails. Walk me through what happened.
+
+- *weak answer* — "at-least-once delivery is unavoidable, there's nothing to do about it."
+  True as a statement about the broker, and it dodges the actual question.
+- *strong answer* — name the gap precisely: the handler sent the email, then crashed or was
+  rebalanced away before committing the offset, so the same offset was redelivered and the
+  handler ran again with no memory of the first attempt. The fix is a dedup key — the message's
+  partition and offset, or a business idempotency key — persisted with a unique constraint
+  *before* the email actually sends, so the second attempt fails the constraint instead of
+  sending twice.
+- *follow-up* — "what if the side effect is calling a third-party API you don't control?" Use an
+  idempotency key the API itself supports if it has one; if it doesn't, you can only make your
+  own call into that API idempotent by checking a local "already sent" record first — you cannot
+  retrofit idempotency onto someone else's endpoint.
+
+**Q.** A Kafka consumer group's lag stops decreasing on exactly one partition; every other
+partition is healthy. What's going on?
+
+- *weak answer* — "the broker must be down." A broker outage would show up on every partition
+  it hosts, not one, and it would show as connection errors, not a flat offset.
+- *strong answer* — a poison message: the handler throws on this record every time, and because
+  a partition is a strictly ordered log with one commit position, the consumer cannot skip it
+  without deciding to skip it forever. Fix it by catching the failure explicitly, routing the
+  record to a dead-letter topic with the original headers and the failure reason, and committing
+  past it — Kafka will not do this for you the way RabbitMQ's DLX does.
+- *follow-up* — "how do you avoid silently losing that message once it's dead-lettered?" Alert
+  on DLQ depth, and keep enough context in the DLQ record (original topic, partition, offset,
+  timestamp) to replay it manually once the bug is fixed.
+
+**Q.** Product wants exactly-once processing from Kafka into a Postgres table. Can you give them
+that?
+
+- *weak answer* — "yes, just turn on Kafka's exactly-once semantics." This describes something
+  real but answers the wrong question — Kafka's transactions cover producer-to-broker
+  deduplication and an atomic consume-transform-produce step *inside Kafka*, not a write to an
+  external database.
+- *strong answer* — no system can promise exactly-once delivery across a network boundary; what
+  you can promise is effectively-once, by making the Postgres write idempotent — an upsert keyed
+  on the message's partition and offset, so a redelivered record overwrites itself instead of
+  duplicating.
+- *follow-up* — "what if the write is an INSERT that must fail on a true duplicate business
+  key, not silently upsert?" Make the dedup key (partition + offset) itself a unique constraint
+  on a tracking table written in the same transaction as the insert, and treat a constraint
+  violation as "already applied," not as an error to surface.
+
+**Q.** Why does the outbox pattern exist — why not just publish to Kafka right after committing
+the database transaction?
+
+- *weak answer* — "wrap the DB write and the publish in a distributed transaction." Most brokers
+  do not participate in two-phase commit with your database, and even where the plumbing exists,
+  a 2PC coordinator that dies at the wrong moment leaves participants holding locks until it
+  comes back.
+- *strong answer* — there is no way to make "write to the database" and "publish to the broker"
+  atomic across two independent systems without coordination neither typically offers; the
+  outbox sidesteps this by writing the event as a row in the *same local transaction* as the
+  business change, so the two either both happen or neither does, then relaying that row to the
+  broker afterwards, asynchronously.
+- *follow-up* — "what if the relay publishes the event but crashes before marking the outbox row
+  processed?" It republishes on restart — a duplicate, which the outbox never promised to
+  prevent — so the consumer still has to be idempotent. The outbox guarantees the event is never
+  silently lost; it does not upgrade the relay step to exactly-once.
+
+**Q.** A worker acquires a lease-based lock (a message's visibility timeout, or a Redis lock
+with a TTL) before starting a long job, so only one worker processes it. Is that real mutual
+exclusion?
+
+- *weak answer* — "yes, only one consumer can hold the message at a time." True at the instant
+  it's acquired, and it ignores what happens if the job runs longer than the lease.
+- *strong answer* — no, not on its own: if the job runs past the lease duration — a GC pause, a
+  slow downstream call, a paused container — the lease expires and a second worker can pick up
+  the same job while the first is still running, unaware its lock is gone. Real safety needs a
+  fencing token: a number that only increases with each new lock acquisition, checked by
+  whatever resource the job writes to, which rejects any write carrying a token older than the
+  last one it accepted.
+- *follow-up* — "why doesn't a normal in-process `lock` statement have this problem?" Because
+  the OS releases a thread's lock atomically with the thread's own death or scope exit — there
+  is no separate lease to expire out from under it; a network lease is a promise about time made
+  by two parties that cannot directly observe each other.
+
+**Q.** A topic has 3 partitions; the consumer group has 5 instances. Two sit idle. Why, and what
+would you actually do about it?
+
+- *weak answer* — "the extra two are standing by as backups." Nothing about consumer-group
+  assignment reserves idle members as hot standbys; they are simply unassigned.
+- *strong answer* — a partition is owned by at most one consumer per group at a time, so
+  partition count is a hard ceiling on parallelism regardless of how many consumers you run; with
+  3 partitions, only 3 members ever have work. The fix is more partitions, sized for the
+  parallelism you actually want, provisioned with some headroom in advance.
+- *follow-up* — "what breaks if you raise the partition count later, after the topic already has
+  data?" `hash(key) % partitionCount` changes for every key the moment the count changes, so
+  messages for the same key produced before and after the resize can land in different
+  partitions — the per-key ordering guarantee holds only within each side of that boundary, not
+  across it.

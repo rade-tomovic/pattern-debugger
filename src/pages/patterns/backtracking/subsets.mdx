@@ -1,0 +1,139 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: backtracking
+problem: subsets
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+
+## task
+
+Given an array of **distinct** integers, return every possible subset (the power set) — no
+duplicates, order of subsets doesn't matter.
+
+```text
+nums = [1, 2, 3]  →  [[1,2,3],[1,2],[1,3],[1],[2,3],[2],[3],[]]
+```
+
+## how to think
+
+A bitmask over `n` bits gets you the same `2^n` answers — each bit says "in or out" for one
+element — but writing it that way hides the recursive structure the interviewer wants to see.
+Ask the bitmask question one element at a time instead: *"is `nums[index]` in this subset, or
+not?"* That's a binary choice at every level, and it's the whole algorithm — no target sum to
+hit, no duplicate to dodge, just include-or-skip repeated `n` times.
+
+Because every element gets **exactly one** decision, every complete path through the tree (one
+include-or-skip choice per index, `n` levels deep) corresponds to exactly one subset, and every
+subset corresponds to exactly one path. The leaves of the recursion tree don't approximate the
+power set — they *are* the power set, which is why the base case is just "ran out of elements,"
+with no validity check at all.
+
+<Callout kind="note" label="template instance">
+  **Include / skip** shape: at each index there are always exactly 2 branches, taken
+  unconditionally — no `IsValid` check, only `IsComplete` (`index == nums.Length`). Invariant:
+  `path` holds the subset of `nums[0..index)` that this branch decided to include; the recursion
+  never revisits an index, so no element is ever double-decided.
+</Callout>
+
+## solution
+
+```csharp
+public IList<IList<int>> Subsets(int[] nums)
+{
+    var result = new List<IList<int>>();
+    var path = new List<int>();
+
+    void Backtrack(int index)
+    {
+        if (index == nums.Length)
+        {
+            result.Add(new List<int>(path));    // COPY — path keeps mutating after this
+            return;
+        }
+
+        path.Add(nums[index]);                  // include nums[index]
+        Backtrack(index + 1);
+        path.RemoveAt(path.Count - 1);
+
+        Backtrack(index + 1);                   // skip nums[index] — path already has it removed
+    }
+
+    Backtrack(0);
+    return result;
+}
+```
+
+## trace
+
+`nums = [1, 2, 3]` — 3 elements, 2 decisions each, `2^3 = 8` leaves:
+
+```text
+                                    []
+              include 1 /                    \ skip 1
+             [1]                                []
+     incl 2 /    \ skip 2               incl 2 /    \ skip 2
+   [1,2]      [1]                     [2]        []
+  incl3/\skip3 incl3/\skip3         incl3/\skip3 incl3/\skip3
+[1,2,3][1,2] [1,3] [1]              [2,3]  [2]   [3]    []
+```
+
+Every include/skip decision, in the order the recursion actually makes them:
+
+| call | index | decision | path | result |
+| --- | --- | --- | --- | --- |
+| 1 | 0 | include 1 | `[1]` | recurse |
+| 2 | 1 | include 2 | `[1,2]` | recurse |
+| 3 | 2 | include 3 | `[1,2,3]` | complete → **add [1,2,3]** |
+| 4 | 2 | skip 3 | `[1,2]` | complete → **add [1,2]** |
+| 5 | 1 | skip 2 | `[1]` | recurse |
+| 6 | 2 | include 3 | `[1,3]` | complete → **add [1,3]** |
+| 7 | 2 | skip 3 | `[1]` | complete → **add [1]** |
+| 8 | 0 | skip 1 | `[]` | recurse |
+| 9 | 1 | include 2 | `[2]` | recurse |
+| 10 | 2 | include 3 | `[2,3]` | complete → **add [2,3]** |
+| 11 | 2 | skip 3 | `[2]` | complete → **add [2]** |
+| 12 | 1 | skip 2 | `[]` | recurse |
+| 13 | 2 | include 3 | `[3]` | complete → **add [3]** |
+| 14 | 2 | skip 3 | `[]` | complete → **add []** |
+
+All 14 rows are real calls — 6 internal (recurse) and 8 leaves (add), matching `2^3 = 8`
+subsets exactly. Row 4 is the moment that proves "skip" isn't an afterthought: after including
+`3` and adding `[1,2,3]`, the un-choose (`path.RemoveAt`) fires before the `skip 3` call, so row
+4 correctly sees `[1,2]`, not `[1,2,3]`.
+
+## why it works
+
+There's a bijection between `{include, skip}^n` sequences and subsets of an `n`-element array:
+each sequence says exactly which elements are in, and every subset is describable by exactly one
+such sequence. The recursion tree enumerates `{include, skip}^n` completely — two branches at
+every one of `n` levels — so it visits every subset exactly once, in the order the include/skip
+choices happen to fall.
+
+<Watch items={[['time', 'O(2^n · n)'], ['space', 'O(n) recursion (+ O(n · 2^n) for the output)']]} />
+
+## common bugs
+
+- Adding `path` itself instead of a copy — `result.Add(path)` stores a *reference*; by the time
+  the recursion finishes, every entry in `result` points at the same (now-empty) list. Always
+  `result.Add(new List<int>(path))` or `result.Add([.. path])`.
+- Skipping the `skip` branch entirely — calling `Backtrack(index + 1)` only after including
+  produces one path with everything included, not the power set.
+- Checking `index <= nums.Length` instead of `==` — the guard is then true from the very first
+  call (`index` starts at `0`), so the function records `[]` and returns immediately: you get
+  `[[]]` instead of the power set.
+- Forgetting the un-choose (`path.RemoveAt(path.Count - 1)`) between the include and skip calls
+  — the skip branch then starts from a path that still has the "included" element in it.
+
+## variants you can now solve
+
+- **Subsets II** (LC 90) — `nums` can have duplicates; sort first, then skip a value that
+  equals its predecessor **at the same recursion depth** (not globally) to avoid identical
+  subsets — the same discipline [3Sum](/patterns/two-pointers/three-sum/) uses for duplicate
+  pairs.
+- **[Permutations](/patterns/backtracking/permutations/)** (LC 46) — every element is used
+  exactly once, but order matters now, so the branching shape changes from "2 choices per
+  element" to "pick from whatever's left."
+- **[Combination Sum](/patterns/backtracking/combination-sum/)** (LC 39) — include/skip becomes
+  "how many times can I include this one," bounded by a target sum instead of array length.

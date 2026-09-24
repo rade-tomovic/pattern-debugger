@@ -1,0 +1,603 @@
+---
+layout: '@layouts/TopicLayout.astro'
+topic: threads-and-scheduling
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import ProblemList from '@components/ProblemList.astro';
+import Solution from '@components/Solution.astro';
+
+## the ground floor
+
+- **OS thread** — a stack, a set of register values, and an entry in the kernel's scheduler.
+  It is the only thing that gets put on a core.
+  [Processes, threads and the kernel](/systems/process-and-thread/) builds it from nothing.
+- **blocked** — the state a thread is in when it is waiting for something and consuming no CPU:
+  a parked stack plus a note in a kernel wait queue, woken by a trip through the scheduler once
+  whatever it was waiting for becomes ready.
+- **context switch** — the kernel saving one thread's registers and restoring another's, either
+  because the thread blocked or because its turn ran out.
+- **the heap** — the memory every thread in the process shares.
+  [Stack vs heap](/systems/stack-and-heap/) is the page that shows a local being *promoted* onto
+  it by the compiler, which is exactly what `await` does to your locals.
+- **continuation** — the rest of a method after a particular line. This page's central trick is
+  turning "the rest of this method" into an object somebody else can call later.
+- **a file descriptor** — the small integer the kernel hands back for an open socket or file;
+  every I/O syscall names the file by this number, not by a pointer into your process.
+  **epoll** is the Linux call that lets one thread ask the kernel to watch thousands of file
+  descriptors and wake it only for the ones that became ready — Windows' equivalent is called an
+  **I/O completion port**. Both exist so "wait for any of ten thousand sockets" does not require
+  ten thousand threads.
+
+## core idea
+
+Three things in .NET get called "a thread" in conversation and none of them are the same object.
+An **OS thread** is a stack the kernel schedules. A **thread-pool thread** is an OS thread the
+runtime owns, keeps alive, and hands short work items to. A **`Task`** is not a thread at all: it
+is a heap object holding a status, a result slot, and a list of continuations, and it may be
+completed by a pool thread, by a timer, by a device interrupt handler, or by your own thread
+calling `SetResult`.
+
+Every incident in this topic comes from confusing those three. Blocking a pool thread is not like
+blocking your own thread, because the pool has a bounded number and grows it cautiously. And
+`await` does not "wait" — it returns.
+
+| | OS thread (`new Thread`) | pool thread | `Task` |
+| --- | --- | --- | --- |
+| what it is | a stack the kernel schedules | an OS thread the runtime keeps | a heap object with a status and a continuation list |
+| who creates it | you | the runtime, on demand | you, or any API that promises a result |
+| how it's created | one syscall (`clone`/`CreateThread`) plus a kernel-reserved stack | already there, or the runtime adds one when the queue backs up | a plain `new` — no syscall at all |
+| how many | as many as you make | starts at one per core, grows as needed, capped at 32,767 by default | millions, if you like |
+| when it dies | when its delegate returns | when it has been idle a while | never — it is garbage like anything else |
+| blocking it | costs you one thread | costs the whole process one worker | meaningless: a `Task` cannot block |
+
+## how it actually works
+
+### three different things, one word
+
+The runtime will tell you which one is running your code. This is real output from
+`bench/threads-and-scheduling/index.cs`, run with `dotnet run bench/threads-and-scheduling/index.cs`:
+
+```text
+=== 1. who runs what ===  cores 16, pool min 16/1, max 32767/1000, live pool threads 0
+  Main                                         tid   1  pool=False background=False name=(none)
+  new Thread(...).Start()                      tid   4  pool=False background=False name=(none)
+  Task.Run body                                tid   5  pool=True  background=True  name=.NET TP Worker
+  async method, before the await               tid   7  pool=True  background=True  name=.NET TP Worker
+  async method, after await Task.Delay         tid   7  pool=True  background=True  name=.NET TP Worker
+  a TaskCompletionSource task: IsCompleted=False while nothing at all is running it
+  after SetResult on tid 7: IsCompleted=True, Result=7
+  pool threads created so far: 3; work items completed: 2
+```
+
+Four facts are visible there. The thread you started is `pool=False` and `background=False` — the
+process will not exit while it runs. Pool threads are `background=True`, which is why unfinished
+`Task.Run` work vanishes silently at shutdown. The pool's minimum worker count matches the core
+count (16 here, `Environment.ProcessorCount`) — that is the runtime's starting bet on how much can
+usefully run at once. And the last two lines are the important ones: a `TaskCompletionSource` task
+sat there incomplete with no thread, no timer and no work item behind it, and completed the moment
+some thread — any thread — called `SetResult`.
+
+<Callout kind="trap" label="what a Task is not">
+  A `Task` is not a thread, does not own a thread, and does not imply one will ever exist. It is a
+  *promise*: a status, a result or exception slot, and a list of "call me when this flips". The
+  only Tasks with a thread behind them are the ones you asked for with `Task.Run` or
+  `Task.Factory.StartNew` — those queue a work item. `Task.Delay` puts a deadline in the runtime's
+  timer queue. `Socket.ReceiveAsync`, and therefore `HttpClient`, registers the socket with the
+  kernel's epoll set (an I/O completion port on Windows). `TaskCompletionSource` registers nothing
+  at all and waits for you. The exception worth knowing is file I/O on Unix: .NET has no kernel
+  completion to register there, so `FileStream.ReadAsync` is emulated by doing the blocking read
+  on a pool thread. Clamp the pool to one worker, block it, and a 20 MB `ReadAsync(useAsync:
+  true)` never completes until the worker is released — that is
+  `bench/threads-and-scheduling/unix-file-async.cs`, and running it prints exactly that: it does
+  not complete while the one worker is held, and does complete the instant it is released.
+</Callout>
+
+### the pool: two queues, and a thief
+
+The pool is not one queue. There is one **global queue** for work handed in from outside, and one
+**local queue per worker thread** for work a worker produces while running. A worker takes from
+its own local queue first, then the global queue, and then it steals from another worker's local
+queue.
+
+The two disciplines are different, and you can watch them. `bench/threads-and-scheduling/queue-ordering.cs`
+queues five items in the order 0 1 2 3 4 with the pool clamped to a single worker, so nothing can
+be stolen and the queue discipline is the only thing left:
+
+```text
+=== 1. five work items, queued in the order 0 1 2 3 4, one worker thread ===
+  queued from a plain Thread   (global queue) : 0 1 2 3 4
+  queued from a pool thread, preferLocal:false: 0 1 2 3 4
+  queued from a pool thread, preferLocal:true : 4 3 2 1 0
+  Task.Run from a plain Thread                : 0 1 2 3 4
+  Task.Run from a pool thread                 : 4 3 2 1 0
+```
+
+**The global queue is FIFO. A worker's own local queue is LIFO.** The last line is the one to
+remember: the identical `Task.Run` call runs its five items in opposite orders depending on
+whether the caller was already a pool thread. LIFO is deliberate — the item you just created is
+the one whose data is still in this core's cache, so running it next is the cache-friendly choice
+([the memory hierarchy](/systems/memory-hierarchy/) is why that matters more than fairness).
+
+Give the pool its workers back, and the local queue gets raided:
+
+```text
+=== 2. one pool thread queues 8 items of 30 ms each; 16 workers available ===
+  queued by tid5
+  item7 on tid5
+  item0 on tid8
+  item1 on tid9
+  item2 on tid10
+  item3 on tid11
+  item4 on tid12
+  item5 on tid13
+  item6 on tid14
+  distinct worker threads that ran an item: 8
+```
+
+The owner (tid5) ran `item7` first — the newest, off the tail of its own queue. With sixteen
+workers idle and only eight items on offer, every other item got stolen by a different worker —
+all eight ran on eight distinct threads. **Owners pop from the tail, thieves take from the head**,
+so the two ends of the same deque rarely contend even under this much stealing pressure.
+
+```text
+                    ┌─────────────────────────────────────────┐
+   Task.Run from    │            GLOBAL QUEUE (FIFO)          │
+   a non-pool  ───► │   [w0][w1][w2][w3][w4] …                │
+   thread           └────────────────┬────────────────────────┘
+                                     │  taken when the local queue is empty
+        ┌────────────────────────────┼────────────────────────────┐
+        ▼                            ▼                            ▼
+  ┌───────────┐               ┌───────────┐                ┌───────────┐
+  │ worker 1  │               │ worker 2  │                │ worker 3  │
+  │ local deq │               │ local deq │                │ local deq │
+  │ [a][b][c] │◄── steals ────│  (empty)  │                │  (empty)  │
+  └─────┬─────┘   from head   └───────────┘                └───────────┘
+        │ pops from tail (LIFO): c, then b, then a
+        ▼
+     running                          ▲
+                                      │  ".NET TP Gate" thread: wakes on a
+                                      │  periodic timer; if work is queued
+                                      └─ and nothing finished, adds one worker
+```
+
+### the pool grows, and it grows slowly
+
+The pool creates workers on demand up to `Environment.ProcessorCount` with no delay at all. Past
+that, a separate thread you can see in `/proc` (`.NET TP Gate`) adds workers on its own timer,
+using a hill-climbing algorithm that watches throughput rather than queue depth.
+`bench/threads-and-scheduling/thread-injection.cs` blocks 60 work items and samples the thread
+count at a fixed number of evenly spaced checks. First, blocking on a `ManualResetEventSlim` — an
+event the pool cannot see into:
+
+```text
+mode=event  60 work items blocked  cores=16
+  check  1   pool threads  17   still queued  43
+  check  2   pool threads  18   still queued  42
+  check  3   pool threads  19   still queued  41
+  check  4   pool threads  20   still queued  40
+  check  5   pool threads  21   still queued  39
+  check  6   pool threads  22   still queued  38
+  check  7   pool threads  23   still queued  37
+  check  8   pool threads  24   still queued  36
+  check  9   pool threads  26   still queued  34
+  check 10   pool threads  27   still queued  33
+  check 11   pool threads  28   still queued  32
+```
+
+**Exactly one new worker per check.** The pool only sees a worker go idle without finishing its
+item — it has no way to tell that the thread is parked on an event rather than doing something
+useful — so its response is the smallest one it has. Now the identical starvation, except each
+item blocks on an incomplete `Task` with `.GetAwaiter().GetResult()`, which the runtime *can*
+recognise, because `Task.Wait` tells the pool "this thread is blocked on my code, not busy":
+
+```text
+mode=task  60 work items blocked  cores=16
+  check  1   pool threads  59   still queued   1
+  check  2   pool threads  61   still queued   0
+  check  3   pool threads  61   still queued   0
+  (unchanged through check 11 — the queue is already empty)
+```
+
+Almost the entire deficit filled by the first check, instead of one worker at a time. That is the
+runtime doing its best for the sync-over-async code it knows people write — and it is still a
+*response*, not a load-shedding policy: it costs a full round of injection before the queue
+drains, and a real service under sustained load keeps re-triggering it. Both runs are the same
+file with one argument changed.
+
+<Callout kind="insight" label="the shape that explains the incident">
+  The pool's default response to "all my threads are busy" ranges from "one more worker per
+  check" to "most of the deficit at once", depending only on whether the block is something the
+  runtime can recognise. Neither response is a load-shedding policy — both are a throughput
+  experiment, run once per interval, on the assumption that busy threads are *doing work*. A
+  blocked thread looks exactly like a busy one from the outside.
+</Callout>
+
+### blocking versus awaiting, at the OS level
+
+This is the mechanical difference the whole async story rests on.
+
+**A blocked thread is a parked stack.** Its reserved address space stays reserved, its resident
+pages stay resident, its registers sit in a kernel structure, and the scheduler keeps an entry for
+it. It is not free — it is *idle capacity you have already paid for*.
+
+**A pending `await` is a registered callback.** There is no stack. The compiler moved everything
+the method needs into one heap object, handed a reference to it to whatever you awaited, and
+returned. Nothing anywhere is waiting; something will call `MoveNext` later.
+
+A thousand pending waits, done both ways in one process, real output from
+`bench/threads-and-scheduling/index.cs`:
+
+| 1,000 pending waits | as blocked threads | as pending awaits |
+| --- | --- | --- |
+| OS threads in the process, before → after | 15 → 1,015 | 15 → 15 |
+| resident memory, per unit | ≈18.3 KB | ≈2.1 KB (mostly page-granular noise) |
+| address space reserved, per unit | ≈23.3 MiB | 0 |
+| managed heap bytes, per unit | — | 189 B (exact, `GC.GetTotalAllocatedBytes`) |
+
+<Callout kind="note" label="reading the memory row">
+  RSS is a page-granular counter divided by 1,000 — treat it as an order of magnitude, not a
+  precise per-thread number. The thread-count and managed-bytes rows are exact, and they carry the
+  argument on their own: a thousand blocked threads change the OS thread count by a thousand; a
+  thousand pending awaits change it by zero.
+</Callout>
+
+The second row is the one to keep. A thousand blocked threads reserve tens of gigabytes of address
+space between them, which a 64-bit process can shrug off; what no process can afford is that
+multiplied by ten or a hundred thousand, plus that many scheduler entries and the switching that
+comes with them. The await column has no such ceiling, because there is nothing there to run out
+of.
+
+So who is waiting, if nobody is blocked? A thousand pending `Task.Delay(60_000)`s plus one socket
+receive on a loopback pair that nothing will ever write to — 1,001 operations genuinely in flight —
+and here is every OS thread that exists (`bench/threads-and-scheduling/who-waits.cs`):
+
+```text
+receive still pending? True
+1000 pending awaits + 1 pending socket receive; OS threads in this process:
+  tid 954000   who-waits
+  tid 954075   who-waits-ust
+  tid 954076   who-waits-ust
+  tid 954087   .NET SynchManag
+  tid 954092   .NET EventPipe
+  tid 954102   .NET DebugPipe
+  tid 954104   .NET Debugger
+  tid 954118   .NET Finalizer
+  tid 954199   .NET Tiered Com
+  tid 954349   .NET Timer
+  tid 954375   .NET Sockets
+  tid 954469   .NET TP Worker
+  tid 954471   .NET TP Gate
+  tid 954474   .NET TP Worker
+  tid 954875   .NET SigHandler
+
+100000 pending awaits: 15 OS threads
+```
+
+Fifteen threads for 1,001 in-flight operations — and still fifteen at a hundred thousand, the last
+line of that run. Two of those threads are the machinery: `.NET Timer` and `.NET Sockets`. When a
+deadline expires or a socket becomes readable, that thread queues a work item and one of the pool
+workers picks it up. *That* is what "async" buys — not speed, and not parallelism. It buys you the
+ability to have a hundred thousand operations in flight on a machine that can only park a few
+thousand stacks.
+
+What is behind that single `.NET Timer` thread is worth a look, because the obvious guess — "one
+sorted queue of every deadline" — is wrong on both counts. Reflecting into
+`System.Private.CoreLib` (`bench/threads-and-scheduling/timer-queues.cs`):
+
+```text
+cores 16   TimerQueue.Instances.Length 16
+  fields holding pending timers : _shortTimers, _longTimers
+  TimerQueueTimer link fields   : _next, _prev
+
+1000 pending Task.Delay(60s), all started from this one thread:
+  queue[0]   _shortTimers     0   _longTimers     0
+  queue[7]   _shortTimers     0   _longTimers  1000
+  ... (every other instance: 0 and 0)
+```
+
+The runtime keeps one `TimerQueue` **per core** (16 here), not one global structure — and each
+instance is a pair of intrusive **linked lists** (`_shortTimers`/`_longTimers`, doubly linked via
+`_next`/`_prev`), not a sorted structure. All 1,000 timers landed in the *same* instance because
+they were all created by the same thread: which instance a timer joins depends on who creates it,
+not on its deadline. A single `.NET Timer` thread still services every instance in turn — that
+part of the mental model holds — it just isn't the one-sorted-queue picture it looks like from the
+outside.
+
+### what await actually compiles into
+
+Roslyn rewrites every `async` method into a small state machine object and leaves behind a stub
+that starts it. The generated type for a two-line method, read out of the assembly at run time:
+
+```text
+  [AsyncStateMachine(typeof(<FetchAsync>d__0))]
+  kind       : struct, private nested, implements IAsyncStateMachine
+  fields     :
+    int32                        <>1__state
+    AsyncTaskMethodBuilder`1     <>t__builder
+    int32                        id
+    int32                        <local>5__2
+    TaskAwaiter`1                <>u__1
+  method     : MoveNext (171 bytes of IL)
+```
+
+Your parameter and your surviving local became *fields*. That is the same promotion a captured
+local goes through on [stack vs heap](/systems/stack-and-heap/), for the same reason: the frame
+is gone the moment the method returns at its first `await`, so anything that must outlive the
+frame has to be somewhere else. That changes the local's *lifetime*, not its privacy: it now lives
+as long as the state-machine object does — the whole operation, not just the call — and the code
+that reads it after the resume may run on a different thread than the code that wrote it. That is
+not a data race, because the `await` itself is the hand-off: `MoveNext` only runs after the
+awaited operation completes, so the read is guaranteed to see the write. What the promotion *does*
+rule out is anything whose lifetime is tied to the stack frame — a `Span<T>` (`ref struct`) or a
+`stackalloc` buffer cannot cross an `await` at all, and the compiler refuses it (`CS4007`) rather
+than let a reference to stack memory that may already be gone end up on the heap.
+
+The state field is the whole trick: `-1` means "not started or running", `0` means "suspended at
+the first await", `-2` means "finished". `MoveNext` is a switch on it, and resuming is just
+calling `MoveNext` again with the state set.
+[What `await` compiles into](/systems/threads-and-scheduling/async-state-machine/) reads all 171
+bytes of it line by line.
+
+### the synchronization context, and what `ConfigureAwait(false)` turns off
+
+When you `await`, the compiler asks the current `SynchronizationContext` (or `TaskScheduler`)
+"where should the continuation run?" — and if there is one, the continuation is *posted back to
+it*. That is how a WinForms handler could touch a control after an `await`, and how ASP.NET
+(the .NET Framework one) kept `HttpContext.Current` valid across awaits.
+
+`bench/threads-and-scheduling/sync-context.cs` installs a context with exactly one thread behind it
+— a `SynchronizationContext` is a six-line class — and watches where each continuation lands:
+
+<Solution>
+
+```csharp
+using System.Collections.Concurrent;
+
+static string Who() => $"tid {Environment.CurrentManagedThreadId,2}   context {SynchronizationContext.Current?.GetType().Name ?? "none"}";
+
+static async Task<int> LoadAsync()
+{
+    Console.WriteLine($"  LoadAsync    before await : {Who()}");
+    await Task.Delay(50);                              // captures the current context
+    Console.WriteLine($"  LoadAsync    after  await : {Who()}");
+    return 1;
+}
+
+static async Task<int> LoadFreeAsync()
+{
+    Console.WriteLine($"  LoadFree     before await : {Who()}");
+    await Task.Delay(50).ConfigureAwait(false);        // explicitly does not capture it
+    Console.WriteLine($"  LoadFree     after  await : {Who()}");
+    return 2;
+}
+
+sealed class OneThreadContext : SynchronizationContext
+{
+    readonly BlockingCollection<(SendOrPostCallback cb, object? state)> _q = new();
+    public override void Post(SendOrPostCallback d, object? state) => _q.Add((d, state));
+    public void RunLoop() { foreach (var (cb, state) in _q.GetConsumingEnumerable()) cb(state); }
+    public int Queued => _q.Count;
+}
+```
+
+</Solution>
+
+Run it on a thread that installs the context and pumps `RunLoop`:
+
+```text
+=== 1. where the continuation runs ===
+  callback on the UI thread: tid  4   context OneThreadContext
+  LoadAsync    before await : tid  4   context OneThreadContext
+  LoadAsync    after  await : tid  4   context OneThreadContext
+  LoadFree     before await : tid  4   context OneThreadContext
+  LoadFree     after  await : tid  6   context none
+```
+
+Same two methods, same awaited `Task.Delay`. The plain `await` came home to tid 4. The one with
+`.ConfigureAwait(false)` resumed on a pool thread with no context at all. That is the entire
+difference: **`ConfigureAwait(false)` means "I do not need to resume where I started".**
+
+And here is what it costs to not know that. The same `LoadAsync`, called with `.Result` from the
+one thread its continuation needs:
+
+```text
+=== 2. the same LoadAsync(), blocked on with .Result ===
+  LoadAsync    before await : tid  4   context OneThreadContext
+  did it ever complete? False
+  UI thread state: Background, WaitSleepJoin;   continuations waiting for the UI thread: 1
+```
+
+A permanent deadlock with no lock in it: the continuation is queued for a thread that is blocked
+waiting for the continuation. This is the classic .NET Framework UI/ASP.NET hang, and it is
+*different* from the pool starvation on the next page even though both present as "it stopped
+responding".
+
+<Callout kind="tip" label="what this means today">
+  ASP.NET Core installs **no** `SynchronizationContext`, so this exact deadlock cannot happen
+  there — which is why `.Result` in ASP.NET Core produces the slow collapse of
+  [the deadlock that was not a deadlock](/systems/threads-and-scheduling/threadpool-starvation/)
+  instead of an instant hang. Library code should still use `ConfigureAwait(false)` on every
+  await, because your library does not know whose context it is running on. Application code in
+  ASP.NET Core does not need it, and adding it there buys nothing.
+</Callout>
+
+## the mental model
+
+```text
+   what you write                 what exists at run time
+   ─────────────────────────────  ────────────────────────────────────────────
+   new Thread(f).Start()      →   one OS thread: a kernel-scheduled stack,
+                                  megabytes of reserved address space
+
+   Task.Run(f)                →   a work item pushed onto a deque, plus a
+                                  Task object; runs on a borrowed pool thread
+
+   await SomethingAsync()     →   a heap object holding your locals,
+                                  registered as a callback. NO THREAD —
+                                  tens to ~100 bytes
+
+   SomethingAsync().Result    →   a pool thread parked, waiting for a pool
+                                  thread to run the continuation that wakes
+                                  it — fine if one is free, a growing queue
+                                  or a hang if none is
+```
+
+Three rules worth carrying:
+
+1. **A `Task` is a promise, not a thread.** Ask "what will complete this?" — a work item, a timer,
+   the kernel, or your own code. If the answer is "a pool thread", never block a pool thread on it.
+2. **Blocking spends a thread; awaiting spends a small heap object.** Both wait. Only one of them
+   scales, because only one of them has no per-unit thread behind it.
+3. **The pool replaces a blocked worker cautiously** — one at a time when it cannot tell why you
+   blocked, most of the deficit at once when it can — but neither response is instant, and a
+   request path that blocks a worker per call is a race between demand and a pool that refills a
+   little at a time.
+
+<Watch items={[['pool starts at', '1 worker/core, max 32,767'], ['event-blocked injection', '+1 worker per check'], ['Task-blocked injection', 'most of the deficit at once'], ['parked thread', '≈18 KB resident, ≈23 MiB reserved'], ['pending await', '189 B managed, 0 threads'], ['async Task alloc, no suspend', '72 B'], ['async Task alloc, suspends', '103 B']]} />
+
+## why you should care
+
+**The flagship incident is thread-pool starvation, and its signature is that nothing looks
+broken.** CPU is low. Memory is fine. No exceptions in the log. Every thread is alive. Requests
+queue up and time out, health checks fail, the pod gets killed, and the restart "fixes" it. The
+cause is a `.Result`, a `.Wait()`, a `.GetAwaiter().GetResult()`, or a synchronous I/O call on a
+pool thread — each one converting a work item into a parked stack, against a pool that refills
+cautiously.
+[The deadlock that was not a deadlock](/systems/threads-and-scheduling/threadpool-starvation/)
+reproduces it: the same batch of requests, done with `await`, never needs more workers than there
+are cores; done through a synchronous facade, it burns through several times that many workers and
+several separate rounds of injection before the queue drains.
+
+**The metric that moves is the thread-pool queue length, not CPU.** In `dotnet-counters` that is
+`threadpool-queue-length` alongside `threadpool-thread-count`. A queue length climbing while CPU
+sits at 30% is starvation and nothing else; there is no other thing it can be. Thread count
+climbing a little at a time is the same story from the other side.
+
+**In a dump the symptom is unmistakable**, and you do not even need a managed debugger to see the
+shape of it: on Linux, `/proc/PID/task/*/wchan` says which kernel function each thread is parked
+in, and during starvation every `.NET TP Worker` is sitting in `futex_do_wait` — a census on
+[the deadlock that was not a deadlock](/systems/threads-and-scheduling/threadpool-starvation/)
+shows 21 of them at once, real output from `bench/threads-and-scheduling/blocked-threads.cs`. With
+`dotnet-dump analyze` and `clrstack -all` you get the managed half: dozens of pool threads whose
+stacks all bottom out in a wait beneath `Task.Result` or `GetAwaiter().GetResult()`, and the frame
+above that wait names the file to fix. Threads parked inside the socket engine or the timer queue
+are healthy; threads parked beneath *your* code are the bug.
+
+**The code review you can now do:** flag `.Result`, `.Wait()` and `.GetAwaiter().GetResult()`
+anywhere in a request path — all three are the same bug; flag `async void` (nobody can await it,
+and its exceptions go to the thread pool's unhandled handler and kill the process); flag
+`Task.Run` wrapped around code that only awaits — it costs a queue hop and buys nothing; flag
+`Task.Run` used to "escape" a synchronous library on a server (you have moved the blocking, not
+removed it); flag a `lock` held across an `await` (it does not even compile for `lock`, but
+`SemaphoreSlim` will happily let you do the equivalent); and flag long-running loops queued to the
+pool, which should be `new Thread` or `TaskCreationOptions.LongRunning` so they do not hold a
+worker for minutes.
+
+**Where this goes next.** Everything above assumed that when two of these threads touch the same
+object, you either see the other's writes or you do not, and that is a whole page of its own:
+[the memory model](/systems/memory-model/) explains why a store on one core may not be visible on
+another, and [what goes wrong with concurrency](/systems/concurrency-hazards/) catalogues the
+ways two of these threads ruin each other's day. When one of them has to wait for another,
+[how a lock is built](/systems/locks-internals/) is the mechanism, and it is built out of exactly
+the park-and-wake mechanism this page just walked through.
+
+## the same idea in other languages
+
+| language | what it's called | the trap |
+| --- | --- | --- |
+| Java | a platform `Thread` is an OS thread; `CompletableFuture` is the promise; since Java 21 a *virtual thread* is a stack the JVM parks on the heap and multiplexes onto carrier threads | virtual threads make blocking cheap again, so Java is moving *away* from `async`-coloured methods while .NET stays with them — code ported from Java 21 that "just blocks" will starve a .NET pool, because .NET has no virtual threads |
+| Go | goroutines, scheduled by the runtime onto `GOMAXPROCS` OS threads, with channels instead of promises | the Go runtime detaches an OS thread that blocks in a syscall and keeps scheduling other goroutines on a fresh one, so "just block" is correct advice in Go and catastrophic in .NET. There is no `Task` object either — a goroutine has no handle, so there is nothing to await, cancel, or forget to await |
+| Python | `asyncio` with `async def`/`await`, an event loop, and coroutine objects; `threading.Thread` is a real OS thread held back by the GIL | the loop is single-threaded, so one blocking call stops *everything*, not just one worker; and `asyncio.run` will not nest, which is Python's version of the sync-over-async deadlock shown above |
+| JavaScript | `Promise` plus `async`/`await`, on one event-loop thread; libuv's own worker pool underneath; `Worker`s for real parallelism | the syntax is C#'s and the failure modes are not one but two. There is no `.Result` to write, so nobody blocks a promise — but a blocking call *on the event loop* freezes every request in the process at once, and libuv's pool (`UV_THREADPOOL_SIZE`, default 4) backs `fs`, `dns.lookup`, `crypto` and `zlib`, so those can queue behind each other exactly like a .NET pool. Measured here (`bench/threads-and-scheduling/libuv-pool.cjs`, node 24): with the pool's 4 slots held by CPU-heavy `pbkdf2` jobs, a queued `fs.readFile` does not complete until one of them frees a slot — while an event-loop timer set at the same moment fires on schedule regardless, because it is never routed through the pool at all |
+| C / C++ | `pthread_create` for threads, `std::async`/`std::future` for the promise, epoll or io_uring for the callbacks | `std::future::get` blocks with no pool underneath to notice, and C++20 coroutines give you the state machine but no scheduler at all — you supply the thing that resumes them, which is the part .NET's pool was doing for you here |
+
+## exercises
+
+One takes the flagship incident apart; the other reads the machine your `async` method actually
+became.
+
+<ProblemList topic="threads-and-scheduling" />
+
+## interview drills
+
+**Q.** What's the difference between a `Task` and a thread?
+
+- *weak answer* — "A `Task` is a lightweight thread" or "`Task` uses the thread pool." The first is
+  wrong and the second is only sometimes true; both invite the follow-up that ends it.
+- *strong answer* — A `Task` is a promise object: a status, a result slot and a continuation list.
+  Some tasks have a thread behind them because `Task.Run` queued a work item; most in a real
+  service do not — `Task.Delay` is a timer entry, `Socket.ReceiveAsync` is a registration with the
+  kernel's epoll set. That is why a thousand pending awaits change the OS thread count by zero and
+  a thousand blocked threads change it by a thousand.
+- *follow-up* — "So what completes a `Task` returned by `HttpClient.GetAsync`?" The socket becomes
+  readable, the runtime's epoll thread picks it up, and it queues the continuation to the pool.
+  Your code resumes on a pool thread.
+
+**Q.** A service under load stops responding. CPU is 15%, memory is flat, no exceptions. Where do
+you look?
+
+- *weak answer* — "Check for a deadlock" or "scale out". Scaling out doubles the number of
+  starving pools, and a lock deadlock would not leave CPU at 15% with requests still arriving.
+- *strong answer* — That shape is thread-pool starvation. I'd look at `threadpool-queue-length`
+  and `threadpool-thread-count`: a queue climbing while thread count rises a little at a time is
+  the signature. Then take a dump and run `clrstack -all` — if dozens of pool threads are parked
+  in `Wait` under `Task.Result`, that's it, and the frame above the wait names the file.
+- *follow-up* — "Why does raising `ThreadPool.SetMinThreads` help?" It removes the injection delay
+  for the first N threads, so it converts a slow collapse into a fast, expensive service. It is a
+  tourniquet, not a fix: you're still paying a stack per concurrent request.
+
+**Q.** Does `await` release the thread?
+
+- *weak answer* — "Yes, `await` frees the thread." Right conclusion, no mechanism, and it is wrong
+  in the common case where the awaited task is already complete.
+- *strong answer* — `await` checks `IsCompleted` first; if the result is already there it just
+  keeps running on the same thread with no suspension at all. Only when it has to suspend does the
+  method *return* to its caller, having stored its state in a heap object and registered a
+  continuation. Nothing is released, because nothing was held: the thread goes back to the pool
+  and picks up other work.
+- *follow-up* — "Which thread does it resume on?" Whatever the captured context says — the pool by
+  default in ASP.NET Core and console apps, the original context in UI frameworks, and always the
+  pool if you wrote `ConfigureAwait(false)`.
+
+**Q.** Why is `Task.Run(() => LegacySyncCall()).Result` still wrong on a server?
+
+- *weak answer* — "It's fine, it moves the blocking off the request thread." It moves it onto a
+  pool thread and then blocks the request thread too — that is now two threads consumed.
+- *strong answer* — On ASP.NET Core the request thread *is* a pool thread, so this consumes two
+  pool threads per request instead of one, plus two context switches. The right move is to await
+  the sync work on a dedicated thread only if it is genuinely long-running, or better, to make the
+  call actually async. Wrapping sync in `Task.Run` on a server is a way of hiding a thread, not of
+  removing one.
+- *follow-up* — "When *is* `Task.Run` right?" When you have real CPU-bound work to get off the
+  current thread — a UI thread, or a request thread doing something expensive — or when you need
+  parallelism, not concurrency.
+
+**Q.** When do you use `new Thread` instead of the pool?
+
+- *weak answer* — "Never, the pool is always better." Then you have never had a long-running
+  consumer loop hold a worker hostage for the life of the process.
+- *strong answer* — When the work is long-lived or blocks by design: a dedicated consumer loop, a
+  file watcher, something that must never be starved by pool pressure, or something that needs a
+  non-default stack size or a foreground thread that keeps the process alive. The pool is tuned for
+  short work items, and a task that runs for minutes on a worker is one worker the pool has
+  effectively lost. `TaskCreationOptions.LongRunning` says the same thing to the TPL: on the default
+  scheduler it creates a dedicated thread instead of queueing, and you can see it — the delegate
+  runs on a thread named `.NET Long Running Task` with `IsThreadPoolThread` false.
+- *follow-up* — "What breaks if you queue a long-running loop to the pool anyway?" The hill-climbing
+  heuristic sees a worker that never completes an item, concludes the pool is under-provisioned,
+  and injects more threads — you get thread growth with no throughput gain.
+
+**Q.** What does `ConfigureAwait(false)` actually do, and where do you need it?
+
+- *weak answer* — "It makes it faster" or "it stops deadlocks". It removes a post that may cost
+  nothing, and it prevents one specific deadlock rather than deadlocks in general.
+- *strong answer* — It tells the awaiter not to capture the current `SynchronizationContext`, so
+  the continuation runs on the pool instead of being posted back. It matters in library code, which
+  cannot know whether it's running under a UI or legacy-ASP.NET context, and it is what breaks the
+  sync-over-async deadlock in those environments. Under ASP.NET Core there is no context, so it
+  changes nothing.
+- *follow-up* — "So can I safely block if everything uses `ConfigureAwait(false)`?" No. You have
+  removed the hard deadlock and kept the starvation: the blocked thread is still a pool thread that
+  is no longer available to run continuations.

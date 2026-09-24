@@ -1,0 +1,159 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: backtracking
+problem: combination-sum
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+
+## task
+
+Given an array of **distinct positive** candidates and a `target`, return every combination of
+candidates that sums to `target`. The same candidate may be **reused any number of times**;
+combinations are considered the same if one is a reordering of the other, so the order candidates
+are tried in must not produce duplicate sets.
+
+```text
+candidates = [2, 3], target = 8  →  [[2,2,2,2],[2,3,3]]
+```
+
+## how to think
+
+Subsets and Permutations both moved *forward* through the array on every recursive call — once
+an index was used, it was gone. Reuse breaks that assumption: after choosing `candidates[i]`,
+the next call is still allowed to choose `candidates[i]` again. The fix is one word different
+from Subsets' recursion: pass `i` (not `i + 1`) as the next call's starting index. Everything
+before index `i` stays permanently excluded (that's what keeps `[2,3]` and `[3,2]` from both
+appearing), but index `i` itself stays on the table.
+
+The other piece is *when to stop* — you're not walking a fixed number of positions like Letter
+Combinations, you're walking down a `remaining` budget. Every choice subtracts `candidates[i]`
+from `remaining`; hit exactly `0` and you've found a combination, go negative and the whole
+branch is dead (candidates are positive, so `remaining` only shrinks — no choice ever brings it
+back up). That negative check is real pruning, the first this topic has needed: it kills a branch
+before it reaches full array-length depth, which is exactly the efficiency win backtracking is
+for.
+
+<Callout kind="note" label="template instance">
+  **Reuse allowed** shape: the loop starts at a `start` index and recurses with `i` (not
+  `i + 1`), so any index `>= start` stays choosable forever; indices `< start` are permanently
+  excluded, which is what prevents `[2,3]` and `[3,2]` from both being recorded. `IsComplete` is
+  `remaining == 0`; `IsValid` is implicitly "choosing candidate `i` doesn't take `remaining`
+  negative," checked as a prune at the top of each call instead of a `continue` in the loop.
+</Callout>
+
+## solution
+
+```csharp
+public IList<IList<int>> CombinationSum(int[] candidates, int target)
+{
+    var result = new List<IList<int>>();
+    var path = new List<int>();
+
+    void Backtrack(int start, int remaining)
+    {
+        if (remaining == 0)
+        {
+            result.Add(new List<int>(path));       // COPY — path keeps mutating after this
+            return;
+        }
+        if (remaining < 0) return;                  // prune: overshot, this branch is dead
+
+        for (int i = start; i < candidates.Length; i++)
+        {
+            path.Add(candidates[i]);                 // choose
+            Backtrack(i, remaining - candidates[i]);  // explore — stay on i: reuse allowed
+            path.RemoveAt(path.Count - 1);            // un-choose
+        }
+    }
+
+    Backtrack(0, target);
+    return result;
+}
+```
+
+## trace
+
+`candidates = [2, 3]`, `target = 8` — small enough to trace fully, big enough to need `2` reused
+four times in one branch:
+
+```text
+(remaining=8)
+├─ choose2 → (rem=6)
+│    ├─ choose2 → (rem=4)
+│    │    ├─ choose2 → (rem=2)
+│    │    │    ├─ choose2 → (rem=0)  *ADD*
+│    │    │    └─ choose3 → (rem=-1) ✗
+│    │    └─ choose3 → (rem=1)
+│    │         └─ choose3 → (rem=-2) ✗
+│    └─ choose3 → (rem=3)
+│         └─ choose3 → (rem=0)  *ADD*
+└─ choose3 → (rem=5)
+     └─ choose3 → (rem=2)
+          └─ choose3 → (rem=-1) ✗
+```
+
+Every choose event, in call order:
+
+| call | `i` | candidate | path | remaining | verdict |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 0 | 2 | `[2]` | 6 | recurse (start stays 0) |
+| 2 | 0 | 2 | `[2,2]` | 4 | recurse |
+| 3 | 0 | 2 | `[2,2,2]` | 2 | recurse |
+| 4 | 0 | 2 | `[2,2,2,2]` | 0 | complete → **add [2,2,2,2]** |
+| 5 | 1 | 3 | `[2,2,2,3]` | −1 | **prune** |
+| 6 | 1 | 3 | `[2,2,3]` | 1 | recurse |
+| 7 | 1 | 3 | `[2,2,3,3]` | −2 | **prune** |
+| 8 | 1 | 3 | `[2,3]` | 3 | recurse |
+| 9 | 1 | 3 | `[2,3,3]` | 0 | complete → **add [2,3,3]**; unwind to `[]` |
+| 10 | 1 | 3 | `[3]` | 5 | recurse |
+| 11 | 1 | 3 | `[3,3]` | 2 | recurse |
+| 12 | 1 | 3 | `[3,3,3]` | −1 | **prune**; done |
+
+Call 4 is the deepest a `2`-only branch can go (four `2`s sum to exactly `8`); call 5 shows the
+prune firing the instant a `3` would push `remaining` negative, without ever building a 5th
+element to check. Both real answers — `[2,2,2,2]` at call 4 and `[2,3,3]` at call 9 — show the
+same mechanism from opposite ends: one candidate reused four times, and two different candidates
+mixed, both reachable because `start` never moves past an index that's still affordable.
+
+## why it works
+
+`start` enforces non-decreasing **index** order along any single path — you can pick index `i`
+any number of times in a row, but once you move to `i + 1` you can never come back to `i`. (With
+sorted candidates, as in this trace, that also means non-decreasing *value* order — but the code
+never sorts, and LC 39 doesn't guarantee sorted input, so index order is the property actually
+doing the work.) That ordering is exactly what prevents `[2,3,3]` and `[3,3,2]` from both being
+recorded: each multiset of candidates is only ever built in one canonical order. Combined with
+the `remaining < 0` prune (safe because
+every candidate is positive, so sums are monotonic), the recursion explores every non-decreasing
+multiset of candidates that could possibly sum to `target`, and stops each branch the moment it's
+provably too big.
+
+<Watch items={[['time', 'exponential — bounded by candidates.Length^(target / min(candidates))'], ['space', 'O(target / min(candidates)) recursion depth']]} />
+
+## common bugs
+
+- Recursing with `i + 1` instead of `i` — that turns this into "each candidate used at most
+  once" (Combination Sum II's rule), silently dropping every answer that needs a repeat.
+- Missing the `remaining < 0` prune — it's not an optimization, it's the second **base case**.
+  Without it, a branch that overshoots the target (e.g. `remaining = 1`, choose `3` → `-2`) has
+  no way back to `remaining == 0` and keeps subtracting positive candidates forever: the
+  recursion never bottoms out, and it crashes with a `StackOverflowException` instead of just
+  running slow.
+- Forgetting `start` in the recursive call and always looping from `0` — that regenerates
+  `[2,3,3]`, `[3,2,3]`, and `[3,3,2]` as three separate answers instead of one.
+- Copying `path` before the `remaining == 0` check confirms it's actually complete — the
+  record-at-every-node mistake, adding every partial sum as if it were a valid combination
+  instead of only the exact-sum leaves.
+
+## variants you can now solve
+
+- **Combination Sum II** (LC 40) — each candidate usable once, duplicates allowed in the input;
+  sort, recurse with `i + 1`, and skip a value equal to its predecessor **at the same depth** to
+  avoid duplicate combinations — Subsets II needs the identical skip.
+- **Combination Sum III** (LC 216) — fixed count `k` *and* target sum at once: combine this
+  problem's `remaining` prune with Permutations' `path.Count == k` depth check, reuse disabled.
+- **[Generate Parentheses](/patterns/backtracking/generate-parentheses/)** (LC 22) — another
+  problem where the prune (not the choice list) does the real pruning work, just phrased as
+  `open`/`close` counters instead of a `remaining` budget.

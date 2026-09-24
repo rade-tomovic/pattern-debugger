@@ -1,0 +1,371 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: lock-free-structures
+problem: concurrent-dictionary-traps
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import Solution from '@components/Solution.astro';
+
+## the code
+
+A per-tenant session cache with a hit counter. It came out of a review with no comments: there
+is no `lock` anywhere, every field is a concurrent collection, and every method it calls is
+documented as thread-safe.
+
+<Solution>
+
+```csharp
+public sealed class TenantCache
+{
+    public sealed class Session(string tenant)
+    {
+        public readonly string Tenant = tenant;
+        public bool Closed;
+    }
+
+    public static int SessionsOpened;                     // instrumentation for this bench only
+    public static int SessionsClosed;
+
+    readonly ConcurrentDictionary<string, Session> _sessions = new();
+    readonly ConcurrentDictionary<string, int> _hits = new();
+
+    static Session OpenSession(string tenant)
+    {
+        Interlocked.Increment(ref SessionsOpened);
+        Thread.SpinWait(200);                             // a handshake, a TLS negotiation, a pool checkout
+        return new Session(tenant);
+    }
+
+    public Session For(string tenant) => _sessions.GetOrAdd(tenant, OpenSession);
+
+    public void RecordHit(string tenant) =>
+        _hits[tenant] = _hits.TryGetValue(tenant, out int n) ? n + 1 : 1;
+
+    public int Hits(string tenant) => _hits.TryGetValue(tenant, out int n) ? n : 0;
+
+    public void CloseAll()
+    {
+        foreach (var s in _sessions.Values) { s.Closed = true; Interlocked.Increment(ref SessionsClosed); }
+    }
+}
+```
+
+</Solution>
+
+The call site is what you would expect, on four threads at once:
+
+```csharp
+string tenant = Tenants[i % Tenants.Length];
+cache.For(tenant);            // get or open this tenant's session
+cache.RecordHit(tenant);      // count the request
+```
+
+## find it
+
+<Callout kind="insight" label="before you scroll">
+  There are **two** bugs, and they are different in kind.
+
+  One is about a guarantee `GetOrAdd` never made. Ask: while thread A is inside the factory
+  delegate, what stops thread B from entering it too — and what happens to the object A built if
+  it loses the race?
+
+  The other is about a line where every individual call is atomic. Read `RecordHit` and count how
+  many operations on `_hits` it performs. Then ask what another thread can do between them.
+
+  Both are visible without running anything. Commit to a direction for each before you scroll:
+  will more sessions get opened than there are tenants, and will the hit count come out too high,
+  too low, or exactly right?
+</Callout>
+
+## the failure
+
+Four threads, 100,000 iterations each, over 8 tenants — 400,000 hits and 8 sessions expected.
+Real output from `bench/lock-free-structures/concurrent-dictionary-traps.cs`:
+
+```text
+=== 1. the broken cache ===
+  tenants                8
+  sessions opened        11
+  sessions closed        8
+  sessions never closed  3
+  hits recorded          400,000
+  hits counted           337,197   (84.3% of them)
+  per tenant, expected 50,000: 41,701 41,778 41,065 41,806 44,014 41,644 41,465 43,724
+```
+
+Eleven sessions were opened for eight tenants. `CloseAll` walks the dictionary, so it closes the
+eight that are *in* the dictionary; the other three were built, handed to a caller, used, and
+then dropped on the floor with nothing to close them. And roughly one hit in six vanished.
+
+Neither of those needed special pressure to reproduce — no `Thread.Sleep` in the window, no
+`Thread.Yield`, no millions of iterations to catch a rare interleaving. Four threads and one pass
+is enough, every time, because both windows are *ordinary*: the whole factory body in one case,
+and the gap between two dictionary calls in the other. The one concession to realism is the
+`Thread.SpinWait(200)` inside `OpenSession`, standing in for the handshake a real session does —
+and the third measurement below shows that removing it entirely does not remove the bug.
+
+The lost updates, traced. One key, two threads, 2,000 increments each, with every read and write
+appended to a log; the entry number is an `Interlocked.Increment`, so entries are globally
+ordered even though the operations they describe are not:
+
+```text
+=== 2. one key, two threads, every access logged ===
+  first lost update — entries 62..66 of 8000:
+    #62    thread 1   read  k -> 30
+    #63    thread 0   read  k -> 30
+    #64    thread 1   write k <- 31
+    #65    thread 1   read  k -> 31
+    #66    thread 0   write k <- 31
+  final value 2166, should be 4000, lost 1834
+```
+
+| step | thread 0 | thread 1 | value in the dictionary |
+| --- | --- | --- | --- |
+| #62 | | `TryGetValue("k")` returns 30 | 30 |
+| #63 | `TryGetValue("k")` returns 30 — the same value, nothing has changed yet | | 30 |
+| #64 | | `d["k"] = 31` | **31** |
+| #65 | | `TryGetValue("k")` returns 31, starting its next increment | 31 |
+| #66 | `d["k"] = 31` — computed from the 30 it read at #63 | | **31** |
+
+Two increments went in. The value moved by one. Thread 0 did nothing wrong at any single step:
+it read the value, added one, and wrote it back, and every one of those calls was atomic. What it
+could not do is notice that the value it read had been replaced between its read and its write.
+
+The honest caveat about the log: the sequence number is taken *after* the operation it describes,
+so the log records completion order rather than the instant of each dictionary access. It does
+not weaken the conclusion — two threads reading 30 and both writing 31 is a lost update
+whichever nanosecond each call landed on.
+
+Over the whole run, 4,000 increments produced a final value of 2,166. **1,834 of them — 46% —
+never happened.** The logging itself widens the window (each entry is a contended atomic
+increment), which is why this run lost more than the roughly one-in-six the un-instrumented
+cache lost above.
+
+And the factory, counted directly on 200 fresh keys with four threads:
+
+```text
+=== 3. GetOrAdd factory runs, 200 fresh keys, 4 threads ===
+  factory does real work (SpinWait 200)   200 keys, factory ran 728 times (3.64x)
+  factory is trivial                      200 keys, factory ran 414 times (2.07x)
+```
+
+The second row is the one to notice. Making the factory instant does not make the problem go
+away — it still ran more than twice per key. There is no factory fast enough to close this
+window, because the window is not the factory: it is the gap between "the key was missing when I
+looked" and "I added it".
+
+## why it breaks
+
+**`GetOrAdd` runs the factory outside the lock, on purpose.** `ConcurrentDictionary` is a table
+of buckets guarded by an array of stripe locks, and a write takes exactly one stripe. If the
+factory ran while holding that stripe, arbitrary user code — a database call, a callback, a
+lambda that touches the same dictionary — would be executing under a lock the collection owns.
+That is a deadlock generator, so the implementation does the only safe thing: it calls your
+factory, *then* takes the lock and tries to add. Several threads therefore call the factory for
+the same missing key, one `TryAdd` wins, and the rest discard the objects they made.
+
+Discarding an object is free when the factory is pure. It is a resource leak when the factory
+opened a connection, started a timer, subscribed to an event, or incremented a meter. The API's
+promise is precise and worth memorising: **`GetOrAdd` guarantees that all callers receive the
+same value. It does not guarantee that the factory ran once.**
+
+**`RecordHit` is three operations wearing one line.**
+
+```csharp
+_hits[tenant] = _hits.TryGetValue(tenant, out int n) ? n + 1 : 1;
+```
+
+That is a read of `_hits`, an add outside the dictionary entirely, and a write back to `_hits`.
+Each of the two dictionary calls is atomic; the sequence is not, and there is no `lock` making
+the sequence atomic either. It is the read-modify-write shape from
+[races and deadlock](/systems/concurrency-hazards/), the same one that makes `count++` unsafe on
+[a plain field](/systems/atomics-and-cas/lost-updates/), except here the field lives inside a collection whose
+name has "Concurrent" in it — which is the only reason anybody writes it.
+
+The general rule this is an instance of: **a concurrent collection makes each of its methods
+atomic, and can make no promise at all about a sequence of them.** `ContainsKey` then indexer
+set, `TryGetValue` then `TryUpdate`, `Count` then `TryAdd` — every pair is a window.
+
+## the fix
+
+<Solution>
+
+```csharp
+public sealed class FixedTenantCache
+{
+    public static int SessionsOpened;
+
+    readonly ConcurrentDictionary<string, Lazy<TenantCache.Session>> _sessions = new();
+    readonly ConcurrentDictionary<string, Counter> _hits = new();
+
+    sealed class Counter { public int Value; }
+
+    static TenantCache.Session OpenSession(string tenant)
+    {
+        Interlocked.Increment(ref SessionsOpened);
+        Thread.SpinWait(200);
+        return new TenantCache.Session(tenant);
+    }
+
+    // GetOrAdd may build several Lazy objects; only the one that wins the race is
+    // ever .Value'd by anybody, and Lazy itself guarantees the factory runs once.
+    public TenantCache.Session For(string tenant) =>
+        _sessions.GetOrAdd(tenant, t => new Lazy<TenantCache.Session>(() => OpenSession(t),
+                                                                     LazyThreadSafetyMode.ExecutionAndPublication)).Value;
+
+    // One reference per key, then an atomic increment on a field nobody replaces.
+    public void RecordHit(string tenant) =>
+        Interlocked.Increment(ref _hits.GetOrAdd(tenant, _ => new Counter()).Value);
+
+    public int Hits(string tenant) => _hits.TryGetValue(tenant, out var c) ? Volatile.Read(ref c.Value) : 0;
+}
+```
+
+</Solution>
+
+Under the same four threads and the same 400,000 iterations:
+
+```text
+=== 4. the fixed cache, same pressure ===
+  sessions opened        8 (one per tenant)
+  hits counted           400,000 of 400,000
+  PASS
+```
+
+**Why `Lazy<T>` works.** `GetOrAdd` may still build several `Lazy` objects for one key — that
+race is unchanged and unfixable at this level. But a `Lazy` is inert: constructing it runs
+nothing. Only the instance that *won* the `TryAdd` is ever returned to a caller, and therefore
+only that one ever has `.Value` read. `Lazy` itself then guarantees, under
+`LazyThreadSafetyMode.ExecutionAndPublication`, that its factory runs exactly once no matter how
+many threads reach `.Value` at the same time. You have moved the race from an expensive object
+to a cheap one, which is the whole trick.
+
+**Why a counter object works, and why it costs less than the line it replaces — without needing
+a stopwatch to see it.** Walk what each design actually does to the dictionary on every hit.
+`d[k] = d[k] + 1` (the broken line) and `AddOrUpdate` both perform a dictionary *write* on every
+single call — for the broken line that is the indexer setter; for `AddOrUpdate` it is the
+operation's whole contract, achieved by CASing a bucket entry, retrying its delegate as needed
+(measured directly below). A dictionary write takes the stripe lock. So both designs take a
+stripe lock 400,000 times for 400,000 hits.
+
+`Interlocked.Increment(ref _hits.GetOrAdd(tenant, _ => new Counter()).Value)` calls `GetOrAdd`
+on every hit too, but `GetOrAdd` only *writes* the dictionary the first time a key is seen — for
+every tenant already present, it is a lock-free chain walk, exactly like `TryGetValue` (see "is
+not lock-free, and it never claimed to be" on [the topic page](/systems/lock-free-structures/)).
+For 8 tenants and 400,000 hits, the dictionary entry is written at most 8 times, ever, and every
+other one of the 399,992 remaining hits does zero dictionary operations — the only mutation is
+`Interlocked.Increment` on a private `int` field that no other key's traffic ever touches. Fewer
+stripe-lock acquisitions is not an incidental side effect of this fix; it is the entire mechanism
+the fix relies on.
+
+The two fixes people reach for first, and what is wrong with them:
+
+- **`lock` around the dictionary.** It works, and it discards the reason you chose the type:
+  reads serialize, the striping is wasted, and — much worse — the factory now runs while you hold
+  a lock. That is exactly the design `ConcurrentDictionary` refuses to ship, for exactly the
+  reason it refuses.
+- **`AddOrUpdate` for the counter.** This one is *correct* — it never loses an update — but its
+  update delegate is a CAS retry loop, so the delegate can run more than once per call and must
+  be pure, and every call still takes the stripe lock the way the broken line does. It fixes the
+  correctness bug and keeps the cost the counter-object design avoids.
+
+Two more measured details, because both are load-bearing for the fix. `AddOrUpdate` is one atomic
+operation whose *delegate* is a CAS retry loop — 400,000 calls on four threads, real output from
+two runs:
+
+```text
+run 1 — 400,000 calls, update delegate ran 1,032,630 times (2.58x), final value 400,000
+run 2 — 400,000 calls, update delegate ran 1,027,589 times (2.57x), final value 400,000
+```
+
+The final value is exactly right in both runs — `AddOrUpdate` really is correct — but the
+delegate ran roughly two and a half times per call, not once, which is why it must be pure the
+same way any CAS loop's body must be pure.
+
+And `Lazy` has one failure mode worth knowing before you deploy it, with a factory that throws
+twice and then succeeds:
+
+```text
+=== 6. Lazy<T> and a factory that throws twice before succeeding ===
+  ExecutionAndPublication  factory ran 1x   threw: boom 1 | threw: boom 1 | threw: boom 1 | threw: boom 1
+  PublicationOnly          factory ran 3x   threw: boom 1 | threw: boom 2 | ok after 3 | ok after 3
+```
+
+`ExecutionAndPublication` runs the factory once and then caches the *exception* forever — every
+later caller gets the original failure, and the entry never recovers. `PublicationOnly` retries,
+at the price of allowing several concurrent factory runs, which is the guarantee you wrapped it
+for in the first place.
+
+<Callout kind="tip" label="the other legitimate fix">
+  When the value is cheap to build but expensive to leak, `GetOrAdd` plus cleanup is fine and
+  avoids the extra object: build it, call `GetOrAdd`, and if the reference that comes back is not
+  the one you made, dispose yours. `if (!ReferenceEquals(added, mine)) mine.Dispose();` — the
+  losers are cleaned up instead of prevented. Use `Lazy` when *building* is what you cannot
+  afford to do twice; use dispose-the-loser when *holding* is.
+</Callout>
+
+<Watch items={[['sessions for 8 tenants', '11'], ['hits counted', '≈84%'], ['factory runs per key', '≈2-4×'], ['AddOrUpdate delegate calls per call', '≈2.6×'], ['stripe-lock writes, counter fix', '≤1 per key, ever'], ['stripe-lock writes, broken line', '1 per hit']]} />
+
+## what this looks like in prod
+
+This is the most common concurrency bug in .NET services, and its two halves fail in two very
+different ways.
+
+**The factory half fails at cold start, under load, and never in test.** A single-threaded test
+opens exactly one session per tenant. Production opens N per tenant during the burst that
+follows a deploy, and then the symptom is not an exception — it is a connection pool at its
+limit, a socket count that climbs after every restart, a rate-limit rejection from an upstream
+that thinks you are opening far more clients than you are, or a `SemaphoreSlim` that runs out of
+permits because several disposable objects took one each and only one was ever disposed. The tell
+in a review is any `GetOrAdd` whose lambda contains a `new` on something with a `Dispose`, or any
+I/O at all.
+
+**The counter half never fails.** It just reports numbers that are low by a percentage that
+varies with load. Dashboards look plausible, alert thresholds are tuned against the wrong
+baseline, and the first person to notice is the one who cross-checks the counter against a
+billing system a year later. If you take one production habit from this page, take this one:
+**a metric that is aggregated in memory across threads must be incremented with `Interlocked`,
+not with a read and a write.**
+
+Both halves are found the same way in code review, without any tooling: search for
+concurrent-collection calls and look at what is on either side of them. Two calls to the same
+collection in one statement or one method, with no lock, is the shape.
+
+## the same idea in other languages
+
+| language | what it's called | the trap |
+| --- | --- | --- |
+| Java | `ConcurrentHashMap.computeIfAbsent`, `merge`, `AtomicLong` | this is the case where Java's API is stricter: `computeIfAbsent` runs the mapping function while holding the bin's lock, so it really does run once per key. The price is that the function must not touch the same map — the javadoc says so, and doing it can throw or deadlock. Java engineers arriving in C# assume `GetOrAdd` has the same guarantee, and it does not |
+| Go | `sync.Map.LoadOrStore`, `sync/atomic` counters | `LoadOrStore` takes a value rather than a factory, so it cannot double-run one — but you construct the value before you know whether you need it, so an expensive value is built and thrown away every time. The idiomatic answer is `sync.Once` per key, which is Go's `Lazy` |
+| Python | `dict.setdefault`, `collections.Counter`, `threading.Lock` | `setdefault` is one C-level call and takes a value, so the double-run trap does not exist — but `counter[k] += 1` is a load, an add and a store, and the GIL is released between bytecodes, so it loses updates exactly like the C# line above |
+| C++ | `std::unordered_map` under a `std::mutex`, or a concurrent map from TBB | there is no thread-safe map in the standard library at all, so nobody is tempted to believe a sequence of calls is atomic. The C++ mistake is the opposite one: holding the mutex across the expensive construction, which turns a race into a convoy |
+
+## common bugs
+
+- **Believing "every method is thread-safe" means "any two methods are thread-safe together".**
+  It never has. `ContainsKey` then indexer, `TryGetValue` then set, `Count` then add — all
+  windows. If a sequence must be atomic, the collection cannot give you that; only a lock, a
+  single-call API (`AddOrUpdate`, `TryUpdate`), or an immutable value can.
+- **Putting a side effect in a `GetOrAdd` factory — or in an `AddOrUpdate` delegate.** Both can
+  run more than once, for different reasons: the factory because it runs outside the lock, the
+  update delegate because it is inside a CAS retry loop. Logging, metrics, allocation of
+  disposables, and event subscriptions all count as side effects.
+- **Fixing the counter with `TryUpdate` in a hand-rolled loop.** It works and it is strictly more
+  code than `AddOrUpdate`, which is the same loop written by somebody else. If you find yourself
+  writing `while (!d.TryUpdate(k, want, seen))`, use `AddOrUpdate` — or stop replacing the value
+  and use a counter object, which also avoids taking the stripe lock on every hit.
+- **Assuming `Lazy<T>` retries a failed factory.** With `ExecutionAndPublication` a thrown
+  exception is *cached* and rethrown to every subsequent caller forever — measured above, four
+  calls and one factory run, all four getting the first failure. For a factory that can fail
+  transiently (it opens a socket, after all) either use `PublicationOnly`, which retries, or
+  evict the dictionary entry when `.Value` throws.
+- **Testing for it with more threads instead of more scrutiny.** Both bugs here reproduce on the
+  first pass with four threads, but plenty of variants do not: change the tenant count, the
+  timing, or the core count and a real window can go years without being hit. A test that passes
+  proves nothing about a race; only reading the sequence of operations does.
+- **Reaching for `ConcurrentDictionary` when the data is read-mostly.** If writes are rare, an
+  immutable snapshot behind one reference is simpler, needs no synchronization on the read path
+  at all, and has neither of these traps — [the topic page](/systems/lock-free-structures/) has
+  both designs side by side.

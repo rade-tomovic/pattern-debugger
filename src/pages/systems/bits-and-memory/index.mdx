@@ -1,0 +1,474 @@
+---
+layout: '@layouts/TopicLayout.astro'
+topic: bits-and-memory
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import ProblemList from '@components/ProblemList.astro';
+
+## the ground floor
+
+- **bit** — one binary digit, `0` or `1`. The smallest thing hardware can store, because it is
+  the smallest thing a voltage can be read back as reliably.
+- **byte** — 8 bits, 256 possible values. It is also the smallest unit that has its own
+  *address*: you cannot ask memory for a single bit.
+- **word** — the chunk the CPU naturally moves and computes in: on the x86-64 machine that built
+  this page, 8 bytes. Confusingly, x86 assembly and the Windows headers use "word" for *2* bytes
+  — that is what `WORD` means in a header, and what the `w` in the `nopw` instruction further
+  down this page means. Everywhere on this page "word" means the machine's natural register
+  width, 8 bytes here. That happens to be the same number as the pointer size `IntPtr.Size`
+  reports, but they are two different quantities that coincide on this machine.
+- **memory (RAM)** — one array of bytes, numbered from `0` upward. Not objects, not variables,
+  not types. Bytes.
+- **address** — an index into that array. On x86-64 it is a 64-bit number, and that is all it is.
+- **hex** — base 16, written `0x…`. One hex digit is exactly 4 bits, so two digits are exactly
+  one byte. That property is the entire reason it exists.
+
+## core idea
+
+Everything alive in your process is a number in a numbered box: `42`, a `DateTime`, the
+characters of a `string`, the reference in your local variable, and the machine code of the
+method currently running. There is one flat array of bytes, and nothing in it is labelled.
+
+The meaning comes from the code that reads it. `0xFFFFFFFF` is `4294967295` if the instruction
+that loads it is an unsigned load and `-1` if it is a signed one; the bytes never changed.
+Types, objects, and the GC heap are stories told on top of that array — useful stories, but the
+array is what is actually there.
+
+## how it actually works
+
+### memory is one numbered array of bytes
+
+An array is not a special construct at the hardware level. It is a base address plus arithmetic.
+`a[i]` means "the bytes starting at `base + i × elementSize`", and the CPU computes that in the
+addressing mode of a single instruction.
+
+Here is a real run — four `int` values, and their real addresses:
+
+```csharp
+int[] a = [10, 20, 30, 40];
+
+fixed (int* p = a)                       // pin it: tell the GC not to move it while we look
+    for (int i = 0; i < a.Length; i++)
+        Console.WriteLine($"&a[{i}] = 0x{(nint)(p + i):X}   base + {(byte*)(p + i) - (byte*)p} bytes   value {a[i]}");
+```
+
+```text
+&a[0] = 0x7FE38440D0C8   base + 0 bytes   value 10
+&a[1] = 0x7FE38440D0CC   base + 4 bytes   value 20
+&a[2] = 0x7FE38440D0D0   base + 8 bytes   value 30
+&a[3] = 0x7FE38440D0D4   base + 12 bytes  value 40
+```
+
+That is one real run on this machine; your addresses will differ, and so will the next run's —
+the numbers themselves are not the point, the spacing between them is.
+
+```text
+address   0x…D0C8   0x…D0CC   0x…D0D0   0x…D0D4
+          ┌────────┬────────┬────────┬────────┐
+ memory   │   10   │   20   │   30   │   40   │  ← four 4-byte ints, back to back
+          └────────┴────────┴────────┴────────┘
+ offset      +0        +4        +8       +12
+```
+
+Notice `C8 → CC → D0 → D4`: the addresses go up by 4 because an `int` is 4 bytes. In decimal
+that stride is invisible; in hex it is the last digit. That is what hex is *for*.
+
+The CPU really does compute the address that way. This is a one-line C function compiled with
+`gcc -O2` on this box and disassembled with `objdump` — x86-64, AT&T syntax; the comments to the
+right are mine, everything left of them is verbatim tool output:
+
+```text
+int get(int *a, int i) { return a[i]; }
+
+0000000000000000 <get>:
+   0:   endbr64                         ; branch-target hardening, not part of the logic
+   4:   movslq %esi,%rsi                ; sign-extend the 32-bit index i to 64 bits
+   7:   mov    (%rdi,%rsi,4),%eax       ; load 4 bytes from (a + i*4) — the whole of a[i]
+   a:   ret
+```
+
+One instruction does base, index, scale, and load. `a[i]` was never anything but arithmetic on
+a number. The same reasoning is why walking an array in order is fast and chasing pointers is
+not — that story is the [memory hierarchy](/systems/memory-hierarchy/).
+
+### hex, because binary is unreadable and decimal hides the boundaries
+
+| the value | binary | hex | decimal |
+| --- | --- | --- | --- |
+| a zero byte | `00000000` | `0x00` | 0 |
+| a full byte | `11111111` | `0xFF` | 255 |
+| top nibble set | `11110000` | `0xF0` | 240 |
+| `int` −1 | `11111111 11111111 11111111 11111111` | `0xFFFFFFFF` | −1 |
+
+Every two hex digits is one byte, every hex digit is four bits, and a mask like `0xFF00` is
+readable at a glance as "the second byte". `65280` is the same number and tells you nothing.
+When you see hex in a log, a debugger, or a stack trace, someone chose it because the byte
+boundaries mattered.
+
+### two's complement: a negative number is a big positive one
+
+There are no minus signs in memory. A signed 32-bit integer uses the same 32 bits as an
+unsigned one; the only difference is that the top bit is *interpreted* as worth −2³¹ instead
+of +2³¹.
+
+| bits (8 of them) | read as `byte` | read as `sbyte` |
+| --- | --- | --- |
+| `00000000` | 0 | 0 |
+| `00000001` | 1 | 1 |
+| `01111111` | 127 | 127 |
+| `10000000` | 128 | −128 |
+| `11111111` | 255 | −1 |
+
+The whole scheme is chosen so that **one adder handles both**. `0xFF + 0x01` overflows to
+`0x00` whether you call the operands `255 + 1` or `−1 + 1`; the hardware does not need to know
+which you meant. That is why two's complement won and sign-magnitude did not.
+
+It also explains the negation rule. To negate `x` you want the `y` where `x + y` wraps to zero.
+Flipping every bit gives `~x`, and `x + ~x` is all ones, which is `−1`. Add one more and you
+land on zero — so `-x == ~x + 1`:
+
+```csharp
+int x = 5;
+Convert.ToString(x, 2).PadLeft(8, '0');   // 00000101   =  5
+Convert.ToString(~x, 2)[^8..];            // 11111010   = -6   every bit flipped
+Convert.ToString(~x + 1, 2)[^8..];        // 11111011   = -5   ...and one added
+Convert.ToString(-5, 2)[^8..];            // 11111011   the same bits
+```
+
+That is not a coincidence for small numbers, and it is not something you need a machine to
+confirm: it holds for all 4,294,967,296 values of `int`, including `int.MinValue`, because it
+is an algebraic identity of mod-2³² arithmetic, not a property of the five numbers above.
+`-x` and `~x + 1` are the same computation performed two different ways, so they agree
+everywhere the underlying arithmetic is defined — which, since it is modular, is everywhere.
+
+<Callout kind="insight" label="the asymmetry that bites">
+  The range is not symmetric: `int` runs from −2,147,483,648 to +2,147,483,647. There is one
+  more negative number than positive, because `0` occupies a slot on the positive side. So
+  `int.MinValue` has no positive twin. Negate it at run time and you get `int.MinValue` back
+  unchanged; write it as a literal and the compiler refuses outright, because constant
+  expressions are folded in *checked* mode even when your code is not. `Math.Abs(int.MinValue)`
+  throws `OverflowException` rather than lie to you. Anything that takes an absolute value of
+  untrusted input has to survive that.
+</Callout>
+
+### overflow is wraparound, not an error
+
+C# arithmetic on integers is `unchecked` by default: adding past the top of the range does not
+throw, it wraps to the bottom. The bits carry out of the register and are dropped, exactly like
+an odometer.
+
+```csharp
+int max = int.MaxValue;
+
+unchecked(max + 1)               // -2147483648   silently
+unchecked((byte)(255 + 1))       //  0
+checked(max + 1)                 // throws OverflowException at run time
+```
+
+The variable matters: `checked(int.MaxValue + 1)` on the *literal* is a compile error
+(`CS0220: the operation overflows at compile time`), because the compiler folds constants and
+refuses. Only values it cannot see through reach run time — which is exactly the case where a
+counter grows past the top and nobody is watching.
+
+The classic production shape of this is the binary-search midpoint. Both indices are legal,
+their sum is not:
+
+```csharp
+int lo = 2_000_000_000, hi = 2_100_000_000;
+
+(lo + hi) / 2          // -97483648      → IndexOutOfRangeException, or worse, a wrong answer
+lo + (hi - lo) / 2     //  2050000000    → correct, and can never overflow
+```
+
+`hi - lo` is a distance, and a distance between two non-negative `int` values always fits in an
+`int`. Write the second form every time — [binary search](/patterns/binary-search/) is where you
+will need it.
+
+<Callout kind="trap" label="the two meanings of overflow">
+  "Overflow" in an integer context means wraparound and, by default in C#, is silent. "Stack
+  overflow" is a completely unrelated event — running out of the fixed region a thread uses for
+  call frames — and it kills the process rather than wrapping. Same word, no relationship. The
+  stack one lives in [stack vs heap](/systems/stack-and-heap/).
+</Callout>
+
+### an address is a number — and a C# reference is one
+
+This is the sentence the rest of the section stands on: **a C# reference is an address that the
+runtime manages for you.** Not a handle, not an ID, not a magic token. It is a 64-bit number
+naming a byte in the process's memory, and you can print it:
+
+```csharp
+object o = new object();
+nint before = Unsafe.As<object, nint>(ref o);        // reinterpret the reference as a number
+
+for (int i = 0; i < 300; i++) { var junk = new byte[20_000]; GC.KeepAlive(junk); }
+GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);
+
+nint after = Unsafe.As<object, nint>(ref o);         // same object, same variable
+```
+
+```text
+o lives at 0x7FE38440D388
+after a compacting GC, o lives at 0x7FE383C0BF20
+```
+
+The object did not change. Its address did, because a compacting collection slid the surviving
+objects together and rewrote every reference that pointed at them — which is precisely the part
+the runtime "manages". That is the difference between a C# reference and a C pointer: same
+representation, but one of them can be moved out from under you.
+
+Three consequences that are otherwise arbitrary rules:
+
+- `fixed` and `GCHandle` exist to *pin* an object so its address stays put long enough to hand
+  to native code. Pinning fragments the heap, which is why it is discouraged.
+- Reference equality (`ReferenceEquals`) is an address comparison, so it stays correct across a
+  move only because the GC rewrites both sides at once.
+- An object's address is useless as an identity: `RuntimeHelpers.GetHashCode` does not return
+  it, precisely because it would change under you.
+
+Where those addresses come from — and why some values never get one at all — is
+[stack vs heap](/systems/stack-and-heap/). Why every process gets its own private numbering, and
+why not one of these numbers is the physical location of anything, is
+[virtual memory](/systems/virtual-memory/).
+
+### alignment: not every address is allowed
+
+Memory does not move one byte at a time. It moves in fixed-size blocks called **cache lines** —
+64 bytes on this machine, which is what `getconf LEVEL1_DCACHE_LINESIZE` reports here — and the
+CPU never fetches a single byte, it fetches the line around it. So a value sitting at an address
+that is a multiple of its own size is read in one access, while one that straddles a line
+boundary may take two. (The ladder those lines travel is
+[memory hierarchy](/systems/memory-hierarchy/); this page needs only the 64 bytes.) That is why a
+type of size S wants to sit at an address that is a multiple of S — a `long` at a multiple of 8,
+an `int` at a multiple of 4. A struct inherits the strictest alignment of its fields, and the compiler
+inserts **padding**: bytes that hold nothing, purely to push the next field onto a legal
+address, plus trailing bytes so that the *next array element* also lands legally.
+
+```text
+struct Naive { byte Flag; long Ticks; byte Kind; }     // 1 + 8 + 1 = 10 bytes of data
+
+ offset  0     1                  8                 16    17           24
+         ┌──┬───────────────────┬──────────────────┬──┬──────────────┐
+         │F │  7 bytes padding  │      Ticks       │K │ 7 bytes pad  │
+         └──┴───────────────────┴──────────────────┴──┴──────────────┘
+                                                        size = 24 bytes
+```
+
+Fourteen of those 24 bytes are padding, and reordering the fields removes eight of them: the
+same three fields declared widest-first are 16 bytes, with 6 bytes of tail padding left over,
+because the size still has to round up to a multiple of the struct's 8-byte alignment. No
+ordering of these three fields reaches 10 — only `[StructLayout(Pack = 1)]` does, and it buys
+that by giving up alignment. That is the whole of
+[Struct Size & Padding](/systems/bits-and-memory/sizeof-and-layout/), worked out field by field.
+
+### endianness, and the only place it bites
+
+A 4-byte `int` occupies four consecutive addresses. Which end holds the most significant byte is
+a hardware choice. x86-64 and ARM as normally configured are **little-endian**: the *least*
+significant byte goes at the lowest address.
+
+```csharp
+int v = 0x01020304;
+Convert.ToHexString(MemoryMarshal.AsBytes<int>([v]));   // 04030201  ← reversed, in memory
+Convert.ToHexString(BitConverter.GetBytes(v));          // 04030201  ← host order, whatever that is
+
+Span<byte> wire = stackalloc byte[4];
+BinaryPrimitives.WriteInt32BigEndian(wire, v);
+Convert.ToHexString(wire);                              // 01020304  ← what you meant to send
+```
+
+Inside your process this never matters: the same CPU wrote the bytes that reads them. It bites
+at exactly one place — **a boundary where bytes leave the process**: a socket, a file format, a
+binary protocol, a hash of a struct's bytes, a checksum. Network protocols standardised on
+big-endian, which is why it is also called network byte order.
+
+The .NET trap you will actually meet is `Guid`:
+
+```text
+new Guid("00112233-4455-6677-8899-aabbccddeeff")
+  .ToByteArray()                  → 33221100554477668899AABBCCDDEEFF
+  .ToByteArray(bigEndian: true)   → 00112233445566778899AABBCCDDEEFF
+```
+
+The first three groups come back byte-reversed by default, because .NET stores them as an
+`int` and two `short` values in host order. Round-trip a `Guid` through `ToByteArray()` in C#
+and parse it as raw bytes in Java, Postgres, or Python and you get a different GUID. Use
+`BinaryPrimitives` and the explicit `bigEndian` overloads at every boundary; never
+`BitConverter` and never a raw `MemoryMarshal.AsBytes` reinterpretation.
+
+## the mental model
+
+One array. Numbers in it. Types are a reading convention.
+
+| the thing you say | what is actually there |
+| --- | --- |
+| "a variable" | some bytes at a fixed offset from a known address |
+| "an object" | a run of bytes on the heap, plus a header the runtime reads |
+| "a reference" | one 8-byte number naming that run of bytes |
+| "an `int`" | 4 bytes, top bit weighted −2³¹ |
+| "negative" | the top bit is set; `-x` is `~x + 1` |
+| "it overflowed" | the carry left the register and nobody caught it |
+| "the struct is 24 bytes" | 10 bytes of your data and 14 of alignment padding |
+
+<Watch items={[['bit', '0 or 1'], ['byte', '8 bits, 1 address'], ['word', '8 bytes here'], ['int', '4 bytes, two\'s complement'], ['reference', '8 bytes = an address'], ['hex digit', '4 bits']]} />
+
+## why you should care
+
+**Memory per row is a design decision, and you make it in the field-order line.** A cache of
+20 million rows built from the 24-byte struct above costs 480 MB; the same three fields
+reordered cost 320 MB. That 160 MB is not an optimisation you apply later — it is padding you
+chose by typing the fields in a particular order, and it moves container memory limits, GC
+pause length, and how much of the working set fits in cache. The
+[exercise for this topic](/systems/bits-and-memory/sizeof-and-layout/) walks that exact
+struct byte by byte.
+
+**Silent wraparound is a correctness bug with no exception to find it by.** Counters, byte
+totals, and millisecond durations accumulated into an `int` do not throw when they pass two
+billion; they go negative. The symptom is a dashboard with a negative value, or a
+`IndexOutOfRangeException` in a binary search over a large collection, or a duration that
+suddenly reads as a large negative number of ticks. The review rule is short: any accumulator
+over untrusted or unbounded input is `long`, and any midpoint is `lo + (hi - lo) / 2`.
+
+**Every binary boundary is an endianness decision, whether you made it or not.** If a service
+writes integers to Kafka, Redis, a file header, or a socket with `BitConverter.GetBytes`, it has
+silently declared "the reader is x86". The bug does not appear until something reads it that
+is not — a different language's parser, a checksum computed elsewhere, or a Guid stored as
+`bytea`. `BinaryPrimitives.Write*BigEndian` costs the same and states the contract.
+
+**And once you accept that a reference is an address**, a pile of .NET behaviour stops being
+arbitrary: why `fixed` exists, why pinning hurts the GC, why `Span<T>` cannot be a field of a
+class, why a struct copies on assignment while a class does not, and why a memory dump is
+readable at all. All of that is downstream of "it is a number naming a byte".
+
+Two doors lead out of this page. One goes up a level: those bytes belong to *something* — a
+process with its own address space, and threads that share some of it and not the rest, which is
+[processes, threads and the kernel](/systems/process-and-thread/). The other goes sideways: once
+you can see integers as bit patterns, a whole category of interview question collapses into
+three lines of masking and XOR, which is [bit manipulation](/patterns/bit-manipulation/).
+
+## the same idea in other languages
+
+Every row below was compiled and run on this machine today.
+
+| language | what it's called | the trap |
+| --- | --- | --- |
+| C / C++ | `sizeof`, `offsetof`, `struct` padding | Signed overflow is *undefined behaviour*, not wraparound: the compiler may assume it never happens and delete your `if (x + 1 < x)` check. Unsigned overflow does wrap, and is defined. C# is the safer language here — it defines the wrap. |
+| Java | two's complement `int`, no unsigned types | `Math.abs(Integer.MIN_VALUE)` returns `-2147483648` — it does not throw. C#'s `Math.Abs` throws `OverflowException` on the same input. Java also has no `checked` block, so every overflow is silent; and it needs `>>>` for a logical right shift because `>>` sign-extends. |
+| Go | `unsafe.Sizeof`, `unsafe.Offsetof` | Go lays fields out in declaration order and never reorders, so the same `Flag byte; Ticks int64; Kind byte` struct is 24 bytes here, exactly as in C#. Separately, `int` is *platform-sized* (8 bytes on this box) — it is not a fixed-width type, unlike C#'s `int`. |
+| Rust | `std::mem::size_of`, `#[repr(C)]` | Default `repr(Rust)` reorders fields: the same struct is 16 bytes, while `#[repr(C)]` gives 24. And overflow *panics* in a debug build but wraps in release — the same code changes behaviour with the build flag, so bugs pass tests and fail in production. |
+| Python | arbitrary-precision `int` | There is no wraparound at all: `1 << 200` is exact, so a bit trick ported from C# never overflows and never gives the C# answer. `%` also floors instead of truncating — Python's `-5 % 3` is `1`, C#'s is `-2`. |
+
+The C row is the one worth seeing rather than believing, because it is the one place where the
+C# habit is actively dangerous. Both functions below say the same thing; `gcc -O2` on this box
+compiled them completely differently:
+
+```text
+int      check (int x)      { return x + 1 > x; }
+unsigned ucheck(unsigned x) { return x + 1 > x; }
+
+0000000000000000 <check>:
+   0:   endbr64
+   4:   mov    $0x1,%eax               ; signed overflow is undefined, so the compiler assumes
+   9:   ret                            ;   it never happens — the test is gone, always true
+   a:   nopw   0x0(%rax,%rax,1)
+
+0000000000000010 <ucheck>:
+  10:   endbr64
+  14:   xor    %eax,%eax
+  16:   cmp    $0xffffffff,%edi        ; unsigned wraparound *is* defined, so the test survives
+  19:   setne  %al                     ;   and really compares against UINT_MAX
+  1c:   ret
+```
+
+The overflow check written the C# way does not merely fail to fire in C — it is deleted at
+compile time. C# defining the wrap is exactly what makes `checked` possible and the same guard
+meaningful.
+
+## exercises
+
+Predict first, then work it out by hand — the gap between the guess and the reasoning is the
+lesson.
+
+<ProblemList topic="bits-and-memory" />
+
+## interview drills
+
+**Q.** A counter on your dashboard went negative overnight. Walk me through how that happens.
+
+- *weak answer* — "Something wrote a negative value" or "there's a bug in the increment". True
+  and useless; it invites the follow-up you cannot answer.
+- *strong answer* — An `int` accumulator passed 2,147,483,647 and wrapped to −2,147,483,648,
+  because C# integer arithmetic is unchecked by default: the carry bit leaves the register and
+  no exception is raised. The value on the dashboard is the correct total modulo 2³². Fix is a
+  `long` accumulator, or `checked` on the increment so it fails loudly at the source.
+- *follow-up* — "How would you find out which counter?" Look for a value near −2.1 billion, or
+  one that jumped by roughly 4.29 billion in a single scrape interval — the wrap is a fixed-size
+  step, not a random value.
+
+**Q.** Is a C# reference a pointer?
+
+- *weak answer* — "No, references are safe, pointers are unsafe." That is a description of the
+  API surface, not of the representation, and the interviewer will push.
+- *strong answer* — Structurally, yes: it is an 8-byte address of an object on the heap. The
+  difference is that the runtime owns it — a compacting GC can move the object and rewrite every
+  reference to it, so the numeric value is not stable, and you cannot do arithmetic on it. That
+  is why `fixed` and `GCHandle` exist: they pin an object so its address can safely be handed to
+  native code.
+- *follow-up* — "So why is pinning discouraged?" A pinned object cannot be relocated, so the
+  collector must compact around it, which fragments the heap.
+
+**Q.** You have a 20-million-row in-memory index of structs. How do you decide the field order?
+
+- *weak answer* — "It doesn't matter, the compiler sorts it out." It does matter: C# emits
+  sequential layout for structs, and the runtime honours declaration order for anything without
+  a reference field.
+- *strong answer* — Largest alignment first, smallest last, so padding collapses. A `byte`,
+  `long`, `byte` struct is 24 bytes; reorder to `long`, `byte`, `byte` and it is 16. At 20
+  million rows that is 480 MB versus 320 MB, and the smaller one keeps more of the index in
+  cache. I'd measure `Unsafe.SizeOf` rather than assume, because a struct containing an object
+  reference gets laid out differently again.
+- *follow-up* — "Why not `[StructLayout(Pack = 1)]`?" It removes the padding but breaks natural
+  alignment, so loads may straddle a cache line and the runtime's atomicity guarantee for
+  aligned word-sized reads no longer applies.
+
+**Q.** Your service writes an `int` to a socket and the consumer reads garbage. Where do you look?
+
+- *weak answer* — "Check the serializer settings." There may not be a serializer; this is raw
+  bytes.
+- *strong answer* — Byte order first. `BitConverter.GetBytes` emits host order, which is
+  little-endian on x86-64 and ARM; almost every wire protocol is big-endian. If the consumer is
+  another language or another platform, the four bytes arrive reversed and the value looks like
+  noise. The fix is `BinaryPrimitives.WriteInt32BigEndian` on both sides — explicit at the
+  boundary, and free.
+- *follow-up* — "How would you confirm it quickly?" Send a value whose bytes are distinctive,
+  like `0x01020304`, and dump what the consumer received. Reversal is unmistakable.
+
+**Q.** `(low + high) / 2` — what's wrong with it, and why did it survive code review?
+
+- *weak answer* — "You should use `low + (high - low) / 2`." Correct, but reciting the fix
+  without the reason gets a follow-up about *when* it matters.
+- *strong answer* — Both indices can be valid and their sum still overflow `int`, producing a
+  negative midpoint and an out-of-range index. It survives review because it is only reachable
+  when the collection has more than about a billion elements — so every test passes, and it
+  fails in production on the one service that got big. `low + (high - low) / 2` computes a
+  distance first, and a distance between two non-negative `int` values always fits.
+- *follow-up* — "Is it the same bug when you bisect a value range rather than an index range?"
+  Yes, and it arrives far sooner: bisecting over timestamps, IDs or prices passes two billion
+  immediately, which is why those searches belong in `long` — and still want the distance form.
+
+**Q.** Why is the size of a struct not the sum of its fields?
+
+- *weak answer* — "Alignment." True, but a one-word answer invites the whole question again.
+- *strong answer* — Each field must start at an address that is a multiple of its own size, so
+  the compiler inserts padding between fields, and pads the tail so the *next* array element
+  starts aligned too. `byte`, `long`, `byte` holds 10 bytes of data and occupies 24. The
+  hardware reason is that a misaligned load can span two cache lines and stop being a single
+  operation.
+- *follow-up* — "Does the CLR ever reorder fields?" Yes — any type holding an object reference
+  is laid out automatically regardless of declaration order, even one that asks for
+  `LayoutKind.Sequential` explicitly. Classes default to automatic layout as well, but that is a
+  default rather than a rule: a reference-free class that asks for `LayoutKind.Sequential` does
+  get it — on this box a `byte`, `long`, `byte` class landed at offsets 0, 8 and 16 with the
+  attribute and at 8, 0, 9 without it.

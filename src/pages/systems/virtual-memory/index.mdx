@@ -1,0 +1,692 @@
+---
+layout: '@layouts/TopicLayout.astro'
+topic: virtual-memory
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import ProblemList from '@components/ProblemList.astro';
+import Solution from '@components/Solution.astro';
+
+## the ground floor
+
+- **address** — one number, an index into the flat array of bytes that is your process's
+  memory. [Bits, bytes and addresses](/systems/bits-and-memory/) builds that from nothing.
+- **page** — the unit the operating system manages memory in: 4 KiB on this box (`getconf
+  PAGESIZE` prints 4096). Mappings, permissions and faults are all per page, never per byte.
+- **the kernel** — the trusted part of the OS, the only code allowed to edit the tables this
+  page is about. **User mode** is where your code runs, and a **syscall** is the deliberate
+  door between them. [Processes, threads and the kernel](/systems/process-and-thread/) opens
+  that door.
+- **a process is an address space plus a handle table** — same page. This one is about the
+  address-space half: what it is actually made of, and what each part of it costs.
+- **the MMU** — memory management unit, a piece of hardware inside the CPU that turns the
+  addresses your instructions use into the addresses the memory chips use. It is not optional
+  and it sits on the critical path of every load and every store the machine performs.
+
+## core idea
+
+Every address your program handles — every reference, every `Span<T>`, every pointer you see in
+a disassembly — is a **virtual** address. It is not where the data is. It is a lookup key that
+the MMU translates, through a table of mappings the kernel maintains for your process, into a
+**physical** address before it reaches memory. Each process gets its own table, so two processes
+can both use address `0x7f2c53e00000` for completely different data and neither can see the
+other's.
+
+The second consequence is the one that surprises people: a virtual address can map to *nothing*.
+That is not an error, it is the normal state of nearly all of your address space. Claiming
+address space is bookkeeping; getting physical memory happens later, one page at a time, the
+first time you touch it — and that is why "how much memory does this service use" has four
+different correct answers.
+
+| the question | the number that answers it | this box, .NET process that has done nothing |
+| --- | --- | --- |
+| how much address space has it claimed | `VmSize`, "virtual size" | 127,933 MiB |
+| how much of that is in RAM right now | `VmRSS`, "resident set" | 24 MiB |
+| how much of the resident set is its own | `Pss`, proportional set size | 7 MiB |
+| how much does the GC think it is using | `GC.GetTotalMemory` | 0 MiB |
+
+`bench/virtual-memory/address-space-snapshot.cs` prints all four: it reads `/proc/self/status`,
+`/proc/self/smaps_rollup` and `/proc/self/maps` back to back into memory before printing
+anything, so these really are four measurements of one process at one instant rather than four
+programs' worth of drift. The rest of that one run — the mappings and the `smaps_rollup` those
+numbers came from — appears further down the page. A 125 GiB claim on a 60 GiB machine is not a
+bug and not a leak.
+
+## how it actually works
+
+### an address is a lookup key, not a location
+
+Linux exposes the real translation through `/proc/self/pagemap`: eight bytes per virtual page,
+bit 63 saying whether the page is present in physical memory. (Bits 0-54 would carry the
+physical frame number too, but only for a process with `CAP_SYS_ADMIN` — this session does not
+have it, so that half is redacted to zero below. The present bit still needs no privilege at
+all, and it is the half that proves the point.) From
+`bench/virtual-memory/pagemap-walk.c`, compiled here with `gcc -O2`:
+
+```text
+mmap gave us 16 MiB of address space at 0x7fc3a5400000
+
+--- 1. demand paging (present bit, no privilege needed) ---
+after mmap, before any touch       vaddr 0x7fc3a5400000  present=0  no physical page at all
+after writing one byte             vaddr 0x7fc3a5400000  present=1  pfn(raw)=0x000000
+its neighbour, 1 MiB further in    vaddr 0x7fc3a5500000  present=0  no physical page at all
+```
+
+Sixteen mebibytes of address space arrived instantly and **none of it existed**. The first line
+is the honest state of a fresh allocation: the address is legal, the kernel has written down that
+this range is yours, and there is no memory behind it. One byte written to the first page flips
+its entry from absent to present. Its neighbour a mebibyte away is still nothing at all, because
+nobody has asked for it yet.
+
+That is the whole trick, and everything else on this page is a consequence of it.
+
+### the page table is a four-level tree
+
+`lscpu` on this machine reports "48 bits physical, 48 bits virtual". Forty-eight bits of virtual
+address is 256 TiB, and a flat table of 4 KiB pages covering it would need 512 GiB of table per
+process, which is absurd. So x86-64 splits the address into four 9-bit indices and one 12-bit
+offset, and walks a tree. The same program prints the split of the address it was given:
+
+```text
+the MMU splits 0x7fc3a5400000 into  pml4 255 | pdpt 270 | pd 298 | pt 0 | offset 0
+```
+
+```text
+   virtual address 0x7fc3a5400000, 48 bits that matter
+   ┌────── 9 ─────┬───── 9 ─────┬──── 9 ────┬──── 9 ────┬────── 12 ──────┐
+   │  pml4  255   │  pdpt  270  │   pd 298  │   pt   0  │   offset    0  │
+   └──────┬───────┴──────┬──────┴─────┬─────┴─────┬─────┴────────┬───────┘
+          │              │            │           │              │
+  CR3 ──► PML4 ────────► PDPT ──────► PD ───────► PT ──────► frame N
+  (per-process    each table is ONE 4 KiB page: 512 entries × 8 bytes         │
+   register)      each entry holds the physical address of the next table     │
+                  plus its permission bits: present, writable, user, no-execute
+                                                                              ▼
+                                          physical byte  frame N × 4096 + offset
+```
+
+Four things fall out of that picture and all four matter:
+
+- **`CR3` is the whole context.** A control register in the CPU holds the physical address of
+  this process's top-level table. Switching processes means writing `CR3`, and every translation
+  after that instruction resolves against a different tree. That single register is what makes
+  two processes' identical addresses different bytes. It is also the part of a context switch
+  that [processes and threads](/systems/process-and-thread/) hands off to this page: threads of
+  one process share `CR3`, so switching between them changes nothing about translation. A process
+  switch rewrites it, and on older x86 that flushed the TLB outright — the architecture defines a
+  process-context id (PCID) so a chip can tag entries instead and skip that flush, though what a
+  given box actually exposes varies: this container's CPU flags list `invpcid` (the instruction
+  that invalidates specific tagged entries) without the plain `pcid` feature bit, most likely
+  because the hypervisor hosting it filters CPUID. Treat PCID as the documented x86-64 mechanism,
+  not something every box demonstrates identically.
+- **A translation costs up to four dependent memory reads** — one per level — before the load you
+  actually wrote can even start. Which would be ruinous, so the next section exists.
+- **Permissions live in the entries, not in your code.** Read-only, no-execute and user-vs-kernel
+  are bits in the page-table entry. A write to a read-only page is not caught by a check the
+  compiler emitted; the MMU refuses it and traps.
+- **Nothing forces an entry to exist.** A missing entry is the `present=0` state above, and
+  reaching it is a **page fault**: the CPU abandons the instruction and jumps into the kernel.
+
+### the TLB, the cache that makes this affordable
+
+Since every access would otherwise pay for a four-level walk, the CPU caches recent translations
+in the **TLB** (translation lookaside buffer): a small, per-core, associative cache of
+virtual-page → frame mappings sitting between the core and that four-level tree. A hit needs no
+memory read at all; a miss pays for some or all of the walk (dedicated caches for the upper
+levels usually soften it short of a full four reads).
+
+The TLB is small on purpose — it sits in the path of essentially every memory access, so it has
+to stay small enough to check on every one of them. Published figures for recent x86-64 cores put the first level at a few
+dozen entries and a unified second level at one to two thousand (not measured here; this box has
+neither `cpuid` nor `perf`). At 4 KiB per entry, that puts the second level's **reach** — how much
+memory it can translate without a walk — at a handful of megabytes. Touch more distinct pages
+than that in a tight loop and translation misses stop being occasional.
+
+That arithmetic is reasoning you can do on paper; measuring it yourself is where most people trip
+over a second, unrelated mechanism, and it is worth knowing before you try. [The memory
+hierarchy](/systems/memory-hierarchy/) owns this vocabulary in full, and this much of it is
+enough here: a CPU cache is not a free-for-all. It is divided into **sets**, a fixed slice of the
+middle address bits picks which set a line goes into, and each set holds a fixed number of
+lines — its **ways**. Two addresses whose set-index bits match compete for the same handful of
+ways, however large the cache is. Read off this box's own geometry
+(`/sys/devices/system/cpu/cpu0/cache`): L1d is 32 KiB, 8-way, 64-byte lines, which is 64 sets; L2
+is 512 KiB, 8-way, which is 1,024 sets.
+
+Here is the trap. A stride of exactly one page — 4096 bytes — holds address bits 6-11 constant,
+and those are precisely the bits this box's L1 uses to pick a set. Walk memory one byte per page
+at that stride and every line you touch lands in the *same* L1 set; only eight of them (this
+box's ways) can be resident there at once, however big L1 actually is. L2 fares only a little
+better: a 4096-byte stride reaches just 16 of its 1,024 sets. So a benchmark built to isolate "the
+cost of translation" by spreading data across pages exactly 4096 bytes apart is not isolating
+anything — it is quietly adding a cache-set collision on top of whatever the TLB is doing, and the
+two effects land in the same number with no way to tell them apart after the fact. The fix, if
+you ever build this yourself: advance by one page *plus one cache line* instead of by exactly one
+page, so the set index moves on every hop and only the translation cost is left standing.
+
+### nothing is real until you touch it
+
+`bench/virtual-memory/first-touch-faults.cs` allocates one 256 MiB array — 65,536 pages — and
+reports the kernel's own counters at each step. `/proc/self/stat` field 10 is the process's minor
+fault count, field 12 its major faults; `VmRSS` is how much of the process is in physical memory:
+
+```text
+process at rest: VmSize 127,842 MiB, VmRSS 29,356 kB, VmPTE 268 kB
+
+new byte[256 MiB]                  minor +    389  major +  0  VmRSS    28,820 ->    30,472 kB (    1,652)  VmPTE    268 ->    284 kB
+read one byte per page             minor + 65,552  major +  0  VmRSS    30,472 ->    30,720 kB (      248)  VmPTE    284 ->    796 kB
+write one byte per page            minor + 65,543  major +  0  VmRSS    30,720 ->   292,892 kB (  262,172)  VmPTE    796 ->    796 kB
+write the same bytes again         minor +      8  major +  0  VmRSS   292,892 ->   292,924 kB (       32)  VmPTE    796 ->    796 kB
+```
+
+`VmRSS` is in kilobytes on purpose: rounded to whole mebibytes, two of these four rows would
+appear to have moved a megabyte that never happened. `VmPTE` is the kernel's count of the
+page-table pages this process owns — and it is *not* part of `VmRSS`, which turns out to matter
+one row down.
+
+Read that top to bottom, because every line is a surprise the first time:
+
+**Allocating 256 MiB cost 389 faults and 1.5 MiB of RAM.** `new byte[]` of that size makes the
+runtime ask the kernel for address space. The kernel appends a record to a list, returns, and
+your array reference is valid. There is no memory behind it, which is also why .NET does not have
+to zero it: fresh pages from the kernel are already zero, guaranteed, because handing you another
+process's leftovers would be a security hole.
+
+**The read pass took 65,552 faults and barely moved the resident set.** One fault per page — the
+first read of each page trapped into the kernel — and `VmRSS` moved by 248 kB, which is not the
+array. The kernel satisfied every one of those faults by pointing the page-table entry at a
+single shared, read-only page of zeros that the whole system uses, and Linux does not count a
+mapping to the zero page as resident at all.
+
+To show that the small VmRSS bump is the runtime warming up and not the pages, the same program
+runs the read pass a second time on a second fresh array, in eighths, after everything is warm:
+
+```text
+warm runtime, second array, read one byte per page, in eighths of 8,192 pages:
+  eighth 0   VmRSS +   188 kB   VmPTE +   64 kB
+  eighth 1   VmRSS +     0 kB   VmPTE +   64 kB
+  eighth 2   VmRSS +     0 kB   VmPTE +   64 kB
+  eighth 3   VmRSS +     0 kB   VmPTE +   64 kB
+  eighth 4   VmRSS +     0 kB   VmPTE +   64 kB
+  eighth 5   VmRSS +     0 kB   VmPTE +   64 kB
+  eighth 6   VmRSS +     0 kB   VmPTE +   64 kB
+  eighth 7   VmRSS +     0 kB   VmPTE +   64 kB
+```
+
+Read-touching 8,192 pages costs **nothing resident** — 0 kB in seven of the eight chunks — and
+exactly **64 kB of page table** in all eight, which is 8,192 leaf entries at 8 bytes each, to the
+byte. Page tables are memory too; they are simply charged to a different counter, which is why a
+process can fault in sixty-five thousand pages and have its RSS dashboard show almost nothing at
+all. (The 188 kB in the first eighth is the JIT still tiering the loop it is running — a first
+iteration that measures something other than what you meant to measure, which is the same reason
+a timing benchmark always discards its first pass.)
+
+`bench/virtual-memory/pagemap-walk.c` proves the sharing directly, this time reading the
+per-mapping fields of `/proc/self/smaps` instead of a frame number — `Rss` (pages resident in this
+mapping), `Shared_Dirty` (resident pages more than one process currently maps) and `Private_Dirty`
+(resident pages only this process maps):
+
+```text
+--- 2. the shared zero page, seen through RSS instead of a frame number ---
+before touching z[0..2]            Rss   4 kB   Shared_Dirty   0 kB   Private_Dirty   4 kB
+three pages read-touched, values 0 0 0
+after 3 read touches               Rss   4 kB   Shared_Dirty   0 kB   Private_Dirty   4 kB
+after writing z[0] too             Rss   8 kB   Shared_Dirty   0 kB   Private_Dirty   8 kB
+```
+
+`Rss` starts at 4 kB from an earlier write elsewhere in the same mapping. Three more pages get
+read-touched — three pages that have never been touched by anything — and `Rss` does not move at
+all. Then one of those three pages is written, and `Rss` jumps by exactly one page, 4 kB. The read
+touches genuinely cost nothing resident; only the write did.
+
+<Callout kind="insight" label="the cheapest big array is the one you never read first">
+  `Array.Clear`, `Span.Fill(0)` and a defensive "initialize it to zero" loop over a freshly
+  allocated array all do the same thing: force every page to become real, in a burst, at a moment
+  you chose. Sometimes that is exactly what you want (a warmup). On the allocation path of a
+  request it is 65,000 trips into the kernel that the runtime had already arranged for you to
+  avoid.
+</Callout>
+
+[The First Touch](/systems/virtual-memory/page-fault-walk/) walks the same four states — a fresh
+write, a repeat write, a fresh read, a write that follows a read — and counts exactly how many
+times each one reaches into the kernel.
+
+### minor faults, major faults, and the one that ruins your afternoon
+
+A **fault** is not an error. It is the CPU saying "this translation is not usable, kernel, deal
+with it" and the kernel dealing with it, after which your instruction re-runs as if nothing had
+happened. What varies is how far the kernel has to go:
+
+- **minor fault** — everything needed is already in RAM. Allocate a free frame, or point at a
+  page already in the page cache, or copy a page for copy-on-write. The thread never leaves the
+  CPU.
+- **major fault** — the data is not in RAM at all and must be read from a device: a file you
+  mapped, an executable page nobody has touched yet, or (on a box with swap) a page that was
+  paged out. The thread is *blocked*, and the scheduler runs somebody else meanwhile.
+
+`bench/virtual-memory/fault-ladder.c` walks one byte per page over a 64 MiB region six different
+ways and reports only the kernel's own fault counters — no clock in the file at all:
+
+| walk | what it has to do | minor faults | major faults |
+| --- | --- | --- | --- |
+| A | anonymous memory, first touch is a write | 16,384 | 0 |
+| B | anonymous memory, first touch is a read | 16,384 | 0 |
+| C | anonymous memory, already resident | 0 | 0 |
+| D | file-backed, page cache dropped, readahead off | 0 | 16,384 |
+| E | file-backed, page cache dropped, readahead on | 516 | 1 |
+| F | file-backed, warm page cache | 516 | 0 |
+
+Three things this table is worth reading slowly for:
+
+- **Row C is 0 and 0.** Once an entry exists, touching the page again never reaches the kernel at
+  all — every other row is entirely about pages the page table did not yet have an answer for.
+- **Rows A and B both fault once per page, and the counter cannot tell you they are different
+  amounts of work.** A write fault has to find a free physical frame, zero it, and install a
+  writable entry; a read fault only has to point the entry at the shared zero page. Both increment
+  `minflt` by exactly one. The counter tells you *that* a fault happened, not how much the kernel
+  did inside it — which is the recurring trap of treating a fault count as a stand-in for
+  everything a fault costs.
+- **Readahead turns 16,384 possible faults into 516.** Row D has readahead off, so every page the
+  process has never touched needs its own trip to disk: 16,384 major faults, one per page. Row E
+  is the identical cold file with the kernel's default readahead left on: the very first fault
+  triggers a batched read of neighbouring pages — roughly 32 pages per real disk access here
+  (16,384 ÷ 516 ≈ 31.8, close to the kernel's usual 128 KiB readahead window) — so only one fault
+  actually waits on the disk and the rest land as minor faults against pages that are already
+  there by the time they are asked for. Row F, the same file mapped fresh once it is fully warm in
+  the page cache, shows the ceiling of that effect: with nothing left to read from disk at all,
+  those same 516 minor faults still happen, because a fresh `mmap` needs a page-table entry
+  installed per page regardless of whether the data behind it was already in RAM.
+
+This box has no swap, so the only major faults available here are file-backed ones. On a server
+with swap enabled, the identical mechanism applies to anonymous memory the kernel decided to
+evict, and the symptom is the classic one: a service that was fine becomes uniformly, mysteriously
+unresponsive on a subset of requests, with `si`/`so` moving in `vmstat` and the CPU mostly idle —
+because the blocked threads are not spinning, they are parked waiting on a disk.
+
+### a fault is not a syscall
+
+This one costs people hours in a debugger. `bench/virtual-memory/touch-pages.c` mmaps 64 MiB and
+writes one byte to each of its 16,384 pages. Under `strace -c`, which traces every syscall the
+process makes:
+
+```text
+touched 16384 pages, minor faults 16452, major faults 0
+
+mmap             calls 9
+brk              calls 3
+fstat            calls 3
+mprotect         calls 3
+openat           calls 2
+close            calls 2
+pread64          calls 2
+write            calls 1
+read             calls 1
+getrusage        calls 1
+arch_prctl       calls 1
+set_tid_address  calls 1
+set_robust_list  calls 1
+prlimit64        calls 1
+getrandom        calls 1
+rseq             calls 1
+execve           calls 1
+munmap           calls 1
+access           calls 1   errors 1
+```
+
+Thirty-six syscalls in the entire process, nine of them `mmap` — eight from the dynamic loader
+and one of ours — and *sixteen thousand four hundred and fifty-two* entries into the kernel that
+`strace` cannot see at all. A syscall is your code asking. A fault is the hardware interrupting
+your code mid-instruction. Different mechanism, different entry point, and invisible to syscall
+tracing. When you need to see faults: `/proc/PID/stat`, `getrusage`, or
+`ps -o min_flt,maj_flt -p PID`.
+
+### copy-on-write
+
+If two page-table entries can point at the same frame — which the shared zero page just proved —
+then two *processes* can share physical memory while both believe they own it privately. Mark the
+entries read-only, and let the first write trap. Act 3 of `pagemap-walk.c` forks, and both sides
+report the `Shared_Dirty` / `Private_Dirty` split of the same mapping — the fields the kernel uses
+to say "how many mappers does each resident page here have right now":
+
+```text
+--- 3. fork: one shared page becomes two private ones ---
+parent, before fork                Rss   8 kB   Shared_Dirty   0 kB   Private_Dirty   8 kB
+child, right after fork (COW: shared) Rss   8 kB   Shared_Dirty   8 kB   Private_Dirty   0 kB
+child, after its own write (COW broke) Rss   8 kB   Shared_Dirty   4 kB   Private_Dirty   4 kB
+parent, after child's write (still its own copy) Rss   8 kB   Shared_Dirty   0 kB   Private_Dirty   8 kB
+```
+
+Before the fork, both resident pages are `Private_Dirty` — only one process maps them. The instant
+`fork()` returns, both flip entirely to `Shared_Dirty`: parent and child now both map the exact
+same physical pages, read-only, and the kernel's own accounting says so. The child then writes to
+one of the two pages. That one page flips back to `Private_Dirty` for the child (its own fresh
+copy now) while the other stays `Shared_Dirty` — still genuinely shared, because nobody has
+written to it. Once the child exits, the parent's view settles back to `Private_Dirty 8 kB`: it is
+once again the sole owner of both pages, one of which now differs from the copy the child briefly
+had. `fork` did not copy 16 MiB; it copied page-table entries and cleared their write bits, and
+the copy happened one page at a time, exactly for the page that got written.
+
+.NET does not fork itself, but you live on copy-on-write and page sharing every day, because
+**mapped files are shared by default**. Ask the runtime what it has mapped — this is the second
+block `address-space-snapshot.cs` prints, from the same instant as the four numbers at the top of
+the page — and the assemblies are right there, not read into the heap, mapped:
+
+```text
+77880c200000-77880cfbc000 r--s 00000000 103:09 11177133  .../10.0.11/System.Private.CoreLib.dll   [13.7 MiB]
+778797e90000-778798c62000 r-xp 00000000 103:09 11177133  .../10.0.11/System.Private.CoreLib.dll   [10.8 MiB]
+77879897a000-778798c62000 rw-p 00aca000 103:09 11177133  .../10.0.11/System.Private.CoreLib.dll   [ 2.9 MiB]
+778816fca000-778817494000 r-xp 001c9000 103:09 11177870  .../10.0.11/libcoreclr.so                [ 4.8 MiB]
+CoreLib mapped total 27.5 MiB
+```
+
+(The four largest of the eleven mappings the program printed; the path prefix
+`/usr/lib/dotnet/shared/Microsoft.NETCore.App` is elided to fit.) One file, several mappings, 27.5
+MiB of CoreLib that was never read into the heap: `r--s` is the shared, read-only image, `r-xp`
+the executable code, `rw-p` the writable data section, private and copy-on-write. Their pages
+arrive on demand, from the page cache, and the clean ones are the same physical frames every other
+.NET process on the host is using.
+
+And the consequence, from the `/proc/self/smaps_rollup` of that same instant:
+
+```text
+Rss:               25748 kB
+Pss:                7277 kB
+Shared_Clean:      21336 kB
+Shared_Dirty:         28 kB
+Private_Clean:        96 kB
+Private_Dirty:      4288 kB
+Anonymous:          2916 kB
+```
+
+`Rss` is what this process has resident. `Pss` — proportional set size — divides every shared page
+by the number of processes sharing it, so it is this process's fair share: 7.3 MiB of the 25.
+`Shared_Clean` is the bulk of it, 21 MiB of unmodified file pages that other processes are mapping
+too, and `Private_Dirty` — 4.3 MiB — is the memory that is genuinely and only this process's. Run
+ten copies of a service on one host and you do not pay ten times `Rss`; you pay ten times the
+private part plus one copy of the shared part. That is why summing `Rss` across processes exceeds
+the machine's memory, and why `Pss` exists.
+
+### reserved, committed, resident, and the number your alert fires on
+
+Four words, four different quantities, and .NET reports several of them under names that do not
+match the OS's names. Here is one process at five moments, from
+`bench/virtual-memory/memory-metrics.cs` — every number in MiB:
+
+```text
+moment                            VmSize    VmRSS WorkingSet  GC.Total   gc.Heap gc.Commit
+startup                          128,051       31         31         0         0         0
+allocated 8 GiB, untouched       128,132       34         34     8,192     4,096     4,096
+touched one byte per page        128,132    8,226      8,226     8,192     4,096     4,096
+dropped + blocking gen2 GC       128,131    8,230      8,230         0         0         0
++ LOH compaction, 2 s later      128,131    8,232      8,232         0         0         0
+```
+
+- **Reserved / virtual (`VmSize`)** — address space this process has claimed. 128 GiB before it
+  did anything, because the runtime reserves large ranges up front with no access permission at
+  all: `address-space-snapshot.cs` prints the two biggest `---p` regions of that idle process's
+  `/proc/self/maps`, 124,304 MiB and 1,758 MiB. A reservation costs some kernel bookkeeping and
+  nothing else. **This number is not a memory problem, ever.**
+- **Committed** — address space the process has promised to be able to use. On Linux with default
+  overcommit (`vm.overcommit_memory` is 0 here) this promise is deliberately loose: the kernel
+  hands out more than it has, betting you will not touch it all. Windows does not overcommit —
+  commit charge is checked against RAM plus pagefile at the time you commit — which is the single
+  biggest difference between debugging memory on the two platforms.
+- **Resident (`VmRSS`, and .NET's `WorkingSet64` — identical in every row above)** — pages
+  actually in physical memory now. This is the number your dashboard usually plots and the
+  closest single number to what a container limit is enforced against, though a cgroup counts a
+  little more than this: the page cache your file I/O created is charged to you too.
+- **The GC heap (`GC.GetTotalMemory`, `GCMemoryInfo.HeapSizeBytes`)** — bytes the collector has
+  *handed out* to objects. That is a subset of the address space the GC has committed, and it is
+  emphatically **not** a subset of resident memory: the "allocated 8 GiB, untouched" row above
+  reads 8,192 MiB of GC heap against 34 MiB of `VmRSS`, because those arrays are still nothing but
+  page-table promises. They become resident one page at a time in the row below it, which is this
+  page's whole thesis applied to the GC. Once the pages *are* resident, the GC heap is the part of
+  the resident set that excludes the runtime, the JIT's code, every [thread
+  stack](/systems/stack-and-heap/), and every mapped assembly — which is the other reason it never
+  matches your dashboard. What the collector does with those bytes, and when it hands pages back,
+  is [GC internals](/systems/gc-internals/).
+
+Now the row that ends arguments. After the 8 GiB of arrays became unreachable and a blocking,
+compacting gen2 collection ran, **the GC heap is 0 MiB and the process is still 8,230 MiB
+resident**, and it stayed there two seconds and an LOH compaction later. The collector freed the
+objects; the memory stayed mapped and resident, because returning pages to the OS is a separate
+decision the runtime makes on its own schedule. Your monitoring reports 8 GiB. `GC.GetTotalMemory`
+reports zero. Both are telling the truth about different things.
+
+(One trap in that table: `GCMemoryInfo` describes the *most recent collection*, not this instant —
+which is why `gc.Heap` reads 4,096 while `GC.GetTotalMemory` reads 8,192 in the middle rows.)
+
+All four are one small helper away from your own service. On Linux, `/proc/self/status` and
+`/proc/self/stat` are the operating system's own answer, and the fault counters in particular are
+not available any other way:
+
+<Solution>
+
+```csharp
+// Four numbers, from the two places that actually know them. Linux only:
+// /proc is where the operating system keeps the truth about your process.
+public static class MemoryFacts
+{
+    public static string Snapshot()
+    {
+        long virtualKb = FromStatus("VmSize:"), residentKb = FromStatus("VmRSS:");
+        (long minor, long major) = Faults();
+        long gcHeap = GC.GetTotalMemory(forceFullCollection: false);
+
+        return $"virtual {virtualKb / 1024:N0} MiB | resident {residentKb / 1024:N0} MiB | " +
+               $"gc heap {gcHeap / 1048576:N0} MiB | faults {minor:N0} minor, {major:N0} major";
+    }
+
+    static long FromStatus(string key)
+    {
+        foreach (string line in File.ReadLines("/proc/self/status"))
+            if (line.StartsWith(key, StringComparison.Ordinal))
+                return long.Parse(line.Split(':')[1].Trim().Split(' ')[0]);   // kB
+        return -1;
+    }
+
+    // /proc/self/stat: field 10 is minflt, field 12 is majflt. Field 2 is the command
+    // name and may contain spaces and brackets, so parse after the LAST ')'.
+    static (long minor, long major) Faults()
+    {
+        string s = File.ReadAllText("/proc/self/stat");
+        string[] f = s[(s.LastIndexOf(')') + 2)..].Split(' ');
+        return (long.Parse(f[7]), long.Parse(f[9]));
+    }
+}
+```
+
+</Solution>
+
+Called before and after allocating and touching a 64 MiB array, that prints:
+
+```text
+virtual 127,804 MiB | resident 28 MiB | gc heap 0 MiB | faults 1,666 minor, 0 major
+virtual 127,842 MiB | resident 92 MiB | gc heap 64 MiB | faults 18,084 minor, 0 major
+```
+
+16,418 new minor faults for a 64 MiB array — 16,384 pages, plus change from the runtime itself. A
+**rising major count** is the one to alert on: it means your service is waiting on a disk for
+memory it thought it had.
+
+## the mental model
+
+Three sentences, and they cover most of what you will ever need:
+
+1. **An address is a key, not a place.** The MMU translates it through a per-process tree; the
+   TLB caches the answer; missing entries are faults, not errors.
+2. **Address space is free, physical pages are not.** You get a page the first time you touch it,
+   and the bill arrives as a fault at that moment — not at allocation.
+3. **"Memory used" is four numbers.** Reserved, committed, resident, GC heap. Know which one your
+   alert is watching, because a fix that moves one of them may not move the others.
+
+```text
+   your code          the kernel's records         physical RAM
+   ─────────          ────────────────────         ────────────
+   new byte[256 MiB]  ─► a range noted           ─► nothing         0 faults, nothing resident
+   read a page        ─► entry → the zero page   ─► shared zeros    1 fault,  nothing resident
+   write a page       ─► entry → a fresh frame   ─► one real page   1 fault,  4 KiB resident
+   write it again     ─► unchanged               ─► same page       0 faults
+   process exits      ─► records dropped         ─► frames freed
+```
+
+<Watch items={[['page size', '4 KiB'], ['virtual address', '48 bits: four 9-bit indices + a 12-bit offset'], ['page-table entry', '8 bytes'], ['a fault', 'a hardware trap, not a syscall'], ['"memory used"', '4 different numbers']]} />
+
+## why you should care
+
+**The OOM kill and the `OutOfMemoryException` are different failures with different fixes.** An
+`OutOfMemoryException` is the .NET allocator failing to satisfy a request — usually the GC heap
+against a configured limit, or address-space exhaustion in a 32-bit process. An OOM kill is the
+kernel choosing a victim because *resident* memory across the cgroup exceeded its limit; your
+process gets `SIGKILL` and no exception, no `finally`, no log line. The table above is why one can
+happen without the other: a process whose GC heap is empty can still be 8 GiB resident and get
+killed, and a process at 200 MiB resident can throw `OutOfMemoryException` because it asked for a
+2 GiB contiguous array. When a pod dies with exit code 137 and the last GC log shows a small
+heap, stop looking at the GC.
+
+**GC pressure and the OOM killer are not the same problem and do not have the same fix.** GC
+pressure is an *allocation rate* problem: you are creating garbage fast enough that the collector
+runs often, and it shows up as CPU burnt in GC and latency spikes, with the heap size going up
+and down. Running out of memory is a *residency* problem: the total number of physical pages your
+cgroup holds crossed a limit. Reducing allocation rate helps the first and may do nothing for the
+second — a service that allocates almost nothing but holds a 6 GiB cache, or one whose GC has not
+returned freed pages, dies of the second while looking healthy by the first. Ask which number is
+moving before you tune anything: collections per minute and time-in-GC, or resident bytes.
+
+**Container memory accounting counts pages you did not think were yours.** A cgroup's usage
+includes the page cache your file reads created, not just your anonymous pages; the number
+Kubernetes reports as the working set is derived from cgroup usage with inactive file cache
+subtracted. So a service that streams large files can grow its reported memory without allocating
+a single managed object, and "our memory grows until we restart" is sometimes just a working
+cache doing its job.
+
+**Startup and first-request latency are partly this page.** A freshly started process has its
+code mapped but not resident, its heap claimed but not touched, and its JIT work still ahead of
+it. The first requests fault in the pages they walk — thousands of minor faults, and major ones
+where the assembly pages are still cold on disk. That is a real cost paid on the request path no
+matter what each individual fault costs, which is why a warmup request moves it off the request
+path entirely, and it is worth knowing the effect exists separately from JIT warmup — [IL, the JIT
+and codegen](/systems/il-jit-codegen/) owns that half.
+
+**In code review, this changes what you flag — and it is not always the allocation.** A 64 MiB
+buffer is 16,384 pages, and the request that first walks it pays a minor fault for each one. The
+obvious conclusion is that `new byte[64 * 1024 * 1024]` per request costs 16,384 faults per
+request forever, and that pooling the buffer is the fix. `bench/virtual-memory/pooled-vs-fresh-
+faults.cs` runs the request loop both ways — in two separate processes, so neither inherits the
+other's warm pages — and reads the kernel's own minor-fault counter each round:
+
+| round | `new byte[64 MiB]`, dropped, forced blocking gen2 GC | `ArrayPool` rent, touch, return |
+| --- | --- | --- |
+| 0 | 16,467 | 16,475 |
+| 1 | 16,385 | 3 |
+| 2 | 1 | 3 |
+| 3 | 1 | 3 |
+| 4 | 0 | 3 |
+| 5 | 0 | 3 |
+| resident after round 5 | 158 MiB | 94 MiB |
+
+Both columns stop faulting. The plain allocation loop takes two rounds to get there because the
+heap is still growing through round 1; after that the GC reuses pages it already owns and the
+count falls to zero, the exact same mechanism [the first
+touch](/systems/virtual-memory/page-fault-walk/)'s own control shows: memory an allocator
+recycles is no longer a first touch, faults or no faults.
+
+Read round 0 before you reach for `ArrayPool` as a page-fault fix: the first rent from a cold pool
+faults every one of its 16,384 pages too, because a pooled buffer is not born already-touched — it
+becomes already-touched the second time you rent it. What the pool actually wins in this loop is
+residency (94 MiB against 158 MiB) and the allocations it does not make, not the fault count,
+because the collector stops paying that on its own too by round 2. So what is worth flagging in
+review is the code that pays first touch *inside* a request rather than during warmup, and the
+code that turns a lazy cost into an eager one: a "clear it to be safe" loop over a fresh array
+touches every page whether the request needed them or not, doubling the fault count for that
+buffer.
+
+**A benchmark whose first iteration behaves differently from the rest is not measuring your
+code.** Warm up in-process and discard the first pass, or you are measuring the kernel's fault
+handler instead of the loop you meant to time. That mistake is common enough to have its own
+exercise: [the first touch](/systems/virtual-memory/page-fault-walk/).
+
+## the same idea in other languages
+
+| language | what it is called | the trap |
+| --- | --- | --- |
+| C / C++ | `malloc` above the mmap threshold becomes an `mmap`; `calloc` returns memory it never zeroed | `calloc` of a huge block is nearly instant because the kernel's fresh pages are already zero — while `malloc` plus `memset` faults every page in to zero it by hand. Same result, very different number of trips into the kernel. |
+| Java | `-Xmx` reserves address space; the JVM commits and touches as the heap grows | RSS climbs long after startup and looks like a leak. `-XX:+AlwaysPreTouch` moves that cost to startup by touching every heap page up front — the same trade as a .NET warmup pass. |
+| Go | the runtime maps arenas up front, so `VIRT` is huge and meaningless | Go 1.12-1.15 released pages with `MADV_FREE`, so the kernel kept them resident until it needed the memory and RSS stayed flat after a big drop — dashboards read that as a leak. Since 1.16 the Linux default is `MADV_DONTNEED`, which releases immediately at the cost of faulting the pages back in; `GODEBUG=madvdontneed=0` restores the old behaviour, so the same code can draw two different RSS curves. |
+| .NET on Windows | `VirtualAlloc` splits `MEM_RESERVE` from `MEM_COMMIT` explicitly; "working set" is the Windows word for resident | Windows charges commit against RAM plus pagefile and can refuse it, so the same code that quietly overcommits on Linux can fail at commit time on Windows — and Task Manager's "Memory" column is the working set, not the commit. |
+
+## exercises
+
+One exercise, and it counts the single fact this page is built on.
+
+<ProblemList topic="virtual-memory" />
+
+## interview drills
+
+**Q.** Our pod gets OOMKilled at its 8 GiB limit, but the GC logs say the heap is under 1 GiB.
+Where is the memory?
+
+- *weak answer* — "we have a memory leak somewhere, probably an event handler holding objects
+  alive." That is a GC-heap explanation for a non-GC-heap symptom, and the follow-up ("then why
+  is the heap small?") ends it.
+- *strong answer* — the limit is enforced against resident memory for the whole cgroup, which
+  includes everything the GC heap excludes: native allocations, thread stacks, mapped assemblies,
+  the page cache from file I/O, and heap pages the GC has freed but not returned to the OS. I
+  would compare `GC.GetTotalMemory` against `VmRSS` and the cgroup's own counters; if the GC heap
+  is small and RSS is large, the object graph is not the problem.
+- *follow-up* — "how would you tell native leak from unreturned GC pages?" Watch RSS across a
+  forced compacting gen2 collection: unreturned GC pages tend to be reused by the next allocation
+  burst rather than growing without bound, while a native leak grows monotonically and shows up in
+  `smaps` as a growing anonymous region outside the GC's own ranges.
+
+**Q.** Allocating a 1 GiB array returns immediately. Where did the cost go?
+
+- *weak answer* — "the GC is fast" or "it is lazy allocation". True-ish and shallow; it does not
+  say who pays or when.
+- *strong answer* — the allocation only claimed address space, so the process is no bigger in RAM.
+  The cost is deferred to first touch: one page fault per 4 KiB page, on whichever thread happens
+  to touch it, at whatever moment that happens — a quarter of a million faults spread across
+  however many requests end up walking that gigabyte. Nothing is free, it is just billed later and
+  to somebody else's request.
+- *follow-up* — "so how do you avoid paying it during a request?" Touch it during warmup, or pool
+  the buffer so it is touched once and reused.
+
+**Q.** Why does the same code run fine on your laptop and stall in production on a box that is
+"not even out of memory"?
+
+- *weak answer* — "the production machine is slower" or "it must be GC pressure".
+- *strong answer* — being under the memory limit is not the only failure mode. If the working set
+  exceeds what the machine will keep resident, pages get evicted and come back as major faults,
+  and a major fault blocks the thread waiting on a device while a resident access never leaves the
+  CPU at all — visible as high iowait, low CPU, and latency spikes with no matching allocation
+  rate. A hot loop that faults every few accesses is not slow in the way a slow algorithm is slow;
+  it is repeatedly stopped and handed to a scheduler.
+- *follow-up* — "how do you confirm it?" `ps -o maj_flt` or `/proc/PID/stat` over time; a rising
+  major-fault rate is the signature, and syscall tracing will show you nothing.
+
+**Q.** What actually happens between a `mov` instruction and the memory chip?
+
+- *weak answer* — "the CPU reads the address from RAM". It skips the entire mechanism, and the
+  interviewer is asking about the mechanism.
+- *strong answer* — the address in the instruction is virtual. The MMU checks the TLB; on a hit
+  the physical address is formed immediately. On a miss it walks the four-level page table rooted
+  at `CR3`, up to four dependent memory reads. If an entry is absent or the permissions do not
+  allow the access, the CPU raises a fault, the kernel fixes the mapping or kills the process,
+  and the instruction re-runs.
+- *follow-up* — "why does that make context switches between processes more expensive than
+  between threads?" Threads share `CR3`, so nothing about translation changes when the scheduler
+  moves between them. A process switch rewrites `CR3`; on older CPUs that flushed the TLB
+  outright, and even where the chip tags entries by process (PCID) to avoid that, the kernel keeps
+  only a handful of those tags live per core, so after enough other processes have run you are
+  cold again anyway.
+
+**Q.** Two identical instances of our service run on one host. How much memory do they use?
+
+- *weak answer* — "twice one instance's RSS."
+- *strong answer* — less, because their executable and assembly pages are the same file mappings,
+  clean and shared. Summing RSS double-counts every shared page; `Pss` divides each shared page
+  among its sharers and is the number to add up. On this box an idle .NET process is 25 MiB
+  resident but 7 MiB proportional, with 21 MiB of it clean shared file pages.
+- *follow-up* — "does that survive a container boundary?" Yes if the containers share the same
+  image layers and hence the same underlying files on the same host; no if each has its own copy
+  of the file.

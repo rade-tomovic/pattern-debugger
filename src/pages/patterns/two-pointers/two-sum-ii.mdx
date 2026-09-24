@@ -1,0 +1,122 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: two-pointers
+problem: two-sum-ii
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import Cells from '@components/Cells.astro';
+import Solution from '@components/Solution.astro';
+
+## task
+
+Given a **sorted** (non-decreasing) array of integers and a `target`, return the indices of the
+two numbers that add up to `target`. Exactly one solution exists, and you may not use the same
+element twice. LeetCode #167 wants the answer 1-indexed; we'll solve 0-based and add 1 at the end.
+
+```text
+numbers = [1, 3, 5, 7, 11], target = 10  →  [1, 3]   (3 + 7 = 10)
+```
+
+## how to think
+
+The brute force checks every pair — O(n²). But the array is *sorted*, and sorted order is
+information: if the pair `(numbers[left], numbers[right])` sums too **small**, then `numbers[left]`
+paired with *anything* between them is even smaller — every one of those pairs just became
+impossible, so `left` can move on. Too **big**? Same argument kills everything paired with
+`numbers[right]`.
+
+That's the whole pattern: start with the widest pair, and let each comparison discard an entire
+family of candidates. One pointer moves per step, nobody ever moves backward, so after at most
+n steps they meet and every pair has been either checked or safely ruled out.
+
+<Callout kind="note" label="template instance">
+  **Opposite ends** skeleton, verbatim. What varies: nothing — this *is* the template. Invariant:
+  the answer pair (if it exists) always lies within `[left, right]`. Move rule: sum too small
+  → `left++`, too big → `right--`.
+</Callout>
+
+## solution
+
+<Solution>
+
+```csharp
+public int[] TwoSum(int[] numbers, int target)
+{
+    int left = 0, right = numbers.Length - 1;
+
+    while (left < right)
+    {
+        int sum = numbers[left] + numbers[right];
+
+        if (sum == target)
+            return [left + 1, right + 1];   // LeetCode wants 1-indexed
+
+        if (sum < target) left++;           // everything paired with numbers[left] is too small
+        else right--;                       // everything paired with numbers[right] is too big
+    }
+
+    return [];                              // unreachable — a solution is guaranteed
+}
+```
+
+</Solution>
+
+## trace
+
+`numbers = [1, 3, 5, 7, 11]`, `target = 10`:
+
+| step | L | R | sum | verdict | move |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 0 | 4 | 1 + 11 = 12 | `12 > 10` — too big | `right--` |
+| 2 | 0 | 3 | 1 + 7 = 8 | `8 < 10` — too small | `left++` |
+| 3 | 1 | 3 | 3 + 7 = 10 | hit | return `[2, 4]` (1-indexed) |
+
+Step 1 — the widest pair is too big, so `11` can never be part of the answer:
+
+<Cells
+  data={[1, 3, 5, 7, 11]}
+  pointers={{ 0: [{ t: 'L', c: 'amber' }], 4: [{ t: 'R', c: 'cyan' }] }}
+  cells={{ 4: 'warn' }}
+  caption="1 + 11 = 12 > 10 → discard 11 and every pair containing it"
+/>
+
+Step 3 — after `1` was discarded the same way, the pointers land on the answer:
+
+<Cells
+  data={[1, 3, 5, 7, 11]}
+  pointers={{ 1: [{ t: 'L', c: 'amber' }], 3: [{ t: 'R', c: 'cyan' }] }}
+  cells={{ 0: 'dim', 4: 'dim', 1: 'ok', 3: 'ok' }}
+  caption="3 + 7 = 10 — five elements, ten possible pairs, three comparisons"
+/>
+
+## why it works
+
+Every step eliminates either everything paired with the leftmost survivor or everything paired
+with the rightmost one — n−1 pairs of "work" done by a single comparison. The invariant *"the
+answer is always inside `[left, right]`"* holds at every step, because the only pairs we discard
+are ones proven too small or too big. When the pointers meet, the search space is empty; since
+we never discarded the answer, we must have returned it earlier.
+
+<Watch items={[['time', 'O(n)'], ['space', 'O(1)'], ['passes', '1']]} />
+
+## common bugs
+
+- `while (left <= right)` — with `left == right` you'd test an element against itself, which
+  the problem forbids.
+- Moving **both** pointers after a non-match: each comparison justifies discarding one end,
+  not both.
+- Forgetting the 1-indexed answer (`[left + 1, right + 1]`) on LeetCode #167 specifically.
+- Reaching for this on an **unsorted** array — the discard argument needs sorted order; see
+  [Two Sum unsorted](/patterns/hashmap/two-sum/) for that world.
+
+## variants you can now solve
+
+- **[Two Sum unsorted](/patterns/hashmap/two-sum/)** (LC 1) — same question, no sort:
+  the dictionary takes over. The full tradeoff lives in
+  [the Two Sum family](/deep-dives/two-sum-family/).
+- **[3Sum](/patterns/two-pointers/three-sum/)** (LC 15) — fix one element, run exactly this
+  loop on the rest.
+- **Squares of a Sorted Array** (LC 977) — opposite ends, but the biggest value is at an
+  end, so you fill the answer from the back.

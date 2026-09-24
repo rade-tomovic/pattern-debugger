@@ -1,0 +1,88 @@
+---
+layout: '@layouts/TopicLayout.astro'
+topic: dynamic-programming
+---
+
+import Callout from '@components/Callout.astro';
+import ProblemList from '@components/ProblemList.astro';
+
+## core idea
+
+Every DP problem is four decisions, made in order: what's the **state** (the minimal set of
+parameters that pins down a subproblem), what's the **recurrence** (how a state's answer is built
+from smaller states' answers), what's the **base case** (the states you can answer without
+recursing), and what's the **order** (fill states so every dependency is already known when you
+need it). Two ways to run the same recurrence once you've named all four:
+
+| approach | direction | mechanics |
+| --- | --- | --- |
+| memoization (top-down) | recursion, cached | write the brute-force recursion first, add a cache keyed by state — done |
+| tabulation (bottom-up) | iteration, filled table | flip the recursion into a loop that fills states in dependency order |
+
+<Callout kind="insight" label="DP is backtracking with a memory">
+  Strip the cache out of any DP solution and what's left is a plain backtracking recursion — same
+  states, same choices, same base case. What turns exponential backtracking into polynomial DP is
+  that the state space is small *and* the same states get asked for repeatedly:
+  [backtracking](/patterns/backtracking/) explores a tree where most branches are genuinely
+  distinct; DP recognizes the tree secretly has repeated nodes and answers each one once.
+</Callout>
+
+## when to reach for it
+
+- The problem asks to **count the ways**, or find a **minimum/maximum cost or value**, over a
+  sequence of choices.
+- A brute-force recursion would work but is exponential — and tracing it shows the *same*
+  arguments being recomputed over and over.
+- The problem has **optimal substructure**: the best answer for the whole input is built from the
+  best answers to smaller versions of the same problem, not just *any* answer to them.
+- You can name the state in a sentence ("the best score up to index `i`", "the fewest coins to
+  make amount `a`") and that sentence has few enough distinct fillings to be practical — usually a
+  polynomial count.
+
+## universal templates
+
+Top-down (memoization) — write the recursion you'd write anyway, then cache it:
+
+```csharp
+public int TopDown(int state, Dictionary<int, int> memo)
+{
+    if (IsBaseCase(state)) return BaseValue(state);
+    if (memo.TryGetValue(state, out var cached)) return cached;
+
+    int result = Recurrence(state);    // combines TopDown(smaller states)
+    memo[state] = result;
+    return result;
+}
+```
+
+Bottom-up (tabulation) — the same recurrence, run forward through every state in dependency order:
+
+```csharp
+public int BottomUp(int n)
+{
+    var dp = new int[n + 1];
+    dp[0] = BaseValue;                 // seed the base case(s)
+
+    for (int i = 1; i <= n; i++)
+        dp[i] = Recurrence(dp, i);     // only reads already-filled entries
+
+    return dp[n];
+}
+```
+
+Every problem below names its state, writes the recurrence, and picks a direction. Most people
+think top-down first and ship bottom-up — the array is usually smaller than the recursion's call
+stack, and there's no depth limit to worry about.
+
+<Callout kind="tip" label="rolling arrays">
+  If `dp[i]` only ever reads `dp[i-1]` (and maybe `dp[i-2]`), you don't need the array at all —
+  two or three variables suffice, and space drops from O(n) to O(1).
+  [Climbing Stairs](/patterns/dynamic-programming/climbing-stairs/) and
+  [House Robber](/patterns/dynamic-programming/house-robber/) both compress this way;
+  [Unique Paths](/patterns/dynamic-programming/unique-paths/) shows the same trick one dimension
+  up, rolling a 2D table down to a single row.
+</Callout>
+
+## problems
+
+<ProblemList topic="dynamic-programming" />

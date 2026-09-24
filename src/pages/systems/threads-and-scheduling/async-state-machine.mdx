@@ -1,0 +1,380 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: threads-and-scheduling
+problem: async-state-machine
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import Solution from '@components/Solution.astro';
+
+## the source
+
+Two statements and an `await`. One local is used before the await and again after it, which is the
+only interesting thing about it.
+
+<Solution>
+
+```csharp
+public static async Task<int> FetchAsync(int id)
+{
+    int local = id * 2;
+    int fetched = await StepAsync(local);
+    return fetched + local;
+}
+static async Task<int> StepAsync(int x) { await Task.Delay(1); return x + 1; }
+```
+
+</Solution>
+
+Nothing below is transcribed by hand. `bench/threads-and-scheduling/async-state-machine.cs` reads
+its own assembly at run time: the `[AsyncStateMachine]` attribute names the type Roslyn generated,
+reflection lists its fields, `MethodBody.GetILAsByteArray` returns the bytes Roslyn wrote, and a
+small decoder walks them against the runtime's own opcode table. Run it with
+`dotnet run bench/threads-and-scheduling/async-state-machine.cs -c Release`.
+
+## what the machine got
+
+First, the type that appeared out of nowhere:
+
+```text
+=== 1. the type Roslyn generated for FetchAsync ===
+  [AsyncStateMachine(typeof(<FetchAsync>d__0))]
+  full name  : Machine+<FetchAsync>d__0
+  kind       : struct, private nested, implements IAsyncStateMachine
+  fields     :
+    int32                        <>1__state
+    AsyncTaskMethodBuilder`1     <>t__builder
+    int32                        id
+    int32                        <local>5__2
+    TaskAwaiter`1                <>u__1
+  method     : MoveNext (171 bytes of IL)
+  method     : SetStateMachine (13 bytes of IL)
+```
+
+Then what is left of `FetchAsync` itself — the body is gone; this is a constructor call:
+
+```text
+.method Machine::FetchAsync   // 55 bytes of IL, 1 locals
+  .locals [0] <FetchAsync>d__0
+  IL_0000:  ldloca.s      0
+  IL_0002:  call          AsyncTaskMethodBuilder`1::Create
+  IL_0007:  stfld         <FetchAsync>d__0::<>t__builder
+  IL_000c:  ldloca.s      0
+  IL_000e:  ldarg.0
+  IL_000f:  stfld         <FetchAsync>d__0::id
+  IL_0014:  ldloca.s      0
+  IL_0016:  ldc.i4.m1
+  IL_0017:  stfld         <FetchAsync>d__0::<>1__state
+  IL_001c:  ldloca.s      0
+  IL_001e:  ldflda        <FetchAsync>d__0::<>t__builder
+  IL_0023:  ldloca.s      0
+  IL_0025:  call          AsyncTaskMethodBuilder`1::Start
+  IL_002a:  ldloca.s      0
+  IL_002c:  ldflda        <FetchAsync>d__0::<>t__builder
+  IL_0031:  call          AsyncTaskMethodBuilder`1::get_Task
+  IL_0036:  ret
+```
+
+And the method your body actually became. All 171 bytes, nothing removed:
+
+```text
+.method <FetchAsync>d__0::MoveNext   // 171 bytes of IL, 4 locals
+  .locals [0] int32
+  .locals [1] int32
+  .locals [2] TaskAwaiter`1
+  .locals [3] Exception
+  IL_0000:  ldarg.0
+  IL_0001:  ldfld         <FetchAsync>d__0::<>1__state
+  IL_0006:  stloc.0
+  IL_0007:  ldloc.0
+  IL_0008:  brfalse.s     IL_0052
+  IL_000a:  ldarg.0
+  IL_000b:  ldarg.0
+  IL_000c:  ldfld         <FetchAsync>d__0::id
+  IL_0011:  ldc.i4.2
+  IL_0012:  mul
+  IL_0013:  stfld         <FetchAsync>d__0::<local>5__2
+  IL_0018:  ldarg.0
+  IL_0019:  ldfld         <FetchAsync>d__0::<local>5__2
+  IL_001e:  call          Machine::StepAsync
+  IL_0023:  callvirt      Task`1::GetAwaiter
+  IL_0028:  stloc.2
+  IL_0029:  ldloca.s      2
+  IL_002b:  call          TaskAwaiter`1::get_IsCompleted
+  IL_0030:  brtrue.s      IL_006e
+  IL_0032:  ldarg.0
+  IL_0033:  ldc.i4.0
+  IL_0034:  dup
+  IL_0035:  stloc.0
+  IL_0036:  stfld         <FetchAsync>d__0::<>1__state
+  IL_003b:  ldarg.0
+  IL_003c:  ldloc.2
+  IL_003d:  stfld         <FetchAsync>d__0::<>u__1
+  IL_0042:  ldarg.0
+  IL_0043:  ldflda        <FetchAsync>d__0::<>t__builder
+  IL_0048:  ldloca.s      2
+  IL_004a:  ldarg.0
+  IL_004b:  call          AsyncTaskMethodBuilder`1::AwaitUnsafeOnCompleted
+  IL_0050:  leave.s       IL_00aa
+  IL_0052:  ldarg.0
+  IL_0053:  ldfld         <FetchAsync>d__0::<>u__1
+  IL_0058:  stloc.2
+  IL_0059:  ldarg.0
+  IL_005a:  ldflda        <FetchAsync>d__0::<>u__1
+  IL_005f:  initobj       TaskAwaiter`1
+  IL_0065:  ldarg.0
+  IL_0066:  ldc.i4.m1
+  IL_0067:  dup
+  IL_0068:  stloc.0
+  IL_0069:  stfld         <FetchAsync>d__0::<>1__state
+  IL_006e:  ldloca.s      2
+  IL_0070:  call          TaskAwaiter`1::GetResult
+  IL_0075:  ldarg.0
+  IL_0076:  ldfld         <FetchAsync>d__0::<local>5__2
+  IL_007b:  add
+  IL_007c:  stloc.1
+  IL_007d:  leave.s       IL_0096
+  IL_007f:  stloc.3
+  IL_0080:  ldarg.0
+  IL_0081:  ldc.i4.s      -2
+  IL_0083:  stfld         <FetchAsync>d__0::<>1__state
+  IL_0088:  ldarg.0
+  IL_0089:  ldflda        <FetchAsync>d__0::<>t__builder
+  IL_008e:  ldloc.3
+  IL_008f:  call          AsyncTaskMethodBuilder`1::SetException
+  IL_0094:  leave.s       IL_00aa
+  IL_0096:  ldarg.0
+  IL_0097:  ldc.i4.s      -2
+  IL_0099:  stfld         <FetchAsync>d__0::<>1__state
+  IL_009e:  ldarg.0
+  IL_009f:  ldflda        <FetchAsync>d__0::<>t__builder
+  IL_00a4:  ldloc.1
+  IL_00a5:  call          AsyncTaskMethodBuilder`1::SetResult
+  IL_00aa:  ret
+```
+
+`ldarg.0` in `MoveNext` is `this` — the state machine — so almost every pair of lines is "load
+`this`, touch one of its fields". That is why the listing looks so repetitive: your locals are
+fields now, and IL has no way to say "field of this" in one instruction.
+
+## line by line
+
+The generated fields first, because everything else refers to them:
+
+| field | what it is | where it came from |
+| --- | --- | --- |
+| `<>1__state` | which await we are suspended at: `-1` not suspended, `0` at the first await, `-2` finished | the compiler's bookkeeping |
+| `<>t__builder` | `AsyncTaskMethodBuilder<int>` — owns the returned `Task` and the resume plumbing | the `async Task<int>` in the signature |
+| `id` | the parameter, copied in before anything runs | `FetchAsync(int id)` |
+| `<local>5__2` | `local`, promoted to a field because it is read after the await | `int local = id * 2;` |
+| `<>u__1` | the `TaskAwaiter<int>` being waited on, parked here while suspended | `await StepAsync(local)` |
+
+Notice what is *not* there: `fetched`. It is written and read entirely after the resume point, so
+it never has to survive a suspension — and in Release it does not even get a slot: the value
+`GetResult()` returns is added straight to `local` on the evaluation stack at `IL_0070`–`IL_007b`.
+(In Debug, where nothing is optimised, it *is* hoisted, which is why that build has seven fields
+including `<fetched>5__2`.) The compiler promotes exactly the variables whose lifetime crosses an
+`await`, which is the same rule that decides what a lambda's closure captures on
+[stack vs heap](/systems/stack-and-heap/).
+
+The stub that is left of `FetchAsync`:
+
+| IL | what it does | source |
+| --- | --- | --- |
+| `IL_0002 call Create` / `stfld <>t__builder` | build the thing that will own the returned `Task` | the `async Task<int>` signature |
+| `IL_000e ldarg.0` / `stfld id` | copy the parameter into the state machine | `FetchAsync(int id)` |
+| `IL_0016 ldc.i4.m1` / `stfld <>1__state` | state = −1: created, never suspended | — |
+| `IL_0025 call Start` | run `MoveNext` **synchronously, on this thread**, until it suspends or finishes | the first line of the body |
+| `IL_0031 call get_Task` / `ret` | hand the caller the `Task` | the method's return type |
+
+**Nothing here is asynchronous.** Calling an async method runs its body on your thread until the
+first `await` that is not already complete. But it runs it *inside* the catch at `IL_007f` in the
+listing above, so a throw before the first `await` does not reach your call site — it faults the
+returned `Task`, and surfaces only when somebody awaits it. That is exactly why eager argument
+validation is written in a non-`async` wrapper that calls an `async` local function: a plain
+method's throw propagates at the call. The half that does hold is the blocking half — an expensive loop before the first `await`
+runs on the caller's thread no matter how many `async` keywords surround it.
+
+`MoveNext`, in the order the CPU meets it:
+
+| IL | what it does | source line |
+| --- | --- | --- |
+| `IL_0000-0008` | load `<>1__state`, and if it is `0` jump to `IL_0052` — the resume path | the compiler's switch |
+| `IL_000a-0013` | `id * 2` stored into the field `<local>5__2` | `int local = id * 2;` |
+| `IL_0018-0023` | call `StepAsync(local)`, then `GetAwaiter()` on the `Task` it returned | `await StepAsync(local)` |
+| `IL_0029-0030` | `if (awaiter.IsCompleted) goto IL_006e` — **the fast path: no suspension at all** | `await`, when the result is already there |
+| `IL_0032-0036` | state = `0`: "suspended at await number zero" | `await`, slow path |
+| `IL_003b-003d` | park the awaiter in the field `<>u__1`, because this frame is about to vanish | `await`, slow path |
+| `IL_0043-004b` | `AwaitUnsafeOnCompleted(ref awaiter, ref this)` — register "call `MoveNext` when done" | `await`, slow path |
+| `IL_0050 leave.s IL_00aa` | **return.** The thread is free; the method is not finished | `await`, slow path |
+| `IL_0052-0058` | resume: take the awaiter back out of `<>u__1` | resuming after `await` |
+| `IL_0059-005f` | `initobj` on the field — clear it, so the completed Task is not kept alive | resuming after `await` |
+| `IL_0065-0069` | state = `-1`: running again | resuming after `await` |
+| `IL_006e-0070` | `awaiter.GetResult()` — the value, or the exception rethrown here | the value of the `await` expression |
+| `IL_0075-007c` | add `<local>5__2` to it, into the local that becomes the result | `return fetched + local;` |
+| `IL_007f-008f` | the catch: state = `-2`, `builder.SetException(e)` — the Task faults, nothing is thrown to the caller | every line of the body |
+| `IL_0096-00a5` | state = `-2` (finished), `builder.SetResult(result)` — the Task completes and its continuations run | `return` |
+
+Both exits — `SetResult` and `SetException` — set the state to `-2` first. There is no third exit.
+An async method never throws to its caller after the first suspension; it *completes a Task*
+either way, and the exception is stored in the Task until somebody looks at it.
+
+## why it looks like that
+
+**The shape is forced by one fact: a frame does not survive `await`.** `IL_0050` is a `ret`. The
+stack frame that held `local` is gone the instant it executes, and something has to call `MoveNext`
+again minutes later. This is the Release build's path — where the state machine starts out as a
+`struct` living inside the caller's own frame (the `why a struct in Release` paragraph below says
+why) and only moves to the heap at the moment it actually has to suspend:
+
+```text
+   before the first await                after the suspending await returns
+
+   caller's stack                        caller's stack
+   ┌─────────────────────┐               ┌─────────────────────┐
+   │ FetchAsync frame     │               │ (gone — FetchAsync   │
+   │   id  = 4            │   suspend     │  already returned    │
+   │   local = 8          │   ────────►   │  a Task to it)        │
+   │   ...                │               └─────────────────────┘
+   └─────────────────────┘
+                                            the heap
+                                           ┌─────────────────────┐
+                                           │ <FetchAsync>d__0     │
+                                           │   <>1__state = 0     │
+                                           │   id          = 4    │
+                                           │   <local>5__2 = 8    │
+                                           │   <>u__1 = {awaiter} │
+                                           └─────────────────────┘
+                                            registered as the
+                                            awaiter's continuation
+```
+
+`id` and `local` do not move or get copied at the moment of suspension — they were fields of the
+state-machine object from the start, so there is nothing left on the stack to lose. What changes is
+that the *stack frame around them* disappears while the object holding them lives on. Everything
+else follows from that one fact:
+
+- Locals that cross the await become **fields**, because fields live in an object and objects
+  outlive frames.
+- The method becomes a **switch on a state field**, because "resume in the middle" is not something
+  a machine can do; you can only re-enter at the top and jump.
+- The awaiter is **stored** rather than kept on the evaluation stack, for the same reason.
+- The method returns a `Task` built by a **builder**, because the caller needs something to hold on
+  to and the result does not exist yet.
+
+**Why a `struct` in Release and a `class` in Debug.** The same file, built the other way, generates
+a different type:
+
+| | Release (`-c Release`) | Debug (`dotnet run file.cs`) |
+| --- | --- | --- |
+| generated type | `struct` | `class` |
+| fields | 5 | 7 (`fetched` and a temporary are hoisted too) |
+| `MoveNext` | 171 bytes of IL | 208 bytes |
+| `SetStateMachine` | 13 bytes | 1 byte |
+
+The struct is the optimisation: while the method never suspends, the state machine lives in the
+caller's frame and costs nothing. The moment it *does* suspend, `AwaitUnsafeOnCompleted` boxes it
+onto the heap — that is what `SetStateMachine` is for, telling the copy where its new home is.
+Debug uses a class unconditionally so the debugger can watch fields at a stable address, which is
+why the byte counts below differ by more than a rounding error between the two columns — Debug
+is not a scaled-down version of the same program — it allocates a different shape, not merely more of it.
+
+That design shows up directly in the allocation counter (`GC.GetAllocatedBytesForCurrentThread`,
+marginal bytes per call, exact rather than sampled — `bench/threads-and-scheduling/async-state-machine.cs`):
+
+| what the method does | Release | Debug |
+| --- | --- | --- |
+| plain synchronous method | 0 B | 0 B |
+| `async Task<int>`, awaits an already-completed task | 72 B | 120 B |
+| `async ValueTask<int>`, awaits an already-completed task | **0 B** | 56 B |
+| `async Task<int>`, actually suspends | 103 B | 128 B |
+| `async ValueTask<int>`, actually suspends | 112 B | 136 B |
+| `Task.Run(() => ...)` capturing a local | 160 B | 160 B |
+
+Read the table against the IL and the design falls out. **An `await` that does not suspend costs,
+for a `ValueTask`, zero bytes** — the `IsCompleted` branch at `IL_0030` skips everything, so
+nothing is ever allocated for the state machine at all. **An `await` that does suspend costs 103
+bytes for `Task<int>`**, which is the state-machine object boxed onto the heap plus its captured
+continuation. `Task.Run` costs more (160 bytes, the last row of the table) for the same underlying
+reason — something has to be parked on the heap for a callback to find later — plus the delegate
+closure and the queued work item wrapping it, which the plain `await` case does not need.
+
+`ValueTask<T>` earns its zero only on the synchronous path, and the suspending row shows the price
+when it is wrong: 112 bytes versus `Task`'s 103, because a `ValueTask` that has to suspend
+allocates a box anyway and gets no help from the runtime's cache of completed `Task` objects. Use
+it where the common case is "the value is already here" — a cache hit, a buffered read — and not
+as a blanket replacement.
+
+<Watch items={[['state machine fields', '5'], ['MoveNext IL', '171 B'], ['await, no suspend (Task)', '72 B'], ['await, no suspend (ValueTask)', '0 B'], ['await, suspends (Task)', '103 B'], ['await, suspends (ValueTask)', '112 B'], ['state values', '-1 / 0 / -2']]} />
+
+## what this looks like in prod
+
+**Async stack traces are not the mess they were.** Three async frames deep, throwing after the
+await — so that every frame in the trace has already returned once — and the runtime still
+reconstructs it (`bench/threads-and-scheduling/async-stack-trace.cs`):
+
+```text
+System.InvalidOperationException: boom
+   at Program.<<Main>$>g__Level3|0_0(Int32 x) in .../async-stack-trace.cs:line 6
+   at Program.<<Main>$>g__Level2|0_1(Int32 x) in .../async-stack-trace.cs:line 7
+   at Program.<<Main>$>g__Level1|0_2(Int32 x) in .../async-stack-trace.cs:line 8
+   at Program.<Main>$(String[] args) in .../async-stack-trace.cs:line 10
+
+--- the same failure, reached through .Result ---
+AggregateException: One or more errors occurred. (boom)
+  inner: InvalidOperationException: boom
+```
+
+The first trace is the honest one: it names your methods and your line numbers, because the runtime
+walks the chain of continuations to rebuild it. What broke it is the second block — blocking with
+`.Result` wraps the real exception in an `AggregateException`, so every `catch (InvalidOperationException)`
+above it stops matching. `await` unwraps and rethrows the original; `.Result` and `.Wait()` do not.
+That is a second, quieter reason not to block, on top of
+[the starvation](/systems/threads-and-scheduling/threadpool-starvation/).
+
+**Where the state machine shows up in a memory profile.** Search a dump for type names containing
+`d__` and you are looking at suspended async methods — one object per in-flight operation, each
+holding every local that crosses its await. A leak of them means operations that never complete: a
+`TaskCompletionSource` nobody ever sets, a `CancellationToken` that never fires, an unbounded queue
+of pending work. And because each one holds your locals, one leaked state machine can pin a whole
+object graph — a request context, a buffer, a `DbContext` — which is a
+[GC](/systems/gc-internals/) problem caused by an async bug.
+
+**The practical consequences of "your locals became heap fields":** a `ref struct` such as
+`Span<T>` cannot cross an `await` (error CS4007 — there is nowhere to put it), a `stackalloc`
+buffer cannot either, and a local that crosses an `await` is genuinely shared state that another
+thread can reach. It is no longer thread-private just because it was declared inside a method.
+
+## the same idea in other languages
+
+| language | what it's called | the trap |
+| --- | --- | --- |
+| Python | the same transform: an `async def` becomes a coroutine object with a resume point, driven by `send()` from the event loop | the coroutine object does nothing until it is awaited or scheduled — calling an `async def` and dropping the result runs *no code at all*, whereas C# runs the body up to the first await immediately. Opposite defaults, same syntax |
+| JavaScript | `async`/`await` over promises, transformed the same way (and visibly so in any transpiler's output) | an async function also starts running synchronously up to the first `await`, like C# — but there is one thread, so a long synchronous prologue freezes the whole process instead of one pool thread |
+| Rust | `async fn` compiles to a generated enum implementing `Future`, one variant per suspension point — the same state field, with the type system tracking it | Rust's futures are *lazy*: nothing runs until an executor polls them, so an un-awaited future is dead code rather than work in flight. And the compiler makes "does this local cross an await" a visible, checked property, which is the same rule C# applies silently |
+| C++ | C++20 coroutines: `co_await` and a compiler-generated frame, with a promise type you write yourself | the coroutine frame is heap-allocated by default and the language gives you no scheduler at all — you supply the thing that resumes it, which is the job .NET's thread pool is quietly doing in `AwaitUnsafeOnCompleted` |
+
+## common bugs
+
+- **Believing an async method starts on another thread.** `IL_0025 call Start` runs `MoveNext`
+  synchronously on the calling thread. Everything before the first suspending `await` is your
+  caller's time, including a slow validation loop or a file read you forgot was synchronous.
+- **`async void`.** There is no builder-owned Task to put an exception in, so `SetException` has
+  nowhere to go and the runtime rethrows it on the pool — an unhandled exception that kills the
+  process rather than faulting a Task somebody could catch. Event handlers are the only legitimate
+  use.
+- **Judging async's cost from a Debug build.** The state machine changes from a struct to a class,
+  so a method that allocates 0 bytes in Release allocates 56 in Debug — any conclusion about "how
+  expensive async is" drawn from an unoptimized build is a conclusion about the debugger's build,
+  not about the code that will actually ship.
+- **Adding `async`/`await` to a method that only forwards.** `return await Foo();` builds a whole
+  state machine to do what `return Foo();` does for free — 72 to 103 bytes per call, for nothing.
+  (Keep the `await` when you need the exception inside your own `try`, or when a `using` must
+  outlive the call; drop it otherwise.)
+- **Assuming `ValueTask` is a free upgrade.** It is 0 bytes when it completes synchronously and
+  *more* expensive than `Task` when it does not, and it comes with rules `Task` does not have: a
+  `ValueTask` may be awaited only once, and must not be blocked on with `.Result`.
+- **Capturing something huge in a local that crosses an `await`.** It becomes a field of a heap
+  object that lives until the operation completes, so a 4 MB buffer declared before an `await` is
+  4 MB pinned for the duration of the I/O, times your concurrency.

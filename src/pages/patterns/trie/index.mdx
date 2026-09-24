@@ -1,0 +1,132 @@
+---
+layout: '@layouts/TopicLayout.astro'
+topic: trie
+---
+
+import Callout from '@components/Callout.astro';
+import ProblemList from '@components/ProblemList.astro';
+import Cells from '@components/Cells.astro';
+
+## core idea
+
+A trie is a tree where **edges spell characters** and **root-to-node paths spell prefixes**.
+Insert `"car"` and `"care"` and they share the nodes for `c`, `a`, `r` — only `e` is new. Every
+node is a tiny dictionary of "what character can I go to next," so the cost of a lookup is the
+length of the string, never the number of words stored. That's the whole trade you're making:
+pay per character inserted, get prefix search for free.
+
+<Cells
+  data={['c', 'a', 'r', 'e']}
+  cells={{ 2: 'ok', 3: 'ok' }}
+  indices={false}
+  caption={'insert "car" then "care" — c-a-r is shared; r and e are both end-of-word nodes'}
+/>
+
+The one real design decision is how a node stores its children:
+
+| approach | lookup | memory | when |
+| --- | --- | --- | --- |
+| `Dictionary<char, TrieNode>` | O(1) avg, hashing cost | one entry per child that actually exists | any alphabet, sparse branching, wildcard search |
+| `TrieNode?[26]` | O(1), no hashing | 26 slots per node, mostly `null` | lowercase `a`-`z` only, you want the fastest possible walk |
+
+## when to reach for it
+
+- The problem statement says **prefix**, **starts with**, or ships a **dictionary of words**
+  you'll query repeatedly.
+- You need autocomplete-style lookups: "what words begin with this prefix?"
+- A wildcard character (`.` meaning "any letter") appears in the search — a trie turns that into
+  a small DFS over children instead of testing every stored word.
+- Many words share long prefixes and you'd be repeating work with a plain `HashSet<string>`.
+
+## universal templates
+
+Dictionary-based node — the default, works for any alphabet:
+
+```csharp
+public class TrieNode
+{
+    public Dictionary<char, TrieNode> Children { get; } = [];   // sparse: pay only for chars used
+    public bool IsWord;                                          // true at nodes that end a word
+}
+
+public class Trie
+{
+    private readonly TrieNode _root = new();
+
+    public void Insert(string word)
+    {
+        var node = _root;
+        foreach (char c in word)
+        {
+            if (!node.Children.TryGetValue(c, out var next))
+                node.Children[c] = next = new TrieNode();        // extend the tree on the first miss
+            node = next;
+        }
+        node.IsWord = true;                                       // mark the path we just walked
+    }
+
+    public bool Search(string word)
+    {
+        var node = _root;
+        foreach (char c in word)
+        {
+            if (!node.Children.TryGetValue(c, out var next)) return false;  // path breaks → not stored
+            node = next;
+        }
+        return node.IsWord;                                       // path exists, but is it a full word?
+    }
+}
+```
+
+Array-based node — same shape, `a`-`z` only, no hashing:
+
+```csharp
+public class TrieNode
+{
+    public TrieNode?[] Children { get; } = new TrieNode?[26];    // index c - 'a' directly
+    public bool IsWord;
+}
+
+public class Trie
+{
+    private readonly TrieNode _root = new();
+
+    public void Insert(string word)
+    {
+        var node = _root;
+        foreach (char c in word)
+            node = node.Children[c - 'a'] ??= new TrieNode();    // create-if-missing in one line
+
+        node.IsWord = true;
+    }
+
+    public bool Search(string word)
+    {
+        var node = _root;
+        foreach (char c in word)
+        {
+            node = node.Children[c - 'a'];
+            if (node is null) return false;
+        }
+        return node.IsWord;
+    }
+}
+```
+
+Every problem below is `Insert` plus a walk over `Children` — search, wildcard search, and grid
+backtracking are all the same walk with a different stopping rule.
+
+<Callout kind="insight" label="the one question to ask">
+  Before picking a representation, ask: *"is my alphabet small, fixed, and dense — or could it be
+  anything?"* Interview problems are almost always lowercase English, so the array is the
+  idiomatic choice when performance is on the table. Reach for the dictionary the moment the
+  alphabet is uppercase-and-lowercase, includes digits, or you're not sure — it costs nothing to
+  be safe.
+</Callout>
+
+## problems
+
+Three problems, one structure: build it, search it with a wildcard, then run a grid search
+through it.
+
+<ProblemList topic="trie" />

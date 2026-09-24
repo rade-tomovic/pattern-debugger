@@ -1,0 +1,117 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: sliding-window
+problem: max-sum-subarray-of-size-k
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import Cells from '@components/Cells.astro';
+
+## task
+
+Given an integer array `nums` and an integer `k`, find the maximum sum of any contiguous
+subarray of size exactly `k`.
+
+```text
+nums = [2, 1, 5, 1, 3, 2], k = 3  →  9   (5 + 1 + 3)
+```
+
+## how to think
+
+The brute force checks every start index and sums `k` elements from there — `O(n·k)`. But slide
+the window from start `i` to start `i+1` and almost nothing changes: you lose `nums[i]` off the
+left edge and gain `nums[i+k]` on the right edge. Every other element is shared between the two
+windows. So don't recompute the sum — maintain it, and update it in `O(1)` per slide: seed the
+first window once, then for every later position add the entering element and subtract the
+leaving one.
+
+There's no validity check here, because the window size never changes — it's the fixed-window
+shape in its purest form, no shrink logic at all.
+
+<Callout kind="note" label="template instance">
+  **Fixed window** skeleton, verbatim. Invariant: `windowSum` always equals the sum of
+  `nums[right-k+1 .. right]`. Nothing varies problem to problem here except the aggregate op —
+  swap `+=`/`-=` for a running product or a running count and the same skeleton answers a
+  different question.
+</Callout>
+
+## solution
+
+```csharp
+public int MaxSumSubarray(int[] nums, int k)
+{
+    int windowSum = 0;
+    for (int i = 0; i < k; i++) windowSum += nums[i];   // seed the first window once
+
+    int best = windowSum;
+    for (int right = k; right < nums.Length; right++)
+    {
+        int left = right - k;
+        windowSum += nums[right] - nums[left];          // add entering, remove leaving — O(1) per slide
+        best = Math.Max(best, windowSum);
+    }
+    return best;
+}
+```
+
+## trace
+
+`nums = [2, 1, 5, 1, 3, 2]`, `k = 3`:
+
+| right | action | enter | leave | windowSum | best |
+| --- | --- | --- | --- | --- | --- |
+| — | seed `[0..2]` | — | — | `2+1+5 = 8` | 8 |
+| 3 | slide | `nums[3]=1` | `nums[0]=2` | `8 + 1 - 2 = 7` | 8 |
+| 4 | slide | `nums[4]=3` | `nums[1]=1` | `7 + 3 - 1 = 9` | 9 |
+| 5 | slide | `nums[5]=2` | `nums[2]=5` | `9 + 2 - 5 = 6` | 9 |
+
+Seed: the first three elements, before any sliding —
+
+<Cells
+  data={[2, 1, 5, 1, 3, 2]}
+  pointers={{ 0: [{ t: 'L', c: 'amber' }], 2: [{ t: 'R', c: 'cyan' }] }}
+  cells={{ 0: 'win', 1: 'win', 2: 'win' }}
+  caption="seed window [0..2]: 2+1+5 = 8"
+/>
+
+`right = 4`: the window has slid twice and now holds the maximum —
+
+<Cells
+  data={[2, 1, 5, 1, 3, 2]}
+  pointers={{ 2: [{ t: 'L', c: 'amber' }], 4: [{ t: 'R', c: 'cyan' }] }}
+  cells={{ 2: 'ok', 3: 'ok', 4: 'ok' }}
+  caption="window [2..4]: 5+1+3 = 9 — six elements, four windows, three O(1) updates"
+/>
+
+## why it works
+
+`windowSum` is an invariant maintained by construction, not recomputed: after the update on step
+`right`, it equals `sum(nums[right-k+1 .. right])` because that's exactly what got added and
+subtracted. Since every window of size `k` is visited exactly once as `right` walks from `k-1` to
+`n-1`, and each visit costs `O(1)`, the whole scan is `O(n)` regardless of `k`.
+
+<Watch items={[['time', 'O(n)'], ['space', 'O(1)']]} />
+
+## common bugs
+
+- Recomputing the sum from scratch on every slide instead of add/remove — correct, but throws
+  away the whole point of the pattern and costs `O(n·k)`.
+- Seeding the loop from `right = 0` instead of `right = k` — the first window has already been
+  summed; re-adding `nums[0..k-1]` double-counts it.
+- Off-by-one on `left = right - k` — `left` must trail `right` by exactly `k`, not `k - 1`, or
+  the window holds `k + 1` elements.
+- Not checking that `k <= nums.Length` before seeding — indexing past the array on the seed loop.
+- Mixing this up with the variable-window problems below: a **fixed** `k` never needs a `while`
+  shrink loop, only a single subtract-then-add per slide.
+
+## variants you can now solve
+
+- **Minimum Size Subarray Sum** (LC 209) — same running-sum idea, but the window size is no
+  longer fixed: shrink while the sum stays valid, the shortest-window discipline from the
+  [topic page](/patterns/sliding-window/).
+- **Sliding Window Maximum** (LC 239) — track the max of each window with a monotonic deque
+  instead of a running sum; a different aggregate on the same fixed-window skeleton.
+- [Range Sum Query — Immutable](/patterns/array-techniques/range-sum-query/) — when you need
+  *many* arbitrary-range sums instead of one sliding fixed-size sum, precompute prefix sums
+  instead of sliding at all.

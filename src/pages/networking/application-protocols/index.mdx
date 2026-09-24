@@ -1,0 +1,773 @@
+---
+layout: '@layouts/TopicLayout.astro'
+topic: application-protocols
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import Solution from '@components/Solution.astro';
+
+## the ground floor
+
+- **A byte stream with no message boundaries** is what TCP hands the application: every byte
+  arrives, once, in order, and nothing preserves where one `Send` ended.
+  [TCP and UDP](/networking/tcp-and-udp/) owns that, and it is the reason half of this page exists.
+- **A port is a 16-bit field in the TCP or UDP header**, and the kernel picks the receiving socket
+  with the four-tuple — [ports and sockets](/networking/ports-and-sockets/) owns both.
+- **A name becomes an address before any of this starts.** `api.example.com` is resolved first, and
+  the connection is made to the address that came back — [DNS](/networking/dns/) owns the lookup and
+  the caches that make it lie to you.
+- **A socket is a kernel object behind a handle**, so every read and write below is a syscall —
+  [processes, threads and the kernel](/systems/process-and-thread/) built that boundary.
+- **"Application layer"** is the top of the stack: the layer whose messages are the reason all the
+  headers underneath were filled in. [The OSI model](/networking/osi-model/) is where the numbering
+  comes from, and where the honest version of layers 5 to 7 lives.
+
+## core idea
+
+Everything below the application layer moves bytes between two programs and has no opinion about
+what they mean. The protocols on top supply the meaning: what a message is, where it ends, what a
+reply looks like, and what the two ends may assume about each other between messages.
+
+HTTP is the one worth knowing byte for byte, because it is **plain text lines over a byte stream**
+and because almost everything a .NET service talks to is either HTTP or shaped like it. Once you
+have read a request and a response as literal bytes, the rest of the page is variations: TLS wraps
+those bytes, WebSockets abandon the request/response shape after borrowing HTTP to get started, and
+gRPC keeps the shape while replacing the text with binary frames.
+
+The sentence worth carrying: **HTTP is a message format, and TCP has no messages — so the whole
+protocol is, first and last, an answer to "where does this one end".**
+
+## how it actually works
+
+### one request and one response, byte for byte
+
+Here is a complete HTTP/1.1 request as it is written into the socket. Line endings are carriage
+return followed by line feed — bytes `0x0D 0x0A`, shown here as `<CR><LF>` because their being
+there is the entire framing story:
+
+```text
+GET /orders/42 HTTP/1.1<CR><LF>
+Host: api.example.com<CR><LF>
+User-Agent: dotnet/10.0<CR><LF>
+Accept: application/json<CR><LF>
+<CR><LF>
+```
+
+Four things, in a fixed order:
+
+- **The request line**: method, request target, protocol version, separated by single spaces. That
+  is the whole line — `GET /orders/42 HTTP/1.1` — and everything a server routes on is in it or in
+  a header below it.
+- **Header lines**: `Name: value`, one per line, case-insensitive names. The order of *different*
+  names is not significant; the relative order of repeated lines with the *same* name is. A name may
+  legally repeat, and where the field is defined as a comma-separated list the repeats fold into one
+  value — `Set-Cookie` is the exception that does not, which is why every HTTP API surfaces it as a
+  collection rather than a string.
+- **One empty line.** This is not formatting. The blank line is the delimiter that says "headers are
+  over", and a server reads bytes until it has seen `<CR><LF><CR><LF>` before it can parse anything.
+- **The body**, if there is one. `GET` normally has none — the request above is 101 bytes and ends at
+  the blank line.
+
+The response has exactly the same shape, with a status line instead of a request line:
+
+```text
+HTTP/1.1 200 OK<CR><LF>
+Content-Type: application/json; charset=utf-8<CR><LF>
+Content-Length: 23<CR><LF>
+<CR><LF>
+{"id":42,"total":19.99}
+```
+
+`200` is the code the program reads; `OK` is the reason phrase, free text for humans, and no client
+should ever branch on it. `Content-Length: 23` is the count of **body bytes** — not characters, not
+lines — and the body here is ASCII so the two happen to coincide. Get that number wrong by one and
+the connection is unusable for anything after it, which is the point of the framing section below.
+
+<Callout kind="note" label="the words this page will keep using">
+  A **message** is one request or one response, headers and body together. A **header** here is an
+  HTTP field, not the packet header of [network basics](/networking/network-basics/) — same word,
+  two layers, and this page uses it in the HTTP sense throughout. A **request target** is the path
+  and query as written on the request line, which is not a URL: the scheme and host live in the
+  `Host` header instead, for reasons that get their own section below.
+</Callout>
+
+### proving it: a socket, a listener, and no HTTP library
+
+Nothing in the bytes above requires an HTTP client to produce. Write them into a TCP socket by hand
+and a listener that knows nothing about HTTP can print them back. Below, both ends are in one
+process, talking over loopback: the listener accepts one connection and dumps whatever it reads,
+with the control bytes made visible.
+
+<Solution>
+
+```csharp
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
+
+// A listener that speaks no HTTP whatsoever. It reads bytes and prints them.
+var listener = new TcpListener(IPAddress.Loopback, 0);   // port 0: kernel, pick one
+listener.Start();
+var endpoint = (IPEndPoint)listener.LocalEndpoint;
+
+var server = Task.Run(async () =>
+{
+    using TcpClient conn = await listener.AcceptTcpClientAsync();
+    using NetworkStream stream = conn.GetStream();
+
+    var buffer = new byte[4096];
+    int read = await stream.ReadAsync(buffer);   // ONE read — see the caveat below
+
+    // Render CR and LF, or the framing is invisible in the output.
+    string shown = Encoding.ASCII.GetString(buffer, 0, read)
+        .Replace("\r", "<CR>")
+        .Replace("\n", "<LF>\n");
+
+    Console.WriteLine($"server read {read} bytes:");
+    Console.Write(shown);
+});
+
+using var client = new TcpClient();
+await client.ConnectAsync(endpoint.Address, endpoint.Port);
+
+// Exactly the bytes from the previous section, typed out.
+const string request =
+    "GET /orders/42 HTTP/1.1\r\n" +
+    "Host: api.example.com\r\n" +
+    "User-Agent: dotnet/10.0\r\n" +
+    "Accept: application/json\r\n" +
+    "\r\n";
+
+await client.GetStream().WriteAsync(Encoding.ASCII.GetBytes(request));
+
+await server;
+listener.Stop();
+```
+
+</Solution>
+
+What this would print — arithmetic, not a capture; the request line and the three header lines are
+25, 23, 25 and 26 bytes with their line endings, plus the 2-byte blank line that ends them:
+
+```text
+server read 101 bytes:
+GET /orders/42 HTTP/1.1<CR><LF>
+Host: api.example.com<CR><LF>
+User-Agent: dotnet/10.0<CR><LF>
+Accept: application/json<CR><LF>
+<CR><LF>
+```
+
+Two things to take from that. The first is that the request is just bytes an ordinary `Write` put on
+an ordinary socket: there is no HTTP object anywhere in the program, and the server side is a byte
+dump. The second is the caveat in the comment — **that single `ReadAsync` returning the whole
+request is luck, not protocol.** One small write on loopback lands in one read essentially every
+time, and that is exactly the accident that lets a hand-rolled parser survive testing. A real server
+loops until it has seen the blank line, because the request may arrive in one read, or in three, or
+split in the middle of the word `Host`. That is
+[the byte-stream truth](/networking/tcp-and-udp/) showing up in its most consequential place.
+
+### the request line: methods, safe, and idempotent
+
+The method is a word on the front of a line, and the two properties that matter about it are
+properties the *protocol* promises, which is what lets software you did not write make decisions
+about your requests.
+
+- **Safe** — the method asks for nothing to change. It is a statement of intent by the client, not a
+  guarantee about your handler: your server can log the request and increment a counter and still be
+  compliant. What it means in practice is that anything on the path — a browser prefetcher, a
+  crawler, a caching proxy — is entitled to issue the request on its own initiative.
+- **Idempotent** — sending the request N times leaves the server in the same state as sending it
+  once. This is about *state*, not about the response: `DELETE` twice is idempotent even though the
+  second one answers `404`. This is the property that makes an automatic retry safe, and it is why
+  proxies, load balancers and HTTP client libraries will replay some of your requests and not
+  others.
+
+Every safe method is idempotent. The reverse is not true, and `PUT` and `DELETE` are the reason the
+distinction exists at all.
+
+| method | safe | idempotent | body | what it means |
+| --- | --- | --- | --- | --- |
+| `GET` | yes | yes | no | give me the representation of this resource |
+| `HEAD` | yes | yes | no | the headers a `GET` would return, without the body |
+| `OPTIONS` | yes | yes | no | what may I do here — the CORS preflight uses it |
+| `PUT` | no | **yes** | yes | make the resource at this target be exactly this |
+| `DELETE` | no | **yes** | rarely | make the resource at this target not exist |
+| `POST` | no | **no** | yes | process this, according to whatever this endpoint does |
+| `PATCH` | no | no | yes | apply this partial change — not idempotent in general |
+
+`PUT` is idempotent because it names the final state; `POST` is not because it names an action, and
+"place an order" done twice is two orders. That is the whole of it, and it is the reason the retry
+question in every distributed system eventually becomes an idempotency-key question — which
+[timeouts, retries and circuit breakers](/system-design/reliability/) owns.
+
+<Callout kind="trap" label="a method is a promise you can break">
+  Nothing enforces any of this. A `GET /orders/42/cancel` that cancels an order is legal HTTP and
+  broken engineering: it invites every prefetcher, link checker and retrying proxy on the path to
+  cancel orders for you. The properties are only useful because everyone else's software believes
+  them, which means the cost of lying is paid by you and collected by someone else's crawler.
+</Callout>
+
+### status codes: the first digit, then the pairs people mix up
+
+The first digit is the class, and handling the class correctly gets you most of the way:
+
+| class | meaning | what a client should do |
+| --- | --- | --- |
+| `1xx` | informational, interim — the real response is still coming | keep reading; `101` is the exception, and it changes protocol entirely |
+| `2xx` | it worked | carry on; `201` carries a `Location`, `204` has no body at all |
+| `3xx` | it is somewhere else | follow the `Location`, if you are willing to |
+| `4xx` | the request was wrong | do not retry unchanged — nothing on the server will fix it |
+| `5xx` | the server failed to handle a valid request | retrying may work, if the method is idempotent |
+
+Three pairs get confused constantly, and each confusion has a real cost.
+
+**`401` versus `403`.** `401 Unauthorized` is misnamed: it means *unauthenticated*. It says the
+request carried no usable credentials, and it must carry a `WWW-Authenticate` header naming the
+scheme to try — so the correct client response is "authenticate and try again". `403 Forbidden`
+means the server knows perfectly well who you are and the answer is still no. Retrying a `403` with
+the same identity is pointless by definition. The practical tell: if refreshing a token could
+possibly help, it was a `401`; if only a permissions change could help, it was a `403`.
+
+**`301` versus `302` versus `307` and `308`.** Two independent questions hide in these: is the
+redirect permanent, and does the method survive it.
+
+| code | permanence | method on the follow-up |
+| --- | --- | --- |
+| `301` Moved Permanently | permanent — clients and caches may remember it indefinitely | historically rewritten from `POST` to `GET`; clients are still allowed to |
+| `302` Found | temporary | same historical rewrite, same ambiguity |
+| `303` See Other | temporary | always becomes a `GET` — this is what POST-redirect-GET is built on |
+| `307` Temporary Redirect | temporary | method and body preserved, guaranteed |
+| `308` Permanent Redirect | permanent | method and body preserved, guaranteed |
+
+The `301` trap is the one that ends up in an incident review: a browser that has cached a permanent
+redirect will not ask you again, so a `301` issued by mistake keeps redirecting users after you have
+removed it. Issue `302` or `307` unless you are certain you will never want the old URL back. And
+when the method must survive — a redirected `POST` to an API — only `307` and `308` promise that.
+
+**`502` versus `503` versus `504`.** All three usually come from something in *front* of your
+service, which is the first thing to internalise: your process may never have seen the request.
+
+- **`502 Bad Gateway`** — the proxy tried to talk to your service and could not get a usable response
+  out of it. In practice this is what a proxy returns when the connection was refused or reset, or
+  when what came back was not valid HTTP. The upstream said something wrong, or nothing at all.
+- **`503 Service Unavailable`** — whatever answered is declining on purpose: overloaded, shedding
+  load, draining, or a load balancer with no healthy backend to send you to. It may carry
+  `Retry-After`, and it is the one 5xx that is a deliberate decision rather than a failure.
+- **`504 Gateway Timeout`** — the proxy reached your service, sent the request, and gave up waiting.
+  Note the consequence carefully: **your process is probably still working on it.** The client has a
+  `504`; you have a request in flight, and whatever it does to the database it will still do.
+
+That maps straight onto the distinction that the whole troubleshooting ladder is built on: a refused
+connection means something answered and said no, silence means something dropped the packet, and
+they are different diagnoses — [seeing the network](/networking/network-troubleshooting/) is where
+you separate them.
+
+Worth having on the same shelf: `400` (malformed — the server could not parse it), `404` versus
+`410` (missing versus deliberately gone forever), `409` (conflict, the optimistic-concurrency
+answer), `422` (parsed fine, semantically wrong), and `429 Too Many Requests`, which should always
+carry `Retry-After` and which your client should always honour rather than backing off on its own
+guess.
+
+### `Host`: why HTTP/1.1 made it mandatory
+
+In HTTP/1.0 the request line carried only a path. The server therefore had no idea which *name* the
+client had typed — it only knew which address and port the connection had arrived on. One IP
+address, one website.
+
+HTTP/1.1 made the `Host` header mandatory and the problem went away: the hostname travels inside the
+request, so one address and port can serve any number of names, chosen per request by looking at
+that header. A server must reject an HTTP/1.1 request that lacks a `Host` header, with `400`. This
+is name-based virtual hosting, and it is the reason a shared load balancer, an ingress controller
+and every CDN in existence can front thousands of sites on one address.
+
+Two consequences you will actually meet:
+
+- **The hostname is request data, not connection data**, and it is therefore attacker-controlled. A
+  service that builds absolute URLs from the incoming `Host` — password-reset links being the
+  classic — will happily build them pointing at whatever host an attacker put in the header. Pin the
+  public hostname in configuration; do not read it off the request.
+- **Once TLS wraps the bytes, the proxy cannot read `Host` before decrypting.** That is precisely
+  what SNI solves, below.
+
+HTTP/2 and HTTP/3 carry the same information as an `:authority` pseudo-header rather than a `Host`
+line, because their headers are binary fields rather than text lines. Same job, different
+encoding — [the network path](/system-design/networking/) has the versions in full.
+
+### where does the message end? the two framings
+
+This is the section the rest of the page hangs on. TCP delivers a stream. HTTP puts messages in it.
+So every HTTP implementation, on both sides, needs an answer to "where does this message stop", and
+there are exactly two answers plus a deprecated third.
+
+```text
+  the reader's view: one unbroken run of bytes, arriving in chunks it did not choose
+  (·· = <CR><LF>)
+
+  HTTP/1.1 200 OK··Content-Type: application/json··Content-Length: 23····{"id":42,"total":19.99}
+  └───────────────────────────── headers ─────────────────────────────┘└┘└── body, 23 bytes ───┘
+                                                                       ▲
+  step 1: scan for the first EMPTY line, marked here ──────────────────┘
+  step 2: then read exactly as many more bytes as a header already told you
+
+  the 94 bytes above might come off the socket as reads of 40, then 12, then 42.
+  All three are legal, and not one of those boundaries means anything.
+```
+
+**Framing one: `Content-Length`.** A length prefix, written as a decimal count of body bytes. The
+reader reads exactly that many. This is the same shape as the 4-byte length prefix in any binary
+protocol, and it has the same requirement: you must know the size before you send the first byte of
+the body.
+
+**Framing two: `Transfer-Encoding: chunked`.** When you do not know the size in advance — you are
+streaming a report, or proxying something whose length you have not seen yet — you send a series of
+self-describing chunks: a size in **hexadecimal**, a `<CR><LF>`, that many bytes, a `<CR><LF>`, and
+so on, terminated by a chunk of size zero. Here is the same 23-byte body as before, split into a
+9-byte chunk and a 14-byte one (`e` is 14 in hex):
+
+```text
+HTTP/1.1 200 OK<CR><LF>
+Content-Type: application/json; charset=utf-8<CR><LF>
+Transfer-Encoding: chunked<CR><LF>
+<CR><LF>
+9<CR><LF>
+{"id":42,<CR><LF>
+e<CR><LF>
+"total":19.99}<CR><LF>
+0<CR><LF>
+<CR><LF>
+```
+
+There is no `Content-Length` anywhere, and there cannot be a meaningful one — the sender did not
+know the total when the headers went out. The trailing `0` chunk is the end-of-message signal, which
+is why a truncated chunked response is detectable: the reader knows it never saw the zero chunk.
+
+**The deprecated third: close the connection.** HTTP/1.0's fallback was "the body ends when the
+connection ends". It works, and it costs you two things: the connection, which now has to be
+re-established for the next request, and the ability to distinguish a complete response from a
+truncated one — both look like a close. This is why persistent connections and one of the two real
+framings go together, and it is the concrete reason `Content-Length` exists at all.
+
+<Callout kind="trap" label="when the two framings disagree, that is a vulnerability">
+  A message must not use both. Where a `Content-Length` and a `Transfer-Encoding: chunked` both
+  appear, the rule is that the chunked framing wins and the length is ignored — and current
+  specifications go further for requests, telling the server to answer `400` and close the
+  connection rather than resolve the conflict at all. The reason for that severity is that the
+  failure mode is not "the wrong one gets picked", it is **two devices on the path picking
+  differently**.
+  The proxy believes the message ended where `Content-Length` said; the server believes it ended
+  where the zero chunk was. The bytes in between are then read by the server as the *start of the
+  next request* — an attacker's request, injected into someone else's connection. That is HTTP
+  request smuggling. The defensible position for anything you write: reject a message carrying both
+  headers rather than choosing between them, and do not hand-roll an HTTP parser in front of a
+  server that has a real one.
+</Callout>
+
+Two smaller notes that fall out of framing. `HEAD` returns the headers a `GET` would have returned,
+including a `Content-Length`, with no body — the header describes the body that would have been
+sent, and a reader that does not special-case `HEAD` will sit waiting for bytes that are never
+coming. And `Connection` is a *hop-by-hop* header: it describes this one connection to the next
+device, not the end-to-end message. In HTTP/1.1 connections persist by default, so
+`Connection: close` is how you opt out; `Connection: keep-alive` is an HTTP/1.0-era spelling that
+still gets emitted for compatibility. HTTP/2 forbids the header entirely, because it multiplexes and
+the concept no longer applies.
+
+### stateless on purpose, and the cookie that works around it
+
+HTTP is **stateless**: every request carries everything needed to interpret it, and the server is
+required to keep no memory of previous requests on the same connection. Connection reuse is a
+transport optimisation and nothing more — request two on a reused connection has no more standing
+than request one on a fresh one.
+
+That is not an oversight, it is the property that makes horizontal scaling trivial: if no request
+depends on which machine handled the last one, any request can go to any backend, a backend can be
+removed mid-conversation, and a load balancer needs no knowledge of your application. Every piece of
+"sticky session" configuration you have ever seen is somebody giving that property back.
+
+Cookies are the bolt-on that restores state without breaking that. The server sends one on a
+response:
+
+```text
+HTTP/1.1 200 OK<CR><LF>
+Set-Cookie: session=8f3a2c...; Path=/; Max-Age=3600; HttpOnly; Secure; SameSite=Lax<CR><LF>
+Content-Length: 0<CR><LF>
+<CR><LF>
+```
+
+and the client sends it back on every subsequent matching request, as an ordinary header:
+
+```text
+GET /orders/42 HTTP/1.1<CR><LF>
+Host: api.example.com<CR><LF>
+Cookie: session=8f3a2c...<CR><LF>
+<CR><LF>
+```
+
+The attributes are the whole security surface, and each one is worth knowing exactly:
+
+- `Domain` and `Path` — the **scope**: which hosts and paths the cookie is attached to. Attachment is
+  decided by the destination, not by the page that triggered the request, which is the entire root
+  of cross-site request forgery.
+- `Max-Age` / `Expires` — the **lifetime**. With neither, it is a session cookie and dies with the
+  browser session.
+- `HttpOnly` — script cannot read it. This is the difference between a cross-site scripting bug
+  stealing the session and merely defacing the page.
+- `Secure` — sent only over HTTPS, so it never appears in cleartext on a downgrade.
+- `SameSite` — `Lax`, `Strict` or `None`: whether the cookie rides along on requests initiated by
+  other sites. This is the actual CSRF lever, and `None` requires `Secure`.
+
+The value itself should be an opaque key into server-side state, or a signed token. If you put the
+state *in* the cookie unsigned, you have shipped your authorisation logic to the client — and either
+way you now pay those bytes on every single request to that host, which is a real reason large
+cookies are a performance problem rather than merely untidy.
+
+The rest of HTTP's per-request state is the same idea with different names: `Authorization: Bearer`
+carries a token instead of a cookie and is not attached automatically by anything, which is why APIs
+prefer it; `ETag` plus `If-None-Match` lets a server answer `304 Not Modified` with no body at all;
+`Cache-Control` states who may store the response and for how long. The policy questions those raise
+belong to [caching](/system-design/caching/) — the mechanism is just headers.
+
+### TLS, in outline
+
+TLS sits between TCP and HTTP and changes nothing about the bytes above it. HTTP still writes the
+same request lines and headers; they go into a TLS record layer instead of straight into the socket,
+and what crosses the network is encrypted records.
+
+```text
+  what your code says              what actually goes on the wire
+
+  await http.GetAsync("https://api.example.com/orders/42")
+        │
+        ▼
+  HTTP    GET /orders/42 HTTP/1.1··Host: api.example.com··   ← text, unchanged by TLS
+        │
+        ▼
+  TLS     encrypted records                                   ← only because the URI said https
+        │
+        ▼
+  TCP     one byte stream, in segments, to port 443           ← no idea any of this is HTTP
+        │
+        ▼
+  IP      packets addressed to 203.0.113.10                   ← no idea there is a stream
+```
+
+Three things it adds, and it is worth naming them separately because they fail separately:
+
+- **Confidentiality** — nobody on the path reads the bytes.
+- **Integrity** — nobody on the path alters them undetected.
+- **Server identity** — the server presents a certificate chaining to a certificate authority the
+  client already trusts, and the name in that certificate must match the name the client asked for.
+  This is the part that fails on a bad day: an expired certificate, a chain missing an intermediate,
+  or a name mismatch are three different failures that all present as "TLS broke".
+
+HTTPS is HTTP over TLS, and its convention is port 443 against HTTP's 80. **SNI** — Server Name
+Indication — is the hostname sent *in the clear* in the client's first handshake message, so a
+server holding many certificates on one address can pick the right one before it can decrypt
+anything. It is `Host` solved a second time, one layer down, because the first solution became
+invisible the moment the bytes were encrypted; the side effect is that which site you asked for is
+observable on the path even though the request is not (a newer extension encrypts that first message
+to close the gap, and adoption is uneven).
+
+How many round trips that handshake costs, what 0-RTT resumption trades away, and how any of it
+interacts with HTTP/2 and HTTP/3 is the applied layer's material, and it is covered properly in
+[the network path](/system-design/networking/). Everything on this page is the same whether TLS is
+underneath it or not, which is exactly the point of putting it there.
+
+### when request/response is the wrong shape: WebSockets and gRPC
+
+HTTP's shape is one client request, one server response. Two things go wrong with that. The server
+cannot speak first — a client that wants to know about events has to keep asking, and every poll
+that finds nothing is a whole request, headers and all, for no information. And on an HTTP/1.1
+connection a request has to complete before the next one on that connection begins.
+
+**WebSockets** solve the first by borrowing HTTP just long enough to get a connection, then leaving.
+The client sends an ordinary `GET` with upgrade headers; the server answers `101 Switching
+Protocols`; after that final `<CR><LF>` the same TCP connection is no longer HTTP at all:
+
+```text
+client                                                    server
+
+GET /feed HTTP/1.1<CR><LF>
+Host: api.example.com<CR><LF>
+Upgrade: websocket<CR><LF>
+Connection: Upgrade<CR><LF>
+Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==<CR><LF>
+Sec-WebSocket-Version: 13<CR><LF>
+<CR><LF>                              ─────────────────→
+
+                                      ←─────────────────  HTTP/1.1 101 Switching Protocols<CR><LF>
+                                                          Upgrade: websocket<CR><LF>
+                                                          Connection: Upgrade<CR><LF>
+                                                          Sec-WebSocket-Accept: s3pPLMBiTxaQ...<CR><LF>
+                                                          <CR><LF>
+
+  ══════ from here the same TCP connection carries WebSocket frames, both ways ══════
+
+   frame: opcode (text/binary/ping/pong/close) · payload length · mask · payload
+   either side may send at any time; neither is answering the other
+```
+
+The `Sec-WebSocket-Accept` value is a hash of the client's key with a fixed constant — a proof that
+the responder actually understood the upgrade, not a security mechanism. Frames carry an opcode, a
+payload length, and a masking key on client-to-server frames only. Note the two useful properties
+that fall out: framing is back (frames have lengths, so message boundaries exist again), and there
+are no status codes, no methods, and no caching any more — you gave those up along with the request
+shape.
+
+<Solution>
+
+```csharp
+using System.Net.WebSockets;
+using System.Text;
+
+using var socket = new ClientWebSocket();
+await socket.ConnectAsync(new Uri("wss://api.example.com/feed"), CancellationToken.None);
+
+await socket.SendAsync(
+    Encoding.UTF8.GetBytes("""{"subscribe":"orders"}""").AsMemory(),
+    WebSocketMessageType.Text,
+    endOfMessage: true,
+    CancellationToken.None);
+
+var buffer = new byte[4096];
+while (socket.State == WebSocketState.Open)
+{
+    ValueWebSocketReceiveResult result = await socket.ReceiveAsync(buffer.AsMemory(), CancellationToken.None);
+
+    if (result.MessageType == WebSocketMessageType.Close)
+    {
+        await socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "done", CancellationToken.None);
+        break;
+    }
+
+    // EndOfMessage can be false: one message may span several frames, and one frame
+    // may span several receives. The stream problem again, one layer up.
+    Console.WriteLine(Encoding.UTF8.GetString(buffer, 0, result.Count));
+}
+```
+
+</Solution>
+
+WebSockets beat polling when the server has something to say at moments the client cannot predict —
+a price feed, a chat message, a job that finishes — and when the per-message overhead of a full
+request would dominate the message. What they cost is real: one open connection per client is
+server-side state, which is the thing HTTP's statelessness was buying you, so scaling out now needs
+sticky routing or a backplane; idle connections get culled by proxies, NATs and load balancers, so
+you need ping/pong keepalives; and reconnection with resume-from-where-I-was is now your problem. If
+the traffic is one-directional server-to-client, **Server-Sent Events** does that over ordinary HTTP
+with none of this, and is worth ruling out first. In .NET, `ClientWebSocket` and
+`app.UseWebSockets()` are the raw layer; SignalR is the layer that negotiates a transport, falls
+back when WebSockets are unavailable, and handles reconnection.
+
+**gRPC** keeps request/response but replaces everything else. The contract is written first, in a
+`.proto` file, and both ends are generated from it; messages are binary protobuf rather than text;
+the transport is HTTP/2, with each call as one stream, which is what makes its four call shapes —
+unary, server-streaming, client-streaming and bidirectional — natural rather than bolted on. The
+call's own outcome is a gRPC status code carried in the trailers, not the HTTP status, so a failed
+gRPC call routinely rides inside an HTTP `200`. The operational consequence worth remembering:
+because it requires HTTP/2 end to end, an intermediary that speaks HTTP/2 to the client but
+HTTP/1.1 to your backend breaks every call, and nothing in the contract or the client API warned you
+the hop downgraded. Compared with JSON over HTTP you trade readable-in-a-terminal and cache-friendly
+for a schema, smaller payloads and real streaming — which
+is why it is common between services and rare at a browser-facing edge.
+
+### the protocols worth recognising, and their ports
+
+| protocol | default port | what it is | worth knowing |
+| --- | --- | --- | --- |
+| SSH | 22 | encrypted remote shell and tunnel | also the transport under `scp`, `sftp` and port forwarding |
+| SMTP | 25, 587 | mail *submission and relay*, not retrieval | 25 is server-to-server and blocked outbound by most cloud providers; 587 is authenticated submission |
+| DNS | 53 | name resolution | UDP with TCP fallback — [DNS](/networking/dns/) has the whole walk |
+| HTTP | 80 | this page | plain text; anything sensitive on it is readable on the path |
+| HTTPS | 443 | HTTP over TLS | also where HTTP/3 and most tunnelling ends up, because 443 is the port firewalls allow |
+| IMAPS | 993 | mail retrieval over TLS | the "why is my mail client broken" port; POP3S is 995 |
+| SQL Server | 1433 | TDS | should never be reachable from the internet, and regularly is |
+| PostgreSQL | 5432 | the Postgres wire protocol | same, plus a connection is expensive enough that pooling is not optional |
+| RabbitMQ | 5672 | AMQP | 15672 is the management HTTP UI, and it is a different service on a different port |
+| Redis | 6379 | RESP, a simple text protocol | historically unauthenticated by default — an exposed 6379 is a full compromise |
+
+Say this once and mean it: **a port number is a convention, not a property of the protocol.** The
+number is a 16-bit field the two ends agreed on, recorded in a registry so that clients have a
+sensible default. Nothing in TCP knows what is being spoken. HTTPS on 8443 works, SSH on 2222 works,
+and a scanner that finds something listening on 443 has learned that something is listening on 443
+and nothing else. The corollary matters more than the trivia: "the port is open" and "the service is
+healthy" are different claims, and only [ports and sockets](/networking/ports-and-sockets/) can tell
+you which one you have.
+
+## the mental model
+
+```text
+  HTTP = text lines over a byte stream, framed twice in one message
+
+    request line    METHOD SP target SP HTTP/1.1     <CR><LF>
+    header lines    Name: value                       <CR><LF>   (repeat)
+    end of headers  (nothing at all)                  <CR><LF>   ← delimiter framing
+    body            exactly as many bytes as a header said       ← length framing
+
+  the two body framings, and there are only two:
+    Content-Length: N            exactly N bytes follow
+    Transfer-Encoding: chunked   hex size, bytes, ... terminated by a 0 chunk
+    both present                 → smuggling seam. Reject, do not choose.
+
+  status: the first digit is the triage
+    1xx wait · 2xx done · 3xx elsewhere · 4xx you · 5xx me (or a proxy in front of me)
+
+  the properties other people's software acts on:
+    safe        = I asked for no change      → prefetchers and crawlers may issue it
+    idempotent  = N times equals once        → proxies and clients may retry it
+
+  stateless by design; the cookie is the workaround:
+    Set-Cookie (response, once)  →  Cookie (request, every time, to every matching host)
+
+  TLS changes none of the above. It wraps it, adds identity, and moves the port to 443.
+```
+
+<Watch items={[['line ending', 'CR LF — bytes `0x0D 0x0A`'], ['end of headers', 'one empty line, then the body'], ['body framing', '`Content-Length` or chunked — nothing else'], ['status triage', 'first digit: 4xx yours, 5xx theirs'], ['idempotent', 'same state after N sends as after one'], ['`Host`', 'mandatory in HTTP/1.1; missing is a 400'], ['ports', 'HTTP 80 · HTTPS 443 — convention, not property']]} />
+
+## why you should care
+
+**The 5xx you did not send.** A `502`, `503` or `504` in a user's screenshot with nothing whatsoever
+in your service's logs is not a mystery, it is information: the status was manufactured by something
+in front of you. Read them as three different sentences. `502` — the hop in front tried to talk to
+your process and got a refusal, a reset, or garbage; look at whether the process was up, whether it
+was listening on the interface the proxy dials, and whether it returned something that is not valid
+HTTP. `503` — whatever answered chose to decline; look at load shedding, health checks and whether
+the backend pool was empty. `504` — the proxy gave up waiting, and **your process is very likely
+still running that request**, which means the work may complete after the client has been told it
+failed, and a client retry can then duplicate a non-idempotent side effect. That last one is why a
+gateway timeout shorter than your own handler timeout turns an innocent-looking retry into a
+duplicate write, with no error anywhere in your logs.
+
+**Framing bugs are security bugs, and they are not exotic.** Everything in the framing section
+becomes a vulnerability the moment two implementations on one path disagree — a CDN, a reverse
+proxy, an in-house gateway and Kestrel all parsing the same bytes. The practical rules are short:
+never write your own HTTP parser to sit in front of one that exists; keep the proxy and the server
+on versions that agree; reject messages carrying both framings rather than resolving them; and treat
+anything that reconstructs a request from parts — a rewritten path, an injected header, a `Host`
+copied into a URL — as parsing you now own.
+
+**Your HTTP client throws away most of this by default.** `EnsureSuccessStatusCode` collapses `401`,
+`404`, `429` and `503` into one `HttpRequestException`, which is exactly the distinction your retry
+policy needs: `4xx` means stop, `5xx` and `429` mean maybe, and *maybe* still depends on whether the
+method was idempotent. `HttpClient.Timeout` covers the whole operation including reading the body,
+and it surfaces as a `TaskCanceledException` rather than a `SocketException`, so a
+`catch (SocketException)` never sees it and the socket-level diagnosis is gone — pass
+`HttpCompletionOption.ResponseHeadersRead` when you are streaming a large body and want the status
+before the bytes. And the failure that looks like the network but is not: a client that keeps a
+handler forever keeps talking to the address it first resolved, which is
+[the DNS trap](/networking/dns/) rather than anything on this page.
+
+**Cookies and a shared handler do not mix.** `HttpClientHandler` and `SocketsHttpHandler` handle
+cookies for you by default, in a container that belongs to the *handler* — and `IHttpClientFactory`
+pools and shares handlers across callers by design. A `Set-Cookie` from one call is therefore
+attached to a different caller's request through the same handler, which for a service calling a
+downstream on behalf of many users is a cross-user data leak with no exception anywhere. Turn
+cookies off on shared handlers and set the header yourself when you actually need one.
+
+**The code review you can now do:** a `GET` that mutates; a `301` where a `302` was meant; a retry
+policy that retries `POST`; a `Content-Length` computed from a string's `Length` rather than its
+encoded byte count; a hand-rolled socket reader that assumes one read is one message; a cookie
+without `HttpOnly`, `Secure` and a `SameSite`; an absolute URL built from the incoming `Host`
+header; and a WebSocket endpoint behind a load balancer with no sticky routing and no keepalive.
+
+The version questions this page deliberately left alone — HTTP/1.1 versus HTTP/2 versus HTTP/3, what
+the TLS handshake costs in round trips, and how connection pooling changes all of it — are the next
+layer up, in [the network path](/system-design/networking/). Everything there assumes the anatomy on
+this page; nothing here changes when the version does.
+
+## the same idea elsewhere
+
+| where the same mechanism shows up | what matches | the trap |
+| --- | --- | --- |
+| a length-prefixed binary protocol over a socket | `Content-Length` is a length prefix and the blank line is a delimiter — HTTP uses both framings in one message — see [TCP and UDP](/networking/tcp-and-udp/) | "which framing does this use" has two answers per message, and a parser that gets the second one from the first one's byte count is where smuggling lives |
+| `Host` and TLS's SNI | the same problem — many names, one address — solved twice, once in cleartext and once in the handshake, because the first solution is invisible once encrypted | a proxy routing on SNI cannot see the path; one routing on `Host` must terminate TLS and therefore must hold your certificate |
+| an idempotency key on a payment API | HTTP method idempotence is the same property, declared rather than implemented — it is what lets other people's software retry for you — see [timeouts, retries and circuit breakers](/system-design/reliability/) | a `POST` retried after a lost response duplicates the effect; the network cannot tell "never arrived" from "answered, and the answer was lost" |
+| an `ETag` and a cache key | a conditional request is a cache validation protocol built out of two headers, and `304` is a hit — see [caching](/system-design/caching/) | the freshness decision moved to the client, so a wrong `Cache-Control` is a bug you cannot fix by deploying, only by waiting |
+| a session cookie and a session key in a distributed cache | the cookie is a key, the state is somewhere else; putting the state in the cookie makes it client-editable and pays its bytes on every request | scoping is by destination host and path, not by which page made the request — which is exactly why CSRF exists and `SameSite` had to be invented |
+
+## interview drills
+
+**Q.** Users are getting `502`s. Your service's logs are completely clean for those requests. Where
+do you look?
+
+- *weak answer* — "The service must be crashing." Maybe, but the logs say the request never got
+  there, and this answer skips the one piece of information the status actually carries.
+- *strong answer* — A `502` is manufactured by a proxy in front of me: it means the hop in front
+  tried to reach my process and could not get a usable HTTP response out of it. So I would check
+  liveness and, more usefully, *where* the process is listening versus where the proxy is dialling —
+  a service bound to loopback answers from inside the container and refuses from anywhere else. Then
+  whether anything is returning something that is not valid HTTP.
+- *follow-up* — "And if it were a `504` instead?" Then the proxy did reach me and gave up waiting,
+  my process is probably still running the request, and any client retry can duplicate whatever that
+  request writes.
+
+**Q.** When do you return `401` and when do you return `403`?
+
+- *weak answer* — "`401` is not logged in, `403` is not allowed." Right instinct, but it will not
+  survive the follow-up about what the client should do next.
+- *strong answer* — `401` means unauthenticated — no credentials, or credentials that were not
+  accepted — and it must carry a `WWW-Authenticate` header naming what to try, because the correct
+  client behaviour is to authenticate and retry. `403` means the identity is established and still
+  not permitted, so retrying with the same identity is pointless by construction. The test I use:
+  could refreshing a token possibly help? If yes it was a `401`.
+- *follow-up* — "What if you do not want to admit the resource exists?" Then `404`, deliberately —
+  that is a disclosure decision, and it is worth writing down that it was one.
+
+**Q.** How does an HTTP client know where a response ends?
+
+- *weak answer* — "It reads until the connection closes." That was HTTP/1.0's fallback, and it costs
+  you the connection and the ability to detect truncation.
+- *strong answer* — Two framings and no others. Either `Content-Length` gives the exact body byte
+  count and the reader reads that many, or `Transfer-Encoding: chunked` sends self-describing chunks
+  — hex size, bytes, repeat — terminated by a zero-size chunk, which is what you use when you do not
+  know the length before you start sending. The headers themselves are delimiter-framed: the reader
+  scans for a blank line first. The reason any of this is needed is that TCP has no message
+  boundaries at all.
+- *follow-up* — "What if a message has both headers?" The spec says chunked wins, but the real
+  danger is two devices on the path deciding differently — that is request smuggling, and the safe
+  behaviour is to reject the message.
+
+**Q.** Which HTTP methods can a load balancer safely retry, and why does it get to decide?
+
+- *weak answer* — "Retry `GET`s, do not retry `POST`s." Correct answer, no mechanism, and it will not
+  extend to `PUT` or `PATCH`.
+- *strong answer* — It can retry idempotent methods: `GET`, `HEAD`, `PUT`, `DELETE`, `OPTIONS`. The
+  property is about server *state* — N sends leave the same state as one — not about the response,
+  which is why `DELETE` is idempotent even though the second one answers `404`. `POST` and, in
+  general, `PATCH` are not. It gets to decide because the method is a promise the protocol makes on
+  my behalf to software I did not write, which is also why a `GET` that mutates is a genuine bug and
+  not a style question.
+- *follow-up* — "How do you make a `POST` retryable anyway?" An idempotency key the server
+  deduplicates on, because otherwise nothing can distinguish "never arrived" from "processed, and
+  the response was lost".
+
+**Q.** A team wants WebSockets for a dashboard that currently polls every few seconds. What do you
+ask?
+
+- *weak answer* — "Sure, WebSockets are more efficient than polling." True in some regimes and it
+  ignores everything the change costs.
+- *strong answer* — First: does the server need to speak unprompted, or is the client just asking
+  too often? If it is one-directional server-to-client, Server-Sent Events does it over ordinary
+  HTTP and keeps the statelessness. If it genuinely needs both directions, the upgrade is cheap but
+  the consequences are not: an open connection per client is server-side state, so scaling out now
+  needs sticky routing or a backplane, idle connections get culled by proxies and NATs so you need
+  keepalives, and reconnect-and-resume becomes application logic.
+- *follow-up* — "How does the connection start?" As an ordinary HTTP `GET` with `Upgrade: websocket`
+  answered by `101 Switching Protocols`; after that response's blank line the same TCP connection
+  carries WebSocket frames and is not HTTP any more.
+
+**Q.** Why did HTTP/1.1 make `Host` mandatory, and what is the security consequence?
+
+- *weak answer* — "So you can host several sites on one server." The right fact, and it stops one
+  step before the part that matters.
+- *strong answer* — HTTP/1.0's request line carried only a path, so a server knew which address the
+  connection arrived on but not which name the client typed — one address, one site. Making `Host`
+  mandatory moves the hostname into the request, so one address and port can serve any number of
+  names, which is what every CDN and ingress controller is built on. The consequence is that the
+  hostname is now request data and therefore attacker-controlled: a service that builds absolute
+  URLs from the incoming `Host` — password reset links, say — will build them pointing wherever the
+  attacker asked.
+- *follow-up* — "What happens once the connection is TLS?" The proxy cannot read `Host` before
+  decrypting, so the hostname is sent in the clear in the TLS handshake as SNI — the same problem
+  solved a second time, one layer down.

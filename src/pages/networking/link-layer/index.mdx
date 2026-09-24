@@ -1,0 +1,657 @@
+---
+layout: '@layouts/TopicLayout.astro'
+topic: link-layer
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import Solution from '@components/Solution.astro';
+
+## the ground floor
+
+- **Frame, packet, header, payload, EtherType, encapsulation** are all built in
+  [the OSI model and what actually runs](/networking/osi-model/). A frame is the layer-2 chunk;
+  a packet is the layer-3 chunk that rides inside it. This page assumes both and does not
+  redefine them.
+- **A link** is one segment two devices can hand bytes to each other over directly, with nothing
+  in between — [what a network actually is](/networking/network-basics/) defines it, along with
+  **hop** and **best-effort delivery**.
+- **A network interface** is the hardware or virtual device that puts bytes on a link. This page
+  is entirely about what one interface does with one link, and about nothing beyond it.
+- **Subnet, on-link, and the default gateway.** A **subnet** is the set of addresses your
+  interface can reach without a router — written as a prefix like `192.0.2.0/24`, and an address
+  inside it is **on-link**. Anything else goes to the **default gateway**: a router on your own
+  subnet that forwards on your behalf. (Not the API gateway you deploy — same word, a layer-7
+  proxy, unrelated.) The arithmetic that decides which is which belongs to
+  [IP addresses, subnets and routing](/networking/ip-and-routing/); this page uses the words and
+  not the arithmetic.
+- **MTU** — the largest layer-3 payload one link will carry in a single frame. Named on the OSI
+  page because the arithmetic there needed it; this page owns it.
+- **The kernel owns the interface.** Nothing on this page is reachable from your process without
+  privilege, and every send is a crossing into the kernel —
+  [processes and threads](/systems/process-and-thread/) owns that boundary.
+
+## core idea
+
+Every other layer is about reaching a machine that could be anywhere. This one is about reaching
+a device that is *right here*, on the other end of one link, and it is the only layer that ever
+thinks about a wire. Its horizon is exactly one hop wide: put a frame on this link, addressed to
+one neighbour on this link, and stop.
+
+That narrowness produces the sentence worth carrying off this page: **the destination MAC address
+in the frame leaving your NIC is almost never the destination server's.** It is the address of the
+next device on the path — usually your default gateway. The two addresses in one frame routinely
+point at two different machines, and the layer-3 one is the only one that survives the journey.
+
+| | layer 2, this page | layer 3, the next page |
+| --- | --- | --- |
+| the address | MAC, 48 bits, flat | IP, 32 or 128 bits, structured |
+| how far it means anything | this link only | the whole path |
+| rewritten at each hop | yes, entirely — new source and destination | no, it is the same header end to end |
+| the question it answers | which neighbour gets this frame | which direction is the destination in |
+
+## how it actually works
+
+### a MAC address is 48 bits with no structure to route on
+
+Six bytes, written as six hex octets — `02:42:ac:11:00:02` — and assigned in two halves. The
+first three bytes are an **OUI**, an identifier the IEEE hands out to a manufacturer; the last
+three are whatever that manufacturer chose to stamp on this particular NIC. Two bits in the first
+octet carry meaning: one marks an address as a group address rather than a single device, and one
+marks it as locally administered rather than factory-assigned.
+
+Notice what that structure is *about*. It tells you who made the card. It tells you nothing about
+where the card is. Two adjacent OUIs are two companies, not two neighbours; a NIC keeps its
+address when you fly it across the world. There is no prefix you could match, no aggregation you
+could do, no way to look at an address you have never seen and say which direction to send it —
+which is exactly what a routing table has to do for every packet.
+
+That is the whole argument for IP existing. A flat 48-bit space is fine for "is this frame mine",
+which is a comparison against a handful of local addresses, and useless for "which of my four
+neighbours is closer to this address", which is what forwarding across a network of networks
+requires. An IP address is *assigned by where you are attached*, not by who built your hardware,
+and that is the property that makes a routing table possible.
+[IP addresses, subnets and routing](/networking/ip-and-routing/) is where that structure gets used.
+
+<Callout kind="note" label="burned in, and routinely overwritten">
+  "Burned into the card at the factory" is the origin story and it is still true of physical NICs,
+  but assume nothing from it. The virtual interfaces in a VM, a container or a Kubernetes pod have
+  generated addresses. `ip link set dev eth0 address ...` changes one on Linux in a single command,
+  and the locally-administered bit exists precisely to say "this one was not assigned by a vendor".
+  Phones and laptops now randomise their Wi-Fi address per network on purpose, so that the address
+  cannot be used to track them between cafés. Uniqueness on your own segment is what actually
+  matters, and that is all you should rely on.
+</Callout>
+
+### the Ethernet frame, byte by byte
+
+Fourteen bytes on the front, four on the back, and the entire IP packet in the middle:
+
+```text
+one Ethernet II frame — offsets in bytes, from the first byte of the frame
+
+  offset   size    field
+  ──────   ─────   ────────────────────────────────────────────────────────────────
+   (−8)     8      preamble + start-of-frame delimiter: alternating bits so the
+                   receiver's clock can lock on, then one byte marking "frame starts
+                   now". Not part of the frame. The NIC strips it; you never see it.
+  ──────   ─────
+      0     6      destination MAC   ← who on THIS link should keep this frame
+      6     6      source MAC        ← who on THIS link sent it; switches learn from this
+     12     2      EtherType         ← names what is inside:
+                                        0x0800 IPv4 · 0x86DD IPv6
+                                        0x0806 ARP  · 0x8100 an 802.1Q VLAN tag follows
+     14    46–1500 payload           ← the whole layer-3 packet, its header included
+      …     4      frame check sequence — a CRC over every byte above it
+  ──────   ─────
+                   64 bytes minimum, 1518 bytes maximum, then a mandatory idle gap
+                   before the next frame goes out
+```
+
+Three of those numbers are worth understanding rather than memorising.
+
+**The 4-byte FCS detects corruption and does not repair it.** A NIC that computes a different CRC
+than the one on the end drops the frame silently and increments an error counter. Nothing is
+retransmitted at this layer on Ethernet — the loss is handed upward as "a packet that never
+arrived", and whether anyone notices is TCP's problem or your application's.
+
+**The 46-byte minimum payload is a fossil of collision detection.** On the original shared-wire
+Ethernet, a station had to still be transmitting when the echo of a collision at the far end of
+the cable got back to it, or it would never learn that its frame had been destroyed. That set a
+floor on frame size, and the floor is 64 bytes counting the header and FCS, which leaves 46 for
+the payload. A shorter payload is padded with zeroes. Modern switched full-duplex Ethernet has no
+collisions at all, and the minimum is still there, because everything on earth implements it.
+
+**The 1500-byte maximum has no derivation, and you should stop looking for one.** It was a
+judgement call in the original DIX Ethernet specification around 1980, trading receiver buffer
+memory — expensive then — against the per-frame header overhead you pay more of when frames are
+smaller, and against how long one station could hold a shared wire. It froze because everything
+above it now assumes it. Later, when the IEEE reused the two bytes at offset 12 as a *length* field
+in an alternative framing, it had to pick a value above which the field would be read as an
+EtherType instead; it chose `0x0600`, which is 1536, comfortably clear of the 1500 that was
+already there. So the two readings never collide — but note the causality, because people get it
+backwards: 1500 came first and the threshold was chosen around it.
+
+Jumbo frames of 9000 bytes exist and are common inside storage and cluster networks. They are not
+standard Ethernet, and every device on the path has to agree, which is why they live on networks
+one team controls end to end and essentially never on the internet.
+
+### what a switch does that a hub did not
+
+A **hub** was a layer-1 repeater. Bits arriving on any port were blasted out every other port,
+because a hub had no idea what a frame was. Every device shared one **collision domain**: two
+stations transmitting at once destroyed each other's frames, both detected it, both backed off a
+random amount and retried. Everyone also saw everyone else's traffic, which made packet-sniffing
+on a LAN a matter of plugging in.
+
+A **switch** reads the frame. Specifically it does two things, and the first is the clever one:
+
+```text
+a switch learning its forwarding table, from three frames
+
+  port 1 ── A (aa:..:01)      port 3 ── C (cc:..:03)
+  port 2 ── B (ba:..:02)      port 4 ── uplink to the router (ee:..:ff)
+
+  frame 1   A → B     arrives on port 1, source aa:..:01
+            learn:  aa:..:01 is on port 1          ← from the SOURCE field
+            lookup: ba:..:02 not in the table
+            action: FLOOD out ports 2, 3, 4 — everyone but the one it came in on
+
+  frame 2   B → A     arrives on port 2, source ba:..:02
+            learn:  ba:..:02 is on port 2
+            lookup: aa:..:01 → port 1
+            action: forward out port 1 ONLY. C never sees it.
+
+  frame 3   A → B     arrives on port 1
+            lookup: ba:..:02 → port 2
+            action: forward out port 2 only
+
+  table now:  aa:..:01 → 1     ba:..:02 → 2     (cc:..:03 still unknown —
+                                                 C has not transmitted yet)
+```
+
+The switch learns from the **source** address of every frame that arrives, and forwards on the
+**destination**. It is a cache built entirely by eavesdropping, and it has the three properties
+every cache has: entries age out when idle, a miss is expensive, and a full table is a problem.
+The miss here is **unknown unicast flooding** — send it everywhere and hope — which is why a
+device that only ever listens and never transmits is never learned, and every frame to it is
+flooded forever. Fill the table beyond its capacity and a switch degrades to flooding everything,
+which is a real attack and the reason managed switches limit how many addresses a port may learn.
+
+The second thing a switch does is give every port its own collision domain. Combined with
+full-duplex links — separate pairs for each direction — collisions simply stop happening on a
+switched network, and the whole CSMA/CD apparatus that Ethernet was built around goes unused.
+
+What a switch does **not** do is stop a broadcast. A frame addressed to `ff:ff:ff:ff:ff:ff` goes
+out every port, always, by definition. The set of devices a broadcast reaches is the **broadcast
+domain**, and a switch does not divide it — only a router, or a VLAN boundary, does. Hold that
+thought, because the next thing on this page is a protocol built entirely out of broadcasts.
+
+### ARP: from an IP address to the MAC of the next hop
+
+The kernel is about to send an IP packet. It knows the destination IP address, because that is
+what your code passed to `ConnectAsync`. To build the frame around it, it needs a destination MAC
+address — and nothing it has so far tells it one.
+
+**ARP** is the protocol that fills that gap. It rides directly in an Ethernet frame with EtherType
+`0x0806` — not inside an IP packet — which is why it has no ports, no TTL, and no place in the
+layer diagram. Its payload is 28 bytes for the IPv4-over-Ethernet case, which is smaller than the
+46-byte minimum, so every ARP frame on the wire is padded out to the 46-byte floor.
+
+Here is the exchange, for a destination on the same subnet. Every address below is an example, and
+the IP addresses come from the documentation ranges:
+
+```text
+host A · 192.0.2.10 · aa:aa:aa:00:00:01      wants to send to 192.0.2.50
+
+  step 1 — A broadcasts a request. Every device in the broadcast domain gets a copy
+           and has to look at it.
+
+     ┌ Ethernet ─────────────────────────────────────────────────────────┐
+     │ dst ff:ff:ff:ff:ff:ff   src aa:aa:aa:00:00:01   EtherType 0x0806  │
+     ├ ARP, 28 bytes ────────────────────────────────────────────────────┤
+     │ hardware type 1 (Ethernet)      protocol type 0x0800 (IPv4)       │
+     │ hw addr len 6                   proto addr len 4                  │
+     │ operation 1 = REQUEST                                             │
+     │ sender  192.0.2.10   aa:aa:aa:00:00:01                            │
+     │ target  192.0.2.50   00:00:00:00:00:00   ← the blank being asked  │
+     └───────────────────────────────────────────────────────────────────┘
+              in words: "who has 192.0.2.50? tell 192.0.2.10"
+
+           B, C, D, the router — all of them parse this. All but one discard it.
+           Every one of them may also file away that 192.0.2.10 is at aa:aa:aa:00:00:01,
+           which is free information the request handed out.
+
+  step 2 — the owner answers. UNICAST, straight back to A — it learned A's MAC from
+           the request, so the reply needs no resolution of its own.
+
+     ┌ Ethernet ─────────────────────────────────────────────────────────┐
+     │ dst aa:aa:aa:00:00:01   src ba:ba:ba:00:00:50   EtherType 0x0806  │
+     ├ ARP ──────────────────────────────────────────────────────────────┤
+     │ operation 2 = REPLY                                               │
+     │ sender  192.0.2.50   ba:ba:ba:00:00:50   ← the answer             │
+     │ target  192.0.2.10   aa:aa:aa:00:00:01                            │
+     └───────────────────────────────────────────────────────────────────┘
+
+  step 3 — A caches 192.0.2.50 → ba:ba:ba:00:00:50 with a timeout, builds the frame
+           it wanted in the first place, and sends it. The packet that triggered all
+           this was held in a queue the whole time; if no reply ever comes, it is
+           dropped and the send fails with "no route to host" or a timeout.
+```
+
+The cache is the point. One broadcast pays for every subsequent frame to that host until the entry
+goes stale, which is why a busy segment is not drowning in ARP traffic. Linux does not simply
+expire entries on a fixed clock either — an entry that is being used successfully is refreshed by
+the fact that traffic is flowing, and one that has gone quiet is marked stale and re-verified with
+a unicast probe the next time it is needed, rather than with another broadcast. That is a cache
+with a validation step, and it behaves like every other one you know:
+[caches and the memory hierarchy](/systems/memory-hierarchy/) is the same machinery a layer down,
+and the CPU's TLB is very nearly the same object — a small cache of translations from one naming
+scheme into another, where a miss stalls the operation until it is filled.
+
+### the fact that makes routing click: ARP resolves the NEXT HOP
+
+Everything above assumed the destination was on your own subnet. Now it is not, and this is the
+part worth slowing down for.
+
+Before it can build a frame, the kernel consults its routing table and gets back exactly one
+answer: **which next hop**. Two shapes come out of that lookup.
+
+```text
+sending host: 192.0.2.10 on eth0, subnet 192.0.2.0/24, default route via 192.0.2.1
+
+  destination 192.0.2.50   — inside 192.0.2.0/24, so it is ON-LINK.
+                             next hop = the destination itself.
+                             ARP asks for:  192.0.2.50
+    frame:  dst MAC = 192.0.2.50's        dst IP = 192.0.2.50
+            src MAC = 192.0.2.10's        src IP = 192.0.2.10
+                      ── both halves name the same machine ──
+
+  destination 203.0.113.7  — matches nothing on-link, so the default route applies.
+                             next hop = 192.0.2.1, the gateway.
+                             ARP asks for:  192.0.2.1   ← NOT 203.0.113.7
+    frame:  dst MAC = 192.0.2.1's         dst IP = 203.0.113.7
+            src MAC = 192.0.2.10's        src IP = 192.0.2.10
+                      ▲                             ▲
+                      the router next door          a server you may never share
+                                                    a link with
+```
+
+Read the second frame again. Its two destination addresses are two different machines. The MAC
+says "router, this is for you"; the IP says "…and it is not for you, forward it". The router obeys
+both: it accepts the frame because its own MAC is on it, strips the entire Ethernet header, decides
+the next hop itself, and builds a **completely new frame** for the next link with new source and
+destination MACs. That happens again at every hop.
+
+Three consequences fall straight out, and they are the reason this page exists:
+
+- **You never learn the destination server's MAC address, and neither does anything else along the
+  path.** It is only known to the last router before it, on the last link. There is nothing to
+  learn: a MAC address means nothing off the link it was used on.
+- **There is one ARP resolution per hop, performed by whoever is transmitting on that hop.** Your
+  machine resolves your gateway. Your gateway resolves its next hop. And so on. Each is a purely
+  local question.
+- **Your ARP cache only ever holds addresses from your own subnets.** That is a checkable fact you
+  can use: an entry for an address outside your prefixes means something unusual is happening —
+  most often proxy ARP, where a router answers on behalf of a host elsewhere.
+
+On the Linux box these pages were written on, `eth0` has exactly this shape: one on-link prefix,
+`192.0.2.0/24`, and a default route via `192.0.2.1`. Decoding those routing-table rows, the
+longest-prefix match that picks between them, and the subnet arithmetic that decides what "on-link"
+means is [IP addresses, subnets and routing](/networking/ip-and-routing/)'s job — this page only
+needs its answer.
+
+<Callout kind="trap" label="ARP is unauthenticated, and that is not an oversight">
+  Any device on the segment can answer any request, and can send an unsolicited reply that hosts
+  will believe. There is no signature, no challenge, and — because the addresses are flat — no
+  structure a receiver could check a claim against. That is what makes on-path attacks trivial on
+  a LAN you do not control, and why enterprise switches ship features whose entire job is to
+  police ARP replies against what the switch already knows.
+
+  The benign version of the same trick is a **gratuitous ARP**: a host broadcasts an announcement
+  for its *own* address so everyone updates their cache immediately. That is how a floating
+  virtual IP moves between nodes on failover, and it is the mechanism the first incident below is
+  about.
+</Callout>
+
+### reading it from your own process, and where you stop
+
+There is no `EthernetFrame` type in .NET and there never will be — the OSI page explains why the
+kernel keeps those headers. What you *can* see is the interface's own layer-2 facts:
+
+<Solution>
+
+```csharp
+using System.Net.NetworkInformation;
+
+foreach (NetworkInterface nic in NetworkInterface.GetAllNetworkInterfaces())
+{
+    // 48 bits, and PhysicalAddress.ToString() renders them as bare hex with no
+    // separators — "0242AC110002", not "02:42:ac:11:00:02". Loopback has no
+    // meaningful address: on Linux it reports six zero bytes and prints
+    // "000000000000"; on Windows it returns PhysicalAddress.None, which prints empty.
+    PhysicalAddress mac = nic.GetPhysicalAddress();
+
+    // the MTU is a property of THIS interface, not of Ethernet. Reading it per
+    // interface is the whole point: a tunnelled one carries less than a real one.
+    int mtu = nic.Supports(NetworkInterfaceComponent.IPv4)
+        ? nic.GetIPProperties().GetIPv4Properties().Mtu
+        : -1;
+
+    Console.WriteLine($"{nic.Name,-8} {nic.NetworkInterfaceType,-14} mac={mac} mtu={mtu}");
+}
+```
+
+</Solution>
+
+What is deliberately missing from that API is a neighbour table. No managed type exposes the ARP
+cache, because it is kernel state your process has no business editing. On Linux you read it with
+`ip neigh show`, or out of `/proc/net/arp`. Here is what that command *asks* and how to read what
+it gives back — an annotated schematic with placeholder addresses, not a session anyone ran:
+
+```text
+ANNOTATED SCHEMATIC — the shape of `ip neigh show` output, with example addresses
+
+  192.0.2.1    dev eth0  lladdr 12:22:33:44:55:66  REACHABLE
+  │            │         │                         └ verified recently; frames to
+  │            │         │                           192.0.2.1 go out immediately
+  │            │         └ the answer ARP got: the gateway's MAC
+  │            └ which interface this mapping is valid on — a MAC means nothing
+  │              without a link to qualify it
+  └ always an address on one of this host's own subnets, never a remote server's
+
+  192.0.2.50   dev eth0  lladdr ba:ba:ba:00:00:50  STALE
+                                                   └ believed, but unverified; the
+                                                     next send probes before trusting it
+
+  192.0.2.99   dev eth0                            FAILED
+                                                   └ asked, nobody answered. Nothing is
+                                                     at that address on this segment —
+                                                     a layer-2 answer to a layer-3 question
+```
+
+`FAILED` or `INCOMPLETE` against your own gateway is one of the cleanest diagnostics in the
+section: it says the failure is *below* IP, so there is no point checking routes, ports or
+firewalls further out.
+
+### MTU: the number where behaviour stops being gradual
+
+The MTU is the largest layer-3 payload one link will carry in one frame. On standard Ethernet it
+is 1500 bytes — and it is 1500 bytes *of IP packet*, header included, which is where the numbers
+you actually care about come from:
+
+```text
+  Ethernet payload MTU                                    1500
+    − IPv4 header, no options                              −20
+    − TCP header, no options                               −20
+    ────────────────────────────────────────────────────  ────
+    = largest chunk of your data in one segment            1460   ← the MSS
+
+  on a link with an MTU of 1400 (a tunnel), the same arithmetic gives  1360
+```
+
+TCP does not discover this by accident: each end advertises a maximum segment size in its opening
+handshake, computed from **its own** interface MTU. Which is the flaw — neither end knows anything
+about a narrower link in the middle. Note also that a connection with options negotiated carries
+less than the arithmetic above suggests; on Linux the TCP timestamp option is commonly present and
+takes the header past 20 bytes, so the usable payload is smaller than 1460 in practice.
+
+When an IP packet is larger than the MTU of the link it must cross, one of three things happens,
+and which one is decided by a single bit:
+
+- **IPv4, Don't Fragment clear:** the router chops the packet into fragments that each fit, and the
+  *destination* reassembles them. Only the first fragment carries the TCP or UDP header, so any
+  device in between that filters on ports cannot classify the rest. Lose one fragment and the whole
+  original packet is lost.
+- **IPv4, Don't Fragment set:** the router drops the packet and sends back an ICMP message saying
+  "too big, and here is the MTU I can take". The sender is expected to shrink and retry. Linux sets
+  this bit on TCP by default, precisely so that this feedback happens.
+- **IPv6:** routers never fragment, ever. The sender must get the size right, and the equivalent
+  ICMPv6 message is the only way it learns.
+
+Two of those three depend on an ICMP message getting back to the sender. Block ICMP wholesale —
+which people do, believing it is a security measure — and the sender never learns anything. Small
+packets fit and succeed; large ones vanish without a word and are retransmitted forever. That is
+the classic **black hole**, and its fingerprint is a *size* threshold rather than a protocol or
+endpoint difference. The discovery mechanism itself, path MTU discovery, belongs to
+[IP addresses, subnets and routing](/networking/ip-and-routing/); what you own here is why the
+ceiling exists and what sits underneath it.
+
+On the Linux box these pages were written on, `/sys/class/net/eth0/mtu` reads **1400** — a hundred
+bytes below the Ethernet default, which is the signature of a tunnelled interface making room for
+an outer set of headers — and `/sys/class/net/lo/mtu` reads **65536**, because loopback is not a
+wire and has no reason to pretend it is one.
+
+### Wi-Fi is a link layer with different rules underneath
+
+802.11 presents the same interface upward: 48-bit MAC addresses, a payload with an EtherType-style
+demultiplexer above it, one hop. Underneath it is a genuinely different animal, because the medium
+is shared and a station cannot listen on the channel it is transmitting on — so it cannot *detect*
+a collision the way wired Ethernet did.
+
+So Wi-Fi avoids them instead. A station listens for the channel to go idle, waits a randomised
+backoff before transmitting, and then requires a link-layer acknowledgement for every unicast
+frame; no ack means it retransmits, on its own, below IP. There is also a hidden-node problem —
+two stations that can both hear the access point but not each other — with an optional
+request-to-send/clear-to-send handshake to work around it. And an 802.11 frame carries up to four
+address fields rather than two, because the access point is relaying between the wireless side and
+the wired one.
+
+The consequence that matters to you: **on Wi-Fi, loss is often repaired below IP and shows up as
+variable delay instead of as loss.** TCP infers congestion from loss, so a link that hides its
+losses and turns them into jitter is feeding TCP a signal it was not designed for — how TCP reads
+loss as a congestion signal in the first place is [the network path](/system-design/networking/)'s
+subject. When someone says an application "behaves differently on Wi-Fi", this is usually the
+mechanism, and none of it is visible from your process.
+
+### VLANs, in one paragraph
+
+A VLAN splits one physical switch into several independent broadcast domains. The mechanism is an
+802.1Q **tag**: 4 bytes inserted at offset 12, right where the EtherType was, holding a marker
+value of `0x8100`, a 3-bit priority, one drop-eligible bit, and a 12-bit VLAN ID — so 4094 usable
+VLANs — with the real EtherType pushed along behind it. An *access* port carries one VLAN and its
+devices never see the tag; a *trunk* port carries many and tags every frame so the switch at the
+far end can keep them apart. Two devices in different VLANs on the same switch cannot reach each
+other with a frame at all; the traffic has to go through a router, exactly like traffic between two
+buildings. The practical trap is arithmetic: the tag pushes the maximum frame from 1518 to 1522
+bytes, and gear that was not told to expect it drops those four extra bytes' worth of frames as
+oversized while everything smaller works fine — the same size-threshold fingerprint as an MTU black
+hole, from a different cause.
+
+### IPv6 does not use ARP
+
+IPv6 replaces ARP with **NDP**, the Neighbor Discovery Protocol, and the differences are not
+cosmetic. NDP runs over ICMPv6, which means it lives *inside* an IP packet rather than directly in
+a frame — so it inherits IP's hop limit and can be secured like any other IP traffic, which
+unauthenticated ARP never could be. And it does not broadcast: IPv6 has no broadcast address at
+all. A neighbour solicitation goes to a **solicited-node multicast** group derived from the low
+bits of the address being asked about, so only the small handful of hosts whose addresses end the
+same way are interrupted, instead of every device on the segment. The same protocol also handles
+router discovery and duplicate-address detection, which ARP never did. The mental model transfers —
+ask who owns an address, cache the answer, resolve the next hop and not the destination — but do
+not expect `arp` to show you anything on a v6-only network.
+
+## the mental model
+
+```text
+  the frame, and the two numbers that matter
+
+    ┌ dst MAC 6 ┬ src MAC 6 ┬ type 2 ┬ payload 46–1500 ┬ FCS 4 ┐
+    └───────────┴───────────┴────────┴─────────────────┴───────┘
+     offset 0     offset 6    offset 12   offset 14
+     64 bytes minimum frame · 1518 maximum · 1522 with a VLAN tag
+
+  what the kernel does before it can build one:
+
+    1. routing table:  which NEXT HOP for this destination IP?
+                       on-link  → the next hop IS the destination
+                       off-link → the next hop is a gateway on my own subnet
+    2. ARP cache:      do I have that NEXT HOP's MAC?
+                       hit  → build the frame, send
+                       miss → broadcast "who has <next hop>", hold the packet,
+                              cache the reply, then send
+
+  the two addresses in one frame, for anything off your subnet:
+
+       dst MAC = your gateway          dst IP = the far server
+       ▲ one hop away                  ▲ possibly the other side of the world
+
+  and the ceiling:
+
+       MTU 1500 = the IP packet, header included    →  MSS 1460 for plain IPv4/TCP
+       over it: IPv4 fragments or bounces an ICMP; IPv6 only bounces an ICMP
+       ICMP blocked → nothing bounces → small works, large hangs
+```
+
+Three lines to carry around:
+
+1. **A MAC address is flat and means nothing off its own link.** It identifies a manufacturer and
+   a card, never a location, which is why it cannot be routed on and why IP had to be invented on
+   top of it.
+2. **ARP resolves the next hop, not the destination.** For anything off your subnet the frame's
+   destination MAC is your gateway's while its destination IP is the far server's, and every router
+   along the way throws the frame away and builds a new one.
+3. **MTU is a cliff, not a slope.** Behaviour is identical up to the limit and catastrophic one
+   byte past it, and the mechanism that is supposed to tell you rides on ICMP that people block.
+
+<Watch items={[['MAC address', '48 bits — 24 vendor OUI + 24 device'], ['Ethernet header / trailer', '14 bytes at offset 0 / 4-byte FCS'], ['EtherType offset', 'byte 12 — 0x0800 IPv4 · 0x0806 ARP · 0x86DD IPv6'], ['payload range', '46–1500 bytes'], ['frame size range', '64–1518 bytes, 1522 with an 802.1Q tag'], ['ARP payload, IPv4 over Ethernet', '28 bytes, padded to the 46-byte floor'], ['MSS from a 1500 MTU', '1460 for IPv4 + TCP with no options'], ['broadcast MAC', 'ff:ff:ff:ff:ff:ff — flooded by every switch, always']]} />
+
+## why you should care
+
+**The failover that half-worked.** A virtual IP moves from a primary node to a standby. The
+standby broadcasts a gratuitous ARP announcing that the address is now at its MAC, and most things
+update. But the announcement is a single broadcast frame on a best-effort network — anything that
+misses it keeps the old mapping until its own cache entry expires or is re-probed. The symptom is
+that *some* clients recover immediately and others hang, with no pattern you can find in the
+application, and the affected set is whoever's cache happened to be freshly refreshed at the wrong
+moment. The tell is which failure they see: connections **time out** rather than being
+**refused**, because frames are being delivered to a MAC address that is no longer answering, so
+nothing comes back at all. That distinction is worth more than any log line here —
+[seeing the network](/networking/network-troubleshooting/) builds the whole checklist around it.
+Structurally this is the same failure as a stale DNS answer one layer up, and the same as any
+cache with a TTL and no invalidation channel; the trade is
+[caching](/system-design/caching/)'s subject, and the reason a push announcement is not a
+guarantee is [best-effort delivery](/networking/network-basics/).
+
+**Small requests work, large ones hang.** This is the most valuable pattern on the page, because
+it looks like an application bug and is not one. `GET` requests succeed and `POST`s of any size
+stall. A TLS handshake completes — the handshake messages are small — and then the first full-size
+record disappears. A health check is green while real traffic fails. Every one of those is a size
+threshold, and a size threshold is an MTU problem: something in the path takes less than 1500
+bytes, the ICMP that should have said so is being dropped, and the sender is retransmitting a
+packet that can never fit. The first thing to look at is the interface MTU at both ends and inside
+any tunnel or overlay between them — a container network reporting 1400 like the one these pages
+were written on, or a VPN, or a cloud provider's virtual network. Nothing in your service's code
+or config is going to explain it.
+
+**Broadcast domains have a size, and it is a design parameter.** Every ARP request goes to every
+device in the broadcast domain, and every one of them takes an interrupt and parses the frame to
+discover it is not theirs. That cost is fine on a segment with dozens of hosts and unpleasant on
+one with thousands, which is the practical argument for cutting a large flat network into subnets
+or VLANs rather than one enormous layer-2 domain. It is the same argument as partitioning anything
+else that fans out to all participants — the work is O(n) in listeners and it is paid by every
+listener.
+
+**The code review you can now do:** a container or overlay network deployed with the default 1500
+MTU inside a tunnel that cannot carry it; an ICMP-drop-everything security group written by
+someone who thought ICMP meant `ping`; a health check small enough to prove nothing about whether
+real requests fit; a failover runbook that assumes the gratuitous ARP is a guarantee rather than a
+best-effort hint, with no verification step and no fallback to waiting out the cache; and any
+diagnosis that reads "the MAC address is wrong" about a host that is not on your subnet, which
+cannot be true, because you never had its MAC address in the first place.
+
+The next page picks the thread up exactly where this one drops it. This layer can only ask "which
+neighbour", and it gets the answer handed to it from above.
+[IP addresses, subnets and routing](/networking/ip-and-routing/) is where that answer is computed:
+what makes an address on-link, how a routing table picks a next hop by longest-prefix match, what a
+router changes and what it leaves alone, and how a sender discovers the smallest MTU on a path it
+cannot see.
+
+## the same idea elsewhere
+
+| where the same shape shows up | what it is | the trap |
+| --- | --- | --- |
+| the CPU's TLB | a small cache of translations from one naming scheme (virtual addresses) into another (physical), filled on demand, invalidated when the mapping changes | identical to an ARP cache, including the failure: a mapping changed and something is still holding the old translation. Both are covered in [caches and the memory hierarchy](/systems/memory-hierarchy/) |
+| a DNS record with a TTL | a name-to-address mapping cached by everyone who asked, expiring on its own clock | the mismatch is the same as a stale ARP entry, one layer up: you can lower a TTL *before* a change, but you cannot recall an answer already handed out |
+| a max request body size, or a broker's max message size | a hard ceiling where behaviour is identical below it and total failure above it | like MTU, the failure is discontinuous and the payload that triggers it is usually the one you did not test — and the error, if any, arrives somewhere other than where the limit is |
+| a checksum on a stored record or a message | detects that bytes changed; does not say what changed, does not repair it, does not prove who wrote it | the Ethernet FCS is exactly this. People read "checksum passed" as "trustworthy"; it means "not obviously corrupted in transit" and nothing else |
+| an ARP announcement versus polling for a change | one is a push nobody is guaranteed to receive, the other is a pull that costs a round trip every time | pushing an invalidation and pulling a fresh copy fail differently: the push fails silently for whoever missed it, the pull fails loudly for everyone at once |
+
+## interview drills
+
+**Q.** You open a TCP connection from a server in one datacenter to a server in another. What
+destination MAC address is in the very first frame that leaves your NIC?
+
+- *weak answer* — "The destination server's." It is the intuitive answer and it is wrong, and it
+  is wrong in a way that reveals the whole mental model is missing.
+- *strong answer* — The default gateway's, and the machine has to ARP for it first if the mapping
+  is not cached. The kernel consults its routing table, finds the destination is not on-link, and
+  gets back a next hop that is an address on my own subnet — so ARP asks for the *gateway's* MAC,
+  not the server's. The frame that goes out carries the gateway's MAC and the far server's IP:
+  two different machines in one frame. The gateway strips that Ethernet header entirely and builds
+  a new one for its next link.
+- *follow-up* — "So when does anything learn the destination's MAC?" Only the last router before
+  it, on the last link. A MAC address means nothing off the link it was used on, so there is
+  nothing for anyone else to learn — which is exactly why my ARP cache only ever contains addresses
+  from my own subnets.
+
+**Q.** Every NIC on earth already has a globally unique address. Why do we need IP at all?
+
+- *weak answer* — "IP is layer 3 and MAC is layer 2." That names the layers instead of answering,
+  and the follow-up will be "yes, but why are there two".
+- *strong answer* — Because a MAC address is flat. Its structure identifies a manufacturer, not a
+  location, and it never changes when the device moves. Forwarding needs the opposite property: an
+  address assigned by *where you are attached*, so that many destinations aggregate into one prefix
+  and a router can hold a small table and still make a decision about an address it has never seen.
+  A flat 48-bit space can only be handled by an exact-match table with an entry per device, which
+  works on a segment and cannot work on an internet.
+- *follow-up* — "So is uniqueness useless?" Not useless, just local. It is what makes "is this
+  frame mine" a cheap comparison against a handful of addresses, and it is why two hosts on one
+  segment do not need to negotiate anything.
+
+**Q.** A virtual IP failed over to the standby node. Most clients recovered at once; a handful kept
+hanging. What happened?
+
+- *weak answer* — "DNS caching." Plausible reflex, wrong layer — the address did not change, only
+  which machine answers to it.
+- *strong answer* — Stale ARP entries. The standby sends a gratuitous ARP announcing the address at
+  its own MAC, but that is one broadcast frame on a best-effort network. Anything that missed it
+  keeps sending frames to the old MAC until its own cache entry is re-probed or ages out. The
+  clients that hung are exactly the ones that missed the announcement, which is why the set looks
+  random. The confirming detail is that those clients *time out* rather than getting a refusal:
+  frames are going to a MAC that no longer answers, so nothing comes back at all.
+- *follow-up* — "How would you make the failover more reliable?" Repeat the announcement rather
+  than sending it once, and stop treating it as a guarantee — anything that must be correct within
+  a bounded time needs its own health check on the client side, because you cannot invalidate a
+  cache you do not control.
+
+**Q.** Requests to a service succeed until the payload gets large, and then they hang forever with
+no error. Walk me through it.
+
+- *weak answer* — "The request is too big, raise the body size limit." If it were an application
+  limit you would get a `413` back. Getting *nothing* back is the actual clue and this answer
+  ignores it.
+- *strong answer* — A size threshold with silence past it is an MTU black hole. Something on the
+  path carries less than the sender thinks — a tunnel, an overlay, a VPN — so a full-size packet
+  will not fit. The router should reply with an ICMP "too big", but if ICMP is being dropped the
+  sender never learns and simply retransmits a packet that can never arrive. I would compare the
+  MTU on the interfaces at both ends and inside any encapsulation between them, and confirm the
+  threshold behaves like a size cliff rather than tracking any particular endpoint or method.
+- *follow-up* — "Why does TCP's MSS negotiation not prevent this?" Because each end computes its
+  advertised MSS from its *own* interface MTU. Neither end knows about a narrower link in the
+  middle; that is the entire reason path MTU discovery exists, and the entire reason blocking ICMP
+  breaks it.
+
+**Q.** What does a switch do that a hub did not, and what problem does that not solve?
+
+- *weak answer* — "A switch is the modern one, a hub was the dumb one." No mechanism, and the
+  second half of the question goes unanswered.
+- *strong answer* — A switch reads frames. It learns which port each MAC address is on by watching
+  the **source** address of arriving frames, and forwards on the destination — flooding out every
+  other port only when the destination is not in its table. That gives each port its own collision
+  domain, and with full duplex, collisions stop happening at all. What it does not do is limit
+  broadcasts: a frame to `ff:ff:ff:ff:ff:ff` goes out every port by definition, so the whole switch
+  is still one broadcast domain. Splitting that takes a router or a VLAN.
+- *follow-up* — "What happens when its table fills up?" It falls back to flooding, which means
+  every frame reaches every port — a performance problem and a confidentiality problem at once, and
+  the reason managed switches cap how many addresses a single port may learn.

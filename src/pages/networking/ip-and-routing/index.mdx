@@ -1,0 +1,635 @@
+---
+layout: '@layouts/TopicLayout.astro'
+topic: ip-and-routing
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import Solution from '@components/Solution.astro';
+
+## the ground floor
+
+- **Packet, header, payload, host, hop, best-effort delivery** are built from nothing in
+  [what a network actually is](/networking/network-basics/), and this page assumes all of them.
+- **A header is fields at fixed offsets**, and each layer wraps the one above it —
+  [the OSI model](/networking/osi-model/) walks one request down and back up the stack.
+- **A MAC address is flat**: 48 bits with no structure anybody can route on, which is exactly why
+  the addresses on this page have to exist. [The link layer](/networking/link-layer/) owns MACs,
+  frames and ARP — and the fact that ARP resolves *the next hop*, not the destination.
+- **MTU** is the largest payload one link will carry in a single frame; 1500 bytes on standard
+  Ethernet. Also the link layer's, and half this page is about what happens when you exceed it.
+- **Bits, hex and masking** — `x & mask`, and why hex exists at all — are built in
+  [bits, bytes and addresses](/systems/bits-and-memory/). Everything below is that arithmetic
+  applied to a 32-bit number.
+- **The kernel** owns the routing table and every interface;
+  [processes and threads](/systems/process-and-thread/) builds that boundary. Your process never
+  routes anything — it hands the kernel a destination and the kernel decides.
+
+## core idea
+
+A MAC address tells you *which* machine but nothing about *where* it is, so a network built only
+on MACs has to know every machine individually. IP fixes that by making the address carry
+structure: the leading bits name a network, the trailing bits name a host inside it, and a router
+therefore needs one table entry per **network** rather than one per machine. That single decision
+is what lets a box with a few hundred thousand routes forward to billions of hosts.
+
+Everything on this page is a consequence. A subnet mask is the line between the two halves of the
+address. A routing table is a list of prefixes, and forwarding is "find the longest prefix that
+matches, send it that way". A default route is the prefix of length zero — the entry that matches
+everything and therefore loses to everything else. NAT is a box that lies about the address half
+of the packet and keeps notes so it can un-lie on the way back.
+
+## how it actually works
+
+### an IPv4 address is 32 bits with a punctuation habit
+
+An IPv4 address is a 32-bit unsigned integer. The dotted quad is a display format: four 8-bit
+fields, each written in decimal, separated by dots because nobody wants to read ten digits of
+decimal or eight of hex. On the wire it is four bytes in big-endian order — most significant
+first — at a known offset in the IP header, and nothing about the dots survives the trip.
+
+```text
+  10   .   1    .   2    .   37       the written form
+  0x0A     0x01     0x02     0x25     the same four bytes, in hex
+  00001010 00000001 00000010 00100101 the same 32 bits, in the order they go on the wire
+
+  as one number: 167,838,245 — correct, useless, and never how anyone says it
+```
+
+The reason the display format is octet-shaped and not, say, hex-shaped, is historical rather than
+principled, and it costs you something real: **the boundary between the network half and the host
+half does not have to land on a dot.** Most of the pain in this subject comes from people
+reasoning in octets about a mask that does not respect them.
+
+### CIDR arithmetic, by hand
+
+This is the one thing interviewers actually ask, and it is pure bit manipulation. The question:
+given `10.1.2.37/22`, what is the network address, the broadcast address, the usable host range
+and the host count?
+
+The `/22` means *the first 22 bits are the network part*. The mask is that written out: 22 ones,
+then 10 zeros.
+
+```text
+  00001010 00000001 00000010 00100101   address   10.1.2.37
+  11111111 11111111 11111100 00000000   mask      255.255.252.0   ← this is what /22 means
+  ───────────────────────────────────   AND, bit by bit:
+  00001010 00000001 00000000 00000000   network   10.1.0.0
+                          ↑
+                          the /22 boundary — six bits into the third octet, not on a dot
+
+  a 1 in the mask keeps the address bit; a 0 clears it. That is the whole operation.
+```
+
+So the network address is **`10.1.0.0/22`**. The broadcast address is the same network bits with
+every host bit set to 1 instead of 0:
+
+```text
+  00001010 00000001 00000000 00000000   network     10.1.0.0
+  00000000 00000000 00000011 11111111   host bits, all set
+  ───────────────────────────────────   OR:
+  00001010 00000001 00000011 11111111   broadcast   10.1.3.255
+```
+
+There are `32 - 22 = 10` host bits, so 2¹⁰ = **1024 addresses** in the block, running from
+`10.1.0.0` to `10.1.3.255`. Two of them are not assignable to a host: the all-zeros one is the
+network's own name and the all-ones one is the broadcast address. That leaves **1022 usable
+hosts**, `10.1.0.1` through `10.1.3.254`. And `10.1.2.37` is inside that range, which is the check
+worth doing out loud.
+
+<Callout kind="insight" label="the shortcut, once you trust the long way">
+  A `/22` leaves two bits free in the third octet, so blocks of this size step by 4 there:
+  `10.1.0.0`, `10.1.4.0`, `10.1.8.0`, … The third octet of the address is 2, which falls in the
+  first block, so the network is `10.1.0.0` and the broadcast is one below the next block's base.
+  The mask octet is the same arithmetic from the other end: `256 − 4 = 252`. Do it the long way
+  in an interview anyway — showing the AND is most of what is being marked.
+</Callout>
+
+Two edge cases that come up in real config and confuse people who only ever learned the rule
+above. A `/32` is a single host — a *host route*, used to say "this one address, specifically,
+goes that way". A `/31` is two addresses with no network or broadcast address at all, which is
+legal and standard for point-to-point links precisely because a link with exactly two ends has
+nothing to broadcast to. And on the other side, cloud providers reserve more than two: an AWS
+subnet has five unusable addresses, not two, so the host count you derive by hand is an upper
+bound on what the console will let you allocate.
+
+Here is the same arithmetic as code, which is worth seeing because .NET grew a type for it and
+because the hand-rolled version has a genuine trap in it:
+
+<Solution>
+
+```csharp
+using System.Buffers.Binary;
+using System.Net;
+
+// .NET 8+ ships this. Reach for it before writing the arithmetic yourself.
+var net = IPNetwork.Parse("10.1.0.0/22");
+bool inside = net.Contains(IPAddress.Parse("10.1.2.37"));   // true
+int prefix = net.PrefixLength;                              // 22
+
+// The same thing by hand, for the interview and for the cases IPNetwork does not cover.
+static (IPAddress Network, IPAddress Broadcast, long Usable) Cidr(IPAddress address, int prefix)
+{
+    // IPv4 goes on the wire most-significant byte first, so read it back that way.
+    uint bits = BinaryPrimitives.ReadUInt32BigEndian(address.GetAddressBytes());
+
+    // The guard is not paranoia: C# masks a 32-bit shift count to 5 bits, so `<< 32`
+    // is a no-op and a /0 mask would come out as all ones instead of all zeros.
+    uint mask = prefix == 0 ? 0u : uint.MaxValue << (32 - prefix);
+
+    uint network = bits & mask;
+    uint broadcast = network | ~mask;
+    long usable = prefix >= 31 ? (1L << (32 - prefix)) : (1L << (32 - prefix)) - 2;
+
+    return (ToAddress(network), ToAddress(broadcast), usable);
+}
+
+static IPAddress ToAddress(uint value)
+{
+    Span<byte> bytes = stackalloc byte[4];
+    BinaryPrimitives.WriteUInt32BigEndian(bytes, value);
+    return new IPAddress(bytes);
+}
+```
+
+</Solution>
+
+What that would report for `10.1.2.37/22` is `10.1.0.0`, `10.1.3.255`, and 1022 — the three
+numbers derived above, which is the point of showing both.
+
+### the ranges you have to recognise on sight
+
+Not every address is routable across the internet, and knowing which is which turns a whole class
+of confusing incidents into one-line diagnoses.
+
+| range | name | what it means when you see it |
+| --- | --- | --- |
+| `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16` | private (RFC 1918) | never routed on the public internet; something is doing NAT, or you are inside a VPC or a home LAN |
+| `127.0.0.0/8` | loopback | never leaves the host; `127.0.0.1` is one of sixteen million addresses in it |
+| `169.254.0.0/16` | link-local | the host gave up on DHCP and assigned itself one, or a cloud metadata service lives at `169.254.169.254` |
+| `100.64.0.0/10` | carrier-grade NAT | your ISP or cluster is NATing you a second time; you have no public address of your own |
+| `224.0.0.0/4` | multicast | one-to-many; not a host address at all |
+| `192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24` | documentation | reserved for examples — every made-up address on these pages comes from here |
+| `0.0.0.0` | the wildcard | means two different things, below |
+
+`0.0.0.0` is the one worth pulling out, because it means opposite-feeling things in the two places
+you meet it. **In a bind it is a wildcard**: `IPAddress.Any` in C#, `INADDR_ANY` underneath, and
+it tells the kernel "accept connections arriving on *every* address this host has", as opposed to
+binding `127.0.0.1`, which accepts only from the host itself. **In a route it is a prefix of
+length zero**: `0.0.0.0/0` matches every possible destination, and because it is the shortest
+prefix in the table it is the entry that loses to every other match. Same four bytes, and the two
+readings never collide, because one is an address and the other is an address plus a mask.
+
+### the routing table, and longest-prefix match
+
+Every host has a routing table, not just routers. Every outbound packet is a lookup in it. The
+question the lookup answers is not "where is the destination" — nobody knows that — but **"which
+of my interfaces do I hand this to, and does it go to a neighbour directly or to a router?"**
+
+The rule is **longest-prefix match**: of every entry whose prefix matches the destination, the one
+with the *most* network bits wins. Not the first match, not the order the entries were added.
+
+```text
+  destination: 10.1.2.37
+
+  candidate routes                      matches?   prefix length
+  10.1.2.0/24     via 10.1.0.1            yes          24     ← most specific, this one wins
+  10.1.0.0/22     dev eth1  (on-link)     yes          22
+  10.0.0.0/8      via 192.0.2.1           yes           8
+  0.0.0.0/0       via 192.0.2.1           yes           0     ← default route, last resort
+  192.168.0.0/16  dev eth2                no
+```
+
+Two outcomes, and the difference matters for the next thing the host does:
+
+- **On-link** (the route names an interface and no gateway): the destination is a neighbour on
+  that link. Resolve *its* MAC address with ARP and frame the packet for it directly.
+- **Via a gateway**: the destination is somewhere else entirely. Resolve *the gateway's* MAC
+  address and frame the packet for the gateway. The destination IP in the packet is untouched.
+
+That second case is the sentence that makes routing click, and it is why
+[the link layer](/networking/link-layer/) insists that ARP resolves the next hop rather than the
+destination. The L2 addresses are about this link; the L3 addresses are about the whole journey.
+
+### decoding a real routing table
+
+Linux exposes the kernel's IPv4 routing table as a file. Here are two rows of it from the Linux
+box these pages were written on, trimmed to the four columns that carry the address information
+(the real file also has flags, reference and use counts, a metric, an MTU, a window and an initial
+RTT):
+
+```text
+  Iface   Destination   Gateway    Mask
+  eth0    00000000      010200C0   00000000
+  eth0    000200C0      00000000   00FFFFFF
+```
+
+Those hex fields are the reason this file has a reputation. They are **little-endian**: the kernel
+formats the 32-bit value as it sits in memory on this machine, and an IPv4 address is stored in
+network order, so the byte pairs come out reversed relative to the dotted quad. Read them in pairs
+**from the right**:
+
+```text
+  010200C0   → pairs, right to left:  C0  00  02  01
+                                     192   0   2   1     → 192.0.2.1
+  000200C0   → pairs, right to left:  C0  00  02  00
+                                     192   0   2   0     → 192.0.2.0
+  00FFFFFF   → pairs, right to left:  FF  FF  FF  00
+                                     255 255 255   0     → 255.255.255.0  = /24
+  00000000   →                        00  00  00  00
+                                       0   0   0   0     → 0.0.0.0        = /0
+```
+
+Substituting those back:
+
+```text
+  row 1:  0.0.0.0/0     via 192.0.2.1   dev eth0     ← the default route
+  row 2:  192.0.2.0/24  on-link         dev eth0     ← the subnet this box is on
+```
+
+Which is the minimum viable routing table and the shape nearly every container and VM has. It says
+two things and nothing else: *anything in `192.0.2.0/24` is my neighbour, reachable directly over
+`eth0`; everything else in the universe goes to `192.0.2.1` and becomes its problem.* Gateway
+`0.0.0.0` in row 2 is not an address there — it is the file's way of writing "no gateway, on-link".
+
+<Callout kind="note" label="the field order is a memory layout, not a format">
+  If the reversal looks arbitrary, it is the same endianness question as any other multi-byte value
+  read out of memory — [bits, bytes and addresses](/systems/bits-and-memory/) has the general case.
+  Network byte order is big-endian, this CPU is little-endian, and the file prints the raw word.
+  `ip route` and `route -n` do the conversion for you, which is why almost nobody notices.
+</Callout>
+
+### what a router does to a packet
+
+A router's inner loop is short, and worth being able to recite:
+
+1. A frame arrives; the L2 header says it is addressed to this router's interface, so keep it.
+2. Strip the frame header. Verify the IPv4 header checksum; drop the packet if it fails.
+3. **Decrement the TTL by one.** If it reaches zero, drop the packet and send an ICMP Time
+   Exceeded back to the source.
+4. Look up the destination address by longest-prefix match to choose an outgoing interface and a
+   next hop.
+5. Recompute the IPv4 header checksum, because the TTL just changed.
+6. **Build a brand-new L2 header** for the outgoing link: source MAC is this router's outgoing
+   interface, destination MAC is the next hop's, resolved by ARP.
+7. Send it.
+
+The thing that is *not* in that list is the point: **the source and destination IP addresses are
+never touched.** L2 is rebuilt from scratch on every hop; L3 is carried end to end.
+
+```text
+  host A                    router R1                 router R2                 host B
+  198.51.100.9                                                              203.0.113.20
+
+  ┌──────────────────────────────────────────────────────────────────────────────────┐
+  │ L3 header, identical on every link:   src 198.51.100.9 → dst 203.0.113.20         │
+  └──────────────────────────────────────────────────────────────────────────────────┘
+
+     link 1                    link 2                    link 3
+     L2 src = A's MAC          L2 src = R1's MAC         L2 src = R2's MAC
+     L2 dst = R1's MAC         L2 dst = R2's MAC         L2 dst = B's MAC
+     TTL 64                    TTL 63                    TTL 62
+       ↑ built by A              ↑ built by R1             ↑ built by R2
+         and discarded             and discarded             and discarded
+         by R1                     by R2                     by B
+```
+
+TTL is an 8-bit field, so 0–255. The name is a lie inherited from a design where it counted
+seconds; it counts **hops**. Its job is to make a routing loop terminate: two routers that each
+think the other is the way to a destination will bounce a packet between them, and the only thing
+that stops that from being permanent is the counter running out. Common starting values are 64 on
+Linux, 128 on Windows, 255 on network gear.
+
+### traceroute is a lie built out of that counter
+
+There is no "trace this route" message in IP. Traceroute manufactures the information by abusing
+the TTL rule: send a packet to the real destination with **TTL set to 1**. The first router
+decrements it to zero, drops it, and — obeying step 3 above — sends back an ICMP Time Exceeded
+*from its own address*. That reply is the discovery. Then TTL 2, which dies at the second router.
+Then 3. Each round names one more hop.
+
+```text
+  probe TTL=1  →  R1 decrements to 0, drops, replies "time exceeded"   → R1's address known
+  probe TTL=2  →  R1 → 1, R2 decrements to 0, drops, replies           → R2's address known
+  probe TTL=3  →  R1 → 2, R2 → 1, R3 drops, replies                    → R3's address known
+  probe TTL=n  →  reaches the destination, which replies differently   → the walk terminates
+```
+
+How the last step is recognised depends on the probe. Classic Unix traceroute sends UDP to a port
+nothing is expected to be listening on, so the destination answers with ICMP Port Unreachable
+rather than Time Exceeded. Windows `tracert` sends ICMP Echo Requests and looks for an Echo Reply.
+`tcptraceroute` sends TCP SYNs and looks for a SYN-ACK or an RST, which is often the only variant
+that gets through a firewall.
+
+Three limits, all of which people misread as failures:
+
+- A router is **not obliged to answer**, and many are configured not to, or rate-limit the replies
+  they send. A hop that shows nothing is a hop that declined to talk, not necessarily a hop that
+  dropped your traffic.
+- **The reply takes the return path**, which may be a completely different set of routers. What you
+  are seeing is a mixture of two directions.
+- **Equal-cost paths mean successive probes may take different routes**, so consecutive lines can
+  belong to different physical paths and do not necessarily form a chain.
+
+Which is why traceroute proves reachability and identity far better than it proves anything about
+where a problem is. The `## why you should care` section on
+[seeing the network](/networking/network-troubleshooting/) is where that becomes a procedure.
+
+### ICMP is the error channel, and dropping it is a self-inflicted outage
+
+ICMP is not a transport protocol. It rides directly inside IP as protocol number 1 — the same slot
+that holds 6 for TCP and 17 for UDP — and **it has no ports**, because ports are a transport-layer
+idea that IP knows nothing about. It exists so the network can report back about a packet it
+could not deliver.
+
+| type | name | what it tells the sender |
+| --- | --- | --- |
+| 0 / 8 | Echo Reply / Echo Request | the two halves of `ping`; the only ICMP most people know |
+| 3 | Destination Unreachable | delivery failed; the *code* says why — network, host, port, or… |
+| 3 code 4 | Fragmentation Needed, DF set | "your packet is too big for my next link, and here is its MTU" |
+| 5 | Redirect | "you sent this to me, but a better router is on your own link" |
+| 11 | Time Exceeded | "your TTL hit zero here" — the message traceroute lives on |
+
+Type 3 code 4 is the load-bearing one. IPv4 lets a sender set the **Don't Fragment** flag, and TCP
+sets it. When a packet that big meets a link with a smaller MTU, the router cannot fragment it and
+cannot forward it, so it drops it and sends back type 3 code 4 carrying the MTU it *could* have
+taken. The sender lowers its estimate of the path MTU and resends smaller. That feedback loop is
+**path MTU discovery**, and it is the only way a sender ever learns a number that depends on links
+it cannot see.
+
+<Callout kind="trap" label="blanket-dropping ICMP is how you build a black hole">
+  Somebody decides ICMP is an attack surface and drops all of it at a firewall or security group.
+  Now the Fragmentation-Needed messages never arrive. The sender never learns to send smaller
+  packets; it just keeps retransmitting the same too-large segment into a link that keeps silently
+  discarding it. The symptom is unmistakable once you have seen it: the connection establishes, small
+  requests work perfectly, and anything with a large body hangs until it times out. On the Linux box
+  these pages were written on, `eth0` has an MTU of 1400 rather than the Ethernet default of 1500 —
+  a tunnelled interface, the exact situation where this bites. (`lo` is 65536, which is why nothing
+  ever reproduces over loopback.) Rate-limit ICMP if you must. Do not drop type 3.
+</Callout>
+
+Fragmentation itself is worth one paragraph, because the design is a cautionary tale. An IPv4
+router *may* split an oversized packet into fragments when DF is not set, using an identification
+field, a more-fragments flag, and a 13-bit offset counted in 8-byte units. **Reassembly happens
+only at the final destination, never at an intermediate router** — so fragments travel the rest of
+the path independently, and losing any one of them loses the entire original datagram. That makes
+fragmentation a loss amplifier, which is why TCP avoids it by negotiating a maximum segment size
+during the handshake instead. On a 1500-byte link that lands at 1460 bytes: 1500 minus a 20-byte
+IPv4 header minus a 20-byte TCP header. On the 1400-byte interface above it lands at 1360. UDP has
+no such negotiation, which is why a large UDP payload is the classic thing that gets fragmented
+and then quietly disappears. The handshake mechanics belong to [TCP and UDP](/networking/tcp-and-udp/).
+
+### NAT rewrites what the router refused to touch
+
+The router above changed nothing above L2. A NAT box is defined by doing exactly the opposite: on
+the way out it **rewrites the source address, and usually the source port too**, and it records
+the substitution in a translation table so it can reverse it on the way back.
+
+```text
+  inside (private)                 NAT box                     outside (public)
+
+  192.168.1.24:51314  ──────→  203.0.113.7:40001  ──────→  198.51.100.5:443
+  192.168.1.31:51314  ──────→  203.0.113.7:40002  ──────→  198.51.100.5:443
+             ↑                            ↑
+   two hosts happened to pick   the NAT had to give them different
+   the same source port          outside ports to stay unambiguous
+
+  translation table — one row per flow, created by the first outbound packet:
+
+   proto   inside                 outside               peer
+   TCP     192.168.1.24:51314     203.0.113.7:40001     198.51.100.5:443
+   TCP     192.168.1.31:51314     203.0.113.7:40002     198.51.100.5:443
+
+  a reply arriving for 203.0.113.7:40002 matches row 2 and is rewritten back to
+  192.168.1.31:51314 before it is forwarded inside. A packet arriving for a port
+  with no row has nowhere to go and is dropped.
+```
+
+Three consequences worth carrying:
+
+- **The source port a server logs is very often not the port the client chose.** So is the source
+  address. If you are correlating client-side and server-side logs by port, or allowlisting by
+  source IP, a NAT in between makes both of those wrong in ways that look like data corruption.
+- **The table is state, and state expires.** A row that sees no traffic for long enough is
+  reclaimed, and after that the inside host's packets are still going out but the replies have no
+  row to match. The connection is not closed — it is *silently* one-way, which is why a pooled
+  connection that has been idle behind a NAT fails on its next use rather than on the idle period,
+  and why keepalives exist.
+- **A NAT has a finite number of outside ports per public address**, which puts a hard ceiling on
+  simultaneous flows through it. That ceiling is a real capacity limit in front of any NATed egress.
+
+<Callout kind="trap" label="NAT is not a firewall">
+  It is the most durable false belief in this subject. NAT does incidentally block unsolicited
+  inbound connections — there is no table row for them, so they have nowhere to be delivered — but
+  that is a side effect of the mechanism, not a policy. It inspects nothing, decides nothing, and
+  logs nothing about what it lets through; every outbound connection from anything inside creates
+  its own hole, and anything that can get one packet out has a bidirectional path for as long as
+  the row lives. A firewall is a thing that evaluates rules. Say "we have a firewall" only when
+  something is actually evaluating rules.
+</Callout>
+
+### IPv6, tightly
+
+IPv6 is the same job with a bigger number and three decisions worth knowing.
+
+**128 bits**, written as eight groups of four hex digits. Leading zeros in a group may be dropped,
+and **one** run of consecutive all-zero groups may be replaced by `::` — only one, because two
+would make the expansion ambiguous (you could no longer tell how many zero groups each `::` stood
+for).
+
+```text
+  2001:0db8:0000:0000:0000:ff00:0042:8329   the full form, 128 bits
+  2001:db8:0:0:0:ff00:42:8329               leading zeros dropped per group
+  2001:db8::ff00:42:8329                    the one zero-run collapsed to ::
+
+  ::1        loopback, the whole of 127.0.0.0/8's job in one address
+  ::         unspecified — "I do not have an address yet"
+  fe80::/10  link-local; every IPv6 interface has one, and NDP runs over it
+  2001:db8::/32  the documentation range — every IPv6 example on this site
+```
+
+**No NAT by design.** The address space is large enough that every device can hold a globally
+unique address, so the reason NAT exists — too few addresses — is gone. The privacy and
+inbound-blocking side effects people had come to rely on are handled by, respectively, temporary
+addresses and an actual firewall. A `/64` is the standard subnet size for a link, which means a
+single subnet holds more addresses than the entire IPv4 internet; sites are typically delegated a
+`/48` or `/56`. Subnetting arithmetic still works exactly as on this page — it is the same AND
+against a prefix — you just do it in hex and almost never on the host bits.
+
+**Routers never fragment.** The fragmentation machinery moved out of the base header entirely, and
+only the source may fragment, via an extension header. That makes path MTU discovery mandatory
+rather than an optimisation, which is why ICMPv6 type 2 "Packet Too Big" must not be filtered.
+ICMPv6 is load-bearing in a way ICMPv4 is not: it also carries NDP, the neighbour discovery that
+replaces ARP, so a rule that drops ICMPv6 does not degrade IPv6, it disables it. The header is a
+fixed 40 bytes with no checksum and no options field, and IPv6 requires every link to support an
+MTU of at least 1280 bytes.
+
+**Dual-stack means the resolver's answer is a choice.** A name can have both an `A` record and an
+`AAAA` record, and the resolver hands back both — [DNS](/networking/dns/) is where those come from.
+A client that simply tries them in the order it received them will, on a host that has an IPv6
+address but no working IPv6 path, attempt the `AAAA` first and stall there until it times out
+before it ever tries the `A`. That failure looks exactly like "the service is down" and is
+entirely local. The defined mitigation is Happy Eyeballs (RFC 8305): start the connection attempts
+to both families with a short stagger and keep whichever completes first. Whether a given client
+does that is a property of the client, so check yours rather than assuming — in .NET, what
+`Dns.GetHostAddressesAsync` returns is both families in one array, and what happens next depends
+on which layer above it is doing the connecting.
+
+## the mental model
+
+```text
+  an address = network bits ++ host bits.  The mask says where the split is.
+
+  network address  = address AND mask          (host bits all 0)
+  broadcast        = address OR (NOT mask)      (host bits all 1)
+  addresses        = 2 ^ (32 - prefix)
+  usable hosts     = that, minus 2             (except /31 and /32)
+
+  forwarding = longest-prefix match, every packet, every hop
+      more network bits wins.  0.0.0.0/0 has none, so it is the last resort.
+
+  per hop:   L2 header  rebuilt from scratch     ← this link only
+             TTL        decremented by one       ← loop insurance
+             L3 addrs   untouched                ← unless a NAT is lying
+
+  NAT changes the source address and port on the way out, and reverses it on the
+  way back from a table. It is not a firewall. It is state, and state expires.
+```
+
+<Watch items={[['IPv4 address', '32 bits'], ['IPv6 address', '128 bits'], ['IPv4 header', '20 bytes without options'], ['IPv6 header', '40 bytes, fixed'], ['TTL field', '8 bits, so 0–255'], ['`10.1.2.37/22`', 'network `10.1.0.0`, broadcast `10.1.3.255`, 1022 usable'], ['ICMP for path MTU', 'type 3 code 4 — never drop it'], ['IPv6 minimum link MTU', '1280 bytes']]} />
+
+## why you should care
+
+**The overlapping-CIDR outage.** A pod cannot reach a database that everything else can reach, and
+the address is right, and the security group is right. Look at the pod's routing table before
+anything else: if the cluster's pod network or a VPN's advertised range overlaps the database's
+subnet, a more specific on-link route matches first and the packet is handed to a neighbour that
+does not exist instead of to the gateway. Nothing is dropped by a firewall — the packet never
+leaves the correct way. This is longest-prefix match doing exactly its job, and it is invisible
+unless you read the table. The same mechanism explains why a VPN "breaks the internet" for some
+users and not others: it pushed a route more specific than theirs.
+
+**The MTU black hole, which is the incident this page is really for.** Symptom: the connection
+establishes, health checks pass, small API calls are fine, and one endpoint that returns a large
+body hangs until the client's timeout. Nothing in the application logs is wrong, because from the
+application's point of view nothing happened at all. The chain is: a tunnel, overlay network or
+VPN somewhere on the path has an MTU below 1500 (this container's `eth0` is 1400); a full-size
+segment with DF set reaches it; the router sends ICMP type 3 code 4; something drops the ICMP; the
+sender never shrinks. The fix is upstream of your code — restore the ICMP, or clamp the MSS at the
+tunnel — and the reason you can name it immediately instead of spending a whole session hunting
+is that "large responses hang, small ones do not" has exactly one common cause.
+
+**NAT state and pooled connections.** A connection pool that keeps idle connections open across a
+NAT is holding rows in a table you do not control. When a row is reclaimed, the connection is not
+reset — it becomes a hole, and your next use of that pooled connection sends bytes into it and
+waits. In .NET this surfaces as a `SocketException` or an `HttpRequestException` on the *first*
+request after a quiet period, which is why "the first call after lunch fails and the retry works"
+is a real bug report and not user error. `SocketsHttpHandler.PooledConnectionIdleTimeout` set below
+the NAT's idle reclamation, or TCP keepalives, is the fix; the retry that "makes it work" is a
+band-aid over a diagnosable cause. The pooling design behind that lives on
+[the network path](/system-design/networking/); the reason the connection died lives here.
+
+**The source address is not the client's.** Behind NAT, a CDN or a load balancer, every request
+you see may carry the same handful of source addresses. IP allowlists, per-IP rate limits and
+abuse heuristics built on `RemoteIpAddress` will therefore either block a whole population or
+throttle a legitimate fleet as one client — and the header that exists to fix it is only
+trustworthy at the hop that set it. This is also where [caching](/system-design/caching/) keys and
+per-tenant limits go wrong: an identifier that is not actually per-client.
+
+Two pages follow directly from this one. [Ports and sockets](/networking/ports-and-sockets/) picks
+up the field NAT was rewriting alongside the address, and the four-tuple that makes it a key rather
+than a name. [Seeing the network](/networking/network-troubleshooting/) turns the diagnoses above
+into a ladder you can walk in order.
+
+## the same idea elsewhere
+
+| the idea here | where else it shows up | what carries over, and what does not |
+| --- | --- | --- |
+| longest-prefix match over a table of prefixes | a [trie](/patterns/trie/) — which is literally how software routers store the table, and what a TCAM does in hardware | same lookup: walk the bits, keep the deepest match. The difference is that a router must answer in bounded time for every packet, so it pays in memory rather than in probes |
+| a subnet mask | any `x & mask` in application code — [bit manipulation](/patterns/bit-manipulation/) has the identities | identical arithmetic. The only reason it feels harder here is the dotted-quad display splitting a 32-bit number into four decimal pieces that the mask does not respect |
+| the default route as the entry that matches everything | route matching in a web framework, where the most specific template wins and the catch-all is checked last | the priority rule is the same, and so is the failure: a catch-all placed as if it were an ordinary rule swallows traffic that had a better home |
+| the NAT translation table | any connection or session map keyed by a tuple, with idle eviction | same lifecycle, same failure mode: the entry expires while both ends still believe the association exists, and the discovery happens on the next use rather than at eviction |
+| TTL as a hop counter | a hop or depth limit in a distributed call chain, or a maximum-redirects setting | both exist to make a cycle terminate rather than to express a budget. Neither tells you anything useful about distance — a low TTL and a short path look identical from the outside |
+
+## interview drills
+
+**Q.** Given `10.1.2.37/22`, what is the network address, the broadcast address and the number of
+usable hosts?
+
+- *weak answer* — Reaching for the third octet and answering `10.1.2.0`. The `/22` boundary is six
+  bits into the third octet, not on the dot, and that answer is a different network from the one
+  the address is actually in.
+- *strong answer* — `/22` means 22 network bits, so the mask is `255.255.252.0`. AND the address
+  with it: the third octet `00000010` AND `11111100` is `00000000`, so the network is `10.1.0.0/22`.
+  Set the ten host bits instead of clearing them and the broadcast is `10.1.3.255`. 2¹⁰ = 1024
+  addresses, minus the network and broadcast addresses, is 1022 usable — `10.1.0.1` to `10.1.3.254`.
+- *follow-up* — "What about a `/31`?" Two addresses, no network or broadcast address, both usable —
+  it exists for point-to-point links, where there is nothing to broadcast to.
+
+**Q.** A pod can reach the API by IP but not the database, and the security group allows it. Where
+do you look?
+
+- *weak answer* — "Check the firewall and the security group again." You have already been told
+  they are fine, and repeating the check does not narrow anything.
+- *strong answer* — Read the routing table on the pod, because forwarding is longest-prefix match
+  and a more specific route beats the default. If the cluster's pod CIDR or a VPN's advertised
+  range overlaps the database's subnet, the packet matches an on-link route and gets handed to a
+  neighbour that is not there, so it never reaches the gateway at all. Nothing drops it; it goes
+  the wrong way. I would compare the database's subnet against every prefix in the table.
+- *follow-up* — "How would the symptom differ from a security group blocking it?" A dropped packet
+  gives you silence until a timeout; something that answers and refuses gives you an immediate
+  reset. Both differ from this case, where the packet was delivered somewhere useless.
+
+**Q.** Small requests to a service succeed and large responses hang. First hypothesis?
+
+- *weak answer* — "The server is slow on big payloads." That would produce a slow response, not a
+  hang, and it does not explain why the size threshold is sharp.
+- *strong answer* — Path MTU black hole. Something on the path has an MTU below the sender's,
+  full-size segments have DF set, and the ICMP Fragmentation-Needed message that would tell the
+  sender to shrink is being dropped by a firewall or security group. The connection establishes
+  because the handshake packets are small; the first full-size segment vanishes and is
+  retransmitted forever. I would check the interface MTUs along the path and whether ICMP type 3
+  is permitted.
+- *follow-up* — "How do you confirm it without touching the firewall?" Send probes of increasing
+  size with DF set and find the size at which replies stop; that boundary is the real path MTU.
+
+**Q.** What does a router change in a packet? What does a NAT change?
+
+- *weak answer* — "The router changes the addresses so it gets to the next hop." That is the
+  single most common wrong model in this subject, and it makes NAT impossible to explain
+  afterwards.
+- *strong answer* — A router leaves the IP addresses alone. It decrements the TTL, recomputes the
+  IPv4 header checksum because the TTL changed, and builds an entirely new link-layer header for
+  the next link — source MAC its own, destination MAC the next hop's. The L3 header is end to end;
+  the L2 header is per link. A NAT is the exception that proves it: it rewrites the source address
+  and usually the source port, and keeps a translation table so replies can be mapped back.
+- *follow-up* — "Why does it rewrite the port too?" Because one public address has to represent
+  many inside hosts, and two of them can choose the same source port; the outside port is what
+  makes the mapping unambiguous.
+
+**Q.** Is NAT a firewall?
+
+- *weak answer* — "Effectively yes, since nothing can get in from outside." It is the conclusion
+  that gets a network built without a policy anywhere in it.
+- *strong answer* — No. NAT blocks unsolicited inbound as a side effect — an inbound packet with
+  no matching row has nowhere to be delivered — but it evaluates no rules, and every outbound
+  connection from anything inside opens a bidirectional path for as long as its row lives. It is
+  address translation with a state table. A firewall is a thing that makes decisions, and if
+  nothing on the path is making decisions, you do not have one.
+- *follow-up* — "So what protects an IPv6 network with no NAT?" A stateful firewall, doing
+  explicitly what NAT was doing accidentally.
+
+**Q.** How does traceroute work, and why do some hops come back empty?
+
+- *weak answer* — "It asks each router along the path to identify itself." There is no such
+  request in IP, and believing there is makes the empty hops inexplicable.
+- *strong answer* — It sends probes with the TTL set to 1, then 2, then 3. Each one expires at one
+  router further out, and that router drops it and returns an ICMP Time Exceeded from its own
+  address — so the error message is the discovery. It stops when the destination answers
+  differently: Port Unreachable for the UDP variant, an Echo Reply for the ICMP one, a SYN-ACK or
+  RST for the TCP one. An empty hop is a router that declines to send Time Exceeded, or is
+  rate-limiting them — not evidence that traffic is being dropped there.
+- *follow-up* — "So what does traceroute actually prove?" That packets got at least that far, and
+  the identity of the routers willing to say so. It proves much less about *where* a problem is
+  than people use it for, partly because the replies come back over a return path you are not
+  looking at.

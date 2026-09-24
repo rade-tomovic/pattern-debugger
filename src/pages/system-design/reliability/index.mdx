@@ -1,0 +1,358 @@
+---
+layout: '@layouts/TopicLayout.astro'
+topic: reliability
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+
+## the ground floor
+
+- **idempotent** — calling an operation twice produces the same result as calling it once. Not
+  "safe to retry" as a vibe — a precise property you can check: does a second `POST` with the
+  same input change the outcome a second time?
+- **jitter** — randomness deliberately added to a wait time so that many independent clients,
+  which all failed at roughly the same moment, don't all retry at roughly the same moment too.
+- **half-open** — the circuit breaker state between open and closed: a small number of trial
+  calls are let through to test whether the dependency has actually recovered, before the flow
+  gate is fully reopened.
+- **bulkhead** — a resource pool (threads, connections, a semaphore's permits) scoped to one
+  dependency, so that dependency running out of its pool cannot also starve every other
+  dependency sharing the same one.
+
+## core idea
+
+None of these patterns make a dependency more reliable. They bound how much damage an unreliable
+dependency can do to *you* — turning an unbounded wait into a bounded one, an independent retry
+into a coordinated one, and a slow death by resource exhaustion into a fast, visible failure.
+The one sentence: reliability engineering at this layer is about failing fast, failing
+predictably, and never letting one broken dependency's problem become every dependency's
+problem.
+
+## how it actually works
+
+### timeout budgets shrink down the call chain, or the wait never ends
+
+A timeout is not a property of one call — it's a share of a budget the caller upstream has
+already committed to. If every hop in a chain sets its own independent, generous timeout, the
+outermost caller can give up and return an error to the user while every hop beneath it is still
+patiently waiting on its own full timeout, holding a thread, a connection, sometimes a database
+lock, for work whose answer nobody will ever read.
+
+```text
+gateway         budget 4000ms total, has used 0ms
+  │ calls order-service, must not exceed remaining budget
+  ▼
+order-service   remaining budget ~3800ms → sets its own call timeout to, say, 3000ms
+  │ calls inventory-service, has already burned 900ms of its own work
+  ▼
+inventory-service   remaining budget ~2100ms → sets its own call timeout to 1500ms
+  │ calls SQL Server
+  ▼
+SQL Server      remaining budget ~1900ms → command timeout must be < that, not a fixed 30s
+```
+
+Each hop's timeout must be strictly smaller than what it inherited, minus its own overhead. A
+fixed 30-second command timeout on the database call, unrelated to what's left of the user's
+patience, is the single most common instance of this bug — the request the user already gave up
+on keeps running to completion anyway, consuming a connection-pool slot the whole time.
+
+### retries: jitter, or you synchronize the outage
+
+A bare retry — same delay, every client — looks harmless in isolation and is dangerous in
+aggregate. When a dependency degrades, every client's request fails at roughly the same moment
+(they were all in flight when it happened), so a fixed backoff makes every client retry at
+roughly the same moment too. You've turned N independent failures into N simultaneous requests,
+repeated on a clock, against a dependency that just told you it was already struggling.
+
+```text
+without jitter — fixed 200ms backoff, doubling, N clients in flight:
+
+ t=0     dependency degrades; all N calls fail together
+ t=200   ALL N clients retry at once            ← load spike, dependency still recovering
+ t=600   ALL N clients retry again (backoff x2)  ← spike again, worse timing
+ t=1400  ALL N clients retry again               ← the dependency never sees a quiet window
+
+with full jitter — sleep = random(0, base * 2^attempt), capped:
+
+ t=0     dependency degrades; all N calls fail together
+ t=0-200   retries land spread across the window, not stacked on it
+ t=?-?     each client's own next retry is independently randomized again
+           → the dependency sees a ramp of load it can absorb, not a repeating spike
+```
+
+Full jitter — sampling the whole `[0, base * 2^attempt]` range, not just adding a small random
+offset to a fixed schedule — is the version that actually decorrelates clients; a narrow jitter
+window still leaves them clustered. Retries also need a cap on total attempts *and* on total
+time spent retrying, or a client can keep quietly retrying a request the caller above it has
+already timed out on.
+
+<Callout kind="trap" label="idempotency, not optimism">
+Retrying a non-idempotent operation because "it probably didn't go through" is not a resilience
+feature — it's a correctness bug. A timeout tells you the response was lost; it tells you
+nothing about whether the write committed. Retry a payment charge without a client-generated
+idempotency key the server dedupes on, and the failure mode is a duplicate charge, not a
+retried failure.
+</Callout>
+
+### circuit breakers need the middle state
+
+A circuit breaker that only has "call through" and "fail fast" is missing the state that makes
+it self-healing: **half-open**. Without it, either the breaker never reopens (someone has to
+manually reset it) or it reopens by letting full traffic straight back through, which — if the
+dependency is only barely recovered — reproduces the exact overload that tripped it in the
+first place.
+
+```text
+                 failures >= threshold, in the rolling window
+        CLOSED ─────────────────────────────────────────────▶ OPEN
+          ▲                                                      │
+          │ trial call(s) succeed                                │ cooldown timer elapses
+          │                                                       ▼
+          └───────────────────── HALF-OPEN ◀─────────────────────┘
+                          (let through a small, bounded
+                           number of trial calls only)
+              any trial call fails ──────────────▶ back to OPEN
+```
+
+CLOSED counts failures in a rolling window and trips to OPEN once a threshold is crossed — OPEN
+fails every call immediately, without touching the dependency at all, which is the entire point:
+it stops adding load to something that's already struggling and stops holding threads waiting on
+it. After a cooldown, HALF-OPEN lets a *small, bounded* number of calls through as a probe. The
+bound matters as much as the state itself — if every client instance independently decides
+"cooldown's up, let's all try one call now" at the same moment, half-open reproduces the retry
+storm one state earlier.
+
+<Watch items={[['closed → open', 'failure rate >= threshold in rolling window'], ['open → half-open', 'cooldown elapsed'], ['half-open → closed', 'trial call(s) succeed'], ['half-open → open', 'any trial call fails']]} />
+
+### bulkheads: one dependency's failure shouldn't starve another's calls
+
+A synchronous call to a slow dependency doesn't fail fast on its own — it holds a thread (or a
+connection, or a semaphore permit) for the full duration of the wait. If every dependency shares
+one pool of those, a single slow dependency can eventually hold *all* of them, and now calls to
+completely unrelated, perfectly healthy dependencies fail too, because there's no thread left to
+make them with. A bulkhead is just giving each dependency its own bounded pool, so exhausting one
+dependency's pool can't touch another's.
+
+### load shedding and rate limiting are different problems wearing similar clothes
+
+Rate limiting protects a callee from a caller that's sending more than its share. Load shedding
+protects a service from *total* demand exceeding what it can do at all, regardless of whose
+requests they are — and the discipline is to shed before you queue, not after: a request
+rejected in a microsecond at the front door costs nothing; a request accepted into a queue that's
+already backed up just delays the rejection while burning memory in the meantime.
+
+Three rate-limiting algorithms answer "how many requests in a window" differently:
+
+- **token bucket** — a bucket refills at a fixed rate and holds up to a cap; a request costs one
+  token. This explicitly *allows bursts* up to the bucket's capacity, then throttles down to the
+  refill rate. Right when bursts are a legitimate, expected pattern.
+- **sliding window** (log or weighted counter) — measures the actual rate over a continuously
+  moving interval. No burst allowance beyond the stated limit itself, because there's no fixed
+  boundary to burst across.
+- **fixed window** — cheapest to implement, and it has the boundary-spike problem: a client can
+  send close to the full quota in the last moment of one window and again in the first moment of
+  the next, doubling the effective rate right at the boundary, with nothing in the counter that
+  ever saw it happen.
+
+## the tradeoff
+
+| mechanism | responds to | unit it operates on | wrong-sized cost |
+| --- | --- | --- | --- |
+| retry + jitter | a transient, independent failure | one call | too many attempts *or* no cap on total time masks a real outage as latency; non-idempotent retry corrupts data |
+| circuit breaker | sustained failure of one dependency | per dependency, ideally shared state across instances | too sensitive trips on noise and takes a healthy dependency offline; too lax keeps hammering a dead one |
+| bulkhead | one dependency starving a shared resource pool | thread pool / connection pool / semaphore, per dependency | too small rejects healthy traffic; too large isolates nothing |
+| load shedding | total demand exceeding capacity | at the edge, before queueing | shedding the wrong requests (health checks, your highest-tier customers) is a new, self-inflicted outage |
+| rate limiting | one caller exceeding its fair share | per caller / key | a fixed window's boundary spike, or a limit so strict it throttles legitimate steady traffic |
+
+None of these substitute for each other — they answer different questions, and a call path
+usually needs several at once. The default for a typical internal service-to-service call: a
+per-attempt timeout that shrinks down the chain, two or three retries with full jitter under a
+bounded total time budget, wrapped by a circuit breaker so retries stop entirely once the
+dependency is confirmed down rather than continuing to slow-fail, and a bulkhead if that
+dependency shares a thread or connection pool with others. Load shedding and rate limiting belong
+at your service's own edge, not scattered through internal call sites. Depart from "retry it"
+specifically when the operation is non-idempotent and there's no dedup key: then correctness
+outranks availability, and the right move is to surface the ambiguity to a human or a
+reconciliation job, not to guess.
+
+## how it fails
+
+- **retry storm** — dashboards show latency and error rate spiking on a regular, near-periodic
+  cadence rather than smoothly; the period matches the retry backoff schedule. Cause: retries
+  without jitter (or jitter too narrow to decorrelate clients) synchronizing every client's
+  next attempt.
+- **cascading failure through thread-pool exhaustion** — one endpoint that calls a slow
+  dependency starts timing out, and then *unrelated* endpoints on the same service start timing
+  out too, with no errors from their own dependencies. Cause: no bulkhead, so the slow
+  dependency has consumed every thread or connection in a pool that everything else also needs.
+- **zombie work** — connection-pool or thread-pool exhaustion shows up even though the request
+  rate looks unremarkable on its own graph. Cause: an inner hop's timeout is longer than the
+  budget the outer caller already gave up on, so work continues for requests nobody is waiting
+  on any more.
+- **breaker flapping** — the circuit breaker's state graph oscillates between open and
+  half-open rather than settling closed. Cause: the cooldown is shorter than the dependency's
+  actual recovery time, or the half-open probe isn't bounded so it re-triggers the same overload
+  the moment it lets traffic back in; also common when breaker state isn't shared across service
+  instances, so some pods are open while others are still hammering the dependency.
+- **the duplicate-charge ticket** — a support ticket, not a metric: a customer was charged
+  twice, or an order was created twice, and it reproduces only under a real mid-flight timeout,
+  so it rarely shows up in staging. Cause: retrying a non-idempotent write.
+- **the rate limiter that let the DB fall over anyway** — traffic graphs show the limiter
+  correctly enforcing its stated cap per window, and the downstream still gets overloaded.
+  Cause: fixed-window boundary spike — the enforced-per-window number was correct and the
+  effective peak rate at the boundary was double it.
+
+## in practice
+
+**Polly and `HttpClient`.** Polly is the .NET resilience library underneath most of this:
+`RetryStrategyOptions` with a jittered backoff generator, `CircuitBreakerStrategyOptions` with
+its own failure-ratio threshold and break duration, `TimeoutStrategyOptions`, and a bulkhead via
+`RateLimiterStrategyOptions` or a plain `SemaphoreSlim`-backed limiter. `IHttpClientFactory` in
+recent .NET ships `AddStandardResilienceHandler()`, a pre-built pipeline chaining a rate limiter,
+retry, circuit breaker, and per-attempt timeout around `HttpClient` calls — worth reading its
+defaults rather than trusting them blind, because the "standard" thresholds were tuned for a
+generic HTTP dependency, not necessarily yours. Composition order matters: put the circuit
+breaker *inside* the retry (so each individual retry attempt is what trips the breaker, and the
+breaker can stop the retry loop early) and the per-attempt timeout innermost of all, so it bounds
+one try rather than the whole retry sequence.
+
+```csharp
+// illustrative shape, not a full working pipeline
+var pipeline = new ResiliencePipelineBuilder()
+    .AddRetry(new RetryStrategyOptions
+    {
+        MaxRetryAttempts = 3,
+        BackoffType = DelayBackoffType.Exponential,
+        UseJitter = true, // this is the line that turns a synchronized storm into a ramp
+    })
+    .AddCircuitBreaker(new CircuitBreakerStrategyOptions
+    {
+        FailureRatio = 0.5,
+        SamplingDuration = TimeSpan.FromSeconds(10),
+        BreakDuration = TimeSpan.FromSeconds(30),
+    })
+    .AddTimeout(TimeSpan.FromSeconds(2)) // per attempt, not per call to pipeline
+    .Build();
+```
+
+**EF Core and SQL Server.** EF Core's execution strategy (`EnableRetryOnFailure`, or
+`SqlServerRetryingExecutionStrategy` explicitly) retries a specific class of *transient*
+infrastructure errors — connection drops, deadlock victim (1205), Azure SQL throttling (40501)
+— not application failures, and it does not make your unit of work idempotent for you. The
+sharp edge: a retrying execution strategy is incompatible with a manually-opened
+`DbContext.Database.BeginTransaction()` unless you wrap the whole operation in
+`strategy.ExecuteAsync(...)` yourself, because a bare retry inside an already-open transaction
+would just retry against a transaction that's already been rolled back by the failure.
+
+**Message brokers as the durable alternative.** Azure Service Bus's `PeekLock` plus
+`MaxDeliveryCount` plus a dead-letter queue is a retry-with-a-hard-cap-and-bulkhead pattern
+implemented at the message layer instead of the call layer — a poison message that keeps
+failing gets shunted out rather than retried forever. RabbitMQ's `prefetch` count is a bulkhead
+in disguise: it bounds how many unacked messages one consumer holds at once, so one slow
+downstream call inside message handling can't starve every other consumer sharing the channel.
+Kafka's `max.poll.interval.ms` is the timeout budget for "the consumer is still alive and
+processing," and blowing it triggers a rebalance — treating a slow handler the same way a
+circuit breaker treats a slow dependency: assume it's stuck and hand the work to someone else.
+See [Queues & Event Streams](/system-design/queues-and-streams/) for the durable-buffering
+alternative to in-process retrying generally.
+
+**Redis and thread-pool starvation.** `StackExchange.Redis`'s multiplexer issues commands over a
+shared connection and completes them on the .NET thread pool; if the thread pool is already
+starved (see the bulkhead failure mode above, or a burst of `Task.Run`-backed synchronous
+blocking elsewhere in the same process), Redis calls back up with timeouts that look exactly
+like "Redis is slow" on a dashboard when the actual cause is upstream of Redis entirely. It's a
+sharp, concrete instance of "no dependency's reliability story is separable from the process
+health it's measured inside of."
+
+## the same idea elsewhere
+
+| here | over there | the trap |
+| --- | --- | --- |
+| retry with full jitter | a CAS retry loop backing off under contention, in [Lock-Free Data Structures](/systems/lock-free-structures/) | the mechanism (randomize to decorrelate competitors) is identical; the cost of one more attempt is nanoseconds of spin there and a network round trip here — get the retry budget wrong at this layer and it's a lot more expensive |
+| bulkhead (a per-dependency thread or connection pool) | a lock convoy on one mutex, in [What a Lock Is Made Of](/systems/locks-internals/) | both are "one shared, contended resource stalls everyone behind it" — a bulkhead is the fix of giving each consumer its own resource instead of one shared queue |
+| circuit breaker half-open, bounded probe count | the network path's own retransmission backoff after a timeout, on [The Network Path](/system-design/networking/) | both need the probe/retry itself bounded, or the recovery attempt reproduces the exact overload it was testing for |
+| load shedding at the edge, before queueing | backpressure in a bounded channel between producer and consumer, in [Parallelism That Actually Scales](/systems/parallelism-patterns/) | same choice — reject early versus buffer and delay the rejection — one layer up, with a network caller instead of another thread on the other end |
+
+## interview drills
+
+**Q.** A downstream dependency that used to answer quickly started taking longer under load, and
+your service's own error rate spiked even though the dependency never returned an actual error.
+
+- *weak answer* — "must be a network problem downstream."
+- *strong answer* — the dependency slowed down, not failed, and every thread that called it
+  synchronously is now parked waiting; once the shared thread or connection pool is exhausted,
+  calls to completely unrelated, healthy dependencies start failing too because nothing is left
+  to make them with. Fix: a bulkhead so this dependency has its own bounded pool, a timeout tight
+  enough that a slow call fails fast rather than holding a thread, and a circuit breaker so
+  sustained slowness stops sending calls at all.
+- *follow-up* — "how do you size that timeout?" A timeout longer than the caller above you is
+  willing to wait is pure waste; base it on the dependency's own tail latency and shrink it
+  again for every hop further down the chain.
+
+**Q.** You added retries to a flaky call, and the outage got worse, not better.
+
+- *weak answer* — "retries always help — worst case, it's the same as not retrying."
+- *strong answer* — without jitter, every client that failed at roughly the same moment retries
+  at roughly the same moment, converting N independent failures into N simultaneous requests
+  against a dependency you already know is struggling — a retry storm. The fix is exponential
+  backoff sampled with full jitter, a cap on total attempts, and a circuit breaker so retries
+  stop outright once the dependency is confirmed down instead of continuing to add load slowly.
+- *follow-up* — "what if the call isn't idempotent?" Then a retry after a timeout can double-
+  execute it, because a timeout tells you the response was lost, not that the write didn't
+  happen — you need an idempotency key the server dedupes on, or you don't retry it at all.
+
+**Q.** Design a circuit breaker for a call to a payment gateway. Walk me through the states.
+
+- *weak answer* — "it's open when the dependency is failing and closed when it's healthy,"
+  with no mention of anything in between.
+- *strong answer* — closed counts failures in a rolling window and trips to open once a
+  threshold is crossed; open fails every call immediately without touching the dependency at
+  all; after a cooldown, half-open lets a small, bounded number of trial calls through, and
+  success closes it while any failure reopens it. The bound on half-open matters as much as the
+  state itself, or every instance's simultaneous probe reproduces the original overload.
+- *follow-up* — "the breaker keeps flapping between open and half-open — what's your first
+  guess?" Either the cooldown is shorter than the dependency's real recovery time, or breaker
+  state isn't shared across instances, so some are still hammering it while others have backed
+  off.
+
+**Q.** Should a client retry a payment write that timed out?
+
+- *weak answer* — "yes, to be safe — worst case the second call just does the same thing again."
+- *strong answer* — a timeout means the response was lost, not that the write didn't commit; the
+  first attempt may well have succeeded. Retrying a non-idempotent write on that assumption is a
+  correctness bug — a possible duplicate charge — not a reliability feature. The fix is a
+  client-generated idempotency key the server deduplicates on before you retry, or you don't
+  retry and instead reconcile the ambiguous state explicitly.
+- *follow-up* — "what does at-least-once delivery plus idempotent processing actually give you?"
+  Effectively-once from the caller's point of view within that system's boundary — not
+  exactly-once over the network, which isn't achievable in general; worth naming the difference
+  out loud whenever someone claims "exactly-once" in a design review.
+
+**Q.** Gateway timeout 5s, service A timeout 5s (which calls service B), service B timeout 5s.
+What's wrong with this?
+
+- *weak answer* — "looks fine, everything gets 5 seconds."
+- *strong answer* — the timeout doesn't shrink down the chain, so the gateway can give up and
+  return an error to the user at 5s while service A is still burning its own full 5-second
+  budget waiting on service B — work whose result nobody will read, holding a thread and a
+  connection the whole time. Each hop's timeout has to be strictly smaller than the remaining
+  budget it inherited, not a fixed independent number.
+- *follow-up* — "how do you propagate that budget in .NET specifically?" Derive a
+  `CancellationToken` from the remaining deadline (for example `CancellationTokenSource
+  .CancelAfter` with the time left, not each layer's own fixed value) and pass it down the call
+  chain rather than letting each layer pick its own timeout independently.
+
+**Q.** You rate limit an API to 1000 requests per minute per customer. A customer with a steady,
+well-behaved client complains they still get 429s right around the top of every minute.
+
+- *weak answer* — "raise the limit."
+- *strong answer* — that's the fixed-window boundary problem: a client can send close to the
+  full quota in the last moment of one window and again in the first moment of the next,
+  doubling the effective peak rate right at the boundary, with nothing in a per-window counter
+  that ever observes it. A sliding window (or weighted counter) measures the rate over a moving
+  interval instead of a hard boundary, which removes the spike without changing the stated
+  limit.
+- *follow-up* — "when would you reach for a token bucket instead?" When bursts up to some cap
+  should be explicitly *allowed*, not smoothed away — a token bucket's whole point is permitting
+  a burst then throttling to the refill rate, which a sliding window deliberately does not.

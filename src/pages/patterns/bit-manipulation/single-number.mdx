@@ -1,0 +1,100 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: bit-manipulation
+problem: single-number
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import Cells from '@components/Cells.astro';
+
+## task
+
+Given an integer array where **every element appears exactly twice except for one**, find that
+one. Linear time, constant extra space.
+
+```text
+nums = [4, 1, 2, 1, 2]  →  4
+```
+
+## how to think
+
+The space-unconstrained answer is a [hashmap](/patterns/hashmap/): a `HashSet<int>` where you add
+a value on first sight and remove it on second sight, then read off whatever is left. That's
+O(n) time and O(n) space, and it works — but "constant extra space" in the prompt is a direct hint
+that a hash set is not the intended tool.
+
+The identity that replaces it is `x ^ x == 0`. XOR every element of the array together: each
+value that appears twice contributes `v ^ v`, which vanishes, and `0` doesn't affect anything else
+XORed with it. Since XOR is commutative and associative, it doesn't matter what order the
+duplicates arrive in or how they're interleaved with the loner — every pair still finds each other
+and cancels. What's left when the dust settles is the one value that had no partner to cancel
+with.
+
+<Callout kind="note" label="template instance">
+  **XOR cancellation** skeleton, verbatim. Invariant: after processing the first `k` elements,
+  the running XOR equals the XOR of whichever values among those `k` have not yet found their
+  pair. What varies: nothing — this problem *is* the template with no extra bookkeeping.
+</Callout>
+
+## solution
+
+```csharp
+public int SingleNumber(int[] nums)
+{
+    int result = 0;
+    foreach (int num in nums)
+        result ^= num;
+    return result;
+}
+```
+
+## trace
+
+`nums = [4, 1, 2, 1, 2]`:
+
+| step | num | result before | XOR | result after |
+| --- | --- | --- | --- | --- |
+| 1 | 4 | 0 | `0 ^ 4` | 4 |
+| 2 | 1 | 4 | `4 ^ 1` | 5 |
+| 3 | 2 | 5 | `5 ^ 2` | 7 |
+| 4 | 1 | 7 | `7 ^ 1` | 6 |
+| 5 | 2 | 6 | `6 ^ 2` | 4 |
+
+Final `result = 4` — exactly the value with no partner.
+
+<Cells
+  data={[4, 1, 2, 1, 2]}
+  cells={{ 0: 'ok', 1: 'warn', 2: 'warn', 3: 'warn', 4: 'warn' }}
+  caption="indices 1 and 3 hold the same value (cancel); 2 and 4 hold the same value (cancel); only index 0's value has no partner"
+/>
+
+## why it works
+
+XOR is commutative (`a ^ b == b ^ a`) and associative (grouping doesn't matter), so the five XORs
+above can be reordered however you like — say, grouped by value: `(1 ^ 1) ^ (2 ^ 2) ^ 4`. Each
+matched pair collapses to `0` by `x ^ x == 0`, and `0 ^ 4 == 4` by `x ^ 0 == x`. The array can
+have the duplicates in any arrangement — interleaved, reversed, whatever — and the algebra still
+reduces to "the pairs vanish, the loner is what's left."
+
+<Watch items={[['time', 'O(n)'], ['space', 'O(1)'], ['passes', '1']]} />
+
+## common bugs
+
+- Reaching for a `HashSet<int>` out of habit — it passes, but it's the O(n)-space solution the
+  problem is explicitly steering you away from.
+- Using `+` instead of `^` to "cancel" pairs — addition doesn't cancel anything; only XOR (or
+  subtraction with careful bookkeeping) does.
+- Assuming this generalizes to "every element appears **three** times except one" — it doesn't;
+  `x ^ x ^ x == x`, so three copies don't vanish. See the variant below.
+- Forgetting to seed `result` at `0` — XOR needs an identity element to start from, and `0` is it.
+
+## variants you can now solve
+
+- **[Missing Number](/patterns/bit-manipulation/missing-number/)** (LC 268) — same XOR
+  cancellation idea, but you XOR the array against the index range instead of against itself.
+- **Single Number II** (LC 137) — every element three times except one: plain XOR fails, so you
+  count each bit position mod 3 instead.
+- **Single Number III** (LC 260) — *two* numbers appear once each: XOR everything first, then
+  use a set bit in that result to split the array into two groups and solve each with this exact
+  trick.

@@ -1,0 +1,662 @@
+---
+layout: '@layouts/TopicLayout.astro'
+topic: concurrency-hazards
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import ProblemList from '@components/ProblemList.astro';
+import Solution from '@components/Solution.astro';
+
+## the ground floor
+
+- **thread** — a stack, a set of registers, and a scheduling entity. Threads share the heap and
+  never share a stack, which is the one fact the whole section rests on.
+  [Processes, threads and the kernel](/systems/process-and-thread/) builds it.
+- **critical section** — a stretch of code that at most one thread may be inside at a time. A
+  lock is the mechanism; the critical section is the region it protects.
+  [What a lock is made of](/systems/locks-internals/) takes one apart.
+- **atomic** — an operation no other thread can observe half-finished.
+  [Atomics and compare-and-swap](/systems/atomics-and-cas/) shows why `count++` is not one.
+- **visibility and ordering** — whether another thread's write is observable to you yet, and in
+  what order writes appear to happen. Separate guarantees from atomicity;
+  [the memory model](/systems/memory-model/) is where all three are pulled apart.
+- **invariant** — the sentence about your shared state that must be true whenever no thread is
+  in the middle of updating it. "Stock is never negative." "Every reserved seat has exactly one
+  holder." Locks exist to hide the moments when the invariant is false.
+
+## core idea
+
+Two different failures wear the same word.
+
+A **data race** is a property of the *code*: two threads touch the same memory location, at least
+one of them writes, and nothing orders those accesses. That is a mechanical fact you can find by
+reading, and the memory model says the result is not defined.
+
+A **race condition** is a property of the *outcome*: the result depends on which thread got there
+first. You can have one without a single data race — every individual access perfectly atomic,
+every field `volatile`, every method locked, and still the wrong answer, because the invariant
+spans more than one access and nothing held the world still in between.
+
+| | no data race | data race |
+| --- | --- | --- |
+| **no race condition** | correct code | the loop that never exits: one plain `bool` flag, read by a thread the compiler proved never sees a write. No value is ever wrong, and the program hangs. [Shown on the memory-model page](/systems/memory-model/) |
+| **race condition** | the expensive kind: check-then-act with atomic parts. 18% of rounds wrong below, and no tool that hunts unsynchronised accesses will point at it | the cheap kind: `count++` from four threads. 13% of updates lost below, and it is the one every tool finds |
+
+The bottom-right cell is what people mean by "thread bug" and it is the easy one. The bottom-left
+cell is where the production incidents live, and the rest of this page is mostly about it.
+
+Almost every one of these bugs is one of two shapes:
+
+| shape | what it looks like | why it breaks |
+| --- | --- | --- |
+| **read-modify-write** | `count++`, `total += x`, `list[i] = list[i] + 1` | three machine operations pretending to be one; another thread's write lands between the read and the write, and is then overwritten |
+| **check-then-act** | `if (!dict.ContainsKey(k)) dict.Add(k, v)`, `if (stock >= n) Take(n)`, `if (_x is null) _x = new()` | the fact you checked was true when you read it and false by the time you acted on it |
+
+## how it actually works
+
+### the two shapes, in a real run
+
+Both experiments below run 20,000 *independent* rounds: reset the state, release four threads
+through a `Barrier` so they start together, run one tiny body each, then count the rounds that
+came out wrong. Independent rounds are what turn "it happens sometimes" into a count you can look
+at. The file is `bench/concurrency-hazards/index.cs`, run as
+`dotnet run bench/concurrency-hazards/index.cs shapes`.
+
+<Solution>
+
+```csharp
+// shape 1 — read-modify-write. The classic.
+plainCounter++;
+
+// shape 1, fixed — one indivisible operation.
+Interlocked.Increment(ref plainCounter);
+
+// shape 2 — check-then-act. EVERY access here is atomic.
+if (Volatile.Read(ref seats) < 1)          // check  — an atomic read
+{
+    Interlocked.Increment(ref seats);      // act    — an atomic increment
+    Interlocked.Increment(ref admitted);
+}
+
+// shape 2, fixed — the check and the act inside ONE critical section.
+lock (gate)
+{
+    if (seats < 1) { seats++; admitted++; }
+}
+```
+
+</Solution>
+
+```text
+=== shape 1: read-modify-write. 4 threads, one ++ each, 20,000 rounds ===
+  count++ (no synchronisation)          rounds that lost an update:   2674 / 20000  (13.37%)
+  Interlocked.Increment                 rounds that lost an update:      0 / 20000  (0.00%)
+
+=== shape 2: check-then-act. 1 seat, 4 threads, 20,000 rounds ===
+    every single access below is atomic. that is not the same as correct.
+  atomic read, then atomic increment    rounds that oversold the seat:   3611 / 20000  (18.05%)
+  one lock around check AND act         rounds that oversold the seat:      0 / 20000  (0.00%)
+```
+
+| 4 threads, 20,000 rounds | rounds gone wrong |
+| --- | --- |
+| `plainCounter++` | 2,674 (13.37%) |
+| `Interlocked.Increment` | 0 (0.00%) |
+| atomic check, then atomic act | 3,611 (18.05%) |
+| one `lock` around check and act | 0 (0.00%) |
+
+The exact percentage moves between runs — how often two threads land in the same few-nanosecond
+window depends on where the OS scheduler happens to put them relative to each other, and that is
+not something your code controls. What does not move is which rows can ever be nonzero. Run either
+unsynchronised row again and you get some count greater than zero, because the window that lets an
+update get lost or a seat get oversold is still there, just small. Run either synchronised row
+again — this page's author has, many times — and it is zero, because `Interlocked.Increment` and
+the `lock` remove the window a scheduler could ever land in. The rate is not the lesson. Zero
+versus nonzero is.
+
+Row 3 is the whole lesson. There is no data race in it: `Volatile.Read` is an atomic read with
+acquire semantics, `Interlocked.Increment` is an atomic read-modify-write with a full fence.
+A race detector that looks for unsynchronised access to shared memory finds nothing to complain
+about. And close to one seat in five was sold twice.
+
+<Callout kind="insight" label="the size of the atomic step is decided by the invariant">
+  "Make every field atomic" is not a strategy, it is a category error. The unit that has to be
+  indivisible is **the span over which your invariant is false** — from the moment you read
+  `seats` to the moment you have finished changing it. Atomics make individual *accesses*
+  indivisible. Only a lock (or one compare-and-swap that does the whole job) makes a *span*
+  indivisible.
+</Callout>
+
+### why `lock` is the boring right answer
+
+`lock (x) { … }` gives you all three guarantees at once — mutual exclusion over the whole block,
+visibility of everything the previous holder wrote, and ordering — and that is why the vast
+majority of correct concurrent .NET code contains no `volatile`, no `Interlocked` and no memory
+barrier. [The memory model page](/systems/memory-model/) works through why acquiring and
+releasing a lock hands you the other two for free.
+
+What a lock cannot do is guess how big your invariant is. Every hazard below is a way of getting
+that span wrong: too small (check-then-act), taken in inconsistent orders (deadlock), given up
+halfway (livelock), or taken on the wrong thread entirely (the async deadlock).
+
+### deadlock: four conditions, and breaking any one is enough
+
+Deadlock is the state where a set of threads each hold something the next one needs, in a cycle.
+Draw the **wait-for graph** — an arrow from each thread to the thread holding what it is waiting
+for — and deadlock is exactly a cycle in that graph:
+
+```text
+   thread A                                  thread B
+   ────────                                  ────────
+   lock (account1)   ← HOLDS 1               lock (account2)   ← HOLDS 2
+     lock (account2) ← WANTS 2                 lock (account1) ← WANTS 1
+         │                                          │
+         └──────────────┐              ┌────────────┘
+                        ▼              ▼
+                  wait-for graph:   A ──wants 2──▶ B
+                                    ▲              │
+                                    └──wants 1─────┘
+                                    a cycle. nobody moves. ever.
+```
+
+Coffman's four conditions have to hold *simultaneously* for that cycle to be possible. The point
+of listing them is that you get to pick which one to break:
+
+| condition | what it means | how you break it in .NET |
+| --- | --- | --- |
+| mutual exclusion | the resource cannot be shared | make it immutable, or copy-on-write, so no lock is needed |
+| hold and wait | a thread holding one lock asks for another | take everything you need up front, or restructure so you only ever hold one |
+| no preemption | a lock cannot be taken away from its holder | `Monitor.TryEnter` with a timeout: give up voluntarily. This is the one people reach for, and it is the worst of the four |
+| circular wait | the wait-for graph has a cycle | **impose a global order on lock acquisition.** This is the fix |
+
+Breaking circular wait is the practical answer because it costs nothing at runtime and it is a
+local, reviewable property: sort your locks by some stable key — an id, a name, even
+`RuntimeHelpers.GetHashCode` — and always take them smallest first. A cycle needs a thread going
+"up" and a thread going "down"; if everyone walks the same direction, there is no cycle to have.
+
+<Solution>
+
+```csharp
+// The bug: the order depends on the arguments, so Transfer(a, b) and Transfer(b, a) disagree.
+void TransferNaive(Account from, Account to, long amount)
+{
+    lock (from) { lock (to) { from.Balance -= amount; to.Balance += amount; } }
+}
+
+// The fix: the order depends on the accounts, so every thread walks the same direction.
+void TransferOrdered(Account from, Account to, long amount)
+{
+    Account first  = from.Id < to.Id ? from : to;
+    Account second = from.Id < to.Id ? to : from;
+    lock (first) { lock (second) { from.Balance -= amount; to.Balance += amount; } }
+}
+```
+
+</Solution>
+
+[Two locks, two orders](/systems/concurrency-hazards/deadlock-repro/) runs both versions under
+load, forces the interleaving on demand, and measures the thing that makes this bug so dangerous:
+how much traffic the broken version survives before the cycle happens to close.
+
+### livelock and starvation: alive, and getting nothing done
+
+**Livelock** is deadlock's cousin: threads are running, changing state, using CPU, and no work
+completes. The classic recipe is the "no-preemption" fix from the table above — take the first
+lock, try the second with a timeout, and on failure release everything, back off, retry.
+
+That is worth demonstrating, because the folklore ("it livelocks") and what actually happens here
+are not the same thing. Two threads, opposite lock orders, abort-and-retry, a FIXED number of
+attempts per thread at three different backoff lengths — fixed count, not a time window, so
+nothing below is a rate:
+
+```text
+=== abort-and-retry instead of a lock order: two threads, opposite orders, 200,000 attempts each ===
+  spin=   50:  completed    185,240   abandoned    214,760   of    400,000 total attempts   (53.7% wasted)
+  spin=  200:  completed    196,438   abandoned    203,562   of    400,000 total attempts   (50.9% wasted)
+  spin= 1000:  completed    199,857   abandoned    200,143   of    400,000 total attempts   (50.0% wasted)
+```
+
+| backoff (`Thread.SpinWait` iterations) | completed | abandoned | wasted |
+| --- | --- | --- | --- |
+| 50 | 185,240 | 214,760 | 53.7% |
+| 200 | 196,438 | 203,562 | 50.9% |
+| 1,000 | 199,857 | 200,143 | 50.0% |
+
+**I could not produce a permanent, zero-progress livelock**, in this shape or in a
+symmetric Dekker-style variant, and it would be dishonest to show you one. What reproduced every
+time is the tax: **close to half of every attempt is thrown away**, at every backoff length, and
+the fraction sits close to 50% regardless of how long each thread spins before retrying, because
+the two threads settle into lockstep — each one's retry lands in the other's window. The lesson is
+not "the process hangs". The lesson is that swapping a lock order for a retry loop buys
+correctness with a hidden cost: roughly half the CPU work this code does is thrown away,
+structurally, and tuning the backoff does not change that fraction. *Reasoning, not a run:* a true
+zero-progress livelock needs the retry period to match on both sides closely enough that no
+thread ever wins, which is why randomised backoff is the standard cure — it destroys exactly the
+symmetry this experiment kept reproducing.
+
+**Starvation** is one thread making no progress while others do. .NET's `Monitor` is not fair:
+there is no queue discipline that guarantees the longest waiter goes next, and a thread that
+releases the lock and immediately re-acquires it often wins against a thread already parked. Four
+threads race for a FIXED pool of 4,000,000 acquisitions of one lock, nothing inside the critical
+section — how that pool splits among them is the evidence, not how fast it was consumed:
+
+```text
+=== 4 threads, one lock, racing for a fixed pool of 4,000,000 acquisitions, no work inside the critical section ===
+  acquisitions per thread: 1,057,279  1,003,976  889,215  1,049,530   max/min = 1.19x
+```
+
+| thread | acquisitions | share of the pool |
+| --- | --- | --- |
+| 0 | 1,057,279 | 26.4% |
+| 1 | 1,003,976 | 25.1% |
+| 2 | 889,215 | 22.2% |
+| 3 | 1,049,530 | 26.2% |
+
+That is unfairness, not starvation — every thread got at least a fifth of the pool in this run,
+which is not a guarantee, just what one run's scheduler happened to produce. What is structural,
+and does not depend on the run, is the mechanism: `Monitor` makes no fairness promise at all, so
+nothing stops a thread that just released the lock from winning it back before a thread already
+parked ever gets scheduled. Push the skew further — more threads than cores, a critical section
+long enough that the barging thread keeps the lock warm — and the same mechanism can starve a
+thread outright rather than just slow it down. The rule to carry away is the honest version:
+**`lock` promises you exclusion, not a turn.** If you need a turn, you need a structure that
+queues — a `Channel<T>`, a `SemaphoreSlim` you treat as a ticket dispenser, or work partitioned so
+that nobody has to wait at all.
+
+**Priority inversion** — a low-priority thread holding a lock a high-priority thread needs, while
+a medium-priority thread runs and preempts the low one — is the third member of this family. This
+box cannot demonstrate it: thread priorities in a container are advisory at best, and .NET's
+`Monitor` has no priority inheritance to show off. It matters most in real-time and embedded
+systems; the .NET-relevant version of the same shape is a `Task` on a starved thread pool holding
+a lock that a request thread is waiting for, which
+[thread-pool starvation](/systems/threads-and-scheduling/threadpool-starvation/) covers.
+
+### reentrancy: `lock` re-enters, `SemaphoreSlim` does not
+
+`lock` in C# is `Monitor.Enter`/`Monitor.Exit`, and a `Monitor` is **reentrant**: it remembers
+which thread owns it and keeps a recursion count, so the thread that already holds it may enter
+again. That is why a locked method can safely call another locked method of the same object.
+
+`SemaphoreSlim` counts *permits*, not owners. It has no idea who holds one. A thread that takes
+the only permit and then asks for it again is waiting for itself:
+
+<Solution>
+
+```csharp
+lock (gate)
+{
+    lock (gate)                                  // same thread, same object: fine
+    {
+        Console.WriteLine(Monitor.IsEntered(gate));   // True
+    }
+}
+
+var permit = new SemaphoreSlim(1, 1);
+permit.Wait();                                   // takes the only permit
+bool second = permit.Wait(500);                  // asks for it again — from the same thread
+Console.WriteLine(second);                       // False. it timed out waiting for itself
+```
+
+</Solution>
+
+```text
+  lock: entered twice from one thread. Monitor.IsEntered = True
+  SemaphoreSlim(1,1): first Wait() succeeded, second Wait(500) returned False
+  SemaphoreSlim.CurrentCount = 0   (the permit this thread is holding itself)
+  PASS
+```
+
+With no timeout, that second `Wait()` never returns — a one-thread deadlock, no contention
+required. This matters because `SemaphoreSlim` is what people reach for when a method becomes
+`async` (you cannot `await` inside a `lock`), and the refactor silently removes reentrancy from
+code that was relying on it.
+[The thread-safe class that was not](/systems/concurrency-hazards/check-then-act/) ends on exactly
+that trap: a fix that works with `lock` and hangs with `SemaphoreSlim`.
+
+Reentrancy is a convenience, not a virtue. A reentrant lock lets you re-enter a critical section
+*whose invariant is currently broken* — you took the lock, half-updated the state, called a
+helper, and the helper cheerfully re-entered and read the half-updated state. Reentrancy converts
+a deadlock into a correctness bug, which is harder to find.
+
+### the async deadlock: blocking the thread the continuation needs
+
+`await` splits a method in two. The part after the `await` is a continuation that has to run
+somewhere, and by default it runs *back on the context it started on* — a `SynchronizationContext`
+if one is installed. On a UI framework or legacy ASP.NET, that context is a single-threaded
+message pump: the continuation is posted to a queue that exactly one thread drains.
+
+Now block that thread on `.Result` and count the threads available to run the continuation. Zero.
+
+<Solution>
+
+```csharp
+// A single-threaded message pump — what WinForms, WPF and legacy ASP.NET install.
+sealed class PumpContext : SynchronizationContext
+{
+    readonly BlockingCollection<(SendOrPostCallback cb, object? state)> _queue = new();
+    public int Posted;
+    public override void Post(SendOrPostCallback d, object? state)
+    {
+        Interlocked.Increment(ref Posted);
+        _queue.Add((d, state));                  // the continuation goes HERE
+    }
+    public void Pump(CancellationToken ct)
+    {
+        try { foreach (var (cb, st) in _queue.GetConsumingEnumerable(ct)) cb(st); }
+        catch (OperationCanceledException) { }
+    }
+}
+
+static async Task<int> GetAsync(bool configureAwaitFalse)
+{
+    await Task.Delay(50).ConfigureAwait(!configureAwaitFalse);
+    return 42;
+}
+
+// on the pump thread, with the context installed:
+int r = GetAsync(configureAwaitFalse).Result;    // the blocking call
+```
+
+</Solution>
+
+Same file, both settings, back to back — logged with a monotonic step counter, not a clock, so
+what you're reading is real cross-thread ORDER, not a duration:
+
+```text
+  [  1] tid   4  pump thread: context installed, calling GetAsync(ConfigureAwait(false) = True).Result
+  [  2] tid   4  pump thread: .Result returned 42
+  [  3] tid   1  main: ConfigureAwait(false) = True -> pump thread returned before the watchdog fired? True   result = 42   continuations posted to the pump queue: 0
+  [  4] tid   1  main: pump thread state = Stopped
+  [  5] tid   9  pump thread: context installed, calling GetAsync(ConfigureAwait(false) = False).Result
+  [  6] tid   1  main: ConfigureAwait(false) = False -> pump thread returned before the watchdog fired? False   result = -1   continuations posted to the pump queue: 1
+  [  7] tid   1  main: pump thread state = Background, WaitSleepJoin
+  [  8] tid   1  WATCHDOG: the continuation is queued to the thread that is blocked. killing the process.
+```
+
+Step 3: `ConfigureAwait(false)` posted nothing to the pump queue and the pump thread returned on
+its own, well before the watchdog's cap. Step 6: `ConfigureAwait(true)` (the default) posted one
+continuation, and the only thread that drains that queue is the same thread parked in `.Result` —
+so that continuation never runs, and the watchdog is the only thing that ends the process.
+
+<Callout kind="trap" label="this deadlock cannot happen in a console app or in ASP.NET Core">
+  Neither installs a `SynchronizationContext`, so continuations go to the thread pool and
+  `.Result` merely blocks a pool thread instead of deadlocking. **I had to build the pump above to
+  reproduce it at all**, and that is worth knowing precisely: the classic
+  "`.Result` deadlocks" advice is about WinForms, WPF, MAUI and legacy ASP.NET.
+
+  What replaces it in ASP.NET Core is not a hang but
+  [thread-pool starvation](/systems/threads-and-scheduling/threadpool-starvation/): every
+  `.Result` or `.Wait()` parks a pool thread instead of returning it to the queue, so under load
+  the pool has fewer and fewer threads free to drain a growing backlog of continuations, and
+  request latency climbs. Different mechanism, same root cause — a thread blocked on async work —
+  and the same fix: `await` it instead.
+</Callout>
+
+### initialise-once, four ways
+
+Lazy initialisation is check-then-act wearing a hat, and it is the single most common place a
+senior .NET engineer writes this bug on purpose. Four ways to fill one field, four threads racing
+for it, 20,000 independent rounds:
+
+```text
+=== initialise one field once. 4 threads racing, 20,000 independent rounds ===
+  if (x is null) x = Build()                  rounds where the factory ran more than once:   7955 / 20000  (39.77%)
+  double-checked lock, volatile field         rounds where the factory ran more than once:      0 / 20000  ( 0.00%)
+  Lazy<T> (default, ExecutionAndPublication)  rounds where the factory ran more than once:      0 / 20000  ( 0.00%)
+  Lazy<T> (PublicationOnly)                   rounds where the factory ran more than once:   6839 / 20000  (34.20%)
+```
+
+| how the field gets filled | factory ran twice or more |
+| --- | --- |
+| `if (x is null) x = Build();` | 7,955 (39.77%) |
+| double-checked lock over a `volatile` field | 0 (0.00%) |
+| `Lazy<T>` (default) | 0 (0.00%) |
+| `Lazy<T>` with `LazyThreadSafetyMode.PublicationOnly` | 6,839 (34.20%) |
+
+The last row is not a bug in `Lazy<T>` — `PublicationOnly` documents that the factory may run more
+than once and that the first value to be published wins. It is in the table because it is the mode
+people select for speed without reading that sentence, and because it behaves *like the broken
+hand-rolled version*: both land in the same double-digit-percent range of contended rounds where
+the factory ran more than once, which is the same order of wrongness. If the factory opens a file
+handle, starts a timer, or registers an event handler, that is a resource leak on a meaningful
+share of contended calls.
+
+Here is double-checked locking written correctly, and the thing about it that is genuinely
+subtle:
+
+<Solution>
+
+```csharp
+static volatile object? _instance;               // volatile is not decoration here
+static readonly object _gate = new();
+
+static object Instance
+{
+    get
+    {
+        if (_instance is null)                   // fast path: no lock once initialised
+        {
+            lock (_gate)
+            {
+                if (_instance is null)           // slow path: re-check, now holding the lock
+                    _instance = Build();
+            }
+        }
+        return _instance;
+    }
+}
+```
+
+</Solution>
+
+The outer check is an optimisation: it skips the lock on every call after the first. The inner
+check is the correctness: two threads can both pass the outer check, and only one may build. The
+`volatile` is there for the *reader* — without it, a thread could in principle see a non-null
+reference whose fields the constructor has not finished writing, because the store publishing the
+reference was allowed to become visible before the stores initialising the object.
+
+<Callout kind="trap" label="the demo this page cannot give you">
+  I cannot show you non-volatile double-checked locking failing on this machine. x86-64 forbids
+  store-store reordering in hardware, so the store that publishes the reference cannot become
+  visible to another core before the constructor's stores that filled the object — the exact
+  ordering the `volatile` is there to buy is one this CPU hands out for free, and the unsafe
+  version is accidentally safe here. The JIT is the other reordering agent, and on x86/x64 CoreCLR
+  does not reorder stores either — but read that as this platform's implementation, not as a
+  promise of the .NET memory model: on ARM64 the hardware allows StoreStore reordering
+  ([the four reorderings, by architecture](/systems/memory-model/)) and CoreCLR does not emit a
+  release store for an ordinary write to paper over it. Same source, same IL, different outcome,
+  and "it worked on my laptop" is now a phrase with a mechanism behind it. The one reordering x86
+  *does* permit is StoreLoad — that one you can catch here, and the memory-model page shows it
+  happening.
+
+  Which is the real argument for the next paragraph: do not write this at all.
+</Callout>
+
+`Lazy<T>` is the answer you should reach for. It is correct, it is one line, and its default mode
+(`ExecutionAndPublication`) guarantees the factory runs exactly once:
+
+<Solution>
+
+```csharp
+static readonly Lazy<Connection> _conn = new(() => Build());   // exactly-once, thread-safe
+static Connection Instance => _conn.Value;
+```
+
+</Solution>
+
+A `static` field with an initialiser is even better when the value does not depend on runtime
+state: the CLR's static constructor already gives you exactly-once with no lock in the steady
+state, and the JIT can eliminate the initialisation check entirely once the class is initialised.
+
+### where this goes next
+
+You now have the failure catalogue. The two directions out of it both make the catalogue smaller
+rather than teaching you to survive it: [lock-free structures](/systems/lock-free-structures/),
+where a single compare-and-swap replaces a critical section and the hazards change shape, and
+[parallelism that actually scales](/systems/parallelism-patterns/), where the answer to contention
+is to partition the state so that no two threads want the same thing in the first place. The
+hazard you cannot have is the one on state nobody shares.
+
+## the mental model
+
+Three questions, in order, about any piece of concurrent code:
+
+1. **What is the invariant, and over how many lines is it false?** That span is the critical
+   section. If your lock is shorter than the span, you have a race condition no matter how atomic
+   the parts are.
+2. **Does any thread ever hold two of these at once?** If yes, name the global order they are
+   taken in, and check every path. If you cannot name the order, you have a deadlock waiting for
+   traffic.
+3. **Does anything inside the lock block, wait, call out, or `await`?** Blocking under a lock is
+   how a slow dependency becomes a total outage, calling out is how you get a lock-ordering bug
+   you cannot see, and `await` under a lock is either a compile error or a `SemaphoreSlim` that
+   just lost its reentrancy.
+
+| hazard | the tell in the code | the fix that actually works |
+| --- | --- | --- |
+| read-modify-write race | `x++`, `x += y` on a shared field | `Interlocked`, or a lock if more than one field moves |
+| check-then-act race | an `if` on shared state, then a mutation of it | one critical section spanning both; expose a single `TryX` method |
+| deadlock | two locks held at once, order set by the arguments | a global lock order on a stable key |
+| livelock | `TryEnter` with a timeout, in a retry loop | a lock order instead; randomised backoff if you must retry |
+| starvation | one worker making far less progress than its peers | a queue (`Channel<T>`), or partitioned work |
+| async deadlock | `.Result`, `.Wait()`, `.GetAwaiter().GetResult()` | `await`; `ConfigureAwait(false)` in libraries |
+| self-deadlock | a `SemaphoreSlim` that replaced a `lock` | do not call locked methods from inside the lock, or keep an explicit "already held" path |
+| duplicate init | `if (_x is null) _x = …` | `Lazy<T>`, or a static initialiser |
+
+<Watch items={[['shapes', '2'], ['coffman conditions', '4'], ['break just', '1'], ['check-then-act oversold, one run', '18%'], ['lost updates, one run', '13%'], ['livelock: attempts wasted', '≈50%'], ['lock reentrant', 'yes'], ['SemaphoreSlim reentrant', 'no']]} />
+
+## why you should care
+
+**The metric that moves is correctness, and it moves invisibly.** A lost update does not throw.
+An oversold seat does not log. The check-then-act row above was wrong on 18% of rounds under a
+`Barrier` designed to align threads; in production the same code is wrong at whatever rate your
+traffic pattern produces, which is usually "never in staging, twice a day at peak, and always for
+the customer who complains loudest". The residue lands in the database as impossible states:
+negative stock, two rows where a unique constraint should have stopped one, a balance that does
+not equal the sum of its transactions.
+
+**The incident shape for deadlock** is the most recognisable one in this section: request latency
+goes vertical for a subset of endpoints, CPU drops to near zero, thread count climbs to whatever
+the pool will inject, and the process stays perfectly alive and answering health checks that do
+not touch the deadlocked path. Zero CPU is the discriminator — a livelock or a lock convoy burns
+CPU, a deadlock does not. On Linux, `dotnet-dump collect` followed by `clrstack -all` in
+`dotnet-dump analyze` shows you which threads are in `Monitor.Enter` and what they hold; the cycle
+is usually visible in under a minute once you have the dump. Take the dump *before* restarting.
+
+**The code review you can now do:** flag any `if` on shared state followed by a mutation of that
+state — that is check-then-act regardless of how many locks are in the vicinity. Flag any method
+that takes two locks whose order comes from its parameters. Flag `.Result`, `.Wait()` and
+`.GetAwaiter().GetResult()` on any path that can run on a request thread. Flag a `SemaphoreSlim`
+that arrived in a diff that also made methods `async` — check every call the critical section
+makes. Flag `if (_field is null) _field = …`. And stop flagging plain `lock` usage as a
+performance problem: an uncontended lock's fast path is a handful of instructions with no kernel
+transition ([how a lock is built](/systems/locks-internals/)), and paying that small constant cost
+for correctness has never been the expensive mistake.
+
+**The class-design habit that prevents most of this** is the one the check-then-act exercise ends
+on: a thread-safe class must expose operations at the granularity of its invariants. `Count` plus
+`Remove` is not a thread-safe API no matter how well each is locked; `TryReserve` is. Every time
+you find yourself wanting to lock *around* somebody else's thread-safe object, that object's API
+is at the wrong granularity, and the fix belongs inside it.
+
+## the same idea in other languages
+
+| language | what it's called | the trap |
+| --- | --- | --- |
+| Java | `synchronized` is reentrant, exactly like `Monitor`; `ReentrantLock` is the explicit version, and `Semaphore` is not reentrant, exactly as in .NET | Java's `Collections.synchronizedMap` wraps every method in a lock and is therefore vulnerable to precisely the check-then-act bug on this page — which is why `ConcurrentHashMap` added `computeIfAbsent`, the compound operation as one atomic method |
+| Go | data races are detectable at runtime: `go test -race` instruments memory accesses and reports the two goroutines and stacks involved | the detector finds *data races* only. A check-then-act bug where both accesses are guarded by the same mutex is invisible to it, exactly as it is to .NET's tooling — and Go's `sync.Mutex` is **not** reentrant, so the "call a locked method from inside the lock" habit that works in C# self-deadlocks |
+| Python | the GIL makes bytecode-level interleaving coarse, so many races are hidden rather than absent | `x += 1` on a shared `int` is still several bytecodes and can still lose updates; the GIL only guarantees one thread runs Python bytecode at a time, not that your compound operation is atomic. Free-threaded builds (PEP 703) remove even that cover |
+| C++ | a data race is formally undefined behaviour, not just an unpredictable value; `std::recursive_mutex` exists precisely because `std::mutex` is not reentrant | `std::lock(m1, m2)` exists to take two mutexes deadlock-free in one call, and `std::scoped_lock` wraps it — there is no equivalent in .NET, so the ordering discipline on this page is manual |
+
+## exercises
+
+Both of these are the same lesson from the two ends: a bug where the locks are missing, and a bug
+where the locks are all present and in the wrong shape.
+
+<ProblemList topic="concurrency-hazards" />
+
+## interview drills
+
+**Q.** What is the difference between a data race and a race condition?
+
+- *weak answer* — "They're the same thing" or "a race condition is when two threads access the
+  same variable". That definition covers only the easy half and misses every bug that survives
+  code review.
+- *strong answer* — A data race is a property of the code: two unordered accesses to the same
+  location with at least one write, which the memory model leaves undefined. A race condition is
+  a property of the outcome: the result depends on timing. You can have a race condition with no
+  data race at all — `if (stock >= 1) Take(1)` with both operations individually atomic is fully
+  synchronised and still oversells, because the invariant spans both.
+- *follow-up* — "Which one do tools find?" Data races, mostly. Go's race detector, ThreadSanitizer
+  and the CLR's equivalents look for unordered accesses. The check-then-act race has no unordered
+  access to find, which is why it is the one that reaches production.
+
+**Q.** A service deadlocks in production once a week. How do you find it?
+
+- *weak answer* — "Add logging around the locks." You will change the timing and the bug will move
+  or vanish, and you still will not have the cycle.
+- *strong answer* — Take a dump of the live process before restarting — `dotnet-dump collect`,
+  then `clrstack -all` in `analyze` — and look for threads blocked in `Monitor.Enter` or
+  `SemaphoreSlim.Wait`. The stacks give you the wait-for cycle directly. The distinguishing
+  symptom while it is happening is near-zero CPU with rising thread count; a lock convoy or a
+  livelock looks similar in latency and burns CPU.
+- *follow-up* — "And the fix?" A global lock order, keyed on something stable, applied everywhere
+  two of those locks can be held at once. Not `TryEnter` with a timeout — that converts a hang
+  into intermittent failures and retry storms, and hides the design bug.
+
+**Q.** Every method on this class takes the same lock. Is the class thread-safe?
+
+- *weak answer* — "Yes, every access is protected." This is the answer the question is fishing
+  for.
+- *strong answer* — Each method is atomic; the class is only thread-safe for operations that fit
+  inside one method. As soon as a caller has to compose two of them — check the count, then
+  remove — the invariant spans two critical sections and the class cannot protect it. Thread
+  safety is a property of an API's granularity, not of the number of locks in it.
+- *follow-up* — "So what do you do?" Add the compound operation as one method holding the lock
+  across both steps. If callers really need arbitrary composition, hand them an explicit
+  transaction scope; never expose the lock object, because then every caller's ordering mistakes
+  become your deadlocks.
+
+**Q.** Why does `.Result` deadlock, and does it deadlock in ASP.NET Core?
+
+- *weak answer* — "Because async and blocking don't mix." True and unactionable; the follow-up
+  will ask what actually blocks.
+- *strong answer* — The continuation after an `await` is posted back to the captured
+  `SynchronizationContext`. If that context is a single-threaded message pump — WinForms, WPF,
+  legacy ASP.NET — and you block that same thread on `.Result`, the continuation is queued to a
+  thread that will never drain the queue. ASP.NET Core installs no context, so it does not
+  deadlock: it blocks a pool thread instead, and at load that becomes thread-pool starvation,
+  which looks like a deadlock and is not one.
+- *follow-up* — "Does `ConfigureAwait(false)` fix it?" It fixes the hang at every `await` that
+  uses it, which is why libraries use it everywhere. It does not fix the blocked thread, so in
+  ASP.NET Core it changes nothing about starvation. The fix is `await`.
+
+**Q.** Is `lock` reentrant? Should it be?
+
+- *strong answer* — Yes: `Monitor` tracks the owning thread and a recursion count, so the holder
+  can re-enter. That is convenient — a locked method can call another locked method — and it is a
+  hazard, because re-entering means running code against state whose invariant is currently
+  broken. `SemaphoreSlim`, which is what most people substitute when a method becomes `async`,
+  counts permits rather than owners and is not reentrant, so the identical call pattern
+  self-deadlocks on one thread with no contention.
+- *weak answer* — "Yes, so you can nest locks." Correct and shallow; it misses that the same
+  property is why re-entrant callbacks are dangerous and why the `async` refactor breaks code.
+- *follow-up* — "What breaks when you swap `lock` for `SemaphoreSlim`?" Reentrancy, and the
+  `finally`. `lock` releases on any exit path; a semaphore needs `try`/`finally` around every
+  single use, and one missing `Release` is a permanent outage rather than a slow one.
+
+**Q.** Write a thread-safe singleton.
+
+- *weak answer* — Double-checked locking, from memory, without `volatile`. It will pass review and
+  it will pass your tests on x86, where the hardware refuses to do the reordering that breaks it.
+- *strong answer* — `Lazy<T>` in its default mode, or a `static readonly` field initialised by the
+  static constructor when the value needs no runtime input. Both are exactly-once and neither has
+  a memory-model subtlety to get wrong. If asked to hand-roll it, double-checked locking with the
+  field marked `volatile`, and I would say why: the outer check skips the lock, the inner check
+  is the correctness, and `volatile` stops a reader seeing a reference to a partly constructed
+  object on a weakly ordered CPU.
+- *follow-up* — "When would you use `LazyThreadSafetyMode.PublicationOnly`?" When the factory is
+  cheap and genuinely side-effect free, and you would rather run it twice than serialise on a
+  lock. In a real run it ran twice on about a third of contended rounds — fine for a pure
+  computation, a leak for anything that opens a handle.

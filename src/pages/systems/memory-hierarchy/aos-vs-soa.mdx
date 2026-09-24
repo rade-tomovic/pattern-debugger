@@ -1,0 +1,345 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: memory-hierarchy
+problem: aos-vs-soa
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import Solution from '@components/Solution.astro';
+
+## the question
+
+Two million particles, eight `float` fields each. Two ways to hold them.
+
+```csharp
+// array of structs — one array, records laid end to end
+struct Particle { public float X, Y, Z, VX, VY, VZ, Mass, Charge; }
+Particle[] particles = new Particle[2_000_000];
+
+// struct of arrays — one array per field, records split across eight
+float[] x, y, z, vx, vy, vz, mass, charge;   // each 2,000,000 long
+```
+
+`Particle` is exactly 32 bytes, so both hold the same 64 MB of floats, in the same order, with
+the same values. And a third layout, the one most .NET code actually ships, because somebody
+wrote `class` instead of `struct`:
+
+```csharp
+sealed class ParticleObj { public float X, Y, Z, VX, VY, VZ, Mass, Charge; }
+ParticleObj[] particles = new ParticleObj[2_000_000];   // an array of references
+```
+
+<Callout kind="insight" label="predict first">
+  Three predictions, all counts rather than speed.
+
+  1. `sum += p.X` over all two million. For AoS and for SoA, what fraction of the 64 bytes a
+     cache line delivers is actually `X`? Two fractions, not one comparison.
+  2. `ParticleObj[]` costs a reference slot plus a heap object. Once you count the object header
+     alongside the fields, does that class layout still get you "the whole record in one cache
+     line" the way the struct array does — or does its own size work against it?
+  3. Now flip the workload: pick one particle at random and read **all eight** fields. How many
+     distinct 64-byte lines does that touch in AoS? In SoA? If your answer to "which layout wins"
+     changed between question 1 and this one, say why in one sentence before you scroll.
+</Callout>
+
+## the code
+
+Not timed. Checks that AoS and SoA hold identical values, measures the class layout's real
+allocated size, and then answers the geometry questions above with real addresses — how many
+lines one record spans in each layout — rather than assuming them.
+
+<Solution>
+
+```csharp
+#:property AllowUnsafeBlocks=true
+// Evidence for /systems/memory-hierarchy/aos-vs-soa/ — run with:
+//   dotnet run bench/memory-hierarchy/aos-vs-soa.cs
+//
+// Not timed. 2,000,000 particles, 8 floats each, in three layouts holding the SAME
+// data:
+//   AoS  Particle[]      — 32 bytes per particle, one array
+//   SoA  eight float[]   — one array per field
+//   AoC  ParticleObj[]   — the layout most .NET code actually ships
+// Checks that all three layouts hold the same values, measures the real allocated
+// size of the class layout, and verifies — with real addresses, not assumptions —
+// how many 64-byte lines one particle's full record occupies in each layout.
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
+
+struct Particle { public float X, Y, Z, VX, VY, VZ, Mass, Charge; }
+sealed class ParticleObj { public float X, Y, Z, VX, VY, VZ, Mass, Charge; }
+
+static class AosSoa
+{
+    const int N = 2_000_000, LineBytes = 64;
+
+    static unsafe long AddrOf(float[] a, int i) { fixed (float* p = &a[i]) return (long)p; }
+    static unsafe long AddrOf(Particle[] a, int i) { fixed (Particle* p = &a[i]) return (long)p; }
+
+    public static void Main()
+    {
+        int particleSize = Unsafe.SizeOf<Particle>();
+        Console.WriteLine($"sizeof(Particle) = {particleSize} B");
+        Console.WriteLine($"Particle[{N:N0}] (AoS)      = {(long)N * particleSize / 1048576} MB");
+        Console.WriteLine($"8 x float[{N:N0}] (SoA)     = {(long)N * 4 * 8 / 1048576} MB\n");
+
+        var ps = new Particle[N];
+        float[] x = new float[N], y = new float[N], z = new float[N], vx = new float[N], vy = new float[N], vz = new float[N], mass = new float[N], charge = new float[N];
+        for (int i = 0; i < N; i++)
+        {
+            float v = i & 7;
+            ps[i] = new Particle { X = v, Y = v, Z = v, VX = 1, VY = 1, VZ = 1, Mass = v, Charge = 1 };
+            x[i] = v; y[i] = v; z[i] = v; vx[i] = 1; vy[i] = 1; vz[i] = 1; mass[i] = v; charge[i] = 1;
+        }
+
+        // correctness: AoS and SoA hold the same values
+        float sumAoS = 0, sumSoA = 0;
+        for (int i = 0; i < N; i++) { sumAoS += ps[i].X; sumSoA += x[i]; }
+        if (sumAoS != sumSoA) throw new Exception($"FAIL: layouts disagree {sumAoS} vs {sumSoA}");
+        Console.WriteLine($"PASS: AoS and SoA sum X to the same value ({sumAoS})\n");
+
+        // the class layout's REAL allocated size — not sizeof, actual bytes allocated
+        long b0 = GC.GetAllocatedBytesForCurrentThread();
+        var pc = new ParticleObj[N];
+        for (int i = 0; i < N; i++) { float v = i & 7; pc[i] = new ParticleObj { X = v, Y = v, Z = v, VX = 1, VY = 1, VZ = 1, Mass = v, Charge = 1 }; }
+        long b1 = GC.GetAllocatedBytesForCurrentThread();
+        long perParticle = (b1 - b0) / N;
+        Console.WriteLine($"ParticleObj[{N:N0}] + {N:N0} objects allocated {b1 - b0:N0} B total = {perParticle} B/particle");
+        Console.WriteLine($"  ({perParticle} = 8 B reference slot + {perParticle - 8} B object: {particleSize} B of fields + {perParticle - 8 - particleSize} B header)\n");
+
+        // does one AoS particle ever straddle a 64-byte line boundary?
+        // (true iff sizeof(Particle) divides evenly into the line size)
+        bool anyStraddles = false;
+        for (int i = 0; i < N; i++)
+        {
+            long off = (long)i * particleSize;
+            if (off / LineBytes != (off + particleSize - 1) / LineBytes) { anyStraddles = true; break; }
+        }
+        Console.WriteLine(anyStraddles
+            ? "FAIL: some AoS particles straddle a 64-byte line"
+            : $"PASS: every one of {N:N0} AoS particles fits inside a single 64-byte line (32 B divides 64 B evenly)");
+
+        // one random particle's 8 SoA fields: real addresses, real line numbers
+        int sample = 12345;
+        long[] addrs = [AddrOf(x, sample), AddrOf(y, sample), AddrOf(z, sample), AddrOf(vx, sample),
+                        AddrOf(vy, sample), AddrOf(vz, sample), AddrOf(mass, sample), AddrOf(charge, sample)];
+        var distinctLines = new HashSet<long>();
+        foreach (var a in addrs) distinctLines.Add(a / LineBytes);
+        Console.WriteLine($"particle #{sample}'s 8 SoA fields live in {distinctLines.Count} distinct 64-byte lines" +
+            $" (arrays are independent {N * 4 / 1048576} MB allocations, so they land far apart in the heap)");
+        long aosLine = AddrOf(ps, sample) / LineBytes;
+        Console.WriteLine($"the same particle's AoS record lives in 1 line (index {aosLine})\n");
+
+        // a fresh, freshly-allocated run of ParticleObj instances: are they even
+        // back-to-back in memory? (bump allocation says yes, absent a GC in between;
+        // verify it rather than assume it, and then check how many straddle a line —
+        // 48 does NOT divide 64 evenly, unlike the 32-byte struct above)
+        const int sampleCount = 200;
+        var fresh = new ParticleObj[sampleCount];
+        for (int i = 0; i < sampleCount; i++) fresh[i] = new ParticleObj();
+        long[] freshAddr = new long[sampleCount];
+        for (int i = 0; i < sampleCount; i++)
+        {
+            var h = GCHandle.Alloc(fresh[i], GCHandleType.Pinned);
+            freshAddr[i] = h.AddrOfPinnedObject().ToInt64();
+            h.Free();
+        }
+        bool allBackToBack = true;
+        int straddling = 0;
+        for (int i = 0; i < sampleCount; i++)
+        {
+            if (i > 0 && freshAddr[i] - freshAddr[i - 1] != perParticle) allBackToBack = false;
+            long start = freshAddr[i], end = start + perParticle - 8 - 1; // object body only, not the array's ref slot
+            if (start / LineBytes != end / LineBytes) straddling++;
+        }
+        Console.WriteLine(allBackToBack
+            ? $"PASS: {sampleCount} freshly allocated ParticleObj instances landed exactly {perParticle - 8} B apart (bump allocation, no GC in between)"
+            : $"note: this run's {sampleCount} objects were NOT all back-to-back (a collection or another allocation landed between them)");
+        Console.WriteLine($"of those {sampleCount}, {straddling} span two 64-byte lines ({perParticle - 8} B does not divide 64 B evenly)");
+        GC.KeepAlive(pc);
+    }
+}
+```
+
+</Solution>
+
+## work it out
+
+Draw one 64-byte line as sixteen `float` slots and place each layout's fields on it.
+
+```text
+AoS — Particle[], reading only X — one 64-byte line holds two whole particles (32 B each)
+
+  ┌────────────────────────────────┬────────────────────────────────┐
+  │ X Y Z VX VY VZ M C   (32 B)     │ X Y Z VX VY VZ M C   (32 B)     │
+  └────────────────────────────────┴────────────────────────────────┘
+      ▲                                  ▲
+      4 B wanted, 32 B fetched to get it — twice, once per particle in the line
+      8 of 64 bytes fetched are ever used: 1/8 utilisation
+
+SoA — float[] x, reading only X — every byte on the line is an X
+
+  ┌────────────────────────────────────────────────────────────────┐
+  │ X  X  X  X  X  X  X  X  X  X  X  X  X  X  X  X    (16 floats)   │
+  └────────────────────────────────────────────────────────────────┘
+      64 of 64 bytes fetched are used: full utilisation
+```
+
+That is a computed fact, not a guess: reading one field out of AoS moves **eight times** the
+bytes SoA needs to answer the identical question, because `line size ÷ bytes wanted = 64 ÷ 4 =
+16`, and only `4 ÷ 32 = 1⁄8` of each fetched particle is the field you asked for. SoA never pays
+that tax because there is nothing else on the line to skip.
+
+Now the class array. `ParticleObj[]` is a contiguous array of 8-byte references; the objects
+themselves are wherever the allocator put them.
+
+```text
+AoC — ParticleObj[], immediately after allocation
+
+  reference array (contiguous, 8 B slots):
+  ┌──────┬──────┬──────┬──────┬───
+  │ ref0 │ ref1 │ ref2 │ ref3 │ ...
+  └──────┴──────┴──────┴──────┴───
+
+  heap objects (48 B each: 16 B header + 32 B fields), IF allocated back-to-back:
+  ┌────────────────┬────────────────┬────────────────┬───
+  │ hdr │ 32 B flds │ hdr │ 32 B flds │ hdr │ 32 B flds │ ...
+  └────────────────┴────────────────┴────────────────┴───
+    0B             48B              96B             144B
+       one 64-byte line lands at 0-63, cutting straight through object 1 (48-95)
+```
+
+Even in the best case — nothing else allocated in between, so the bump allocator hands out
+consecutive addresses — a 48-byte object does not divide evenly into a 64-byte line the way the
+32-byte struct did. Reading one field of every particle now pays for the reference (8 of every 64
+bytes on that stream are useful) *and* for an object whose own size guarantees some of them
+straddle a line boundary, needing two fetches for one record.
+
+Flip to the random-single-record workload and the whole argument inverts. AoS's 32-byte struct
+divides evenly into 64, so **every** particle's full record — all eight fields — sits inside one
+line: one fetch gets everything you asked for. SoA has scattered those same eight fields across
+eight independent arrays, each several megabytes apart, so reading one particle's whole record
+means eight unrelated addresses and, barring pure coincidence, eight different lines. The layout
+that wasted 7/8 of every fetch in the first workload is the layout that needs only one fetch in
+this one — because "waste" was never an intrinsic property of AoS, it was a property of asking
+for one field out of many when the record holds all of them together.
+
+## the answer
+
+```text
+sizeof(Particle) = 32 B
+Particle[2,000,000] (AoS)      = 61 MB
+8 x float[2,000,000] (SoA)     = 61 MB
+
+PASS: AoS and SoA sum X to the same value (7000000)
+
+ParticleObj[2,000,000] + 2,000,000 objects allocated 112,000,064 B total = 56 B/particle
+  (56 = 8 B reference slot + 48 B object: 32 B of fields + 16 B header)
+
+PASS: every one of 2,000,000 AoS particles fits inside a single 64-byte line (32 B divides 64 B evenly)
+particle #12345's 8 SoA fields live in 8 distinct 64-byte lines (arrays are independent 7 MB allocations, so they land far apart in the heap)
+the same particle's AoS record lives in 1 line (index 1981138868253)
+
+note: this run's 200 objects were NOT all back-to-back (a collection or another allocation landed between them)
+of those 200, 128 span two 64-byte lines (48 B does not divide 64 B evenly)
+```
+
+Every prediction above is answered by a count, not a comparison of feeling: AoS uses 1/8 of every
+line it fetches reading a single field; SoA uses all of it. The class array costs a real, measured
+56 bytes to carry 32 bytes of payload — 8 for the reference, 16 for the object header, and the
+run above shows that header-and-payload combination does not even divide evenly into a line —
+unlike the 32-byte struct, 48 does not divide 64 — so a real majority of freshly created objects,
+nothing exotic, this is the very first allocation of each, already span two lines apiece before
+anything has had the chance to reorder them. (Run it yourself and expect a count in the same
+neighbourhood rather than this exact one: the file above already caught this run's objects
+*not* landing perfectly back-to-back, so the precise number depends on whatever else this
+process happened to allocate first, not on the mechanism — the mechanism only guarantees that
+48 not dividing 64 costs you *some* straddling objects, not a specific count of them.) And the
+random-record workload flips cleanly: one line for AoS, eight for SoA, for the identical particle.
+
+<Watch items={[['struct', '32 B'], ['class, measured', '56 B/particle (8 B ref + 16 B header + 32 B fields)'], ['AoS reading one field', '1/8 of each line used'], ['SoA reading one field', 'all of each line used'], ['AoS random full record', '1 line'], ['SoA random full record', 'up to 8 lines']]} />
+
+## why it works that way
+
+Two workloads, two opposite questions, two opposite right answers — and the rule that predicts
+which layout wins is the same rule both times: **count how many bytes of a fetched line the
+workload actually wants, and how many lines the bytes it wants are spread across.**
+
+"Read one field of every record" wants a small slice of many records. AoS's slice is scattered
+one-per-record across whatever else the record holds, so every fetch carries passengers; SoA
+*is* the slice, contiguous, so nothing rides along that was not asked for. "Read every field of
+one record" wants everything at one address instead of a little of everything at many addresses
+— now AoS's records, packed together, are the contiguous data, and SoA's fields, spread across
+independent arrays, are the scattered ones. Layout follows the access pattern, not a rule about
+which one is generally better, because "generally better" was never a coherent question — the two
+workloads are asking for opposite shapes of data.
+
+The class array adds a cost neither pure layout has: a level of indirection (the reference) and a
+fixed per-object tax (the header) that exist because the CLR needs to find an object's type and
+its lock at runtime, regardless of what you asked the object to hold. That tax is why `class`
+versus `struct` is not a style choice once you are past a few thousand elements — it is 75%
+overhead on top of the payload, measured, before your access pattern gets a vote.
+
+## what this looks like in prod
+
+**Analytics over a `List<T>` of DTOs.** `orders.Where(o => o.Status == Cancelled).Sum(o => o.Total)`
+over a few million orders drags every field of every order through the cache to read two of them,
+and if `Order` is a class it also chases a reference per element first. This is why every
+analytical database on earth — Parquet, ClickHouse, DuckDB, and the column store in SQL Server —
+stores columns rather than rows. Columnar *is* SoA; you have been reasoning about the layout this
+page derives for years without naming it.
+
+**The pragmatic version of the fix.** Do not turn your domain model into eight parallel arrays.
+Keep `Order` as it is, and give the hot path its own layout: a `float[]` of totals and an `int[]`
+of status codes built once, scanned many times. The rewrite is worth it when a scan is repeated;
+building the columns costs a pass, so it is never worth it for a single one.
+
+**The cheap 80% fix in .NET.** Changing a hot `class` to a `readonly record struct` removes the
+reference chase and the header in one edit, and keeps the code identical. Iterate it as
+`CollectionsMarshal.AsSpan(list)` or as a plain array — a `List<T>` indexer returns a *copy* of
+the struct, which is fine for reading one field and wasteful for reading eight.
+
+**Where this bites in game and simulation code**, and why entity-component-system architectures
+exist at all: an ECS is SoA with a vocabulary. Systems that update one component of every entity
+are exactly the "read one field of every record" workload this page derives the cost of.
+
+**The symptom to recognise.** A scan whose cost tracks the *record size* rather than the number of
+fields it actually reads. Add a field to a hot record, watch an unrelated report get slower, and
+you have found this in production.
+
+## the same idea in other languages
+
+| language | what it's called | the trap |
+| --- | --- | --- |
+| C / C++ | AoS is the default (`std::vector<Particle>`); SoA is hand-written parallel vectors | `std::vector<std::unique_ptr<Particle>>` and `std::vector<Particle*>` are the class-array layout of this page, with the same reference chase and the same loss of the "whole record in one line" property once the object size stops dividing the line evenly. |
+| Java | an array of objects is always an array of references — there is no flat array-of-structs layout for a user-defined type | SoA is not an optimisation in Java, it is the only way to get a contiguous layout at all: parallel `float[]` arrays. Code ported from C# `struct[]` to Java `Object[]` silently gains a dereference and a header per element. |
+| Go | `[]Particle` stores the structs inline, exactly like C#; `[]*Particle` is the reference array | `for _, p := range particles` copies each 32-byte struct into `p` on every iteration. Indexing with `particles[i].X` does not. The two look interchangeable. |
+| Rust | `Vec<Particle>` is inline AoS; SoA is a derive macro away in the ecosystem | `Vec<Box<Particle>>` is the scatter layout, and iterator chains — `map`, `filter`, `sum` — change nothing about memory layout no matter how elegant they read. |
+| Python | a list of objects is a list of pointers to heap objects, always | pandas is columnar, so `df['x'].sum()` is the SoA path and `df.iloc[i]` materialises a whole `Series` per row — row-wise iteration over a DataFrame is the slow-by-construction direction, the same asymmetry this page derives. |
+
+## common bugs
+
+- **Assuming an array of a class type is laid out like an array of a struct type.** `Particle[]`
+  and `ParticleObj[]` read almost identically at the call site and are completely different
+  shapes in memory: one is the data, the other is a list of addresses of the data. "Array" in the
+  type name promises contiguity that only the `struct` version actually has.
+- **Assuming SoA is simply better.** Measured here, one line holds a whole AoS record and up to
+  eight lines hold the same SoA record. Layout follows the access pattern; a codebase with both a
+  scan path and a lookup path may genuinely need both, and "which is faster" is not a question
+  with one answer.
+- **Counting the fields and calling it the size.** Eight floats is 32 bytes as a `struct` and a
+  measured 56 bytes as a `class` in an array. The header and the reference slot are invisible in
+  the source and are 75% overhead on top of the data you asked for.
+- **Trusting "allocated in order" to mean "stays contiguous."** The run above shows even the very
+  first batch of objects, fresh off the allocator, was not guaranteed back-to-back — and once a
+  collection compacts, promotes, or anything else allocates in between, the mapping from array
+  index to heap address has no relationship to insertion order left at all.
+- **Switching `class` to `struct` and then iterating a `List<T>` with the indexer.** The indexer
+  returns a copy, so `list[i].X += 1` does not compile and `sum += list[i].X` copies 32 bytes to
+  read 4. Use an array, `CollectionsMarshal.AsSpan`, or a `foreach` over the span.
+- **Growing a hot record "while you are in there."** Two extra `double` fields take `Particle`
+  from 32 to 48 bytes — the same size as the class object above, which no longer divides 64 evenly
+  — so a record that used to fit two-per-line and never straddle a boundary now does both worse at
+  once. See [struct size and padding](/systems/bits-and-memory/sizeof-and-layout/) for how the
+  size is actually computed.

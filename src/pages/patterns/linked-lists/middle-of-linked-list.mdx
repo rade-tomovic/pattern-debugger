@@ -1,0 +1,107 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: linked-lists
+problem: middle-of-linked-list
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+
+## task
+
+Given the `head` of a singly linked list, return its middle node. If the list has two middle
+nodes (even length), return the **second** one.
+
+```text
+head = [1, 2, 3, 4, 5, 6]  →  middle node has Val = 4   (the second of the two middles: 3 and 4)
+```
+
+## how to think
+
+The brute force walks once to count the length `n`, then walks again to node `n / 2` — two
+passes, or one pass into an array if you'd rather trade time for O(n) space. Neither is
+necessary: you don't need the count, you need the *ratio*. If one pointer moves twice as fast as
+another and they start together, then the instant the fast one finishes the list, the slow one
+has covered exactly half of it. One pass, two pointers, no arithmetic on the length at all.
+
+<Callout kind="note" label="template instance">
+  **Fast/slow** skeleton, verbatim — this problem *is* the template. Invariant: after every
+  iteration, `slow` has taken exactly half as many steps as `fast`. The loop guard
+  `fast != null && fast.Next != null` stops the instant `fast` would run off the end, so `slow`
+  never overruns either.
+</Callout>
+
+## solution
+
+```csharp
+public ListNode MiddleNode(ListNode head)
+{
+    ListNode slow = head, fast = head;
+
+    while (fast != null && fast.Next != null)
+    {
+        slow = slow.Next!;
+        fast = fast.Next.Next;
+    }
+    return slow;
+}
+
+// standard interview definition
+public class ListNode(int val = 0, ListNode? next = null)
+{
+    public int Val = val;
+    public ListNode? Next = next;
+}
+```
+
+## trace
+
+`head = [1, 2, 3, 4, 5, 6]`:
+
+```text
+1 -> 2 -> 3 -> 4 -> 5 -> 6 -> null
+```
+
+| step | slow | fast |
+| --- | --- | --- |
+| start | 1 | 1 |
+| 1 | 2 | 3 |
+| 2 | 3 | 5 |
+| 3 | 4 | `null` |
+
+`fast` becomes `null` after step 3 (it stepped off the end onto a node that doesn't exist), so
+the loop guard fails and the walk stops with `slow` on the node valued `4` — the second of the
+two middles.
+
+## why it works
+
+Let the list have `n` nodes. Each iteration advances `fast` by 2 and `slow` by 1, so after `k`
+iterations `slow` sits at node `k` and `fast` sits at node `2k` (both 0-indexed from `head`). The
+loop keeps going as long as `fast` and `fast.Next` both exist, i.e. as long as `2k <= n - 2`, and
+stops the first time that fails. Working through both parities: for even `n`, the last valid `k`
+is `n / 2`, landing `slow` on index `n / 2` — the *second* middle, exactly what LeetCode #876
+wants. For odd `n`, the last valid `k` is `(n - 1) / 2`, landing `slow` on the single true middle.
+
+<Watch items={[['time', 'O(n)'], ['space', 'O(1)'], ['passes', '1']]} />
+
+## common bugs
+
+- Checking only `fast != null` and forgetting `fast.Next != null` — the very next line dereferences
+  `fast.Next.Next`, and a `null` `fast.Next` throws.
+- Assuming this always returns the *first* middle on even-length lists. It returns the second by
+  construction; if you need the first, stop the loop one iteration earlier
+  (`fast.Next != null && fast.Next.Next != null`) — the guard [Palindrome Linked
+  List](/patterns/linked-lists/palindrome-linked-list/) uses for exactly that reason.
+- Precomputing the length first — correct, but throws away the one-pass elegance for no benefit.
+- Not handling a single-node list: `slow` and `fast` both start at `head`, the loop body never
+  runs, and `head` is correctly returned as its own middle.
+
+## variants you can now solve
+
+- [Linked List Cycle](/patterns/linked-lists/linked-list-cycle/) (LC 141) — the same fast/slow
+  loop, but the question changes from "where does `fast` run out?" to "does `fast` ever land back
+  on `slow`?"
+- [Palindrome Linked List](/patterns/linked-lists/palindrome-linked-list/) (LC 234) — finds the
+  middle exactly this way, then reverses everything after it.
+- **Reorder List** (LC 143) — middle, then reverse the second half, then interleave — one step
+  further than the palindrome check.

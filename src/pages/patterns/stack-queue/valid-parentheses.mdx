@@ -1,0 +1,110 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: stack-queue
+problem: valid-parentheses
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+
+## task
+
+Given a string containing only the characters `(`, `)`, `{`, `}`, `[`, `]`, determine if it's
+valid. Valid means every opener has a matching closer of the same type, and openers close in the
+right order — innermost first.
+
+```text
+s = "{[()]}"  →  true
+s = "{[(])}"  →  false   (the ] closes before the ( that's still open)
+```
+
+## how to think
+
+The rule "innermost closes first" is a LIFO rule by definition — the most recently opened bracket
+is the first one that must close. That's a stack, full stop: scan left to right, push every
+opener you see, and every time you hit a closer it must match whatever opener is currently on
+top. If it doesn't — wrong type, or nothing on top at all — the string is broken right there and
+you can bail early.
+
+The only extra machinery is a lookup from closer to the opener it expects, so the match check is
+one dictionary read instead of a chain of `if`/`else`.
+
+<Callout kind="note" label="template instance">
+  **LIFO matching** skeleton, verbatim. Invariant: at every point, the stack holds exactly the
+  openers seen so far that haven't been closed, most recent on top. Move rule: opener → push;
+  closer → pop and compare, fail on empty-stack-or-mismatch.
+</Callout>
+
+## solution
+
+```csharp
+public bool IsValid(string s)
+{
+    var stack = new Stack<char>();
+    var pairs = new Dictionary<char, char> { [')'] = '(', [']'] = '[', ['}'] = '{' };
+
+    foreach (char c in s)
+    {
+        if (pairs.ContainsValue(c))
+        {
+            stack.Push(c);                          // opener: wait for its closer
+        }
+        else if (pairs.TryGetValue(c, out char opener))
+        {
+            if (!stack.TryPop(out char top) || top != opener)
+                return false;                        // nothing to match, or mismatched
+        }
+    }
+    return stack.Count == 0;                          // no unmatched openers left
+}
+```
+
+## trace
+
+`s = "{[()]}"`:
+
+| step | char | action | stack (top-to-bottom) |
+| --- | --- | --- | --- |
+| 1 | `{` | opener → push | `{` |
+| 2 | `[` | opener → push | `[, {` |
+| 3 | `(` | opener → push | `(, [, {` |
+| 4 | `)` | closer, expects `(`; pop `(` → matches | `[, {` |
+| 5 | `]` | closer, expects `[`; pop `[` → matches | `{` |
+| 6 | `}` | closer, expects `{`; pop `{` → matches | *(empty)* |
+
+Stack is empty at the end → every opener found its closer → `true`.
+
+## why it works
+
+Each push records an opener that is still "open" — still owed a matching closer before anything
+enclosing it can close. A closer can only legally resolve the *most recently* opened, still-open
+bracket, because any bracket opened earlier is either already closed (irrelevant) or would end up
+crossing an unclosed inner bracket (invalid nesting) if you let it close first. That's precisely
+what popping the top of the stack checks. If the string is exhausted with the stack empty, every
+opener matched something; if anything remains, those openers never got their closer.
+
+<Watch items={[['time', 'O(n)'], ['space', 'O(n)']]} />
+
+## common bugs
+
+- Checking `stack.Count == 0` only at the very end and skipping the empty-stack check inside the
+  loop — a closer with nothing to pop (e.g. `")"`) throws instead of returning `false`.
+- Using a single `if` per bracket type instead of a dictionary lookup — works, but doesn't scale
+  past three types and hides the real structure (one opener → one closer, always).
+- Forgetting that a string with only openers (`"((("`) or only closers (`")))"`) must return
+  `false` — `"((("` falls through to the final `stack.Count == 0` check, while `")))"` is caught by
+  the in-loop empty-stack guard on its very first character. You need both checks; drop either one
+  and the corresponding case slips through.
+- Comparing `c` against `'('`/`'['`/`'{'` directly instead of via `pairs.ContainsValue` — easy to
+  typo one of the three and silently drop a bracket type.
+
+## variants you can now solve
+
+- **[Minimum Remove to Make Valid Parentheses](/patterns/stack-queue/min-remove-parentheses/)**
+  (LC 1249) — same matching logic, but instead of failing fast you mark the offending indices and
+  rebuild the string.
+- [Generate Parentheses](/patterns/backtracking/generate-parentheses/) (LC 22) — the inverse
+  problem: *construct* every valid string instead of checking one. Same validity rule, different
+  pattern (backtracking).
+- **Longest Valid Parentheses** (LC 32, hard) — push indices instead of characters, and the gaps
+  between unmatched stack entries become the answer.

@@ -1,0 +1,140 @@
+---
+import TopicLayout from '@layouts/TopicLayout.astro';
+import { studyPlan, topicBySlug, topicPath } from '@data/curriculum';
+
+const days = studyPlan.map((d) => ({
+  ...d,
+  items: d.topics.map((slug) => {
+    const t = topicBySlug(slug)!;
+    const coreProblems = t.problems.filter((p) => (p.track ?? 'core') === 'core').length;
+    const stretch = t.problems.length - coreProblems;
+    return { tab: t.tab, title: t.title, path: topicPath(t), coreProblems, stretch };
+  }),
+}));
+const coreDays = days.filter((d) => d.track === 'core');
+const extendedDays = days.filter((d) => d.track === 'extended');
+const systemsDays = days.filter((d) => d.track === 'systems');
+const networkDays = days.filter((d) => d.track === 'network');
+const designDays = days.filter((d) => d.track === 'design');
+
+const tracks = [
+  {
+    heading: 'the core patterns track (days 1\u20137)',
+    intro:
+      'The eight core patterns in the mandated order, two hours a day. Read the topic page first (~20 minutes), then work the problems: attempt each one on paper before reading the solution, and always hand-run the trace. This is the one track with a real deadline shape to it \u2014 seven honest sittings covers the majority of what a coding screen asks.',
+    days: coreDays,
+  },
+  {
+    heading: 'the rest of the patterns (days 8\u201314)',
+    intro:
+      'The rest of the pattern catalogue: the data-structure patterns and the advanced families. Same discipline, same two-hour shape. Stretch-tier problems (purple badge) belong to whichever later pass you can afford \u2014 skip them on the first lap without guilt.',
+    days: extendedDays,
+  },
+  {
+    heading: 'the systems track (days 15\u201329)',
+    intro:
+      'A different kind of study: no problem to solve, a machine to understand. Read the topic page, then actually run the exercises \u2014 predict the number before you look at it, and hunt the bug before you scroll. These days are shorter than the pattern days and they compound; the concurrency half only makes sense once the memory half is in your hands.',
+    days: systemsDays,
+  },
+  {
+    heading: 'the network track (days 30\u201338)',
+    intro:
+      'The other half of the machine, assuming nothing: what a packet is, how the layers stack, what a port actually is, how a name becomes an address, and what to run when none of it works. No problems to grind \u2014 read the page, then try to redraw the header stack and the resolution walk from memory.',
+    days: networkDays,
+  },
+  {
+    heading: 'the system design track (days 39\u201349)',
+    intro:
+      'The distributed layer. There is no code to run here and no single right answer \u2014 the skill is holding a tradeoff in your head and saying out loud what it costs. Read each page, then close it and try to redraw the mechanism from memory; if you cannot, you have not got it yet. The drills on the last day are the rehearsal.',
+    days: designDays,
+  },
+];
+---
+
+<TopicLayout frontmatter={{ topic: 'study-plan' }}>
+  <p>
+    Five tracks, not one course. They are <strong>independent</strong> — the network track does
+    not need the pattern tracks, and the day numbers below are a reading order, not a countdown.
+    Start wherever the gap is, and finish a track before you open the next one.
+  </p>
+
+  <p>
+    Only the two pattern tracks are budgeted in hours, because they are the only ones with
+    problems to grind. Two hours a day is enough there <strong>if the time is honest</strong>:
+    no editor, no running the code first — paper, the template, and a hand trace. The order
+    front-loads the patterns that appear in the most interviews; if you only have one week, the
+    core track alone covers the majority of what a coding screen will ask.
+  </p>
+
+  <p>
+    The systems, network and design tracks are read-and-redraw days instead. They are shorter
+    than a pattern day and there is nothing to submit — the check is whether you can close the
+    page and redraw the mechanism from memory.
+  </p>
+
+  {
+    tracks.map((track) => (
+      <>
+        <h2>{track.heading}</h2>
+        <p>{track.intro}</p>
+        <ol class="not-prose !mt-4 space-y-3 !p-0">
+          {track.days.map((d) => (
+            <li class="bg-panel border-line rounded-[10px] border p-4">
+              <div class="flex flex-wrap items-baseline gap-3">
+                <span class="text-amber font-mono text-[0.8rem] font-bold">
+                  day_{String(d.day).padStart(2, '0')}
+                </span>
+                <span class="text-ink text-[0.95rem] font-semibold">{d.focus}</span>
+              </div>
+              <ul class="mt-2.5 flex flex-wrap gap-2">
+                {d.items.map((i) => (
+                  <li>
+                    <a
+                      href={i.path}
+                      title={i.title}
+                      class="watch-chip hover:border-muted inline-block transition-colors hover:text-amber"
+                    >
+                      {i.tab}
+                      {i.coreProblems > 0 && (
+                        <span class="text-muted"> · {i.coreProblems} problems</span>
+                      )}
+                      {i.stretch > 0 && <span class="text-purple"> +{i.stretch} stretch</span>}
+                    </a>
+                  </li>
+                ))}
+              </ul>
+            </li>
+          ))}
+        </ol>
+      </>
+    ))
+  }
+
+  <h2>how to run a two-hour block (pattern tracks)</h2>
+
+  <table>
+    <thead>
+      <tr><th>minutes</th><th>activity</th></tr>
+    </thead>
+    <tbody>
+      <tr><td class="font-mono">0–20</td><td>Topic page: core idea, templates, when-to-reach-for-it. Write the template from memory once.</td></tr>
+      <tr><td class="font-mono">20–100</td><td>Problems in order. For each: read the task, attempt on paper (10 min cap), compare with the solution, then hand-run the trace — the trace is where the pattern actually sinks in.</td></tr>
+      <tr><td class="font-mono">100–120</td><td>Close the loop: redo the day's hardest problem from a blank page, and skim the cheat card.</td></tr>
+    </tbody>
+  </table>
+
+  <blockquote>
+    Day 8's sorting page is pre-reading more than practice — skim it before bed on day 7 and
+    the heap and intervals days land twice as hard.
+  </blockquote>
+
+  <h2>how to run a reading day (systems, network, design)</h2>
+
+  <p>
+    Read the page once end to end without stopping to look anything up. Then close it and
+    redraw the diagram — the header stack, the page-table walk, the write path — on paper from
+    memory. What you cannot redraw is what you have not got yet, so go back for exactly that
+    part. Where the topic has exercises, run them: predicting the answer before you scroll is
+    the whole exercise, and reading the answer first wastes the page.
+  </p>
+</TopicLayout>

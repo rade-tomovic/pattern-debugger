@@ -1,0 +1,47 @@
+---
+import { cheatFor } from '@data/cheats';
+import CheatSheet from '@components/CheatSheet.astro';
+import Code from '@components/InlineCode.astro';
+
+/**
+ * Data-driven cheat-sheet card for a topic. Renders nothing if the topic has
+ * no entry in cheats.ts yet (content phase fills them in).
+ */
+interface Props {
+  topic: string;
+  title?: string;
+}
+const { topic, title } = Astro.props;
+const cheat = cheatFor(topic);
+
+/** split "use `x` here" into text/code segments */
+function segments(s: string): { code: boolean; text: string }[] {
+  return s.split('`').map((text, i) => ({ code: i % 2 === 1, text }));
+}
+const groups = cheat
+  ? ([
+      ['recognize it', cheat.signals],
+      ['key tricks', cheat.tricks],
+      ['common bugs', cheat.bugs],
+    ] as const)
+  : [];
+---
+
+{
+  cheat && (
+    <CheatSheet title={title ?? 'cheat sheet'}>
+      {groups.map(([label, items]) => (
+        <div class="not-first:mt-4">
+          <p class="font-mono text-[0.7rem] tracking-[0.1em] text-muted uppercase">{label}</p>
+          <ul class="!mt-1">
+            {items.map((item) => (
+              <li>
+                {segments(item).map((seg) => (seg.code ? <Code text={seg.text} /> : seg.text))}
+              </li>
+            ))}
+          </ul>
+        </div>
+      ))}
+    </CheatSheet>
+  )
+}

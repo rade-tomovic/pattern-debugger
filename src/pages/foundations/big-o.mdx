@@ -1,0 +1,193 @@
+---
+layout: '@layouts/TopicLayout.astro'
+topic: big-o
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+
+## core idea
+
+Big-O describes how a solution's cost grows as `n` gets large — it is not a stopwatch reading
+and not a line count. Two implementations that do wildly different amounts of work at `n = 10`
+can carry the same Big-O, because the classification only cares about the shape of the curve as
+`n` grows, after you drop constants and lower-order terms. In an interview you're graded on
+naming that shape correctly and justifying it from the code, not on shaving milliseconds.
+
+| class | name | `n=10` | `n=1,000,000` | typical source |
+| --- | --- | --- | --- | --- |
+| `O(1)` | constant | 1 | 1 | dictionary lookup, array index |
+| `O(log n)` | logarithmic | ~3 | ~20 | binary search, balanced-tree ops |
+| `O(n)` | linear | 10 | 1,000,000 | single pass |
+| `O(n log n)` | linearithmic | ~33 | ~20,000,000 | comparison sort |
+| `O(n^2)` | quadratic | 100 | 10^12 | nested loop over pairs |
+| `O(2^n)` | exponential | 1,024 | unfathomable | subsets, brute-force backtracking |
+| `O(n!)` | factorial | 3,628,800 | unfathomable | permutations, brute-force routing |
+
+## reading the constraints
+
+LeetCode and interviewers hand you the complexity budget disguised as a bound on `n`. Read it
+before you write a line — it tells you what's expected, and what's a wasted optimization:
+
+- `n <= 20` — the constraint *is* the hint: brute force or bitmask-over-subsets (`O(2^n)`) is
+  the intended solution. Don't go looking for something clever.
+- `n <= 500` — `O(n^3)` is comfortable; a naive DP over two or three indices is fine.
+- `n <= 5,000` — `O(n^2)` is fine, nested loops won't time out.
+- `n <= 100,000` to `1,000,000` — you need `O(n log n)` or `O(n)`; a nested loop times out.
+- `n <= 100,000,000`+, or a streaming/many-queries setting — you need `O(n)` total, or
+  `O(log n)` / `O(1)` per query. This is where prefix sums and hash lookups earn their keep.
+
+Reading constraints this way turns "what's the fastest algorithm" into "what's the fastest
+algorithm this input size actually demands" — and it tells you when a clever `O(n)` trick is
+solving a problem the interviewer didn't ask.
+
+## the .NET collection cost table
+
+Every pattern on this site leans on one of these. Know the price list cold — reciting it
+correctly, including the *worst case*, is table stakes in a senior interview. Full API notes
+(which method does which of these) live in
+[the C# interview toolkit](/foundations/csharp-toolkit/).
+
+| collection | access | search | insert | delete | notes |
+| --- | --- | --- | --- | --- | --- |
+| `List<T>` | `O(1)` by index | `O(n)` `Contains`/`IndexOf` | `O(1)` amortized `Add`; `O(n)` `Insert` at front/middle | `O(n)` `Remove`/`RemoveAt` (shifts the tail) | backing array doubles on overflow — see the amortized analysis below |
+| `Dictionary<TKey, TValue>` | — | `O(1)` avg, `O(n)` worst `ContainsKey`/`TryGetValue` | `O(1)` avg, `O(n)` worst | `O(1)` avg, `O(n)` worst | worst case needs pathological hash collisions; treat it as `O(1)` in practice |
+| `HashSet<T>` | — | `O(1)` avg, `O(n)` worst `Contains` | `O(1)` avg, `O(n)` worst `Add` | `O(1)` avg, `O(n)` worst `Remove` | same hash-table engine as `Dictionary`, keys only |
+| `SortedDictionary<TKey, TValue>` | — | `O(log n)` | `O(log n)` | `O(log n)` | red-black tree; `log n` is the price of keeping keys in order |
+| `LinkedList<T>` | `O(n)` to reach a node | `O(n)` | `O(1)` given a `LinkedListNode<T>` (`AddBefore`/`AddAfter`); `O(n)` to find that node first | `O(1)` given the node reference | no random access — the `O(1)` only counts once you're already standing at the node |
+| `PriorityQueue<TElement, TPriority>` | — | no `O(1)` `Contains` | `O(log n)` `Enqueue` | `O(log n)` `Dequeue`/`TryDequeue`; `O(1)` `Peek` | binary heap; no `DecreaseKey` — the lazy-deletion workaround lives in [heap & top-k](/patterns/heap-top-k/) |
+| `Stack<T>` | `O(1)` `Peek` at top | `O(n)` | `O(1)` amortized `Push` | `O(1)` `Pop`/`TryPop` | array-backed, same growth story as `List<T>` |
+| `Queue<T>` | `O(1)` `Peek` at front | `O(n)` | `O(1)` amortized `Enqueue` | `O(1)` `Dequeue`/`TryDequeue` | circular buffer over an array, so the front never needs to shift |
+
+## amortized analysis: why `List<T>.Add` is `O(1)`
+
+The table says `List<T>.Add` is `O(1)` *amortized*, not flat `O(1)` — and explaining that
+distinction unprompted is exactly the kind of thing that separates a senior answer. `List<T>`
+is backed by a plain array. When that array is full, one more `Add` means: allocate a new,
+bigger array, copy every existing element into it, then write the new one. That single call is
+`O(n)`. Every other call is just "write to the next open slot" — `O(1)`.
+
+```csharp
+public static class ListGrowthDemo
+{
+    public static void Run()
+    {
+        var list = new List<int>();
+        int lastCapacity = list.Capacity;
+        Console.WriteLine($"count=0  capacity={list.Capacity}");
+
+        for (int i = 1; i <= 20; i++)
+        {
+            list.Add(i);
+            if (list.Capacity != lastCapacity)   // capacity changed => backing array was reallocated
+            {
+                Console.WriteLine($"count={list.Count,2}  capacity={list.Capacity,2}  <- resized, copied {i - 1} existing elements");
+                lastCapacity = list.Capacity;
+            }
+        }
+    }
+}
+```
+
+Running it through 20 `Add` calls, `List<T>` only reallocates 4 times:
+
+| `Add` # that triggers the resize | count after | new capacity | elements copied |
+| --- | --- | --- | --- |
+| 1 | 1 | 4 | 0 |
+| 5 | 5 | 8 | 4 |
+| 9 | 9 | 16 | 8 |
+| 17 | 17 | 32 | 16 |
+
+20 `Add` calls, but only 4 of them paid a copy cost, and the total copied across the whole run
+is `0 + 4 + 8 + 16 = 28` elements — under `1.5n`. That's the doubling trick: each resize does
+`O(current size)` work, but it also buys that many *free* slots before the next resize, so
+total copying across `n` calls never exceeds `O(n)`. Spread that `O(n)` over `n` calls and each
+one averages `O(1)` — amortized.
+
+<Callout kind="insight" label="the doubling argument">
+  Any growth factor greater than 1 gives amortized `O(1)` `Add` — the key is that capacity
+  grows *proportionally* to size, not by a fixed amount. Growing by a constant (`+1` a time)
+  would make every `Add` an `O(n)` copy, and building the whole list `O(n^2)`. `StringBuilder`
+  leans on the same proportional-growth idea (capacity 16, then 32, then 64, ...) — that's
+  the fix in the next section.
+</Callout>
+
+<Watch items={[['List<T>.Add', 'O(1) amortized, O(n) worst case'], ['List<T>[i]', 'O(1)'], ['List<T>.Insert(0, x)', 'O(n)']]} />
+
+## the string-concat-in-a-loop trap
+
+`string` in C# is immutable. Every `s += part` doesn't mutate `s` — it allocates an entirely
+new string, copies the old contents into it, appends the new piece, and throws the old string
+away. Do that inside a loop and you've built an `O(n^2)` algorithm without writing a single
+nested loop.
+
+<Callout kind="trap" label="the trap">
+  `for (...) result += item;` looks like `O(n)` — one loop, one operation per iteration. It's
+  `O(n^2)`: iteration `i` first re-copies the `i` characters already there, just to append one
+  more.
+</Callout>
+
+```csharp
+public static string ConcatNaive(string[] parts)
+{
+    string s = "";
+    long totalCharsCopied = 0;
+
+    foreach (var part in parts)
+    {
+        int oldLength = s.Length;
+        s += part;                       // new allocation; copies oldLength chars in first
+        totalCharsCopied += oldLength;
+        Console.WriteLine($"append \"{part}\"  ->  length={s.Length,2}  copied {oldLength,2} chars  running total={totalCharsCopied,2}");
+    }
+    return s;
+}
+
+public static string ConcatBuilder(string[] parts)
+{
+    var sb = new System.Text.StringBuilder();
+    foreach (var part in parts)
+        sb.Append(part);                 // amortized O(1) — links a new chunk instead of copying
+    return sb.ToString();
+}
+```
+
+Trace of `ConcatNaive(["a", "b", "c", "d", "e", "f", "g", "h"])`:
+
+| append | resulting length | chars copied this step | running total |
+| --- | --- | --- | --- |
+| `"a"` | 1 | 0 | 0 |
+| `"b"` | 2 | 1 | 1 |
+| `"c"` | 3 | 2 | 3 |
+| `"d"` | 4 | 3 | 6 |
+| `"e"` | 5 | 4 | 10 |
+| `"f"` | 6 | 5 | 15 |
+| `"g"` | 7 | 6 | 21 |
+| `"h"` | 8 | 7 | 28 |
+
+28 copies for 8 appends — that's `n(n-1)/2`. At `n = 100` it's 4,950 copies; at `n = 10,000` it's
+49,995,000. `ConcatBuilder` performs the same 8 appends for total cost `O(n)`: `StringBuilder`
+grows the same way `List<T>` does, capacity-wise — but internally it links a new chunk onto the
+buffer instead of copying, so appending is even cheaper than the backing-array resize story
+above (no re-copy happens until you call `ToString`).
+
+<Watch items={[['string s += x in a loop', 'O(n^2)'], ['StringBuilder.Append in a loop', 'O(n) amortized'], ['space (both)', 'O(n)']]} />
+
+## how to state complexity out loud
+
+Getting the right answer isn't the whole grade in an interview — explaining it cleanly is part
+of the signal. A few habits that separate a senior answer from a junior one:
+
+- Say time **and** space every time, unprompted. "`O(n)` time, `O(1)` space" — not just
+  "`O(n)`". Silence on space reads as not having thought about it.
+- Name the dominant term only. "`O(n)`" — not "`O(2n + log n)`". If you're still adding terms,
+  you haven't finished simplifying.
+- Point at the code that produces the bound: "this is `O(n)` because the `for` loop touches
+  each element once" beats stating a number and hoping it's believed.
+- Call out amortized and average-case explicitly instead of hiding behind a bare `O(1)`.
+  "`Dictionary` lookup — `O(1)` average, `O(n)` worst case on pathological collisions, but I'll
+  treat it as `O(1)`" is the accurate, confident version.
+- When two approaches tie on time, that isn't the end of the comparison — differentiate on
+  space, or on the constant factor that shows up once you call it in a loop.
+- If you're not sure, say what you'd need to check (input distribution, expected `n`, mutable
+  vs. immutable) rather than guessing silently.

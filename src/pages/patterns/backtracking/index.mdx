@@ -1,0 +1,106 @@
+---
+layout: '@layouts/TopicLayout.astro'
+topic: backtracking
+---
+
+import Callout from '@components/Callout.astro';
+import ProblemList from '@components/ProblemList.astro';
+
+## core idea
+
+Backtracking is DFS over a decision tree you *generate as you go* instead of one that already
+exists as data. At every node you try a choice, recurse into what that choice implies, and —
+this is the part plain DFS on a graph never needs — **undo the choice** before trying the next
+sibling, because siblings must not see each other's leftover state. Three lines carry the whole
+pattern: choose, explore, un-choose. Every problem below picks a different *shape* of "choice":
+
+| shape | branching | example |
+| --- | --- | --- |
+| fixed positions, fixed choices | one choice per input position | Letter Combinations |
+| include / skip | 2 branches per element | Subsets |
+| pick from remaining pool | shrinks by 1 each level | Permutations |
+| reuse allowed | stays on the same index | Combination Sum |
+| constrained | branches only if a rule permits it | Generate Parentheses |
+| grid DFS | up to 4 neighbor cells | Word Search |
+
+## when to reach for it
+
+- The problem says "all subsets," "all combinations," "all permutations," or "all paths" —
+  you must enumerate every valid arrangement, not find one optimal value.
+- A brute force would build a candidate one piece at a time, and you can tell it's already
+  invalid *before* it's complete (a duplicate letter, a sum already too big, a cell already
+  used) — checking early beats generating everything then filtering.
+- The state you're building can be cheaply undone: append/remove from a list, mark/unmark a
+  cell, increment/decrement a counter. If undoing a choice is expensive or awkward, this pattern
+  fights you.
+- You're constructing a fixed-length sequence (a path, a string, an assignment) step by step,
+  and each step's legal options depend on what you've already chosen.
+
+## universal template
+
+```csharp
+public List<List<int>> Backtrack(int[] choices)
+{
+    var results = new List<List<int>>();
+    var path = new List<int>();
+    var used = new HashSet<int>();
+
+    void Explore()
+    {
+        if (IsComplete(path, choices))          // define per problem: when is a path a full answer?
+        {
+            results.Add([.. path]);             // COPY — path keeps mutating after this returns
+            return;
+        }
+
+        foreach (int choice in choices)
+        {
+            if (!IsValid(choice, used)) continue;    // prune: this choice isn't available here
+
+            used.Add(choice);
+            path.Add(choice);                        // choose
+
+            Explore();                                // explore — recurse into the consequence
+
+            path.RemoveAt(path.Count - 1);            // un-choose — undo, exactly, before the next sibling
+            used.Remove(choice);
+        }
+    }
+
+    Explore();
+    return results;
+}
+```
+
+`IsComplete` and `IsValid` are the two hooks that turn this into a specific problem: letter
+combinations completes at a fixed depth and every choice is always valid; combination sum stays
+on the same index instead of removing choices; word search validates against a grid instead of
+a `HashSet`. The skeleton itself never changes.
+
+Here is one full choose → explore → un-choose cycle, picking 2 items (no repeats) from
+`{A, B, C}` — the shape underneath Permutations:
+
+```text
+                              ()
+        choose A /        choose B |        \ choose C
+        "A"                 "B"                 "C"
+   choose B/ \C        choose A/ \C        choose A/ \B
+ "AB"      "AC"       "BA"      "BC"      "CA"      "CB"
+  ↑ complete: record, then un-choose back up one level at a time — B off "AB", A off "A", etc.
+```
+
+Every leaf is reached by one path down (choosing) and left by one path up (un-choosing) — the
+tree is walked, not stored.
+
+<Callout kind="insight" label="the one question to ask">
+  Before writing the recursion, ask: *"what state changes when I make a choice, and how do I
+  undo exactly that change?"* If you can't state the undo in one line — `path.RemoveAt(...)`,
+  `used.Remove(...)`, `board[r][c] = saved` — your state isn't factored right yet. Split it until
+  you can.
+</Callout>
+
+## problems
+
+Six problems, six branching shapes, one skeleton underneath all of them.
+
+<ProblemList topic="backtracking" />

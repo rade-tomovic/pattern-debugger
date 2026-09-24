@@ -1,0 +1,167 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: design-drills
+problem: url-shortener
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+
+## the brief
+
+"Design a URL shortener like bit.ly: given a long URL, return a short one; given the short one,
+redirect to the original — at scale."
+
+## clarify first
+
+- **Custom aliases, or system-generated only?** A custom alias introduces a uniqueness race on
+  the write path that a generated code doesn't have.
+- **What's the read:write ratio, roughly?** This is a link-sharing product — reads will
+  dominate — but confirming that, even roughly, is what tells you the read path is where the
+  design effort belongs.
+- **Do links expire, or live forever?** An expiring link needs a TTL and something to act on it;
+  a permanent one needs a storage-growth plan instead.
+- **Do we need click analytics?** That's a second write, per redirect, and it must not sit on
+  the critical path of the redirect itself.
+- **`301` or `302`?** This single HTTP detail decides whether browsers cache the redirect for
+  you or every click still has to reach your service — see below.
+- **Single region, or global?** Decides whether the code-generation scheme can lean on one
+  authority or has to work without one.
+
+## the numbers
+
+Assumptions, stated as assumptions:
+
+- 100 million new short links created per month.
+- A read:write ratio of `100:1` — typical for a link-sharing product, not a measured figure.
+- Mappings retained for 5 years, nothing deleted.
+- Each stored row (code, long URL, metadata) costs roughly 500 bytes.
+
+**Writes:** `100,000,000 / (30 × 86,400s) ≈ 39` creates/sec average.
+
+**Reads:** `100 × 39 ≈ 3,900` redirects/sec average.
+
+**Total links over 5 years:** `100M × 12 × 5 = 6` billion.
+
+**Key space check:** base62 (`26 + 26 + 10 = 62` symbols). Six characters gives
+`62^6 ≈ 56.8` billion possible codes — almost ten times the 5-year total; seven characters
+(`62^7 ≈ 3.5` trillion) gives comfortable headroom either way, which matters most for a
+hash-based scheme where a fuller key space means fewer collisions to retry near the end of the
+range.
+
+**Storage:** `6B × 500 bytes ≈ 3 TB` over 5 years — unremarkable for one well-indexed
+relational table. That number is the whole point of doing the arithmetic: storage was never
+going to be the constraint here, which tells you the interesting design decision is on the read
+side.
+
+**Cache footprint:** if reads follow a power law — a small fraction of links account for most of
+the traffic, an assumption, not a measurement — caching even the 20 million most-recently-active
+mappings at 500 bytes each is about 10 GB: a single Redis instance's job, not a distributed
+cache's.
+
+<Watch items={[['read:write', '100:1 (stated assumption)'], ['5-year storage', '~3 TB'], ['redirect', '302']]} />
+
+## the sketch
+
+```text
+                         ┌────────────┐
+  client (create) ──────▶│  API layer │───▶ ID generator (leased counter ranges)
+                         └─────┬──────┘
+                               │ write {code → long_url, meta}
+                               ▼
+                       ┌────────────────┐
+                       │  mapping store  │   SQL Server / PostgreSQL, unique index on `code`
+                       └────────┬────────┘
+                                │ populate on write
+                                ▼
+                          ┌────────────┐
+  client (GET /code) ────▶│   cache    │───▶ 302 → long_url
+                          └─────┬──────┘
+                                │ miss
+                                ▼
+                       ┌────────────────┐
+                       │  mapping store  │
+                       └────────────────┘
+```
+
+**Write path:** the API asks the ID generator for the next code, writes `{code, long_url,
+created_at, ...}` to the mapping store, and populates the cache in the same request
+(write-through), so the very first read never has to miss.
+
+**Read path:** look up the cache first; on a hit, respond with the redirect immediately; on a
+miss, read the mapping store, populate the cache, then respond. Because writes are rare and
+reads dominate, the whole design bends toward keeping that cache-hit path short — this is
+[caching](/system-design/caching/)'s cache-aside pattern applied to the one access pattern this
+system actually has.
+
+**ID generation**, two real options:
+
+1. **Leased counter ranges, base62-encoded.** A single authority hands each app instance a
+   block of IDs up front (not one round trip per write), and the app encodes them. Sequential
+   IDs within a leased block are guessable in order, which is a real concern if enumerating your
+   link table is a problem for the product.
+2. **Hash the long URL** (truncate an MD5/SHA-256 digest to 6-7 chars). No shared counter, but a
+   truncated hash can collide, so the write path needs a uniqueness check before it commits —
+   an extra read, on the write path, in exchange for removing the counter dependency. A unique
+   index on `code` (an EF Core `[Index(nameof(Code), IsUnique = true)]` maps straight onto it)
+   turns a collision, or a racing custom-alias claim, into one clean failure instead of a silent
+   overwrite.
+
+<Callout kind="trap" label="301 vs 302">
+  `301` (permanent) tells the browser to cache the redirect itself, so repeat clicks never even
+  reach your service — but you also lose the ability to change the target, retire the link, or
+  count the click server-side, because the browser stops asking. `302` (temporary) keeps every
+  click on your service, which is what you want by default: it costs you the browser's cache,
+  which your own cache-aside layer replaces anyway.
+</Callout>
+
+A cache key here is one short code, and the row it fetches — code, URL, metadata — is bigger
+than what a redirect strictly needs (just the URL). That's the same shape as
+[the memory hierarchy](/systems/memory-hierarchy/)'s cache line: the unit of caching is fixed
+once, and every fetch pays for the whole unit whether it needed all of it or not, because
+finer-grained caching would cost more in bookkeeping than it saves.
+
+## the tradeoffs
+
+| decision | chosen | buying | paying |
+| --- | --- | --- | --- |
+| ID generation | leased counter ranges + base62 | no per-write uniqueness check | needs a counter authority; codes are guessable in sequence within a lease |
+| redirect code | `302` | freedom to change or retire a mapping, and per-request routing (A/B, geo) | every click is a real request — no browser caching |
+| mapping store | one indexed relational table (SQL Server/PostgreSQL) in front of a cache | operational simplicity, and the numbers above show it's enough | would need to shard, or move to a horizontally-scaled store (Cosmos DB), before storage size forces it — read QPS is what would actually force that move |
+
+For a typical link-sharing product, leased counter ranges plus `302` behind a cache-aside layer
+is the right default. Reach for `301` only when a mapping is deliberately immutable and you're
+trading server-side control for taking redirect traffic off your service entirely — an SEO
+decision, not a scaling one. Reach for a horizontally-scaled store only once read QPS, not the
+3 TB of storage, is what's forcing the move — see
+[partitioning](/system-design/partitioning/) for what that migration actually costs.
+
+## how it fails
+
+- **A link goes viral (hot key).** The cache absorbs almost all of the extra reads, but a
+  brand-new viral link starts with a cold cache, so the first wave of concurrent misses can all
+  hit the mapping store for the same row at once. The fix is request coalescing — one in-flight
+  read per key, everyone else waits on it — not one query per concurrent miss.
+- **The counter authority is unreachable.** With leased ranges, this only delays *new-link
+  creation*; reads never touch the ID generator at all. That separation is exactly why the
+  generator should never sit anywhere near the read path.
+- **Open-redirect abuse.** Someone uses the shortener to mask a phishing URL. This is a
+  product/security failure, not a scale one — it needs an explicit control (a URL-safety check
+  on write, per-account rate limiting) rather than anything the storage or cache layer fixes.
+- **Two clients race the same custom alias.** The unique index on `code` turns the race into one
+  winner and one clean failure rather than a silent overwrite.
+
+## what they ask next
+
+- **"Does the same long URL always get the same short code?"** Only if the product wants that —
+  it needs a second, reverse index (`long_url → code`) with its own write cost. Most systems
+  skip it deliberately and mint a fresh code every time.
+- **"How would you add click analytics without slowing the redirect down?"** Don't write the
+  event synchronously. Publish it to a queue (Kafka, Azure Service Bus, RabbitMQ) at request
+  time and let a separate consumer aggregate it — the redirect's response never waits on that
+  write.
+- **"The mapping store is a single instance — what happens at ten times the traffic?"** The
+  numbers already answered this: storage was never the constraint, read QPS was. The cache
+  absorbs the great majority of it, and beyond that the store gets read replicas
+  ([replication](/system-design/replication/)) — the write path barely moved, so it doesn't need
+  reshaping at all.

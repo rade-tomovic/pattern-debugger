@@ -1,0 +1,130 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: heap-top-k
+problem: merge-k-sorted-lists
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+
+## task
+
+You are given an array of `k` sorted linked lists. Merge all of them into one sorted list and
+return its head. LeetCode #23.
+
+```text
+lists = [[1,4,5], [1,3,4], [2,6]]  →  [1,1,2,3,4,4,5,6]
+```
+
+## how to think
+
+[Merge Two Sorted Lists](/patterns/linked-lists/merge-two-sorted-lists/) already solves the
+two-list case: dummy head, tail pointer, repeatedly attach whichever of the two candidate heads
+is smaller. That merge is really just answering one question over and over — "which of my
+candidate heads is smallest?" — for exactly two candidates. Generalize to K lists and it's the
+same question over K candidates, and a heap answers "which of these K is smallest?" in
+`O(log k)` instead of a linear scan.
+
+Push every list's head into a min-heap. The heap's root is provably the true global minimum
+among everything unconsumed, because each list is individually sorted — a list's own head *is*
+its smallest remaining value, so nothing still inside any list can beat what's already at the
+heap's root. Pop the root, attach it to the output, and immediately push its successor — the new
+head of that same source — back in.
+
+<Callout kind="note" label="template instance">
+  **K-way merge.** Invariant: the heap always holds exactly one live candidate per non-exhausted
+  list — that list's current head — so the heap's minimum is the true minimum across everything
+  still unconsumed. What varies from the topic-page skeleton: the heap element carries a
+  `ListNode` instead of a raw value, and a source is "refilled" by enqueueing `node.Next`.
+</Callout>
+
+## solution
+
+```csharp
+public class ListNode(int val = 0, ListNode? next = null)   // standard interview definition
+{
+    public int Val = val;
+    public ListNode? Next = next;
+}
+
+public ListNode? MergeKLists(ListNode?[] lists)
+{
+    var heap = new PriorityQueue<ListNode, int>();
+    foreach (var head in lists)
+        if (head is not null) heap.Enqueue(head, head.Val);   // one candidate per source, keyed by its value
+
+    var dummy = new ListNode();
+    var tail = dummy;
+
+    while (heap.TryDequeue(out var node, out _))
+    {
+        tail.Next = node;                          // node is the smallest live candidate — safe to emit
+        tail = tail.Next;
+        if (node.Next is not null)
+            heap.Enqueue(node.Next, node.Next.Val); // replace it with the next candidate from the same source
+    }
+    return dummy.Next;
+}
+```
+
+## trace
+
+Three lists:
+
+```text
+A: 1 -> 4 -> 5
+B: 1 -> 3 -> 4
+C: 2 -> 6
+```
+
+Seed the heap with one head per list, then pop/refill until every source is exhausted:
+
+| step | pop | heap after pop | refill | heap after refill | output so far |
+| --- | --- | --- | --- | --- | --- |
+| seed | — | — | — | `{A:1, B:1, C:2}` | `[]` |
+| 1 | A:1 | `{B:1, C:2}` | A:4 | `{B:1, C:2, A:4}` | `[1]` |
+| 2 | B:1 | `{C:2, A:4}` | B:3 | `{C:2, A:4, B:3}` | `[1,1]` |
+| 3 | C:2 | `{A:4, B:3}` | C:6 | `{A:4, B:3, C:6}` | `[1,1,2]` |
+| 4 | B:3 | `{A:4, C:6}` | B:4 | `{A:4, C:6, B:4}` | `[1,1,2,3]` |
+| 5 | A:4 | `{C:6, B:4}` | A:5 | `{C:6, B:4, A:5}` | `[1,1,2,3,4]` |
+| 6 | B:4 | `{A:5, C:6}` | — (B exhausted) | `{A:5, C:6}` | `[1,1,2,3,4,4]` |
+| 7 | A:5 | `{C:6}` | — (A exhausted) | `{C:6}` | `[1,1,2,3,4,4,5]` |
+| 8 | C:6 | `{}` | — (C exhausted) | `{}` | `[1,1,2,3,4,4,5,6]` |
+
+Step 1 is the tie worth noticing: `A` and `C` both offer `1` at the seed. `PriorityQueue` breaks
+ties arbitrarily — either order is correct, since both `1`s belong at the front either way.
+
+## why it works
+
+Each of the k lists is individually sorted, so at any moment the smallest value still remaining
+in list `L` is exactly its current head — nothing later in `L` can beat it. The heap holds one
+entry per still-nonempty list, so its minimum is the minimum over "the best available from every
+source", which is exactly the global minimum of everything unconsumed. Emit it, replace it in
+the heap with its own list's next node — the invariant ("one candidate per live source") holds
+again — and repeat. Every node is pushed once and popped once; the heap never holds more than k
+elements at a time, so total work is `O(n log k)`, against `O(nk)` for merging the lists two at
+a time sequentially.
+
+<Watch items={[['time', 'O(n log k)'], ['space', 'O(k) heap']]} />
+
+## common bugs
+
+- Not skipping `null` entries in `lists` before the initial enqueue — LeetCode explicitly allows
+  some lists to be empty, and enqueueing a null head throws.
+- Forgetting to re-enqueue `node.Next` after popping — that source goes silent after
+  contributing one node even though it has more, and the rest get dropped without error.
+- Collecting values into a `List<int>`, sorting, and rebuilding nodes afterward — it works, but
+  it's `O(n log n)` and throws away the linked-list structure the problem asked you to return.
+- Sequential pairwise merging (`Merge(Merge(Merge(l1,l2),l3),l4)…`) — correct, but `O(nk)`, since
+  the earliest-merged nodes get re-touched by every subsequent merge. Fine as a fallback, not as
+  the answer you lead with.
+
+## variants you can now solve
+
+- [Merge Two Sorted Lists](/patterns/linked-lists/merge-two-sorted-lists/) (LC 21) — the `k = 2`
+  base case this page generalizes.
+- **Smallest Range Covering Elements from K Lists** (LC 632) — the same one-slot-per-source
+  heap, but you also track the max across the current picks and shrink a window as you advance.
+- [Find Median from Data Stream](/patterns/heap-top-k/find-median-data-stream/) (LC 295) — a
+  different heap shape (two of them, not K), but the same comfort with letting
+  `PriorityQueue` replace a full sort.

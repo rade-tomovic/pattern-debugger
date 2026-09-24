@@ -1,0 +1,166 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: trie
+problem: implement-trie
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+
+## task
+
+Implement a `Trie` class with three operations: `Insert(word)` adds a word, `Search(word)`
+returns whether that exact word was inserted, and `StartsWith(prefix)` returns whether any
+inserted word begins with that prefix.
+
+```text
+Insert("apple")
+Search("apple")     → true
+Search("app")       → false   (never inserted as a standalone word)
+StartsWith("app")   → true    ("apple" begins with "app")
+```
+
+## how to think
+
+A `HashSet<string>` answers `Search` in O(1) but can't answer `StartsWith` without scanning
+every stored word — O(words × length). The fix is to stop storing whole strings and start
+storing **shared prefixes**: build a tree where the path from the root spells out a prefix, one
+character per edge. `"apple"` and `"app"` walk the exact same first three nodes.
+
+That reframes both operations as the same walk. `Search` walks the characters and then checks
+one extra bit at the end: did *this* node get marked as a complete word, or is it merely a prefix
+some longer word passes through? `StartsWith` asks a strictly weaker question — does the path
+exist at all — so it skips that check entirely. Two operations, one traversal, one boolean flag.
+
+<Callout kind="note" label="template instance">
+  The **dictionary-based node** skeleton from the topic page, verbatim — no variation. Invariant:
+  a node is reachable by walking characters `c1, c2, ..., ck` from the root if and only if some
+  inserted word has `c1 c2 ... ck` as a prefix; that node's `IsWord` is true exactly when a word
+  ends there. `Search` requires both "path exists" and `IsWord`; `StartsWith` requires only "path
+  exists".
+</Callout>
+
+## solution
+
+```csharp
+public class TrieNode
+{
+    public Dictionary<char, TrieNode> Children { get; } = [];
+    public bool IsWord;
+}
+
+public class Trie
+{
+    private readonly TrieNode _root = new();
+
+    public void Insert(string word)
+    {
+        var node = _root;
+        foreach (char c in word)
+        {
+            if (!node.Children.TryGetValue(c, out var next))
+            {
+                next = new TrieNode();
+                node.Children[c] = next;
+            }
+            node = next;
+        }
+        node.IsWord = true;                 // this exact path is a complete word
+    }
+
+    public bool Search(string word)
+    {
+        var node = Find(word);
+        return node is { IsWord: true };    // path must exist AND be a stored word
+    }
+
+    public bool StartsWith(string prefix)
+    {
+        return Find(prefix) is not null;    // path existing is enough
+    }
+
+    // shared walk: null if the path breaks, otherwise the node the path ends on
+    private TrieNode? Find(string s)
+    {
+        var node = _root;
+        foreach (char c in s)
+        {
+            if (!node.Children.TryGetValue(c, out var next)) return null;
+            node = next;
+        }
+        return node;
+    }
+}
+```
+
+## trace
+
+Build phase — `Insert("car")` then `Insert("care")`:
+
+| call | char | child existed? | action |
+| --- | --- | --- | --- |
+| `Insert("car")` | `c` | no | create node, descend |
+| `Insert("car")` | `a` | no | create node, descend |
+| `Insert("car")` | `r` | no | create node, descend, mark `IsWord = true` |
+| `Insert("care")` | `c` | yes | reuse node, descend |
+| `Insert("care")` | `a` | yes | reuse node, descend |
+| `Insert("care")` | `r` | yes | reuse node, descend |
+| `Insert("care")` | `e` | no | create node, descend, mark `IsWord = true` |
+
+Resulting tree — two words, three shared nodes:
+
+```text
+root
+ └─ c
+     └─ a
+         └─ r ● word: "car"
+             └─ e ● word: "care"
+```
+
+Query phase against that tree:
+
+| call | path walked | node found | `IsWord` | returns |
+| --- | --- | --- | --- | --- |
+| `Search("car")` | c→a→r, all hit | yes | `true` | `true` |
+| `Search("ca")` | c→a, all hit | yes | `false` | `false` |
+| `StartsWith("ca")` | c→a, all hit | yes | — | `true` |
+| `Search("care")` | c→a→r→e, all hit | yes | `true` | `true` |
+| `StartsWith("care")` | c→a→r→e, all hit | yes | — | `true` |
+| `StartsWith("cars")` | c→a→r hit, `s` miss | no (`null`) | — | `false` |
+
+`Search("ca")` is the row that proves the point: the path exists (every character matched a
+child) but the walk ends on a node whose `IsWord` is `false` — `"ca"` was only ever a prefix,
+never inserted on its own.
+
+## why it works
+
+The invariant holds at every step: a node is reachable from the root along characters
+`c1 c2 ... ck` exactly when some inserted word has that string as a prefix, and `IsWord` is set
+on a node exactly when an `Insert` call's walk *ended* there. `Search` and `StartsWith` never
+touch a word they didn't insert, and every word inserted is reachable — insertion either walks an
+existing path or extends it, so nothing is ever lost.
+
+Cost is proportional to the string you're processing, not to how many words live in the trie —
+that's the entire reason this beats a flat list.
+
+<Watch items={[['insert', 'O(L)'], ['search / startsWith', 'O(L)'], ['space', 'O(total chars, shared prefixes cost once)']]} />
+
+## common bugs
+
+- Checking only "does the path exist" in `Search` and skipping the `IsWord` flag — that makes
+  `Search("app")` return `true` after inserting `"apple"`, which is wrong.
+- Applying the `IsWord` gate to `StartsWith` too — it should accept any existing path, complete
+  word or not.
+- Walking off the trie without a guard: indexing `Children[c]` directly instead of
+  `TryGetValue` throws or auto-creates a node you didn't mean to create.
+- Forgetting `Insert` is idempotent-safe but not additive — inserting the same word twice just
+  re-marks the same `IsWord = true`; there's no built-in occurrence count.
+
+## variants you can now solve
+
+- [Design Add and Search Words](/patterns/trie/design-add-search-words/) (LC 211) — same
+  structure, `Search` grows into a small DFS to handle `.` wildcards.
+- [Word Search II](/patterns/trie/word-search-ii/) (LC 212) — the trie drives a grid
+  backtracking search instead of a plain string walk.
+- **Replace Words** (LC 648) — for each word in a sentence, find its shortest dictionary root by
+  walking the trie and stopping at the first `IsWord`.

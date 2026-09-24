@@ -1,0 +1,38 @@
+---
+import { prevNext } from '@data/curriculum';
+
+interface Props {
+  path: string;
+}
+const { path } = Astro.props;
+const { prev, next } = prevNext(path);
+---
+
+<nav class="border-line mt-12 flex items-stretch gap-3 border-t pt-6" aria-label="Sequence">
+  {
+    prev && (
+      <a
+        href={prev.path}
+        class="bg-panel border-line hover:border-muted group min-w-0 flex-1 rounded-[10px] border px-4 py-3 transition-colors"
+      >
+        <span class="text-muted font-mono text-[0.7rem]">◀ prev</span>
+        <span class="group-hover:text-amber mt-0.5 block truncate font-mono text-[0.85rem] text-ink">
+          {prev.title}
+        </span>
+      </a>
+    )
+  }
+  {
+    next && (
+      <a
+        href={next.path}
+        class="bg-panel border-line hover:border-muted group min-w-0 flex-1 rounded-[10px] border px-4 py-3 text-right transition-colors"
+      >
+        <span class="text-muted font-mono text-[0.7rem]">next ▶</span>
+        <span class="group-hover:text-amber mt-0.5 block truncate font-mono text-[0.85rem] text-ink">
+          {next.title}
+        </span>
+      </a>
+    )
+  }
+</nav>

@@ -1,0 +1,12 @@
+---
+/** Inline code chip, for use where markdown backticks aren't available. */
+interface Props {
+  text: string;
+}
+const { text } = Astro.props;
+---
+
+<code
+  class="bg-code border-line rounded-[4px] border px-1.5 py-px font-mono text-[0.85em] whitespace-nowrap text-cyan"
+  >{text}</code
+>

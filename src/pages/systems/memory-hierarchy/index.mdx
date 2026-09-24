@@ -1,0 +1,448 @@
+---
+layout: '@layouts/TopicLayout.astro'
+topic: memory-hierarchy
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import ProblemList from '@components/ProblemList.astro';
+import Solution from '@components/Solution.astro';
+
+## the ground floor
+
+- **address** — an index into the one flat, numbered array of bytes that is your process's
+  memory. [Bits, bytes and addresses](/systems/bits-and-memory/) builds that idea from nothing.
+- **DRAM** — the physical memory chips: big, cheap, and — per the published latency ladder below
+  — on the order of a hundred times slower to reach than the CPU's own on-chip storage.
+- **cache** — a small, fast copy of recently used memory that sits between the core and DRAM.
+  You never address it, never allocate in it, and cannot see it from C#. It is pure hardware.
+- **cache line** — the fixed-size block a cache deals in: 64 bytes on this machine and on
+  essentially every x86-64 and ARM64 server you will meet. Memory is never moved in smaller
+  pieces. This is the most useful fact on the page.
+- **cycle** — one tick of the CPU clock, the unit a core's work is priced in.
+  [How a CPU runs your code](/systems/cpu-execution/) is where that comes from.
+- **working set** — the bytes a piece of code actually touches in a short window. Not the bytes
+  it allocated: the bytes it touches.
+
+## core idea
+
+A modern core can issue several instructions per cycle and a cycle is a fraction of a
+nanosecond. DRAM answers in something closer to a hundred nanoseconds. If every load went to
+DRAM the core would spend nearly all of its life waiting, so the hardware keeps small fast
+copies of recently used memory next to the core and hopes you ask for the same bytes again, or
+for the bytes next door.
+
+That hope has a name — *locality* — and it is the only thing the whole machine is betting on.
+Two loops with the same Big-O and the same instruction count can still cost very different
+numbers of cache-line fetches, purely from how well they honour that bet. Big-O deliberately
+throws away the constant factor;
+[the memory hierarchy](/foundations/big-o/) is where a large part of that constant actually
+lives.
+
+Whether a byte lives on the [stack or the heap](/systems/stack-and-heap/) decides nothing about
+any of this: the cache does not know or care which allocator handed out an address, only whether
+the *bytes next to it* were touched recently. What the allocator decides is layout — contiguous
+or pointer-chased — and layout is what this page prices.
+
+## how it actually works
+
+### the ladder this machine really has
+
+The kernel will tell you the shape of the caches on any Linux box, no benchmark required:
+
+```text
+$ for d in /sys/devices/system/cpu/cpu0/cache/index*; do
+    echo "L$(cat $d/level) $(cat $d/type)  size=$(cat $d/size)  line=$(cat $d/coherency_line_size)B  ways=$(cat $d/ways_of_associativity)  cpus=$(cat $d/shared_cpu_list)"
+  done
+
+L1 Data         size=32K    line=64B  ways=8   cpus=0,8
+L1 Instruction  size=32K    line=64B  ways=8   cpus=0,8
+L2 Unified      size=512K   line=64B  ways=8   cpus=0,8
+L3 Unified      size=32768K line=64B  ways=16  cpus=0-15
+```
+
+Two things fall out of the last column alone. L1 and L2 belong to *one physical core* — cpu 0 and
+cpu 8 are the same core's two hardware threads (SMT), and they share that core's private caches
+between them, not just its execution units. L3 belongs to all sixteen logical CPUs — every core on
+the chip. Drawn out, with DRAM on the end:
+
+```text
+        core 0                core 1              ...   core 7        (8 cores total)
+   ┌───────────────┐    ┌───────────────┐              ┌───────────────┐
+   │ thread 0 and 8 │    │ thread 1 and 9 │             │ thread 7 and 15│    named by your code
+   ├───────────────┤    ├───────────────┤              ├───────────────┤
+   │   L1d  32 KB   │    │   L1d  32 KB   │             │   L1d  32 KB   │    private to the core
+   ├───────────────┤    ├───────────────┤              ├───────────────┤
+   │   L2  512 KB   │    │   L2  512 KB   │             │   L2  512 KB   │    private to the core
+   └───────┬────────┘    └───────┬────────┘             └───────┬────────┘
+           └──────────────────────┴──── ... 8 cores ────────────┘
+                        ┌────────────────────────┐
+                        │     L3   32 MB shared    │
+                        └────────────┬─────────────┘
+                                     │
+                              ┌──────┴──────┐
+                              │     DRAM     │
+                              └─────────────┘
+```
+
+Every one of those sizes is a fact this machine states identically every time you ask it, and
+none of them tell you a cost in time — for that you need the published ladder, because this
+container has no hardware performance counters and no `perf` to time an individual load:
+
+| level | published order of magnitude |
+| --- | --- |
+| register | well under 1 ns |
+| L1 cache | ≈ 1 ns |
+| L2 cache | ≈ 4 ns |
+| L3 cache | ≈ 20-40 ns |
+| main memory | ≈ 80-100 ns |
+| NVMe SSD random read | ≈ 100 µs |
+| datacenter network round trip | ≈ 500 µs |
+| spinning-disk seek | ≈ 10 ms |
+
+<Callout kind="note" label="published, not measured">
+  This is the conventional latency ladder — order-of-magnitude figures for reasoning about
+  designs, published by hardware vendors and reproduced in every architecture text, not a
+  measurement of this or any specific machine. Use it to answer "is this an in-memory problem or
+  an I/O problem", and never quote it as a benchmark result. It is the one place on this site
+  where a latency number appears without a program that produced it, because the ratio between
+  the rungs is the entire lesson of this page.
+</Callout>
+
+Read the sizes above against that ladder and the shape of the whole page falls out: a working set
+that fits in 32 KB never leaves L1, one that needs up to 512 KB spills into L2, up to 32 MB can
+still live in the shared L3, and past that every miss is a trip down to the ≈80-100 ns rung. Which
+rung a piece of code lives on is a question about *how many distinct bytes it touches in a short
+window* — its working set — not about how much memory it allocated.
+
+Two honest caveats. A working set that crosses many page boundaries also pays for address
+translation on top of whatever the cache is doing — a separate cost, covered on
+[virtual memory](/systems/virtual-memory/). And because L3 here is shared by all eight cores, a
+busy box can make the L3 rungs move even though the ladder's *structure* — cheap and small, dear
+and large — never does.
+
+### the cache line is the unit of transfer
+
+Caches do not store bytes, or fields, or objects. They store **lines**: fixed 64-byte blocks,
+aligned to 64-byte boundaries. When you read one `int`, the hardware fetches the whole 64-byte
+line containing it and installs it in L1.
+
+```text
+one 64-byte line — the smallest thing memory will sell you
+
+  0x…c0                                                      0x…ff
+  ┌────┬────┬────┬────┬────┬────┬────┬────┬─  ─┬────┬────┬────┐
+  │ i0 │ i1 │ i2 │ i3 │ i4 │ i5 │ i6 │ i7 │ …  │i13 │i14 │i15 │  16 ints
+  └────┴────┴────┴────┴────┴────┴────┴────┴─  ─┴────┴────┴────┘
+    ▲
+    you asked for this one. The other fifteen came along free —
+    and you paid for them whether you read them or not.
+```
+
+Every consequence on this page falls out of that one sentence:
+
+- Reading 16 consecutive `int` values costs **one** memory access, not sixteen.
+- Reading 16 `int` values 4 KB apart costs **sixteen** accesses, and fifteen-sixteenths of every
+  line you paid for is thrown away.
+- A `bool` field you never read still costs you if it shares a line with one you do.
+- Two threads writing to two different variables in the same line fight each other, because the
+  coherence protocol works in lines too — that is *false sharing*, and it has its own page at
+  [two counters, one cache line](/systems/atomics-and-cas/false-sharing/).
+
+[Finding the cache line](/systems/memory-hierarchy/stride-and-cache-lines/) derives the 64 from
+behaviour instead of taking the kernel's word for it.
+
+### spatial and temporal locality
+
+Two different bets, and it is worth keeping them apart because they are fixed by different moves.
+
+| bet | the claim | what exploits it | what breaks it |
+| --- | --- | --- | --- |
+| spatial | if you touched an address, you will soon touch its neighbours | fetching a whole 64-byte line; hardware prefetch | pointer-chasing, column walks, big strides |
+| temporal | if you touched an address, you will touch it again soon | keeping the line in L1 until it is evicted | a working set larger than the cache; a pass that touches everything once |
+
+Tiling a matrix multiply is a temporal-locality move: restructure the loops so the block of data
+you just loaded gets reused before it is evicted. Switching a column walk to a row walk is a
+spatial-locality move.
+[Two loops, same Big-O](/systems/memory-hierarchy/loop-order/) works both through in full, with
+real cache geometry rather than a stopwatch.
+
+### the prefetcher, and what it is worth
+
+The hardware does not only react to your loads, it predicts them. When the memory controller sees
+you reading consecutive lines, it starts fetching lines ahead of the one you asked for, so that by
+the time your loop arrives the data is already on its way. It recognises a constant stride —
+including a large one — and it is completely blind to a pointer chase, where each address is only
+known once the *previous* load has come back.
+
+That is a real, mechanical difference, not a matter of degree. A predictable stream can have many
+requests in flight at once, each one's round trip overlapping the others', so the *effective* cost
+per element can fall well under any single access's latency — this is bandwidth, not latency, and
+it is what the sequential end of
+[finding the cache line](/systems/memory-hierarchy/stride-and-cache-lines/) is built on. A pointer
+chase cannot overlap anything: the core must have address *N*'s value in hand before it can even
+issue the load for address *N+1*, so its cost is close to the full round trip, paid once per hop,
+with nothing to hide it behind. Predictability is not a nice-to-have; it decides whether the
+hardware can even attempt to hide the wait.
+
+### why the loop order is a memory decision
+
+.NET lays a rectangular array (`int[,]`) out **row-major**: row 0 end to end, then row 1, in one
+flat run of bytes, and indexing it is the address arithmetic `r * width + c` — the same thing you
+write by hand when you flatten a matrix into an `int[]`. A *jagged* array (`int[][]`) is a
+different animal: an array of references to row objects, so the rows are separate allocations that
+may sit anywhere. Row-major traversal of a jagged array is still fast within a row and pays a
+pointer chase at every row boundary.
+
+```text
+a 4x4 int matrix — 16 ints, one flat run
+
+ index    0    1    2    3    4    5    6    7    8  …   15
+ holds  a0,0 a0,1 a0,2 a0,3 a1,0 a1,1 a1,2 a1,3 a2,0 …  a3,3
+        └──── row 0 ─────┘└──── row 1 ─────┘
+
+ along a row     → next address is +4 bytes    → 16 hits per line fetched
+ down a column   → next address is +width*4    → for a 4096-wide matrix that is
+                                                 +16 KB: a new line AND a new page
+                                                 on every single step
+```
+
+Count what each order actually fetches, and the comparison is a count, not a guess. A row walk
+uses all 16 `int` values a line delivers before moving to the next line: **one line fetch per
+sixteen elements.** A column walk on any matrix wider than 16 columns lands on a fresh line every
+single step, because the next element is `width × 4` bytes away — far past the 64-byte line it
+just paid for: **one line fetch per element, sixteen times as many fetches for the same number of
+reads.** That sixteen is not an estimate; it is `line size ÷ element size`, the identical ratio
+[array of structs vs struct of arrays](/systems/memory-hierarchy/aos-vs-soa/) derives from the
+other direction, and the same reasoning
+[two loops, same Big-O](/systems/memory-hierarchy/loop-order/) uses to work out which loop nests
+in a matrix multiply pay it.
+
+### why some strides are unluckier than others
+
+A cache is not a free-for-all. Each line can only live in one *set*, chosen by a slice of bits out
+of the middle of its address, and each set holds a fixed number of lines (8, in this L1). Addresses
+a large power of two apart land in the same few sets, so a loop striding by a large power of two
+can leave most of a cache's sets idle while hammering a handful of others — even when the total
+data involved is tiny next to the cache's stated capacity. This is why numeric libraries pad array
+rows to break the alignment, and it is worked through with real address arithmetic — not taste —
+on [two loops, same Big-O](/systems/memory-hierarchy/loop-order/), where it is exactly this
+mechanism that singles out one matrix size out of eight as the worst case.
+
+<Callout kind="note" label="what this box cannot show">
+  There is no `perf` and no access to hardware performance counters in this container, so nothing
+  on this page or its exercises is backed by a cycle count or a cache-miss count from the CPU
+  itself — every claim here is either a fact the OS or the runtime reports directly (a size, an
+  address, a byte count), or reasoning about address arithmetic that you can check by hand. Where
+  a mechanism could not be checked either way, it is cut rather than asserted. One socket, one
+  NUMA node — `/sys/devices/system/node/` lists only `node0` — so nothing here shows the extra
+  rung a multi-socket server adds, where reading memory attached to the *other* socket costs
+  roughly double a local access.
+</Callout>
+
+## the mental model
+
+Three rules, in the order you should apply them.
+
+1. **You never load a byte. You load a 64-byte line.** Cost is counted in lines fetched, not in
+   elements read. A loop's line count is roughly `elements touched ÷ elements per line`, and
+   elements per line is `64 ÷ element size`.
+2. **Predictable beats clever.** A sequential or constant-stride walk can be prefetched and
+   overlaps its own round trips; a dependent, unpredictable walk pays each round trip in full,
+   one at a time, with nothing to hide behind.
+3. **Each rung of the published ladder above costs several times the one before it, and the whole
+   span from L1 to DRAM is roughly two orders of magnitude.** Ask "does the hot data fit in a
+   megabyte?" before you ask anything else.
+
+<Watch items={[['cache line', '64 B'], ['L1d', '32 KB / core'], ['L2', '512 KB / core (this box)'], ['L3', '32 MB, shared by 8 cores'], ['page', '4096 B'], ['row vs column, same matrix', '16x the line fetches']]} />
+
+## why you should care
+
+**The `LinkedList<T>` question stops being theoretical.** Big-O says traversing a `List<int>` and
+a `LinkedList<int>` are both O(n), and they are. What Big-O never prices is what each element
+actually costs to move:
+
+<Solution>
+
+```csharp
+// Evidence for /systems/memory-hierarchy/ — run with:
+//   dotnet run bench/memory-hierarchy/index.cs
+//
+// Real per-element cost, not sizeof: GC.GetAllocatedBytesForCurrentThread() counts
+// the actual bytes the allocator handed out.
+static class NodeCost
+{
+    public static void Main()
+    {
+        const int N = 1_000_000;
+
+        long b0 = GC.GetAllocatedBytesForCurrentThread();
+        var list = new List<int>(N);
+        for (int i = 0; i < N; i++) list.Add(i);
+        long b1 = GC.GetAllocatedBytesForCurrentThread();
+
+        var ll = new LinkedList<int>();
+        for (int i = 0; i < N; i++) ll.AddLast(i);
+        long b2 = GC.GetAllocatedBytesForCurrentThread();
+
+        long listBytes = (b1 - b0) / N, nodeBytes = (b2 - b1) / N;
+        Console.WriteLine($"List<int>:       {listBytes} B/element");
+        Console.WriteLine($"LinkedList<int>: {nodeBytes} B/node");
+        if (listBytes != 4) throw new Exception($"FAIL: expected 4 B/element, got {listBytes}");
+        if (nodeBytes != 48) throw new Exception($"FAIL: expected 48 B/node, got {nodeBytes}");
+        Console.WriteLine($"PASS: LinkedList<int> costs {nodeBytes / (double)listBytes:F0}x the bytes per element");
+    }
+}
+```
+
+</Solution>
+
+```text
+List<int>:       4 B/element
+LinkedList<int>: 48 B/node
+PASS: LinkedList<int> costs 12x the bytes per element
+```
+
+Twelve times the bytes moved per element to deliver the same `int` — an object header, three
+references (previous, next, and the owning list), the payload, and padding, against four bare
+bytes in the array. That is the traversal cost while the nodes are still in allocation order, so
+each `.Next` at least lands near the last one. It stops being even that friendly the moment the
+list has been alive long enough to be reorganised: a node removed and reinserted, a sort, a filter
+that relinks survivors — after any of that, traversal order no longer matches allocation order,
+`node.Next` is an address with no relationship to the one before it, and the prefetcher — built
+entirely around *predictable* strides — has nothing to work with. Big-O did not lie about either
+case; it just never claimed to price the constant. Reach for `LinkedList<T>` when you need O(1)
+removal *given a node you already hold* — [the LRU cache](/patterns/linked-lists/lru-cache/) is
+the honest use — and not because "insertion is O(1)".
+
+**The metric that moves is CPU time with no obvious hot method.** A cache-bound service does not
+show up as one expensive function; it shows up as a whole loop being slower than its instruction
+count says it should be, with the profiler's time spread evenly over an innocent `for` body. If a
+hardware-counter profiler is available in your environment, cache misses per instruction and
+"stalled cycles waiting for memory" are the numbers that name this directly. Without one, the tell
+is a job whose runtime grows much faster than its input while the operation count grows linearly —
+the working set crossing a cache boundary the algorithm never notices.
+
+**The code review you can now do.** A `Dictionary<int, Foo>` holding a million entries where `Foo`
+is a class is a million pointer chases in every scan. A `List<Order>` of a million orders,
+filtered by one `bool` field, drags every other field of every order through L1 to read it. A
+"cheap" `.Select(x => x.Id).ToList()` over a large object graph moves far more bytes than the
+`Id`s alone before it is anything else. None of these are wrong; all of them are decisions you can
+now make on purpose.
+[Array of structs vs struct of arrays](/systems/memory-hierarchy/aos-vs-soa/) works through exactly
+this shape, field by field.
+
+**Where this hands off.** Two loops with the same instruction count differ because of memory; two
+loops with the same *memory* pattern can still differ because of branches, which is
+[branches, pipelines and speculation](/systems/cpu-pipeline/). And the fact that a cache line is
+the unit of *coherence* between cores — not just of transfer — is what makes two threads
+incrementing two adjacent counters fight each other, over at
+[atomics and compare-and-swap](/systems/atomics-and-cas/).
+
+## the same idea in other languages
+
+| language | what it's called | the trap |
+| --- | --- | --- |
+| C / C++ | the same hardware, with `struct` arrays that are guaranteed contiguous and `alignas` to control line placement | `std::list` and `std::map` allocate one node per element, exactly like `LinkedList<T>`; `std::vector` is the contiguous one. Choosing the "right" container from its Big-O table is how C++ code ends up losing to a linear scan over a `vector`. |
+| Java | identical hierarchy; `int[]` is contiguous, but `ArrayList<Integer>`, `Integer[]` and every `Object[]` hold references | An array of objects is an array of pointers plus one object header per element. A C# `struct[]` is flat; the same code written against Java objects gains a dereference and a per-element object header, which is why an `Integer` costs far more than the 4 bytes of payload it carries. The source looks the same. |
+| Go | slices are contiguous, and a `[]T` of a struct type stores the structs inline, like C# | `[]*T` is not `[]T`. The pointer version is a scatter, exactly like the class-array layout on [array of structs vs struct of arrays](/systems/memory-hierarchy/aos-vs-soa/), and the syntax difference is one character. |
+| Python | CPython lists are arrays of `PyObject*`, and every `int` is a heap object | No list of Python ints is ever contiguous data. This is the entire reason NumPy exists: `np.array` gives you the flat typed buffer the hierarchy wants. |
+| Rust | `Vec<T>` stores `T` inline; `Box`/`Rc` opt into indirection explicitly | The layout is visible in the type, which is a genuine advantage — but `Vec<Box<T>>` is still a scatter, and iterator chains do not change the memory pattern underneath. |
+
+## exercises
+
+Three exercises, each one a mechanism you work out by hand — with real, non-timed program output
+to check yourself against, not a stopwatch.
+
+<ProblemList topic="memory-hierarchy" />
+
+## interview drills
+
+**Q.** We replaced a `List<T>` with a `LinkedList<T>` because the profile showed a lot of
+`RemoveAt`, and it got slower. Why?
+
+- *weak answer* — "linked lists are slow" or "the constant factor is worse". True, and it gets an
+  immediate follow-up you cannot answer.
+- *strong answer* — `RemoveAt` on a list is O(n) because of the memmove, but that memmove runs at
+  bandwidth over contiguous memory, which is the fastest thing the machine does. Removal from a
+  linked list is only O(1) if you already hold the node; if you have to walk to it you pay a
+  dependent, unpredictable load per element, and a node carries twelve times the bytes of the
+  array element it replaced. An aged list has no locality left at all, since `.Next` no longer
+  correlates with address order. The right fix is a data structure that keeps contiguity and an
+  index, or swap-remove if order does not matter.
+- *follow-up* — "so when is `LinkedList<T>` right?" When you hold the node already and the list is
+  the *index* rather than the storage: an LRU cache where the dictionary hands you the
+  `LinkedListNode<T>` is the canonical case.
+
+**Q.** Two loops do the same arithmetic on the same array and one is noticeably slower in
+production. Where do you look first?
+
+- *weak answer* — profile it and see which line is hot. Both loops have exactly one hot line, and
+  the profiler will point at both.
+- *strong answer* — count the cache lines each version touches, not the instructions. The same
+  operation count with different costs almost always means a different number of lines fetched,
+  or the same number fetched in a less predictable order. Ask what the address of the next access
+  is relative to the last: `+4 bytes` is free, `+16 KB` is a fresh line and possibly a fresh page.
+- *follow-up* — "how would you confirm that without a profiler?" Work out the line count each
+  order fetches by hand — element size, line size, and the stride between consecutive accesses
+  are enough — and check whether the two loops' predicted counts actually differ by the margin
+  you are trying to explain.
+
+**Q.** A batch job's runtime grows noticeably faster than its record count once you push it past
+a few million records, even though every profile shows the same linear algorithm. Is that
+necessarily an algorithmic regression?
+
+- *weak answer* — "the runtime is growing faster than the data, so the algorithm must actually be
+  superlinear — probably an accidental O(n²) hiding in there somewhere."
+- *strong answer* — maybe, but check the working set first. If one million records fit in L3 and
+  ten million do not, the per-record cost genuinely changes even though the algorithm is linear.
+  Confirm by testing three or four sizes and looking for a *step* concentrated around a size where
+  the working set crosses a cache boundary, rather than a smooth curve: a cache cliff has a knee at
+  a hardware boundary, an accidental O(n²) does not.
+- *follow-up* — "and if it is the cache?" Process in chunks sized to the cache, or shrink the
+  per-record footprint so more records fit — the two standard levers.
+
+**Q.** When does making a `struct` bigger make the program slower, even though you never read the
+new fields?
+
+- *weak answer* — it does not; you only pay for what you read.
+- *strong answer* — you pay for lines, not fields. Growing a `struct` from 32 to 40 bytes means
+  fewer records per 64-byte line, so a scan that reads one field fetches proportionally more
+  lines for a field it never uses.
+  [Array of structs vs struct of arrays](/systems/memory-hierarchy/aos-vs-soa/) works the exact
+  arithmetic: reading one field out of a packed struct array moves several times the bytes an
+  equivalent flat array of that one field would.
+- *follow-up* — "so should everything be a struct of arrays?" No — random access to a whole record
+  goes the other way: one record then costs one cache line in a tightly packed AoS array and can
+  cost as many lines as it has fields once those fields are split across separate arrays. Layout
+  follows the access pattern, not taste.
+
+**Q.** You are told to make a hot analytics loop faster and you may not change its algorithm. What
+are your options?
+
+- *strong answer* — three, in order of how cheap they are to try. Change the traversal order so it
+  runs along memory instead of across it — usually a two-line change. Shrink the per-element
+  footprint so more elements fit per line and per cache. Block the loop so a chunk of data loaded
+  once is reused before it would be evicted. All three are memory moves and none touches the
+  algorithm — but be honest about the third one: blocking only pays for itself when something is
+  actually being evicted before reuse, which you have to establish first, not assume.
+  [Two loops, same Big-O](/systems/memory-hierarchy/loop-order/) works through exactly when that
+  is and is not true for one concrete loop nest.
+- *follow-up* — "which do you try first?" Traversal order — it is the cheapest to attempt and the
+  one whose effect you can predict from the access pattern alone, before writing a line of code.
+
+**Q.** A colleague proposes a layout change and says the effect was negligible when they tried it
+locally, so the team should skip it. Why might that not settle the question?
+
+- *weak answer* — "benchmarks are unreliable" or "production is different". True and useless; the
+  interviewer wants the specific reason.
+- *strong answer* — because a cache effect is a property of the working set measured against
+  *that machine's* cache sizes, and neither of those is guaranteed to match production. A laptop
+  with a large last-level cache never evicts an 8 MB array at all, so the effect is genuinely zero
+  there; a server with a smaller cache per tenant, or a production dataset ten times larger, falls
+  off the cliff on identical code. A claim about a layout's effect is only as portable as the
+  working-set-versus-cache-size argument behind it — the sizes, not a single result from one box.
+- *follow-up* — "so how do you make a case that travels?" State the mechanism in terms of the data
+  size and the cache geometry, not a single result: "this loop's reused chunk is `X` bytes, this
+  cache level is `Y`, and `X` no longer fits once the dataset grows past `Z`" is a claim anyone can
+  check against their own machine's numbers.

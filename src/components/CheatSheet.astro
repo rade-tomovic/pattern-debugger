@@ -1,0 +1,19 @@
+---
+/**
+ * The artifact's "tips & traps" box. Put one or more <ul> lists in the slot;
+ * article styles give them the amber › bullets.
+ */
+interface Props {
+  title?: string;
+}
+const { title = 'cheat sheet' } = Astro.props;
+---
+
+<div class="bg-panel border-line rounded-[10px] border px-5 py-4">
+  <h3 class="!mt-0 font-mono text-[0.8rem] tracking-[0.1em] text-amber uppercase before:content-none">
+    {title}
+  </h3>
+  <div class="mt-2 text-[0.9rem]">
+    <slot />
+  </div>
+</div>

@@ -1,0 +1,115 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: bit-manipulation
+problem: counting-bits
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import Cells from '@components/Cells.astro';
+
+## task
+
+Given an integer `n`, return an array `ans` of length `n + 1` where `ans[i]` is the number of
+`1` bits in `i`, for every `i` from `0` to `n`.
+
+```text
+n = 8  →  [0, 1, 1, 2, 1, 2, 2, 3, 1]
+```
+
+## how to think
+
+You already know how to count the bits of one number: [Number of 1
+Bits](/patterns/bit-manipulation/number-of-1-bits/) clears the lowest set bit with `n & (n - 1)`
+until nothing's left. Run that loop for every `i` from `0` to `n` and you get an answer in
+`O(n log n)` — correct, but it recomputes from scratch every time, and the values `0..n` share an
+enormous amount of structure it throws away.
+
+The structure: `i >> 1` is `i` with its lowest bit dropped (integer division by 2 for a
+non-negative `i`). So the popcount of `i >> 1` is the popcount of `i` **minus** whatever that
+dropped bit was worth. That dropped bit is exactly `i & 1` — `1` if `i` was odd, `0` if even. Put
+it back: `bits[i] = bits[i >> 1] + (i & 1)`. Since `i >> 1` is strictly smaller than `i` for every
+`i ≥ 1`, and you're filling the array left to right starting from the base case `bits[0] = 0`,
+every lookup `bits[i >> 1]` has already been computed by the time you need it.
+
+This *is* dynamic programming — state `i`, recurrence `dp[i] = dp[i >> 1] + (i & 1)`, base case
+`dp[0] = 0`, computed in increasing order of `i`. See [Dynamic Programming
+Basics](/patterns/dynamic-programming/) for the general method this is an instance of; here the
+recurrence just happens to be a bit shift instead of the more familiar `dp[i-1] + dp[i-2]` shape.
+
+<Callout kind="note" label="template instance">
+  **Bit-DP recurrence** skeleton, verbatim. Invariant: by the time `dp[i]` is computed, `dp[j]`
+  is correct for every `j < i` — in particular for `j = i >> 1`. What varies: nothing: this
+  problem *is* the template.
+</Callout>
+
+## solution
+
+```csharp
+public int[] CountBits(int n)
+{
+    var bits = new int[n + 1];
+    for (int i = 1; i <= n; i++)
+        bits[i] = bits[i >> 1] + (i & 1);   // drop the lowest bit, add it back if it was set
+    return bits;
+}
+```
+
+## trace
+
+`n = 8`, `bits[0] = 0` by default (base case):
+
+| i | i >> 1 | i & 1 | bits[i >> 1] | bits[i] |
+| --- | --- | --- | --- | --- |
+| 1 | 0 | 1 | 0 | `0 + 1 = 1` |
+| 2 | 1 | 0 | 1 | `1 + 0 = 1` |
+| 3 | 1 | 1 | 1 | `1 + 1 = 2` |
+| 4 | 2 | 0 | 1 | `1 + 0 = 1` |
+| 5 | 2 | 1 | 1 | `1 + 1 = 2` |
+| 6 | 3 | 0 | 2 | `2 + 0 = 2` |
+| 7 | 3 | 1 | 2 | `2 + 1 = 3` |
+| 8 | 4 | 0 | 1 | `1 + 0 = 1` |
+
+Final `bits = [0, 1, 1, 2, 1, 2, 2, 3, 1]`.
+
+Midway through, computing `bits[8]`: it reads `bits[4]`, already filled in three steps earlier —
+the array being built is also the array being read from:
+
+<Cells
+  data={[0, 1, 1, 2, 1, 2, 2, 3, '·']}
+  pointers={{ 8: [{ t: 'i', c: 'amber' }], 4: [{ t: 'src', c: 'cyan' }] }}
+  cells={{ 4: 'mid', 8: 'dim' }}
+  caption="bits[8] = bits[4] + (8 & 1) = 1 + 0 = 1 — index 4 was filled at step i=4, long before i=8 needs it"
+/>
+
+## why it works
+
+Every non-negative integer `i` can be split into "everything above the lowest bit" and "the
+lowest bit itself." Shifting right by one discards exactly the lowest bit and nothing else,
+which is precisely the popcount-minus-zero-or-one relationship the recurrence encodes. Because
+`i >> 1 < i` whenever `i ≥ 1`, a simple increasing loop over `i` is a valid evaluation order —
+every dependency is already resolved by the time it's needed, the same bottom-up discipline as
+any 1D DP table.
+
+<Watch items={[['time', 'O(n)'], ['space', 'O(n) output, O(1) extra']]} />
+
+## common bugs
+
+- Starting the loop at `i = 0` instead of `i = 1` — `bits[0]` is the base case; recomputing it
+  from `bits[0 >> 1]` is harmless (`0 >> 1 == 0`) but signals you don't see it as a base case,
+  and off-by-one variants of this mistake aren't always as harmless.
+- Allocating `new int[n]` instead of `new int[n + 1]` — the range is `0..n` inclusive, so you
+  need `n + 1` slots, not `n`.
+- Filling the array out of order (e.g. recursively without memoizing, or top-down without a
+  cache) — the recurrence only works if `bits[i >> 1]` is guaranteed already computed.
+- Falling back to the `O(n log n)` "call the Number of 1 Bits loop for every `i`" approach under
+  time pressure instead of spotting the shared structure between neighboring values.
+
+## variants you can now solve
+
+- **[Number of 1 Bits](/patterns/bit-manipulation/number-of-1-bits/)** (LC 191) — the single-value
+  version this problem reuses `n log n` times over if you don't spot the DP recurrence.
+- **Reverse Bits** (LC 190) — no counting involved, but the same "process 32 bits with shifts"
+  mechanics: build the answer bit by bit, `(result << 1) | (n & 1)`, shifting `n` right each time.
+- **Sum of Two Integers** (LC 371) — add two integers without `+`: XOR gives the sum-without-carry,
+  `(a & b) << 1` gives the carry, loop the two together until the carry is zero.

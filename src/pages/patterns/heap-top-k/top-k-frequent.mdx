@@ -1,0 +1,145 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: heap-top-k
+problem: top-k-frequent
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import Cells from '@components/Cells.astro';
+
+## task
+
+Given an integer array `nums` and an integer `k`, return the `k` most frequent elements. Any
+order in the returned array is acceptable. LeetCode #347.
+
+```text
+nums = [1, 1, 1, 2, 2, 3], k = 2  →  [1, 2]
+```
+
+## how to think
+
+Two passes. First, build a frequency map — the [hashmap](/patterns/hashmap/) pattern,
+`value -> count`. Second, you need the K values with the largest counts. Sorting all `d` distinct
+values by frequency is `O(d log d)`; a heap capped at size K brings that down to `O(d log k)`.
+The key move: the heap's priority is the **frequency**, a derived quantity, not the value
+itself — this is the exact same bounded-heap template as
+[Kth Largest Element](/patterns/heap-top-k/kth-largest-element/), just keyed differently.
+
+There's an `O(n)` alternative with no log factor at all, because frequency is bounded: no value
+can appear more than `nums.Length` times. That means you can **bucket sort by count** — an array
+of buckets indexed `0..n`, each holding every value with that exact frequency — then walk the
+buckets from the top down until you've collected k values.
+
+<Callout kind="note" label="template instance">
+  **Bounded min-heap (size K)**, keyed by a derived priority (frequency) instead of the
+  element's own value. Invariant: identical to Kth Largest Element's — the heap holds the K
+  entries with the largest key seen so far.
+</Callout>
+
+## solution
+
+```csharp
+public int[] TopKFrequent(int[] nums, int k)
+{
+    var freq = new Dictionary<int, int>();
+    foreach (var n in nums)
+        freq[n] = freq.GetValueOrDefault(n) + 1;
+
+    var heap = new PriorityQueue<int, int>();   // min-heap keyed by frequency, not value
+
+    foreach (var (value, count) in freq)
+    {
+        heap.Enqueue(value, count);
+        if (heap.Count > k) heap.Dequeue();      // evict the least frequent of the club
+    }
+
+    var result = new int[k];
+    for (int i = k - 1; i >= 0; i--) result[i] = heap.Dequeue();
+    return result;
+}
+```
+
+## trace
+
+`nums = [1, 1, 1, 2, 2, 3]`, `k = 2`. The frequency map builds in insertion order:
+`{1:3, 2:2, 3:1}`.
+
+| push (value:freq) | heap after push | evicted | heap after evict |
+| --- | --- | --- | --- |
+| `1:3` | `{1:3}` | — | `{1:3}` |
+| `2:2` | `{2:2,1:3}` | — | `{2:2,1:3}` |
+| `3:1` | `{3:1,1:3,2:2}` | `3:1` | `{1:3,2:2}` |
+
+Draining the heap gives `[1, 2]` (order is irrelevant to the problem). Of the three distinct
+values, only two heap slots exist — `3` has the lowest frequency and loses its spot the moment
+it's pushed:
+
+<Cells
+  data={[1, 2, 3]}
+  cells={{ 0: 'win', 1: 'win', 2: 'warn' }}
+  caption="3 distinct values compete for 2 heap slots — value 3 (frequency 1) gets evicted"
+/>
+
+## why it works
+
+Same induction as [Kth Largest Element](/patterns/heap-top-k/kth-largest-element/), just applied
+to the priority instead of the raw value: after processing all `d` distinct entries, a
+size-bounded min-heap keyed by frequency holds the K entries with the K largest frequencies —
+which is, by definition, the K most frequent elements.
+
+**The bucket-sort alternative.** Frequency can't exceed `nums.Length`, so instead of a heap,
+group values by their exact count and read off the top buckets first:
+
+```csharp
+public int[] TopKFrequentBucket(int[] nums, int k)
+{
+    var freq = new Dictionary<int, int>();
+    foreach (var n in nums)
+        freq[n] = freq.GetValueOrDefault(n) + 1;
+
+    var buckets = new List<int>?[nums.Length + 1];   // frequency can't exceed nums.Length
+    foreach (var (value, count) in freq)
+        (buckets[count] ??= []).Add(value);
+
+    var result = new int[k];
+    int idx = 0;
+    for (int f = buckets.Length - 1; f >= 1 && idx < k; f--)
+    {
+        if (buckets[f] is null) continue;
+        foreach (var v in buckets[f]!)
+        {
+            if (idx == k) break;      // a bucket can hold more than one value — don't overshoot k
+            result[idx++] = v;
+        }
+    }
+    return result;
+}
+```
+
+No comparisons at all — just an array walk — so it's `O(n)` overall instead of `O(n log k)`.
+The heap version stays the one to reach for first in an interview, because it generalizes to
+"top K by any comparable key" without a bounded-range assumption:
+
+<Watch items={[['time', 'O(n log k)'], ['space', 'O(n)']]} />
+
+## common bugs
+
+- Keying the heap by the **value** instead of its **count** — that solves a different problem
+  (the K largest numbers, not the K most frequent).
+- Sizing the bucket array as `new List<int>[k + 1]` instead of `nums.Length + 1` — frequency is
+  bounded by the array length, not by k.
+- `AddRange`-ing an entire bucket without capping at k — one bucket can hold several tied
+  values, and blindly draining it can push the result past the requested count.
+- Returning early once `heap.Count == k` inside the build loop — you still have to keep pushing
+  and evicting for every remaining distinct value, or a later, more-frequent value never gets
+  the chance to compete.
+
+## variants you can now solve
+
+- [Kth Largest Element in an Array](/patterns/heap-top-k/kth-largest-element/) (LC 215) — same
+  heap, keyed by the raw value instead of a derived count.
+- **Top K Frequent Words** (LC 692) — identical idea plus a tie-break: equal frequency sorts
+  lexicographically.
+- **Task Scheduler** (LC 621) — frequency counting again as the setup step, but the greedy
+  scheduling that follows is a different problem — worth knowing the counting step is reusable.

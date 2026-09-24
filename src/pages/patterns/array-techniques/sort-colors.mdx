@@ -1,0 +1,132 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: array-techniques
+problem: sort-colors
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import Cells from '@components/Cells.astro';
+
+## task
+
+Given an array `nums` where every value is `0`, `1`, or `2`, sort it in place so all `0`s come
+first, then all `1`s, then all `2`s. One pass, O(1) extra space — no calling a general sort.
+
+```text
+nums = [2, 0, 2, 1, 1, 0]  →  [0, 0, 1, 1, 2, 2]
+```
+
+## how to think
+
+A general sort is O(n log n) and doesn't use the fact that there are only three distinct
+values. Counting sort would work — count the 0s, 1s, and 2s, then overwrite the array — but
+that's two passes. The one-pass version is the read/write skeleton from
+[two pointers](/patterns/two-pointers/) generalized from **two** regions to **three**: instead
+of one boundary splitting "keep" from "discard", you need two boundaries splitting "0s" from
+"1s" from "2s" — Dutch National Flag.
+
+Three pointers do it: `low` is the front of the 0s region, `high` is the back of the 2s region,
+`mid` scans everything still unclassified between them. Look at `nums[mid]`: a `0` swaps out to
+`low` and grows the front region; a `2` swaps out to `high` and grows the back region; a `1` is
+already home, so `mid` just moves on. The loop ends when `mid` passes `high` — everything
+between them has been classified.
+
+<Callout kind="note" label="template instance">
+  **Dutch National Flag** (three-way partition) skeleton, verbatim. Invariant: `[0, low)` is
+  all 0s, `[low, mid)` is all 1s, `(high, end]` is all 2s — only `[mid, high]` is still
+  unknown. Move rule: `0` → swap with `low`, advance both; `1` → advance `mid` alone; `2` →
+  swap with `high`, shrink the frame from the right.
+</Callout>
+
+## solution
+
+```csharp
+public void SortColors(int[] nums)
+{
+    int low = 0, mid = 0, high = nums.Length - 1;
+
+    while (mid <= high)
+    {
+        switch (nums[mid])
+        {
+            case 0:
+                (nums[low], nums[mid]) = (nums[mid], nums[low]);
+                low++;
+                mid++;              // swapped-in value came from the "known 1s" region — safe to advance
+                break;
+            case 1:
+                mid++;              // already home
+                break;
+            default: // 2
+                (nums[mid], nums[high]) = (nums[high], nums[mid]);
+                high--;             // mid does NOT advance: the swapped-in value is unexamined
+                break;
+        }
+    }
+}
+```
+
+## trace
+
+`nums = [2, 0, 2, 1, 1, 0]`:
+
+| step | nums[mid] before | action | low | mid | high | nums (after) |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | 2 | swap(mid, high) | 0 | 0 | 4 | `[0, 0, 2, 1, 1, 2]` |
+| 2 | 0 | swap(low, mid), low++, mid++ | 1 | 1 | 4 | `[0, 0, 2, 1, 1, 2]` |
+| 3 | 0 | swap(low, mid), low++, mid++ | 2 | 2 | 4 | `[0, 0, 2, 1, 1, 2]` |
+| 4 | 2 | swap(mid, high) | 2 | 2 | 3 | `[0, 0, 1, 1, 2, 2]` |
+| 5 | 1 | mid++ | 2 | 3 | 3 | `[0, 0, 1, 1, 2, 2]` |
+| 6 | 1 | mid++ | 2 | 4 | 3 | `[0, 0, 1, 1, 2, 2]` |
+
+`mid (4) > high (3)` — loop ends.
+
+Steps 2 and 3 swap an index with itself (`low == mid` before the swap) — a real no-op that the
+invariant still accounts for correctly.
+
+<Cells
+  data={[0, 0, 2, 1, 1, 2]}
+  pointers={{ 2: [{ t: 'M', c: 'purple' }], 4: [{ t: 'H', c: 'cyan' }] }}
+  cells={{ 0: 'win', 1: 'win', 5: 'warn' }}
+  caption="after step 3: [0,low) settled as 0s, mid about to see a 2 — that swap won't advance mid"
+/>
+
+<Cells
+  data={[0, 0, 1, 1, 2, 2]}
+  cells={{ 0: 'win', 1: 'win', 2: 'ok', 3: 'ok', 4: 'warn', 5: 'warn' }}
+  caption="final: three regions settled in one pass, six elements, four swaps"
+/>
+
+## why it works
+
+The three-region invariant — `[0, low)` all 0, `[low, mid)` all 1, `(high, end]` all 2 — holds
+before and after every iteration. A `0` at `mid` swaps with `low`: the value coming back from
+`low` is guaranteed to be a `1` (that's what the `[low, mid)` region holds), so placing it at
+`mid` and advancing both pointers keeps the invariant true. A `2` at `mid` swaps with `high`,
+but the value coming back from `high` hasn't been classified yet — it could be a 0, 1, or 2 —
+so `mid` must stay put and look at it again next iteration. That asymmetry is the entire trick:
+one swap direction is "safe to skip past", the other isn't.
+
+<Watch items={[['time', 'O(n)'], ['space', 'O(1)'], ['passes', '1']]} />
+
+## common bugs
+
+- Advancing `mid` after a swap with `high` — the value swapped in is unexamined and might
+  itself be a `2` that now sits unprocessed inside the "unknown" region.
+- Using `while (mid < high)` instead of `while (mid <= high)` — drops the last unclassified
+  element from consideration.
+- Comparing against `high` after it's already moved — recompute the loop condition each
+  iteration, don't cache a stale value.
+- Treating this as "just count and overwrite" when the values aren't literally `0/1/2` but
+  three arbitrary categories — the counting-sort shortcut only works because the range is small
+  and known; the DNF pointers work for any three-way classification.
+
+## variants you can now solve
+
+- **[Move Zeroes](/patterns/array-techniques/move-zeroes/)** (LC 283) — the two-region special
+  case of this same idea: only `low`/`write` and a single boundary, no `high`.
+- **Sort Colors II — K colors** — generalize to `k` categories: either `k - 1` passes of this
+  two-pointer partition, or a full counting sort if `k` is large.
+- **Wiggle Sort** (LC 280) — a different one-pass in-place rearrangement; no fixed alphabet, so
+  the move rule is a local swap based on comparing neighbors instead of classifying into buckets.

@@ -1,0 +1,349 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: memory-model
+problem: the-reordering-test
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import Solution from '@components/Solution.astro';
+
+## the code
+
+Two background workers in the same process both want to run the nightly index rebuild. Only one
+of them may. Taking a lock was rejected in review — the flags are touched on a path that must not
+block, and the author had an argument that no lock is needed.
+
+<Solution>
+
+```csharp
+static class Rebuilder
+{
+    static bool aWants, bWants;                        // shared, no lock
+    static int rebuilds;
+
+    static void WorkerA()
+    {
+        aWants = true;                                 // announce that I want it
+        if (!bWants) Rebuild();                        // nobody else does? then it is mine
+    }
+
+    static void WorkerB()
+    {
+        bWants = true;
+        if (!aWants) Rebuild();
+    }
+
+    static void Rebuild() => Interlocked.Increment(ref rebuilds);
+}
+```
+
+</Solution>
+
+The argument in the pull request, and it is a good one:
+
+> Each worker sets its own flag **before** it reads the other's. So if A reads `bWants` as false,
+> B had not set its flag yet — which means B has not read `aWants` yet either, and when it does,
+> `aWants` is already true, so B backs off. Symmetrically for B. The worst case is that both back
+> off and the rebuild is skipped, which is safe: the scheduler will retry in an hour.
+
+Enumerate the six ways those four operations can interleave and the argument holds every time:
+
+| interleaving | A reads `bWants` as | B reads `aWants` as | who rebuilds |
+| --- | --- | --- | --- |
+| A1 A2 B1 B2 | false | true | A only |
+| A1 B1 A2 B2 | true | true | neither |
+| A1 B1 B2 A2 | true | true | neither |
+| B1 A1 A2 B2 | true | true | neither |
+| B1 A1 B2 A2 | true | true | neither |
+| B1 B2 A1 A2 | true | false | B only |
+
+Two interleavings elect one worker, four elect none, and **no interleaving elects two**.
+
+## find it
+
+<Callout kind="insight" label="before you scroll">
+  The code above is not broken by an interleaving — the table proves that, and it is complete.
+  Commit to an answer before reading on:
+
+  1. Can both workers rebuild? If yes, what happened, given that no interleaving of the four
+     operations produces it?
+  2. Marking both fields `volatile` is the first fix anyone suggests. Does it work? Reason about
+     which of the four reorderings a `volatile` write/read pair actually forbids.
+  3. Which of the three guarantees — atomicity, visibility, ordering — is missing here? Exactly
+     one of them is.
+</Callout>
+
+## the failure
+
+The two workers were run head-to-head, 500,000 trials, each trial resetting the flags and
+releasing both threads from a `Barrier` so they enter the window together. Real output from one
+run of `bench/memory-model/the-reordering-test.cs`:
+
+```text
+=== the test you would have written: fresh threads per trial ===
+  two threads started and joined per trial      both:       0 / 20,000
+
+=== the reviewed version, 500,000 trials ===
+  plain bool fields                          both:   9,387  exactly one:  490,613  neither:        0   first double at trial 23
+  FAIL: two leaders elected in 9,387 of 500,000 trials (1.877%) — the rebuild ran twice.
+```
+
+The harness then runs the remaining rows before it does anything about that (shown under "the
+fix" below), and then throws for real: the run ends `Unhandled exception. System.Exception: two
+leaders elected in 9,387 of 500,000 trials — the reviewed code is broken.` The exact count moves
+from run to run — this is a race, not a deterministic quantity, and rerunning the file will print
+a different number in a different trial. What does not move is the shape: the plain-field row is
+never zero, and the rows under "fixes that hold" further down are.
+
+Read the two blocks together, because the pair is the real lesson.
+
+The first block is the test an engineer actually writes: create two threads, start them, join
+them, check. It found **zero** double-elections in 20,000 trials. Creating a thread costs tens of
+microseconds, so the two bodies are never in flight at the same time; by the time B starts, A has
+finished and its store has long since drained. A test shaped like that will pass forever.
+
+The second block replaces per-trial thread creation with two long-lived threads meeting at a
+barrier, which puts both bodies inside the same few nanoseconds on two different cores. Only then
+does the bug show up — first within the first few dozen trials, every time this has been run.
+
+That is the whole reason this class of bug reaches production: the failure needs two cores inside
+the same nanosecond-wide window, and every convenient way to write a test destroys the window.
+
+Now the timeline. There is no interleaving of the four source operations that elects two workers,
+so the table has to describe something the source does not mention — the per-core **store
+buffer**, the queue a write sits in before it reaches the cache.
+
+| step | core 0 — worker A | core 1 — worker B | A's store buffer | B's store buffer | what the cache holds |
+| --- | --- | --- | --- | --- | --- |
+| 1 | `aWants = true` | — | `aWants=true` queued | empty | `aWants=false`, `bWants=false` |
+| 2 | — | `bWants = true` | `aWants=true` queued | `bWants=true` queued | `aWants=false`, `bWants=false` |
+| 3 | reads `bWants` — not in its own buffer, so it goes to cache | — | `aWants=true` queued | `bWants=true` queued | `aWants=false`, `bWants=false` |
+| 4 | gets **false** | reads `aWants` from cache, gets **false** | `aWants=true` queued | `bWants=true` queued | `aWants=false`, `bWants=false` |
+| 5 | enters the rebuild | enters the rebuild | drains | drains | `aWants=true`, `bWants=true` |
+| 6 | — | — | empty | empty | both true — too late to help anyone |
+
+Every row is what the hardware did. Neither core violated its own program order: A's store really
+did execute before A's load. What is missing is any guarantee that A's store became *visible to
+core 1* before A's load ran.
+
+## why it breaks
+
+A store does not go to the cache. It goes into a small per-core FIFO called the store buffer, so
+the core can continue without waiting for the cache line to arrive in a writable state — a wait
+that costs the core dozens of otherwise-productive cycles. The buffer drains into the cache later,
+in order.
+
+A load from the same core checks that core's own store buffer first, which is why a thread always
+sees its own writes immediately and why single-threaded code cannot tell any of this is happening.
+A load from a *different* core cannot see the buffer at all. So between the moment you execute a
+store and the moment another core can observe it, there is a window, and in that window your store
+does not exist as far as anyone else is concerned.
+
+That is **StoreLoad reordering**: a later load appears to have executed before an earlier store.
+It is the one of the four possible reorderings that x86-64 permits — the architecture forbids
+StoreStore, LoadLoad and LoadStore, which is why so much sloppy concurrent code works on Intel and
+AMD. [The memory model page](/systems/memory-model/) has the full table.
+
+Two things this is *not*, both of which get guessed.
+
+**It is not a compiler reordering.** The JIT emitted the store before the load, exactly as
+written. Real disassembly of `A_Broken` from this file, obtained with
+`DOTNET_JitDisasm=A_Broken DOTNET_JitDisasmDiffable=1 dotnet run` (the diffable flag replaces
+address constants with `(reloc)`; nothing else is edited):
+
+```text
+; Assembly listing for method Claim:A_Broken() (FullOpts)
+       mov      byte  ptr [(reloc)], 1     ; aWants = true
+       cmp      byte  ptr [(reloc)], 0     ; if (!bWants) — the load is AFTER the store
+       jne      SHORT G_M000_IG04
+       mov      dword ptr [(reloc)], 1
+       ret
+```
+
+**It is not a cache coherence failure.** Caches are coherent: there is one agreed value per line,
+and A's write reaches core 1 as soon as it leaves the buffer, with no extra action from anybody.
+Nobody is reading a stale cache. Both loads read the genuinely current value — the writes had
+simply not been published yet.
+
+The bug is that Dekker's argument assumes **sequential consistency** — the single global order of
+memory operations that every thread agrees on, defined on
+[the memory model page](/systems/memory-model/). No mainstream CPU provides it by default, because
+providing it means stalling on every store.
+
+## the fix
+
+The missing guarantee is ordering, specifically store-then-load ordering, and the instruction that
+supplies it is a full fence.
+
+<Solution>
+
+```csharp
+static class Rebuilder
+{
+    static bool aWants, bWants;
+    static int rebuilds;
+
+    static void WorkerA()
+    {
+        aWants = true;
+        Interlocked.MemoryBarrier();   // drain my store before my load runs. both threads, or neither works.
+        if (!bWants) Rebuild();
+    }
+
+    static void WorkerB()
+    {
+        bWants = true;
+        Interlocked.MemoryBarrier();
+        if (!aWants) Rebuild();
+    }
+
+    static void Rebuild() => Interlocked.Increment(ref rebuilds);
+}
+```
+
+</Solution>
+
+`Interlocked.MemoryBarrier()` compiles on x86-64 to `lock or dword ptr [rsp], 0` — a locked
+read-modify-write of a byte nobody cares about, whose only purpose is the `lock` prefix. The
+prefix forces the store buffer to drain before any later load on that core may be satisfied. It is
+not a lock in the `Monitor` sense — it blocks nothing and takes no wait queue.
+
+The same run pasted above, continued — every fix, same 500,000 trials, same file:
+
+```text
+=== the fixes people reach for first ===
+  volatile bool fields                       both:   1,334  exactly one:  498,660  neither:        6   first double at trial 10
+  Volatile.Write / Volatile.Read             both:   8,103  exactly one:  491,897  neither:        0   first double at trial 5
+
+=== fixes that hold ===
+  Interlocked.MemoryBarrier() after the write both:       0  exactly one:  495,004  neither:    4,996   first double at trial -1
+  one word, Interlocked.CompareExchange      both:       0  exactly one:  500,000  neither:        0   first double at trial -1
+  lock (gate) around both lines              both:       0  exactly one:  500,000  neither:        0   first double at trial -1
+```
+
+Rerun the file and every "both" count above will print a different exact number — they are race
+outcomes, not constants. What is stable, and what the table is for, is which rows are capable of
+printing anything other than zero in the "both" column. `volatile` and `Volatile.Write`/
+`Volatile.Read` both belong on that list, every time. `Interlocked.MemoryBarrier()`,
+`CompareExchange` and `lock` do not — their "both" column is not "usually zero", it is
+structurally zero, because none of them contains the reordering the bug needs.
+
+**Why `volatile` is not the fix.** It is the first thing everyone tries, and the "both" count above
+shows it still happening. A `volatile` write is a release store and a `volatile` read is an acquire
+load. Release means "nothing before me moves after me"; acquire means "nothing after me moves
+before me". Neither says anything about a store followed by a *later* load — that is precisely the
+pair they leave unconstrained. On x86-64 the JIT emits a plain `mov` for a volatile write and a
+plain `mov` for a volatile read — the same instructions the plain version gets — which is why
+marking the fields `volatile` does not remove the row from the "sometimes both" list.
+
+**Why `Volatile.Write`/`Volatile.Read` is not the fix either.** Same semantics, different
+spelling: still on the "sometimes both" list, for the same reason. These are the method forms of
+the same release/acquire contract. They are useful when you want the guarantee on a single access
+rather than on every access to a field — and they are useless here for exactly the same reason.
+
+**Why `lock` works but is not the answer.** Structurally zero, and it also gives atomicity and
+visibility for free. But it serialises both workers through one monitor on a path the review
+explicitly did not want to block.
+
+**What you should actually write.** The whole handshake is a hand-rolled Dekker, and Dekker's
+algorithm was published in 1965 because the hardware of the day had no atomic read-modify-write
+instruction. Yours does:
+
+<Solution>
+
+```csharp
+static class Rebuilder
+{
+    static int claimed;                                     // 0 = free, 1 = taken
+    static int rebuilds;
+
+    static void Worker()
+    {
+        // one indivisible operation: read, compare, and write, with nothing in between.
+        // exactly one caller in the process sees 0 come back. no fence to forget.
+        if (Interlocked.CompareExchange(ref claimed, 1, 0) == 0) Rebuild();
+    }
+
+    static void Rebuild() => Interlocked.Increment(ref rebuilds);
+}
+```
+
+</Solution>
+
+One shared word instead of two, one operation instead of two, and one code path instead of two
+mirror-image ones. Its "both" column is not just zero on this run — it is structurally zero,
+because `CompareExchange` on one shared word means exactly one caller in the process can ever see
+the value transition from `0` to `1`; there is no pair of reads to race. Now look at the column the
+fenced version loses on instead: in the run pasted above the fenced fix backs off on *both* sides
+in 4,996 of 500,000 trials, because when both workers announce inside the same window, both
+correctly see the other and both decline. That is not a bug in the fence; it is a property of the
+algorithm — the fence fixes the *ordering* bug and leaves behind the *livelock* the algorithm
+always had. `CompareExchange` does not have that failure mode: somebody always wins.
+[Atomics and compare-and-swap](/systems/atomics-and-cas/) is what that one instruction is doing.
+
+<Watch items={[['guarantee missing', 'ordering'], ['reordering', 'StoreLoad'], ['naive test finds', '0 in 20,000'], ['volatile fixes it', 'no'], ['fence emits', 'lock or'], ['fix', 'CompareExchange']]} />
+
+## what this looks like in prod
+
+The literal two-flag handshake is rare. Its shape is everywhere, and it is always some version of
+*announce, then check whether anyone else announced*:
+
+- A distributed lock implemented over a cache: write my node id, read the key back, and if it is
+  still mine, proceed. Same store-then-load, one network hop longer.
+- A "leader" flag in a static field so a singleton background job runs on exactly one instance of
+  a scaled-out service.
+- A cheap re-entrancy guard: set `_running = true`, check whether the other end already set it,
+  proceed if not.
+- Double-checked locking written by hand, which is the same shape with the second check inside a
+  lock. It has an additional problem the fence does not fix — the reader can obtain a non-null
+  reference to an object whose constructor has not finished publishing its fields — and that one
+  needs the field to be `volatile` so the write is a release. `Lazy<T>` exists so you never write
+  it; [races and deadlock](/systems/concurrency-hazards/) has the full version.
+
+The symptom in production is not a crash and not a metric. It is a duplicate: two rebuild entries
+in the log a millisecond apart, a job whose output is written twice, a counter that is exactly
+double for one hour a month. Nobody can reproduce it locally, the test suite passes, and the rate
+tracks traffic — so it appears after a growth milestone and looks like a regression in whatever
+shipped that week.
+
+When you suspect this shape, the diagnostic is not a debugger — attaching one adds delays that
+close the window. It is to write the barrier-forced harness above: two long-lived threads meeting
+at a `Barrier`, hundreds of thousands of trials. If the code is racy, that harness finds it within
+the first few dozen trials, as it did here.
+
+## the same idea in other languages
+
+| language | what it's called | the trap |
+| --- | --- | --- |
+| Java | `volatile`, since JSR-133 | Java's `volatile` really is a full fix for this: a volatile write followed by a volatile read is sequentially consistent, so the same litmus ported line for line and marked `volatile` in Java shows no double-election, run after run — where C#'s `volatile` leaves the bug in place. "We did it this way in Java" is not evidence in a C# review |
+| C++ | `std::atomic<T>` with `memory_order` | the default `seq_cst` makes this code correct with no thought, but the common "optimisation" of weakening the store to `memory_order_release` and the load to `memory_order_acquire` reintroduces exactly this bug. `std::atomic_thread_fence(std::memory_order_seq_cst)` is the equivalent of the fix above |
+| C | `volatile` | gives no ordering whatsoever — it only stops the compiler caching the value in a register. A handshake like this written with `volatile int` in C is broken on every architecture including x86, and it is the classic reason hand-rolled C spinlocks are wrong |
+| Go | `sync/atomic`, or the recommended answer, `sync.Once` | Go's atomics are sequentially consistent — the ported litmus shows no double-election under `sync/atomic` — but the `sync/atomic` documentation still tells you to prefer channels or `sync`. The idiomatic Go version of the fix is `sync.Once`, which is exactly what `Interlocked.CompareExchange` is doing above |
+
+## common bugs
+
+- **Testing it with a thread per trial.** Twenty thousand trials, zero failures — and a
+  completely broken program. Thread startup is thousands of times longer than the window the bug
+  needs. Any concurrency test that creates its threads inside the loop is measuring the scheduler,
+  not your code.
+- **Reaching for `volatile` because the variable is shared.** `volatile` fixes visibility — the
+  read actually happens — and gives release/acquire ordering. It does not order a store against a
+  later load, does not make anything atomic, and cannot even be applied to `long` or `double`.
+  Two of the three guarantees is not thread-safety.
+- **Concluding the fence is the fix and stopping there.** The fenced version is correct and still
+  fails to run the rebuild some of the time, because both workers politely back off. A correct
+  algorithm with a livelock is a different bug, not a fixed one. Watch the "neither" column, not
+  just the "both" column.
+- **Assuming a low observed rate means low risk.** The harness above is built to maximise the
+  window; in production the same bug might surface once in ten million requests. That is not
+  "rare enough to ignore" — it is "will happen several times a day at scale, and never once while
+  you are watching".
+- **Believing it works because it has worked for years.** It has worked because x86-64 forbids
+  three of the four reorderings and the one it allows needs a narrow window. Move the same binary
+  to ARM64 — an Apple Silicon laptop, a Graviton node — and the guarantees you were leaning on
+  without knowing it are gone.
+- **Adding `Thread.Sleep(0)` or `Thread.Yield()` between the write and the read and declaring it
+  fixed.** Both happen to contain enough machinery to drain the store buffer, so the symptom goes
+  away, and neither is a documented ordering guarantee. You have converted a reproducible bug into
+  one that comes back when the runtime changes.

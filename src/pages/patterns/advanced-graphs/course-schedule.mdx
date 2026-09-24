@@ -1,0 +1,138 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: advanced-graphs
+problem: course-schedule
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+
+## task
+
+There are `numCourses` labeled `0` to `numCourses - 1`. `prerequisites[i] = [a, b]` means to
+take course `a` you must first take course `b`. Return `true` if it's possible to finish every
+course, `false` if the requirements are impossible to satisfy. LeetCode #207.
+
+```text
+numCourses = 2, prerequisites = [[1, 0]]            →  true   (take 0, then 1)
+numCourses = 2, prerequisites = [[1, 0], [0, 1]]    →  false  (each needs the other first)
+```
+
+## how to think
+
+Model each prerequisite as a directed edge `b → a` — "`b` before `a`." "Can every course be
+finished" is then exactly "does this directed graph have a cycle?" A graph with no cycle (a DAG)
+can always be linearized into a valid order; a cycle means every course on it is permanently
+blocked, each waiting on the next one in the loop to go first.
+
+Kahn's algorithm turns that observation into a constructive check instead of a separate
+cycle-detection pass. Track each course's **in-degree** — how many prerequisites it still has
+outstanding. A course at in-degree `0` has nothing blocking it, so enqueue it and "take" it;
+taking it lowers the in-degree of everything that depended on it, possibly unblocking those too.
+Keep peeling off zero-in-degree courses. If every course eventually gets processed, no cycle
+existed. If the queue empties with courses still stuck at a positive in-degree, those courses —
+and only those — are wedged in a cycle no traversal order can escape.
+
+<Callout kind="note" label="template instance">
+  **Topological sort (Kahn's)** skeleton, verbatim. Invariant: a course sits in the queue exactly
+  when every one of its prerequisites has already been processed. What varies: this problem only
+  needs the *count* processed —
+  [Course Schedule II](/patterns/advanced-graphs/course-schedule-ii/) needs the dequeue *order*
+  itself.
+</Callout>
+
+## solution
+
+```csharp
+public bool CanFinish(int numCourses, int[][] prerequisites)
+{
+    var graph = new List<int>[numCourses];
+    var inDegree = new int[numCourses];
+    for (int i = 0; i < numCourses; i++) graph[i] = [];
+
+    foreach (var p in prerequisites)
+    {
+        graph[p[1]].Add(p[0]);      // p[1] must come before p[0]
+        inDegree[p[0]]++;
+    }
+
+    var queue = new Queue<int>();
+    for (int i = 0; i < numCourses; i++)
+        if (inDegree[i] == 0) queue.Enqueue(i);   // no prerequisites — safe to start
+
+    int processed = 0;
+    while (queue.Count > 0)
+    {
+        int node = queue.Dequeue();
+        processed++;
+        foreach (var next in graph[node])
+            if (--inDegree[next] == 0) queue.Enqueue(next);   // this dependency is now satisfied
+    }
+
+    return processed == numCourses;   // fewer than all courses processed => a cycle exists
+}
+```
+
+## trace
+
+`numCourses = 6`, `prerequisites = [[1,0],[2,0],[3,1],[3,2],[4,3],[5,4]]`:
+
+```text
+      1
+    ↗   ↘
+  0       3 → 4 → 5
+    ↘   ↗
+      2
+```
+
+Initial in-degree: `[0, 1, 1, 2, 1, 1]`. Initial queue: `[0]`.
+
+| step | dequeue | processed | in-degree updates | queue after |
+| --- | --- | --- | --- | --- |
+| 1 | 0 | 1 | `1: 1→0`, `2: 1→0` | `[1, 2]` |
+| 2 | 1 | 2 | `3: 2→1` | `[2]` |
+| 3 | 2 | 3 | `3: 1→0` | `[3]` |
+| 4 | 3 | 4 | `4: 1→0` | `[4]` |
+| 5 | 4 | 5 | `5: 1→0` | `[5]` |
+| 6 | 5 | 6 | — | `[]` |
+
+`processed == 6 == numCourses` → `true`.
+
+## why it works
+
+By induction on the number of courses processed: a course only leaves the queue after every
+course it depends on already has, and — transitively — after every course *those* depend on
+already has, all the way back to courses with no prerequisites at all. So `processed` reaching
+`numCourses` proves a full valid order exists. Conversely, any course still stuck at the end has
+an in-degree that never hit zero, which means tracing its outstanding prerequisites forever
+leads back to itself — a cycle, by definition.
+
+The equivalent DFS view, if you'd rather reach for it: color every course white. DFS from each
+white course, marking it gray on entry, black on exit. Walking into a gray course means you've
+hit a back edge — a cycle, since gray means "still on the current call stack." Finishing every
+DFS without ever seeing gray-on-gray means the graph is acyclic. Same answer, opposite proof
+style: Kahn's confirms acyclicity by successfully building a full order; DFS-coloring confirms it
+by failing to find a back edge.
+
+<Watch items={[['time', 'O(V + E)'], ['space', 'O(V + E)']]} />
+
+## common bugs
+
+- Building the edge backwards — `graph[p[0]].Add(p[1])` instead of `graph[p[1]].Add(p[0])` —
+  which silently reverses the whole dependency direction.
+- Forgetting to check `processed == numCourses` and just returning `true` after the loop
+  unconditionally — a cycle leaves the queue empty early, and that's the only signal you get.
+- Incrementing/decrementing in-degree but enqueueing on every touch instead of only when it hits
+  exactly `0` — that reprocesses courses and inflates `processed` past the true count.
+- Assuming a course can't depend on itself. `prerequisites = [[0, 0]]` is legal input and
+  deadlocks course `0` at in-degree `1` forever — the algorithm handles it correctly as long as
+  you don't special-case it away.
+
+## variants you can now solve
+
+- [Course Schedule II](/patterns/advanced-graphs/course-schedule-ii/) (LC 210) — same BFS;
+  record the dequeue order instead of just counting it.
+- **Course Schedule III** (LC 630) — same dependency idea, now with durations and deadlines —
+  greedy plus a heap, not a plain topo sort.
+- [Number of Provinces](/patterns/advanced-graphs/number-of-provinces/) (LC 547) — undirected
+  connectivity instead of directed ordering; union-find replaces Kahn's entirely.

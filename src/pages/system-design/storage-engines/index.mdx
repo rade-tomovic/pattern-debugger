@@ -1,0 +1,340 @@
+---
+layout: '@layouts/TopicLayout.astro'
+topic: storage-engines
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+
+## the ground floor
+
+- **page** — the fixed-size unit (typically 4 KiB or 8 KiB) that a storage engine reads and
+  writes as one block. It exists because the OS page and the disk's own block size are that
+  size — [Caches & the Memory Hierarchy](/systems/memory-hierarchy/) is where that number comes
+  from; this page is where it shows up again, one layer up.
+- **write-ahead log (WAL)** — an append-only file that records every mutation before it is
+  applied to the data structure proper. Crash recovery replays it; nothing else has to be
+  durable at the moment of the write.
+- **amplification** — the ratio between the logical work a write or read represents and the
+  physical I/O it actually costs. There are three kinds, and every storage engine trades between
+  them; none is free to eliminate.
+- **compaction** — background rewriting of on-disk data to keep read cost and space bounded.
+  It is not cleanup — it is the mechanism paying off a debt the engine took on at write time.
+
+## core idea
+
+A storage engine's whole job is turning a stream of writes into something a point or range
+query can answer quickly, on media that is fast to append to and slow to overwrite in place.
+There are exactly two answers in production use: keep the data sorted in place and log changes
+for crash safety (the **B-tree**), or never overwrite anything and periodically merge (the
+**log-structured merge tree**, LSM). Everything downstream — which index type SQL Server
+offers you, why Cassandra writes feel cheap and RocksDB compaction shows up in `iostat`, why
+Postgres needs `VACUUM` — falls out of which of these two write paths the engine chose.
+
+## how it actually works
+
+### the three amplifications
+
+Every engine sits at a different point on one triangle. You cannot minimize all three.
+
+- **write amplification** — bytes actually written to disk per logical byte the application
+  wrote. Counts the WAL entry, any in-place page rewrite, and any later compaction pass that
+  rewrites the same logical byte again.
+- **read amplification** — how many places a query might have to check before it can answer.
+  A B-tree point lookup is one root-to-leaf path. An LSM point lookup may have to check the
+  in-memory table and several on-disk levels before it can even say "not found".
+- **space amplification** — how much disk is held by data that is logically dead: old row
+  versions, delete tombstones, pages that are mostly empty after fragmentation.
+
+`(1) B-tree`, in-place update, one WAL entry, one page rewritten later: low write amplification,
+low read amplification, low space amplification, at the cost of every write being a
+sorted-order random write once the page cache cannot absorb it.
+
+`(2) LSM`, append-only, merge later: writes are always sequential (low write cost per write,
+but the same byte gets rewritten by every compaction pass it survives, so *cumulative* write
+amplification is often higher, not lower, than a B-tree's), reads pay for it, and space is only
+reclaimed when compaction runs.
+
+### the B-tree write path
+
+Rows live in sorted pages, in place. The WAL is the only append-only structure in the system.
+
+```text
+client write
+     |
+     v
+[1] append to the WAL, fsync              <- durable the instant this fsync returns
+     |
+     v
+[2] walk root -> internal -> leaf to locate the page for this key
+     |
+     v
+[3] mutate the leaf page IN PLACE, in the buffer pool (page cache)
+     |
+     +-- room on the page? -> done. page is now "dirty" (not yet on disk)
+     |
+     +-- page full? -> split it, write a new separator key into the parent
+                        (a split can cascade all the way to the root)
+     v
+[4] a background writer flushes dirty pages to disk on its own schedule,
+    independent of when the client's write returned
+
+on crash: replay the WAL from the last checkpoint, reapplying any page
+mutation whose WAL entry is on disk but whose page write never made it
+```
+
+The client's write is durable the moment the WAL `fsync` returns — the page itself can still be
+sitting dirty in memory. That gap is the entire reason the WAL exists: it lets the engine defer
+the expensive random-page write without losing durability.
+
+### the LSM write path
+
+Nothing is ever mutated in place. A write is an append to an in-memory sorted structure, backed
+by the same kind of WAL for crash safety; the engine turns that append log into queryable,
+sorted, immutable files on disk, later, in the background.
+
+```text
+client write
+     |
+     v
+[1] append to the WAL, fsync              <- durable the instant this fsync returns
+     |
+     v
+[2] insert into the memtable (sorted in-memory structure, e.g. a skip list)
+     |                                        write is ACKNOWLEDGED here
+     v
+memtable full? -> freeze it, flush it to disk as a new SSTable (sorted,
+                   immutable file) at level 0. start a fresh memtable.
+     |
+     v
+[3] background compaction merges SSTables across levels: L0 -> L1 -> L2 ...
+    each pass reads N files, drops overwritten/deleted keys, writes fewer,
+    larger, still-sorted files
+
+a point read must check: the memtable, then each level, newest first,
+until the key is found or every level says "not present"
+
+a delete is not a removal — it is a TOMBSTONE record, appended just like
+a write, that shadows older versions of the key until compaction drops
+both the tombstone and the row it shadows
+```
+
+A range scan on an LSM is comparatively cheap — each level is already sorted, so it is a
+bounded number of merged sequential scans. A point lookup for a key that was written long ago
+and never touched since is the expensive case: every level potentially gets probed. Bloom
+filters per SSTable are how real engines avoid probing a level that provably does not contain
+the key — a `false` from the filter skips the read; a `true` still means "check the file", not
+"the key is here".
+
+### why the B-tree page is page-sized
+
+A B-tree node is sized to match the storage and virtual-memory page for the same reason a hash
+bucket is sized to a cache line one layer down: the unit of I/O and the unit of the data
+structure are the same unit on purpose. Read one page, get one node's worth of keys; write one
+page, and it is one atomic unit as far as the underlying block device is concerned. Choose a
+node smaller than a page and you throw away I/O for no gain; choose it larger and one logical
+node write costs multiple physical page writes.
+
+### checkpointing bounds the WAL, not the data
+
+An unbounded WAL means unbounded crash-recovery time — replaying every mutation since the
+database was created. A **checkpoint** flushes enough dirty pages (B-tree) or enough memtable
+state (LSM, effectively "the WAL segments already reflected in flushed SSTables") to disk that
+everything before it is guaranteed no longer needed for recovery, and the WAL before that point
+is truncated or recycled. Recovery only ever replays from the last checkpoint forward.
+
+## the tradeoff
+
+| axis | B-tree | LSM |
+| --- | --- | --- |
+| write pattern | random writes into sorted pages (buffered by the page cache) | always sequential appends |
+| write amplification | lower per write, bounded by page splits | can be higher in total, driven by how many compaction levels a key survives |
+| read amplification | one root-to-leaf path | multiple levels, mitigated by Bloom filters and caching |
+| space amplification | low — pages are reused in place | higher until compaction runs; tombstones and old versions pile up |
+| range scans | good — leaves are already linked in sorted order | good — each level is sorted, merge is cheap |
+| point lookups for cold keys | good — always one path | worse — may touch every level |
+| background cost | page splits, occasional page-cache pressure | compaction: a continuous, tunable, CPU-and-I/O-hungry background job |
+| write-heavy workload fit | fine until random I/O saturates the disk | very good — the whole design exists for this |
+
+The honest summary: an LSM does not make writes cheaper in any absolute sense, it makes writes
+**sequential now** and pays the rest later, as compaction, on a schedule the engine controls
+instead of one the client blocks on. That is the entire trade. For a typical service with a
+mixed, moderate write rate and latency-sensitive point reads, a B-tree engine (SQL Server,
+PostgreSQL, SQLite) is the right default — you get bounded read cost without having to reason
+about compaction at all. Reach for an LSM engine (Cassandra, ScyllaDB, RocksDB, and what backs
+many managed wide-column and time-series stores) when the write rate is the thing you are
+scaling for, writes are append-heavy or overwrite-heavy on a small hot set of keys, and you can
+tolerate either background compaction I/O or engineering effort to control it.
+
+<Callout kind="insight" label="write amplification is not optional">
+  Neither engine "avoids" write amplification. A B-tree pays it as page rewrites and occasional
+  splits; an LSM pays it as compaction, which by design rewrites the same logical bytes multiple
+  times across levels. The question is never "which engine has none" — it is which shape of
+  cost your workload and your ops team can absorb.
+</Callout>
+
+## how it fails
+
+- **write stalls under compaction backpressure (LSM).** Symptom: p99 write latency spikes or
+  writes start returning "too many memtables" / "too many SSTables" style errors. Cause:
+  compaction cannot keep up with the incoming write rate, so the engine throttles or rejects
+  new writes rather than let the number of uncompacted files grow without bound (which would
+  make every read touch more and more files). On a dashboard this looks like a sudden latency
+  cliff correlated with a compaction-queue-depth or pending-compaction-bytes metric climbing.
+- **read amplification blowup on a cold key (LSM).** Symptom: a specific query pattern is slow
+  while aggregate throughput looks fine. Cause: the key hasn't been touched since it was written
+  to a deep level, and no Bloom filter false-positive rate tuning was done, so the read walks
+  every level. This is the ticket that says "reads are slow for old data specifically."
+- **tombstone resurrection and unbounded tombstone accumulation (LSM).** Symptom: deleted rows
+  reappear, or reads get slower over time for a key range with heavy delete traffic. Cause:
+  a tombstone has to survive until every older version of the key it shadows has been compacted
+  away; if compaction is misconfigured (or a node was down long enough that stale replicas
+  still hold the pre-delete version), the delete can be lost, or the tombstone can pile up and
+  itself become the read-amplification problem.
+- **page split cascades and fragmentation (B-tree).** Symptom: write latency degrades slowly
+  over the life of a table with a non-sequential (e.g. GUID) primary/clustering key. Cause:
+  inserts land all over the key space instead of at the end, so pages split constantly and the
+  tree ends up half-empty on disk — more pages read per query than the data volume justifies.
+  This is the "why did index fragmentation climb and range-scan reads get slower" ticket.
+- **buffer pool thrash (B-tree).** Symptom: throughput falls off a cliff once the working set
+  stops fitting in memory, well before disk is nominally full. Cause: pages that were dirty in
+  the cache now have to be evicted and re-read from disk on every access, and every eviction of
+  a dirty page is itself a write. This is the memory-hierarchy story
+  ([Caches & the Memory Hierarchy](/systems/memory-hierarchy/)) recurring one layer up — a
+  working set that doesn't fit in the buffer pool behaves exactly like one that doesn't fit in
+  L2.
+- **checkpoint/WAL growth after a stuck checkpoint.** Symptom: disk fills up, or crash recovery
+  suddenly takes far longer than usual. Cause: something (a long-running transaction, a stalled
+  replica that still needs old WAL segments, a failed background writer) prevented the
+  checkpoint from advancing, so the WAL cannot be truncated and keeps growing. This is the
+  "why is the transaction log 40x its normal size" incident.
+
+## in practice
+
+- **SQL Server and PostgreSQL** are both B-tree engines by default: table data (or the
+  clustered index, if one exists) and every non-clustered/secondary index are B-trees, pages
+  are the unit of I/O, and the transaction log (SQL Server) / WAL (PostgreSQL) is exactly the
+  write-ahead log described above. PostgreSQL's default table storage is a heap (not
+  clustered by any index), which is why `VACUUM` exists — PostgreSQL uses MVCC via row
+  versioning rather than in-place overwrite-and-lock, so old row versions accumulate as
+  "dead tuples" and `VACUUM` is the compaction-shaped job that reclaims them. Skipping
+  autovacuum tuning on a high-churn table is the Postgres version of the space-amplification
+  failure above, and it is one of the most common production incidents on that engine.
+- **SQL Server's clustered index** physically *is* the B-tree the table's rows live in — picking
+  a monotonically increasing clustering key (an `IDENTITY`, or a sequential `NEWSEQUENTIALID()`
+  instead of a random `NEWID()`) avoids the page-split-cascade failure mode above; this is the
+  concrete reason "GUID primary keys hurt write performance" is not folklore, it is the page
+  split mechanism directly.
+- **Cosmos DB** and other managed wide-column stores are commonly LSM-based under the hood
+  (Cosmos DB's engine lineage traces to log-structured techniques); the practical consequence
+  for a .NET team is that its request-unit cost model and its indexing policy interact with
+  compaction-shaped behavior even though the engine hides the mechanism — heavy overwrite or
+  delete traffic on a container is not "free" the way it might look from `CosmosClient` alone.
+- **Redis** is primarily in-memory with an optional append-only file (AOF) for durability — the
+  AOF is a WAL in spirit, and Redis's own periodic rewrite of it to compact away redundant
+  commands is the same "someone has to pay down the log" idea as compaction, on a much simpler
+  data model.
+- **RocksDB and Cassandra/ScyllaDB** are the canonical LSM engines a .NET team is likely to hit
+  behind a managed service. The knob that matters operationally is the compaction strategy
+  (size-tiered vs leveled) — size-tiered favors write throughput and tolerates more space
+  amplification; leveled favors read latency and bounds space amplification at the cost of more
+  total write amplification. Neither is "better"; it is the same triangle from above, dialed by
+  a config value instead of by engine choice.
+- **EF Core** does not choose a storage engine, but its default behavior interacts with these
+  costs: a `SaveChanges()` call that touches many rows with non-sequential keys (e.g. a `Guid`
+  primary key with `Guid.NewGuid()` defaults, which is the EF Core out-of-the-box default for a
+  `Guid` key unless you configure a sequential generator) drives exactly the B-tree page-split
+  pattern above. Switching to a sequential key generation strategy, or letting the database
+  generate the key, is the standard fix.
+
+## the same idea elsewhere
+
+| here | elsewhere | the trap |
+| --- | --- | --- |
+| a B-tree page is sized to the storage/VM page | a CPU cache line sizes hash-table bucket layout ([Caches & the Memory Hierarchy](/systems/memory-hierarchy/)) | assuming "bigger unit is always more efficient" — oversized units waste I/O or bandwidth just like undersized ones do |
+| the write-ahead log is what makes a single node's writes durable and replayable | the same log, shipped to followers, is the replication stream ([Replication](/system-design/replication/)) | treating "written to the WAL" and "acknowledged by a quorum of replicas" as the same guarantee — they are not, and conflating them is a durability bug |
+| LSM compaction reclaims space held by dead versions and tombstones | generational GC reclaims heap space held by unreachable objects ([GC internals](/systems/gc-internals/)) | assuming reclamation is instantaneous on delete — in both systems, "deleted" means "eligible for later reclamation," not "gone" |
+| an LSM's memtable-plus-background-flush is a produce/consume boundary | a lock-free queue or channel with a bounded buffer and a background drain ([Parallelism That Actually Scales](/systems/parallelism-patterns/)) | forgetting that the boundary can apply backpressure — a memtable that cannot flush fast enough stalls writes exactly like a full channel blocks a producer |
+
+## interview drills
+
+**Q.** Why would you ever choose an LSM engine over a B-tree if it doesn't actually reduce total
+write amplification?
+
+- *weak answer* — "LSM is faster for writes." True in a narrow sense and wrong as a general
+  claim; it invites "faster how, and compared to what."
+- *strong answer* — an LSM turns random writes into sequential ones and defers the rest of the
+  cost to a background process the engine controls, instead of blocking the client's write path
+  on random I/O. That's a latency and throughput win for the write path specifically, paid for
+  by higher aggregate I/O and by read amplification, deferred to compaction.
+- *follow-up* — "What happens if compaction can't keep up?" Writes get throttled or rejected to
+  bound the number of files a read has to check — see write-stall failure mode above.
+
+**Q.** Your service's writes are all against a table with a `Guid` primary key generated by
+`Guid.NewGuid()`, and write latency has been climbing for months. Walk me through why.
+
+- *weak answer* — "The table is too big, we need to shard it." Skips the actual mechanism and
+  reaches for infrastructure before diagnosis.
+- *strong answer* — a random `Guid` scatters inserts across the entire key space instead of
+  appending at the end of the B-tree, so nearly every insert hits a different, possibly cold
+  page, driving constant page splits and leaving the tree fragmented — more pages read per
+  query than the row count justifies, and a working set that no longer fits the buffer pool.
+- *follow-up* — "How do you fix it without changing the key type?" A sequential key generator
+  (`NEWSEQUENTIALID()` on SQL Server, or an EF Core sequential-guid value generator) restores
+  append-mostly insert order while keeping the `Guid` type.
+
+**Q.** A teammate says "the write returned successfully, so it's on disk." Is that true?
+
+- *weak answer* — "Yes, that's what a database write means." Conflates the WAL fsync with the
+  data page being on disk.
+- *strong answer* — it means the WAL entry for that write is fsynced and durable; the data page
+  itself (B-tree) or the memtable entry (LSM) can still be resident only in memory, flushed to
+  disk later by a background writer or a checkpoint. Durability and "the page is on disk" are
+  different claims — ACID durability means committed-and-recoverable via the log, not that
+  every structure the log describes has physically been rewritten.
+- *follow-up* — "So what does crash recovery actually do?" Replays the WAL from the last
+  checkpoint forward, reapplying any mutation whose log entry made it to disk but whose data
+  structure write didn't.
+
+**Q.** Reads against an LSM-backed table have gotten slower for old, rarely-updated rows
+specifically, while writes and reads of recent data are fine. What's going on?
+
+- *weak answer* — "The disk is slow" or "we need more RAM" — doesn't explain why it's
+  specifically old data that's affected.
+- *strong answer* — a point read that hasn't been touched since it landed at a deep compaction
+  level has to be checked against the memtable and every level above where it actually lives
+  before it's found — that's read amplification, and it's the LSM's structural cost for making
+  writes cheap. Bloom filters reduce wasted probes into levels that don't have the key, but they
+  don't eliminate the levels that do.
+- *follow-up* — "What would you check first?" Whether Bloom filters are enabled and sized well
+  for the key cardinality, and whether the compaction strategy (size-tiered vs leveled) matches
+  the read pattern — leveled bounds the number of levels a stale key can sink to.
+
+**Q.** Why does a B-tree node happen to be exactly one storage page in size, and not smaller?
+
+- *weak answer* — "So it's fast." Non-specific, doesn't name the actual constraint.
+- *strong answer* — the engine's unit of I/O is the page (the same unit the OS and the block
+  device use), so sizing a node smaller than a page wastes I/O — you'd still read/write a whole
+  page to get part of a node's data — while sizing it larger costs multiple physical page reads
+  or writes per logical node access. Matching the two units means one node access is one page
+  access, which is the cheapest possible relationship.
+- *follow-up* — "Where else on this site does the same reasoning show up?" A CPU cache line
+  sizing decisions in hash table and array layout — see
+  [Caches & the Memory Hierarchy](/systems/memory-hierarchy/); it's the identical argument one
+  level down the hierarchy.
+
+**Q.** Your team is deleting a large batch of rows from a Cassandra-style table nightly, and
+after a few weeks read latency on that table has doubled even though the row count is roughly
+constant. Diagnose it.
+
+- *weak answer* — "Add more nodes." Treats a mechanism problem as a capacity problem.
+- *strong answer* — each delete is a tombstone, not a removal, and tombstones only get dropped
+  once compaction has merged away every older version they shadow. A steady nightly delete
+  workload against a compaction strategy that isn't keeping pace means tombstones accumulate,
+  and every read that scans a range containing them pays to skip over dead entries — this is
+  space amplification manifesting as read latency.
+- *follow-up* — "What's the operational lever?" Tuning the compaction strategy and its
+  scheduling to keep pace with the tombstone rate, and checking whether the engine's tombstone
+  threshold/warning is being tripped and logged.
+
+<Watch items={[['B-tree write', 'WAL fsync, then in-place page update'], ['LSM write', 'WAL fsync, then memtable insert (sequential)'], ['B-tree read cost', 'one root-to-leaf path'], ['LSM read cost', 'memtable + up to every level, newest first'], ['delete in an LSM', 'a tombstone, not a removal'], ['what reclaims space', 'compaction (LSM) / VACUUM or page reuse (B-tree, MVCC engines)']]} />

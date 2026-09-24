@@ -1,0 +1,153 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: design-drills
+problem: chat-system
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+
+## the brief
+
+"Design a chat system: one-to-one and group messaging, real time, with delivery/read state, and
+messages within a conversation showing up in the order they were sent."
+
+## clarify first
+
+- **One-to-one only, or groups too?** A group conversation turns "deliver to one recipient" back
+  into a fan-out problem — much smaller scale than a news feed's celebrity case, but with a
+  stricter ordering requirement.
+- **Real-time push, or is polling acceptable?** The fork between a stateful long-lived
+  connection (WebSocket) and a stateless request/response model — it changes the capacity
+  question from "requests/sec" to "concurrent open connections."
+- **What ordering guarantee is actually needed** — global, across every conversation, or just
+  within one conversation? Global order is a much harder guarantee and almost never the one the
+  product actually needs.
+- **Delivery receipts and read receipts, or just "sent"?** Each is a separate state transition
+  that has to be tracked and pushed back to the sender.
+- **How long is history retained, and does it need to be searchable?** Retention and search are
+  a different storage problem from getting a message to an online recipient right now.
+
+## the numbers
+
+Assumptions, stated as assumptions:
+
+- 50 million daily active users, sending an average of 40 messages/day each, ~100 bytes/message
+  body.
+- 20% of DAU hold a connection open concurrently at peak.
+
+**Message writes:** `50,000,000 × 40 / 86,400 ≈ 23,150` writes/sec average.
+
+**Storage:** `50,000,000 × 40 × ~200 bytes/row` (body plus sender, conversation id, timestamp,
+delivery state) `≈ 400 GB/day`, roughly `146 TB/year` if nothing is deleted. The write shape is
+small rows, arriving continuously, almost never updated after the fact (aside from a
+delivery/read-state flag) and almost never deleted — an append-mostly workload, exactly what
+[storage engines](/system-design/storage-engines/) says an LSM-tree-based engine is built for,
+rather than a B-tree tuned for in-place updates.
+
+**Concurrent connections:** `50,000,000 × 20% = 10` million concurrently open long-lived
+connections at peak. This is a different capacity question from the write-rate arithmetic above:
+a stateless HTTP request is answered and forgotten, but a WebSocket is a socket and some
+in-memory session state that one specific server instance must hold open indefinitely.
+Commonly-cited figures for a tuned connection gateway run to the tens of thousands of concurrent
+connections per instance — a published, order-of-magnitude reference for reasoning about fleet
+size, not a measurement of this design. At that order of magnitude, 10 million concurrent
+connections needs on the order of hundreds of gateway instances whose entire job is holding
+sockets open, before a single message has been routed.
+
+<Watch items={[['ordering scope', 'per-conversation'], ['delivery guarantee', 'at-least-once + idempotency key'], ['transport', 'long-lived WebSocket']]} />
+
+## the sketch
+
+```text
+  sender ──▶ gateway A (WS) ──▶ conversation owner (partition) ──▶ append to message log
+                                        │                                   │
+                                        │ assigns per-conversation seq #    │ durable
+                                        ▼                                   ▼
+                                presence/routing lookup ─────────▶ gateway B (WS) ──▶ recipient
+                                                                      (if online — else read from log on reconnect)
+```
+
+A sender's client holds an open WebSocket to whichever gateway instance it connected to. A
+message goes to that gateway, which forwards it to the owner of that conversation's partition —
+a single logical owner per conversation is what makes per-conversation sequencing possible
+without a coordination round on every message, since only one place is ever assigning that
+conversation's next sequence number. The owner appends to a durable log (the source of truth),
+then looks up where each recipient's connection currently lives — a presence/routing table,
+since a recipient can be connected to a different gateway than the sender, or not connected at
+all — and either pushes the message straight to their gateway, or, if they're offline, leaves it
+for them to catch up on from the durable log at their next connect.
+
+**Ordering: per-conversation, not global.** A monotonically increasing sequence number scoped to
+the conversation, assigned by that conversation's single owner, is enough. Clients render by
+sequence number, not arrival order — network paths differ per recipient, and messages can arrive
+out of order even when they were appended in order.
+
+<Callout kind="trap" label="exactly-once is a claim to read carefully">
+  Delivery here is at-least-once, not exactly-once: a message can be delivered, its ack lost, and
+  redelivered. The fix is a client-generated message ID treated as an idempotency key by both
+  sides, so a duplicate delivery is detected and dropped rather than shown twice. This is the
+  same shape [queues & streams](/system-design/queues-and-streams/) describes generally —
+  "exactly-once" isn't a mode you turn on, it's at-least-once plus deduplication, or nothing
+  achievable over an unreliable network.
+</Callout>
+
+Two conversation-log replicas can briefly disagree about "what's the latest state of this
+conversation" — one has applied a message the other hasn't caught up to yet. That's the same
+shape as [the memory model](/systems/memory-model/)'s two-cores-disagreeing argument, one layer
+up: there, two cores can each hold a stale view of a shared value until a barrier or a
+cache-coherence message catches them up; here, two replicas can each hold a stale view of a
+conversation until replication catches up, and the read side has to be honest about which one
+it's reading from.
+
+## the tradeoffs
+
+| decision | chosen | buying | paying |
+| --- | --- | --- | --- |
+| transport | long-lived WebSocket per online client | real push delivery, no client polling | each connection pins state to a specific gateway — a form of session affinity plain HTTP load balancing never had to think about |
+| ordering scope | per-conversation sequence, not global | one owner per conversation, no platform-wide coordination on every message | one conversation can only be owned by one partition — a hot spot if that conversation is unusually busy |
+| delivery guarantee | at-least-once + client-generated idempotency key | survives redelivery, retries and gateway failover without duplicate messages appearing | every producer and consumer must actually implement the dedup step — it doesn't happen for free |
+| message store | append-mostly log, partitioned per conversation | matches the write pattern — see storage engines | a query across many conversations at once (global search) isn't what this layout is built for, and usually needs a separate index |
+
+For a chat product specifically, per-conversation ordering plus at-least-once-with-dedup is the
+right default: global ordering is a guarantee almost nobody needs and is far more expensive to
+provide, and true exactly-once delivery over an unreliable network isn't achievable in general —
+so the honest design goal is effectively-once behavior from the user's point of view, not the
+literal claim. Depart from a pinned WebSocket-per-connection model only if the real-time
+requirement is loose enough that polling is acceptable — that removes the connection-capacity
+question in the numbers above entirely, at the cost of latency and wasted client requests.
+
+## how it fails
+
+- **A conversation partition goes hot** — a very active group chat. Every message in that one
+  conversation serializes through its single owner, so latency degrades for a handful of users
+  while the aggregate dashboards look fine, because the effect is concentrated on one partition.
+- **A gateway instance dies with connections attached.** Every client pinned to it disconnects at
+  once and has to reconnect and re-resolve presence. The message log itself is unaffected — it
+  was already durable — but there's a burst of reconnect traffic and a window where the routing
+  table is stale for anyone trying to reach those clients.
+- **Presence/routing lag.** A recipient reconnects to a new gateway before the routing table
+  updates; a message sent in that window routes to the old, now-dead gateway and is dropped
+  rather than delivered live. This is why delivery can't rely on live routing alone — the durable
+  log is the fallback a client catches up from on reconnect.
+- **Duplicate-message tickets** are almost always a missing or broken idempotency key somewhere
+  in a retry path, not evidence that "the queue lied about exactly-once" — the queue almost
+  certainly did exactly what its at-least-once guarantee promised.
+
+## what they ask next
+
+- **"How do you show a 'typing…' indicator without writing it to the durable log?"** Treat it as
+  ephemeral — pushed gateway-to-gateway directly, or through a short-TTL cache — rather than
+  through the same durable, ordered path as real messages. It needs neither ordering nor
+  durability, and routing it through the message log would add write load for something nobody
+  needs to replay.
+- **"How do group chats with thousands of members scale differently from one-to-one?"**
+  Delivery to a large group starts to look like
+  [the news feed](/system-design/design-drills/news-feed/)'s fan-out problem at a smaller
+  scale — the same push-vs-pull tradeoff applies, just with member counts that rarely reach
+  celebrity-follower scale.
+- **"A user's messages arrive out of order on a bad connection — walk me through why."**
+  Per-conversation sequence numbers are assigned correctly at the owner; the client is almost
+  certainly rendering by arrival order instead of by the sequence number the server already
+  assigned. The fix is entirely client-side: buffer and reorder by sequence number, never trust
+  arrival order.

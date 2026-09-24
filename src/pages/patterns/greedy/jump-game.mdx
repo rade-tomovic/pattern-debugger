@@ -1,0 +1,131 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: greedy
+problem: jump-game
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import Cells from '@components/Cells.astro';
+
+## task
+
+Given an array `nums` where `nums[i]` is the maximum jump length from index `i`, determine
+whether you can reach the last index starting from index `0`.
+
+```text
+nums = [3, 0, 1, 1, 4]  →  true
+nums = [3, 2, 1, 0, 4]  →  false   (every path stalls at index 3)
+```
+
+## how to think
+
+The brute force explores every jump length from every index — an exponential decision tree
+without memoization, or an O(n²) DP table where `dp[i]` asks "is there any reachable `j < i`
+with `j + nums[j] >= i`?" checked against every earlier index.
+
+The insight: you don't need to know *which* indices are reachable, only the single furthest one
+— call it `farthest`. If index `i` reaches further than anything before it, that's strictly
+better information to carry forward than knowing every individual index that got you there. So
+scan left to right maintaining `farthest = max(farthest, i + nums[i])`; the only way to fail is
+to reach an index `i` that's already beyond `farthest` — nothing reachable can jump that far.
+
+<Callout kind="note" label="template instance">
+  **Track & decide** skeleton, with the twist that a failed check ends the scan early instead of
+  just skipping a step. Invariant: `farthest` is the true maximum index reachable using only
+  indices `0..i-1`. `Update` is a running maximum fold (`i + nums[i]`); the "decide" step is a
+  guard — `if i > farthest, fail` — checked *before* the fold each iteration.
+</Callout>
+
+## solution
+
+```csharp
+public bool CanJump(int[] nums)
+{
+    int farthest = 0;
+
+    for (int i = 0; i < nums.Length; i++)
+    {
+        if (i > farthest) return false;               // this index is unreachable — dead end
+        farthest = Math.Max(farthest, i + nums[i]);    // widen the frontier
+        if (farthest >= nums.Length - 1) return true;  // last index already in reach
+    }
+    return true;                                        // loop finished without ever getting stuck
+}
+```
+
+## trace
+
+`nums = [3, 0, 1, 1, 4]`, `farthest` starts at `0`:
+
+| i | i > farthest? | nums[i] | i + nums[i] | farthest = max(...) | farthest >= 4? |
+| --- | --- | --- | --- | --- | --- |
+| 0 | `0 > 0` no | 3 | 0 + 3 = 3 | max(0, 3) = **3** | `3 >= 4` no |
+| 1 | `1 > 3` no | 0 | 1 + 0 = 1 | max(3, 1) = **3** | `3 >= 4` no |
+| 2 | `2 > 3` no | 1 | 2 + 1 = 3 | max(3, 3) = **3** | `3 >= 4` no |
+| 3 | `3 > 3` no | 1 | 3 + 1 = 4 | max(3, 4) = **4** | `4 >= 4` **yes** → return `true` |
+
+`i = 1` and `i = 2` both land inside the already-claimed frontier and add nothing — the frontier
+only actually moves at `i = 0` and `i = 3`. That stall-then-break-through is the shape to watch
+for:
+
+<Cells
+  data={[3, 0, 1, 1, 4]}
+  pointers={{ 2: [{ t: 'i', c: 'amber' }] }}
+  cells={{ 0: 'win', 1: 'win', 2: 'win', 3: 'win', 4: 'dim' }}
+  caption="after i=2: farthest is stuck at 3 — index 4 isn't reachable yet, but everything in [0,3] is, including the i=2 scan position"
+/>
+
+<Cells
+  data={[3, 0, 1, 1, 4]}
+  pointers={{ 3: [{ t: 'i', c: 'amber' }] }}
+  cells={{ 0: 'win', 1: 'win', 2: 'win', 3: 'ok', 4: 'ok' }}
+  caption="i=3: farthest jumps from 3 to 4 — the frontier finally reaches the last index"
+/>
+
+The false example, `nums = [3, 2, 1, 0, 4]`, plays out identically through `i = 2` (`farthest`
+also gets stuck at `3`), but there `nums[3] = 0` so the frontier never breaks through — at
+`i = 4` the check `4 > 3` fires and the function returns `false`.
+
+## why it works
+
+By induction, `farthest` after processing index `i` equals the true maximum index reachable
+using only jumps that start within `0..i`: it's exactly right at `i = 0` (`nums[0]` is the only
+option), and each step either extends it correctly (`i + nums[i]` is a genuinely reachable
+index, since `i` itself was reachable — that's what the guard enforces) or leaves it unchanged
+if `i`'s jump doesn't beat the existing record. The guard `i > farthest` is the never-regret
+check: the moment an index is unreachable, every jump *from* it is fiction, so the scan must
+stop rather than keep folding in nonsense.
+
+A brute-force [dynamic programming](/patterns/dynamic-programming/) table over the same
+recurrence costs O(n²): for each `i`, scanning all `j < i` to see if any reachable `j` gets you
+there. Greedy collapses that inner scan to nothing, because `farthest` already *is* the max
+over all reachable `j` of `j + nums[j]` — the DP table's only useful signal, kept as a single
+running number instead of recomputed from scratch each time. When the never-regret argument
+doesn't hold for a problem, this is the fallback: keep the full table instead of compressing it
+to one variable.
+
+<Watch items={[['time', 'O(n)'], ['space', 'O(1)'], ['dp alternative', 'O(n²)']]} />
+
+## common bugs
+
+- Treating a `0` in `nums[i]` as automatic failure — it only fails if `farthest` hasn't already
+  jumped past it. `nums = [2, 0, 2, 0, 1]` succeeds: index 0 jumps the frontier to 2, and index
+  2's own jump of `2` carries it straight to the end — the zeros at 1 and 3 never cause trouble.
+- Using `nums.Length` instead of `nums.Length - 1` as the goal — the goal is the last **index**,
+  not the array length.
+- Dropping the `i > farthest` guard and just computing `farthest` over the whole array — that
+  silently produces false positives, because it keeps folding in jump lengths from indices that
+  were never actually reachable.
+- Confusing this with **Jump Game II** (LC 45, below), which counts the *minimum number* of
+  jumps rather than asking reachability — that needs a second boundary (`currentJumpEnd`) and a
+  jump counter, not just one running frontier.
+
+## variants you can now solve
+
+- **Jump Game II** (LC 45) — minimum jumps to reach the end. Same frontier idea, plus a second
+  variable marking the end of the *current* jump and a counter that increments each time you
+  cross it.
+- **Jump Game III** (LC 1306) — reachability again, but jumps go both directions (`i ± nums[i]`)
+  and the target is "reach any index holding value `0`" — the frontier trick doesn't apply
+  directly; it reduces to BFS/DFS instead.

@@ -1,0 +1,131 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: array-techniques
+problem: range-sum-query
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import Cells from '@components/Cells.astro';
+
+## task
+
+Design a class that wraps an integer array and answers `SumRange(left, right)` — the sum of
+`nums[left..right]` inclusive — for many queries. The array never changes between queries
+(that's the "Immutable" in the LeetCode #303 title).
+
+```text
+nums = [-2, 0, 3, -5, 2, -1]
+SumRange(0, 2) → 1     (-2 + 0 + 3)
+SumRange(2, 5) → -1    (3 + -5 + 2 + -1)
+```
+
+## how to think
+
+Summing a range on demand costs O(n) per call — fine for one query, expensive across many.
+Nothing about the array changes between calls, so the wasted work is re-summing the same
+prefix over and over. Do that work exactly once, up front.
+
+Define `prefix[i]` as the sum of the first `i` elements (`prefix[0] = 0` by convention — the sum
+of zero elements). Building it is one O(n) pass: `prefix[i + 1] = prefix[i] + nums[i]`. Once
+built, `SumRange(left, right)` is a single subtraction: the total up to `right` minus the total
+up to `left` removes exactly the elements before `left`, leaving `nums[left..right]`.
+
+This is the formal version of an idea you'll meet again the moment a hashmap gets involved:
+[Subarray Sum Equals K](/patterns/hashmap/subarray-sum-equals-k/) is this same running-total
+trick, except the "queries" are counted on the fly with a dictionary instead of answered after
+the fact with an array.
+
+<Callout kind="note" label="template instance">
+  **Prefix sum** skeleton, wrapped as a class so the O(n) build happens once in the
+  constructor. Invariant: `prefix[i]` always holds the sum of `nums[0..i)`. What varies:
+  nothing in the build — the only new part is turning the range subtraction into a public method.
+</Callout>
+
+## solution
+
+```csharp
+public class NumArray
+{
+    private readonly int[] prefix;
+
+    public NumArray(int[] nums)
+    {
+        prefix = new int[nums.Length + 1];       // prefix[0] = 0 sentinel: sum of zero elements
+        for (int i = 0; i < nums.Length; i++)
+            prefix[i + 1] = prefix[i] + nums[i];
+    }
+
+    public int SumRange(int left, int right) => prefix[right + 1] - prefix[left];
+}
+```
+
+## trace
+
+Building the prefix array for `nums = [-2, 0, 3, -5, 2, -1]`:
+
+| i | nums[i] | prefix[i + 1] |
+| --- | --- | --- |
+| 0 | -2 | 0 + (-2) = -2 |
+| 1 | 0 | -2 + 0 = -2 |
+| 2 | 3 | -2 + 3 = 1 |
+| 3 | -5 | 1 + (-5) = -4 |
+| 4 | 2 | -4 + 2 = -2 |
+| 5 | -1 | -2 + (-1) = -3 |
+
+`prefix = [0, -2, -2, 1, -4, -2, -3]`
+
+<Cells
+  data={[-2, 0, 3, -5, 2, -1]}
+  caption="nums — six elements, indices 0..5"
+/>
+
+<Cells
+  data={[0, -2, -2, 1, -4, -2, -3]}
+  cells={{ 0: 'dim' }}
+  caption="prefix — seven elements; index 0 is the sentinel prefix[0] = 0"
+/>
+
+Now the three queries, each one subtraction against the built array:
+
+| call | prefix[right + 1] | prefix[left] | result |
+| --- | --- | --- | --- |
+| `SumRange(0, 2)` | prefix[3] = 1 | prefix[0] = 0 | 1 - 0 = **1** |
+| `SumRange(2, 5)` | prefix[6] = -3 | prefix[2] = -2 | -3 - (-2) = **-1** |
+| `SumRange(0, 5)` | prefix[6] = -3 | prefix[0] = 0 | -3 - 0 = **-3** |
+
+<Cells
+  data={[0, -2, -2, 1, -4, -2, -3]}
+  pointers={{ 2: [{ t: 'L', c: 'amber' }], 6: [{ t: 'R', c: 'cyan' }] }}
+  cells={{ 6: 'ok' }}
+  caption="SumRange(2, 5): prefix[6] - prefix[2] = -3 - (-2) = -1, no rescanning nums at all"
+/>
+
+## why it works
+
+`prefix[right + 1]` is the sum of everything from index 0 through `right`. `prefix[left]` is the
+sum of everything from index 0 through `left - 1` — exactly the part that shouldn't be counted.
+Subtracting removes that shared prefix and leaves precisely `nums[left..right]`. The build is
+O(n) once; every query after that is O(1), independent of the range's width.
+
+<Watch items={[['time', 'O(n) build / O(1) query'], ['space', 'O(n)']]} />
+
+## common bugs
+
+- Sizing `prefix` to `nums.Length` instead of `nums.Length + 1` — there's no room for the
+  `prefix[0] = 0` sentinel, and every index shifts off by one.
+- Computing `prefix[right] - prefix[left]` (forgetting the `+ 1`) — silently drops
+  `nums[right]` from every range.
+- Rebuilding the prefix array inside `SumRange` "to be safe" — that throws away the whole point
+  of precomputing; the array is stated to be immutable, so build once, in the constructor.
+- Reaching for this when the array *does* mutate between queries — plain prefix sums go stale
+  on every update; that problem needs a Fenwick tree / BIT (LeetCode #307).
+
+## variants you can now solve
+
+- **[Subarray Sum Equals K](/patterns/hashmap/subarray-sum-equals-k/)** (LC 560) — the same
+  running total, but counted with a dictionary instead of pre-answered with an array.
+- **Range Sum Query 2D — Immutable** (LC 304) — the same trick with a 2D prefix-sum matrix and
+  an inclusion-exclusion subtraction (four corners instead of two).
+- **Range Sum Query — Mutable** (LC 307) — the array *does* change now; a Fenwick tree trades
+  O(1) queries for O(log n) queries and O(log n) updates.

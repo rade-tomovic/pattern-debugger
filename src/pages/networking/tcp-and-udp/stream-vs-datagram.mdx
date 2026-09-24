@@ -1,0 +1,312 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: tcp-and-udp
+problem: stream-vs-datagram
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import Solution from '@components/Solution.astro';
+
+## the question
+
+One sender, one receiver, both on `127.0.0.1`, and the smallest possible experiment. The sender
+writes three bytes, then writes three more:
+
+```text
+  Send("AAA")     3 bytes
+  Send("BBB")     3 bytes
+```
+
+The receiver then calls a single receive with a 1024-byte buffer — room for far more than
+everything that was sent. The program does this twice: once over a TCP socket, once over a UDP
+socket, with the same six bytes and the same buffer both times.
+
+<Callout kind="insight" label="predict first">
+  Commit to two numbers before you scroll. Over **TCP**, how many bytes does that one receive
+  return — 3, or 6, or something else? Over **UDP**, how many does the first receive return, and
+  how many receives does it take to get all six bytes? Then answer the harder question underneath
+  both: for whichever of the two you said "6", is that *guaranteed*, or merely what happened?
+</Callout>
+
+## the code
+
+Both halves bind to port 0, which asks the kernel for any free ephemeral port and hands it back —
+so this runs anywhere without a port collision —
+[ports and sockets](/networking/ports-and-sockets/) is where that range and that trick come from.
+The sleep before the first receive is not decoration; the whole point of the exercise is hanging
+off it, and the next section explains why.
+
+<Solution>
+
+```csharp
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
+
+byte[] a = Encoding.ASCII.GetBytes("AAA");
+byte[] b = Encoding.ASCII.GetBytes("BBB");
+var buffer = new byte[1024];
+
+// ── TCP: a connected byte stream ───────────────────────────────────────────────
+using var listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+listener.Bind(new IPEndPoint(IPAddress.Loopback, 0));   // port 0: the kernel picks one
+listener.Listen(backlog: 1);
+
+using var tcpClient = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+tcpClient.Connect(listener.LocalEndPoint!);             // three-way handshake happens here
+using var tcpServer = listener.Accept();
+
+tcpClient.Send(a);
+tcpClient.Send(b);
+
+// Give both segments time to arrive BEFORE anyone reads. Without this the receiver
+// may well run between the two arrivals and see only the first three bytes — which
+// is equally correct behaviour, and is the actual lesson of this page.
+Thread.Sleep(50);
+
+int n = tcpServer.Receive(buffer);
+Console.WriteLine($"TCP  one Receive returned {n} bytes: {Encoding.ASCII.GetString(buffer, 0, n)}");
+
+// ── UDP: two independent datagrams ─────────────────────────────────────────────
+using var udpReceiver = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+udpReceiver.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+var udpTarget = udpReceiver.LocalEndPoint!;
+
+using var udpSender = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+udpSender.SendTo(a, udpTarget);                         // no connect, no handshake, no state
+udpSender.SendTo(b, udpTarget);
+
+Thread.Sleep(50);                                        // same delay, same fairness
+
+EndPoint from = new IPEndPoint(IPAddress.Any, 0);
+int m1 = udpReceiver.ReceiveFrom(buffer, ref from);
+Console.WriteLine($"UDP  first  ReceiveFrom returned {m1} bytes: {Encoding.ASCII.GetString(buffer, 0, m1)}");
+int m2 = udpReceiver.ReceiveFrom(buffer, ref from);
+Console.WriteLine($"UDP  second ReceiveFrom returned {m2} bytes: {Encoding.ASCII.GetString(buffer, 0, m2)}");
+```
+
+</Solution>
+
+## work it out
+
+Follow the six bytes through the kernel on each side, because the difference is entirely in what
+the receiving kernel keeps a record of.
+
+**TCP.** `Send` does not put anything on the wire. It crosses into the kernel — every socket call
+here is a syscall, as [processes, threads and the kernel](/systems/process-and-thread/) builds —
+copies your bytes into the socket's send buffer, and returns. The kernel decides afterwards how to
+cut that buffer into segments, using the path MTU, the receive window and Nagle. On the receiving
+side the arriving segments are stripped of their headers and their payloads are appended to one
+contiguous receive buffer. **Nothing in that
+buffer records where a segment ended, and nothing anywhere records where a `Send` ended.** The
+sequence numbers that did the ordering are byte offsets — they name positions in the stream, not
+messages.
+
+`Receive` is then defined as: block until at least one byte is available, then copy out *up to* as
+many bytes as the caller asked for. Not "one message", not "one segment" — as much as is there,
+capped by your buffer.
+
+| step | sender | receiver's byte queue | what a `Receive(1024)` would return here |
+| --- | --- | --- | --- |
+| 1 | `Send("AAA")` copies 3 bytes into the send buffer | empty | blocks — nothing available |
+| 2 | kernel emits a segment carrying `AAA` | `AAA` | 3 bytes |
+| 3 | `Send("BBB")` copies 3 more | `AAA` | 3 bytes |
+| 4 | kernel emits a segment carrying `BBB` | `AAABBB` | 6 bytes |
+| 5 | the sleep expires, `Receive` finally runs | `AAABBB` | **6 bytes** |
+
+Rows 2 and 3 are the whole reason the sleep is there. If the reader had been sitting in `Receive`
+when the first segment landed, it would have woken up, returned 3, and the second three bytes would
+have needed a second call. Both outcomes are correct; which one you get depends on scheduling you
+do not control. The sleep does not change what TCP is allowed to do — it just makes one of the two
+legal outcomes reliable enough to demonstrate.
+
+There is a second reason the two writes coalesce so readily here, and it is worth naming so you
+don't over-generalise from loopback. Loopback on the Linux box these pages were written on has an
+MTU of 65536 bytes, against 1400 on its `eth0`. Six bytes was never going to be split by any MTU
+on this path — but on a real path with a real MTU and a real MSS, a *large* message is split
+routinely, which is the same mechanism producing the opposite grouping.
+
+**UDP.** `SendTo` builds one datagram, complete with its 8-byte header carrying the length, and
+hands it to IP. The receiving kernel keeps a queue of *datagrams*, not bytes, and each one remembers
+its own length and its own sender. `ReceiveFrom` pops exactly one entry from that queue and never
+merges two.
+
+| step | sender | receiver's datagram queue | what a `ReceiveFrom(1024)` returns |
+| --- | --- | --- | --- |
+| 1 | `SendTo("AAA")` → one datagram, length 3 | `[AAA]` | 3 bytes |
+| 2 | `SendTo("BBB")` → one datagram, length 3 | `[AAA] [BBB]` | 3 bytes — the first entry only |
+| 3 | the sleep expires, first `ReceiveFrom` runs | `[BBB]` | **3 bytes** |
+| 4 | second `ReceiveFrom` runs | empty | **3 bytes** |
+
+The queue is a queue of messages, so the answer never depends on timing at all. Sleep or no sleep,
+one datagram in is one datagram out.
+
+## the answer
+
+What this program prints:
+
+```text
+TCP  one Receive returned 6 bytes: AAABBB
+UDP  first  ReceiveFrom returned 3 bytes: AAA
+UDP  second ReceiveFrom returned 3 bytes: BBB
+```
+
+The UDP half is a guarantee. Two sends, two datagrams, two receives, three bytes each, in that
+order on a loopback path that will not reorder them — and had one been dropped, the other would
+still have arrived whole, because a datagram is delivered entire or not at all.
+
+The TCP half is not a guarantee, and if you predicted "6, definitely" you got the number right for
+the wrong reason. **TCP is allowed to return 6, or 3 twice, or 1 and then 5.** All of those are
+correct implementations of "the bytes arrive, once, in order". The only thing that made 6 reliable
+here is that both segments had already arrived before anyone read. Delete the `Thread.Sleep` and
+run it in a loop and you should expect to see the split outcome sometimes; that variability is not
+a bug in the demonstration, it is the demonstration.
+
+Which leaves the fact this exercise exists to plant: **`Send` calls and `Receive` calls are not
+paired.** Any protocol design that assumes they are is already broken; it just has not met a
+network yet.
+
+## why it works that way
+
+Each protocol has a unit of delivery, and everything else follows from which one it picked.
+
+- TCP's unit is **the byte**. Its sequence numbers name byte positions, its acknowledgements name
+  the next byte wanted, and its buffers are byte queues. There is no field anywhere in the protocol
+  capable of expressing "this is where a message ends" — the `PSH` flag is a hint about *when* to
+  wake the reader, not a delimiter, and nothing surfaces it to your code anyway.
+- UDP's unit is **the datagram**. Its header carries a length, so the boundary is a field on the
+  wire, and the kernel can keep messages as messages all the way to your `ReceiveFrom`.
+
+So if you want messages over TCP, you add the field TCP does not have. Two designs, and only two: a
+length prefix, or a delimiter. HTTP is the protocol you already know that uses both — a
+`Content-Length` header is the prefix, a blank line is the delimiter, and
+[the protocols on top](/networking/application-protocols/) shows the bytes. Here is the length
+prefix, written out the long way so the read loop is visible — this is the loop
+`Stream.ReadExactly` exists to save you from writing.
+
+<Solution>
+
+```csharp
+using System.Buffers.Binary;
+
+static class Framing
+{
+    // The length comes off the wire, so it is attacker-controlled: bound it BEFORE allocating.
+    const int MaxFrame = 1 << 20;
+
+    public static void WriteFrame(Stream stream, ReadOnlySpan<byte> payload)
+    {
+        Span<byte> header = stackalloc byte[4];
+        BinaryPrimitives.WriteInt32BigEndian(header, payload.Length);   // network byte order
+        stream.Write(header);
+        stream.Write(payload);
+    }
+
+    public static byte[] ReadFrame(Stream stream)
+    {
+        Span<byte> header = stackalloc byte[4];
+        FillExactly(stream, header);
+
+        int length = BinaryPrimitives.ReadInt32BigEndian(header);
+        if (length is < 0 or > MaxFrame)
+            throw new InvalidDataException($"frame length {length} out of range");
+
+        var payload = new byte[length];
+        FillExactly(stream, payload);
+        return payload;
+    }
+
+    // What Stream.ReadExactly does for you in .NET 7+, spelled out once so the shape sticks.
+    private static void FillExactly(Stream stream, Span<byte> destination)
+    {
+        int filled = 0;
+        while (filled < destination.Length)
+        {
+            int read = stream.Read(destination[filled..]);   // "up to", never "exactly"
+            if (read == 0)
+                throw new EndOfStreamException();            // 0 is the ONLY end-of-stream signal
+            filled += read;
+        }
+    }
+}
+```
+
+</Solution>
+
+Three details in that loop earn their place. The prefix is written **big-endian**, because network
+byte order is the convention every other language's implementation will assume — `BitConverter`
+would give you the machine's order and interoperate wrongly on the first non-x86 peer. The length
+is **bounded before the allocation**, because otherwise a corrupt or hostile four bytes is a
+request to allocate two gigabytes. And a read returning **0** is the only end-of-stream signal:
+any positive count smaller than you asked for is an ordinary short read, and treating it as a
+disconnect is the second-most-common bug in hand-written protocol code.
+
+In modern .NET you write `stream.ReadExactly(header)` (or `ReadExactlyAsync`) and it does that
+loop, throwing `EndOfStreamException` if the peer closes mid-frame. `ReadAtLeast` is the variant
+for "give me at least N, more is welcome". Neither existed before .NET 7, which is why so much
+older networking code contains a hand-rolled version of `FillExactly` — and why so much of it is
+subtly wrong.
+
+<Watch items={[['TCP unit of delivery', 'one byte'], ['UDP unit of delivery', 'one datagram, whole or not at all'], ['what one Send maps to', 'nothing — not one segment, not one Receive'], ['end of stream', 'a read that returns 0, and only that'], ['length prefix', '4 bytes, big-endian, bounded before allocating'], ['loopback MTU on the box these pages were written on', '65536 bytes, against 1400 on eth0']]} />
+
+## what this looks like in prod
+
+The bug does not appear when the protocol is written. It appears when a message gets bigger, or
+when the traffic starts crossing a real path instead of loopback, and by then the framing code is a
+year old and nobody suspects it. The classic symptom is deserialization errors that correlate with
+*message size* or with *load* rather than with any particular message content — because both make
+the split more likely — on a code path that has not been touched in months.
+
+The two shapes it takes, in the order you will meet them. First, one message split across two
+reads: the reader deserializes a truncated buffer and throws, or worse, succeeds on a prefix that
+happens to parse. Second, two messages coalesced into one read: the reader deserializes the first
+and silently discards the tail, so a message vanishes without any error at all. That second one is
+much nastier, because the failure is a missing record rather than an exception, and it usually
+surfaces days later as a reconciliation mismatch.
+
+The UDP mirror image is truncation. If your buffer is smaller than the datagram, you get a partial
+message and the rest is discarded — the datagram is gone, not queued for a second call. How loudly
+that fails depends on the platform, which is itself worth knowing: Windows reports it, as a
+`SocketException` carrying `SocketError.MessageSize`, while on Linux the truncation is silent —
+you get the bytes that fit and nothing tells you more existed. Do not build on the error. Size the
+receive buffer to the largest datagram the protocol permits, not to the usual one.
+
+And the reason your tests did not catch either: a loopback connection with small messages coalesces
+almost every time, and every integration test you wrote runs on loopback. A test that proves your
+framing works has to write a message in several pieces, or exceed a segment's worth of bytes, or
+read one byte at a time — deliberately, because the environment will not do it for you.
+
+## the same idea in other languages
+
+| language | what it's called | the trap |
+| --- | --- | --- |
+| Go | `net.Conn.Read` returns however many bytes it got; `io.ReadFull` is the loop that insists on all of them | `bufio.Scanner` looks like a free line-framer but caps a token at 64 KiB by default and then *stops scanning* — the truncation is reported only through `Scanner.Err()`, which the loop shape encourages you not to check |
+| Java | `InputStream.read(byte[])` returns a count; `DataInputStream.readFully` is the loop | `available()` is not "how many bytes the message has" — it is a lower bound on what can be read without blocking, and it returning 0 does not mean the stream ended |
+| Python | `socket.recv(n)` returns up to `n` bytes; `sendall` exists precisely because `send` may accept fewer bytes than you gave it | on a UDP socket, `recv(bufsize)` discards the remainder of a datagram that does not fit and tells you nothing — you need `MSG_TRUNC` to even learn it happened |
+| C | `read(2)` and `recv(2)` return a short count and you loop | `recv(..., MSG_WAITALL)` looks like the fix, but it may still return short when a signal interrupts it or the connection ends, so the loop does not go away — it just usually completes on the first pass |
+
+## common bugs
+
+- **Assuming one `Send` equals one `Receive`.** The origin bug this whole page exists for. There is
+  no field in TCP that could carry that relationship, so no implementation can honour it, and every
+  test on loopback with small messages will fail to disprove it.
+- **Treating a short read as a disconnect.** `Receive` returning 3 when you asked for 1024 means
+  three bytes were available, nothing more. **Only a return of 0 means the peer closed its end of
+  the stream** — and it means specifically that, not that the connection is dead: the other
+  direction may still be open after a half-close.
+- **Getting the prefix itself wrong, in either of the two standard ways.** Trusting it: it arrived
+  over a network from something you do not control, so bound it against a maximum before you
+  allocate anything, and remember a negative value is representable in four bytes. And writing it
+  with `BitConverter.GetBytes`, which gives you the machine's byte order — little-endian on every
+  machine you will test on, and wrong the moment the peer is another language's implementation
+  following the network-byte-order convention. `BinaryPrimitives.WriteInt32BigEndian` is explicit
+  about which order it means.
+- **Sizing a UDP receive buffer to the typical datagram.** A datagram bigger than your buffer is
+  truncated and the remainder is *discarded*, not held for the next call. Size the buffer to the
+  largest datagram the protocol permits, not the largest one you have seen.
+- **Concluding from this exercise that UDP is the simpler protocol.** It is simpler here because
+  the test is one hop over loopback with no loss and no reordering. Add a real path and you have to
+  rebuild ordering, loss detection and duplicate suppression yourself —
+  [TCP and UDP](/networking/tcp-and-udp/) lists exactly what you would be signing up for, and
+  [the network path](/system-design/networking/) covers what QUIC had to build to do it properly.

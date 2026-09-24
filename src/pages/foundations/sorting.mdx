@@ -1,0 +1,303 @@
+---
+layout: '@layouts/TopicLayout.astro'
+topic: sorting
+---
+
+import Callout from '@components/Callout.astro';
+import Cells from '@components/Cells.astro';
+
+## core idea
+
+Sorting itself is rarely the interview question. What matters is knowing which sort's
+guarantees you're leaning on when you say "sort first" — and being able to defend the
+complexity out loud. Three things cover it: the theoretical floor every comparison sort is
+stuck under, how merge sort and quicksort actually move data (and what each buys you), and
+which C# API matches the guarantee you actually need.
+
+The floor first, because it explains why counting sort feels like cheating: `n` distinct
+elements have `n!` possible orderings. A comparison-based sort's decision tree branches on
+each comparison's outcome — two branches per node — so a tree that distinguishes all `n!`
+orderings needs depth at least `log2(n!)`, which by Stirling's approximation is on the order
+of `n log n`. Merge sort and heapsort hit that ceiling exactly in the worst case; quicksort
+hits it on average. No algorithm that only ever asks "is A before B?" can beat `O(n log n)`
+across all inputs. Counting sort and bucket sort escape the floor by never comparing elements
+to each other — they use the values themselves as array indices, which only works when the
+values are (or map cleanly to) integers in a bounded range.
+
+| algorithm | avg time | worst time | space | stable |
+| --- | --- | --- | --- | --- |
+| Merge Sort | `O(n log n)` | `O(n log n)` | `O(n)` | yes |
+| Quicksort | `O(n log n)` | `O(n²)` | `O(log n)` | no |
+| Heapsort | `O(n log n)` | `O(n log n)` | `O(1)` | no |
+| Counting Sort | `O(n + k)` | `O(n + k)` | `O(n + k)` | yes |
+| Bucket Sort | `O(n + k)` | `O(n²)` | `O(n + k)` | usually\* |
+
+`k` is the size of the key range (counting sort) or the bucket count (bucket sort). \*Bucket
+sort is stable only if whatever sorts each bucket is stable too.
+
+## when sorting is the move
+
+- Another pattern needs sorted input as its precondition: [two pointers'](/patterns/two-pointers/)
+  opposite-end convergence, [binary search's](/patterns/binary-search/) discard-half logic.
+  Sort once at `O(n log n)`, then run the `O(n)` or `O(log n)` pattern on top — the sort
+  dominates the total cost, so you pay for it exactly once, up front.
+- You need **one** order statistic — kth largest, kth smallest, the median, top-K — not a full
+  ordering. A full sort is a safe `O(n log n)` baseline; quickselect answers a single
+  order-statistic query in `O(n)` average, because it only ever recurses into the half that
+  can still contain the answer.
+- The problem is about calendars or bookings: every interval question — merge, insert, count
+  overlaps, minimum rooms — opens with a sort, and *which* key you sort by (start or end) is
+  itself the design decision. See [Intervals](/patterns/intervals/).
+- The keys are bounded integers, characters, or anything with a small known range: counting
+  sort steps outside the comparison floor entirely, and the bucket-by-frequency trick turns a
+  top-K query into `O(n)`. See [Top K Frequent Elements](/patterns/heap-top-k/top-k-frequent/).
+- You want to canonicalize for grouping — sort each string's characters and use the result as
+  a hashmap key, which is exactly how anagram grouping works.
+
+<Callout kind="insight" label="sort first">
+  Before reaching for [two pointers](/patterns/two-pointers/) or
+  [binary search](/patterns/binary-search/), ask whether sorting the input turns the problem
+  into one of those. A one-time `O(n log n)` sort followed by an `O(n)` or `O(log n)` pass is
+  still asymptotically as good as almost anything else on the table — and under interview
+  pressure it is usually the simplest answer that is provably correct.
+</Callout>
+
+## how the sorts work
+
+You will not implement these from a blank editor in most interviews — but the follow-up
+questions live in the mechanics: *why* is that stable, what's the actual worst case, can you
+do it with `O(1)` extra space.
+
+**Merge sort** splits down to single elements, then merges pairs of already-sorted runs back
+together. The merge step is the whole algorithm; recursion just hands it two sorted inputs:
+
+```csharp
+public static void MergeSort(int[] arr) => MergeSortRange(arr, 0, arr.Length - 1);
+
+private static void MergeSortRange(int[] arr, int lo, int hi)
+{
+    if (lo >= hi) return;                     // 0 or 1 element: already sorted
+
+    int mid = lo + (hi - lo) / 2;
+    MergeSortRange(arr, lo, mid);
+    MergeSortRange(arr, mid + 1, hi);
+    Merge(arr, lo, mid, hi);                   // combine two sorted halves
+}
+
+private static void Merge(int[] arr, int lo, int mid, int hi)
+{
+    int[] left = arr[lo..(mid + 1)];
+    int[] right = arr[(mid + 1)..(hi + 1)];
+
+    int i = 0, j = 0, k = lo;
+    while (i < left.Length && j < right.Length)
+        arr[k++] = left[i] <= right[j] ? left[i++] : right[j++];   // `<=` keeps it stable
+
+    while (i < left.Length) arr[k++] = left[i++];    // drain whichever half remains
+    while (j < right.Length) arr[k++] = right[j++];
+}
+```
+
+Recognize that inner loop? It's [Merge Two Sorted Lists](/patterns/linked-lists/merge-two-sorted-lists/)
+— the same "compare fronts, take the smaller, advance" idea, minus the dummy head, because an
+array lets you write straight into `arr[k]` instead of stitching `.Next` pointers.
+
+`Merge` on `left = [1, 4, 7]`, `right = [2, 3, 9]`:
+
+| k | left[i] | right[j] | comparison | take |
+| --- | --- | --- | --- | --- |
+| 0 | `left[0]=1` | `right[0]=2` | `1 <= 2` | left → `1` |
+| 1 | `left[1]=4` | `right[0]=2` | `4 > 2` | right → `2` |
+| 2 | `left[1]=4` | `right[1]=3` | `4 > 3` | right → `3` |
+| 3 | `left[1]=4` | `right[2]=9` | `4 <= 9` | left → `4` |
+| 4 | `left[2]=7` | `right[2]=9` | `7 <= 9` | left → `7` |
+| 5 | left exhausted | `right[2]=9` | — | right → `9` |
+
+Result: `[1, 2, 3, 4, 7, 9]`.
+
+**Quicksort** picks a pivot, partitions the array around it so everything ends up on its
+correct side, and recurses into the two sides independently — no merge step, because
+partitioning already leaves the pivot exactly where it belongs:
+
+```csharp
+public static void QuickSort(int[] arr) => QuickSortRange(arr, 0, arr.Length - 1);
+
+private static void QuickSortRange(int[] arr, int lo, int hi)
+{
+    if (lo >= hi) return;
+    int p = Partition(arr, lo, hi);
+    QuickSortRange(arr, lo, p - 1);
+    QuickSortRange(arr, p + 1, hi);
+}
+
+private static int Partition(int[] arr, int lo, int hi)
+{
+    int pivot = arr[hi];                 // last element as pivot (Lomuto scheme)
+    int i = lo;                          // `[lo, i)` holds everything so far that is <= pivot
+    for (int j = lo; j < hi; j++)
+    {
+        if (arr[j] <= pivot)
+        {
+            (arr[i], arr[j]) = (arr[j], arr[i]);
+            i++;
+        }
+    }
+    (arr[i], arr[hi]) = (arr[hi], arr[i]);   // pivot drops into its final, correct index
+    return i;
+}
+```
+
+`Partition` on `[5, 3, 8, 4, 2, 7, 6]`, pivot = `arr[6] = 6`:
+
+| j | arr[j] | vs pivot | action | array after |
+| --- | --- | --- | --- | --- |
+| 0 | `5` | `5 <= 6` | swap(i=0, j=0), i → 1 | `5,3,8,4,2,7,6` |
+| 1 | `3` | `3 <= 6` | swap(i=1, j=1), i → 2 | `5,3,8,4,2,7,6` |
+| 2 | `8` | `8 > 6` | no swap | `5,3,8,4,2,7,6` |
+| 3 | `4` | `4 <= 6` | swap(i=2, j=3), i → 3 | `5,3,4,8,2,7,6` |
+| 4 | `2` | `2 <= 6` | swap(i=3, j=4), i → 4 | `5,3,4,2,8,7,6` |
+| 5 | `7` | `7 > 6` | no swap | `5,3,4,2,8,7,6` |
+| final | — | — | swap(arr[4], arr[6]) | `5,3,4,2,6,7,8` |
+
+The pivot lands at index `4` — its final, sorted position. Everything before it is `<= 6`,
+everything after it is `> 6`:
+
+<Cells
+  data={[5, 3, 4, 2, 6, 7, 8]}
+  pointers={{ 4: [{ t: 'P', c: 'green' }] }}
+  cells={{ 0: 'win', 1: 'win', 2: 'win', 3: 'win', 4: 'ok', 5: 'warn', 6: 'warn' }}
+  caption="one partition: everything <= 6 sits left of index 4, the pivot's final resting place, everything > 6 sits right"
+/>
+
+That fact — the pivot ends up at its **final** sorted index — is what makes **quickselect**
+possible. To find the kth largest element you don't need to sort the whole array: partition,
+check whether the pivot landed exactly on the index you're after, and recurse into only the
+half that could still hold it:
+
+```csharp
+private static int QuickSelectKthLargest(int[] arr, int k)
+{
+    int targetIndex = arr.Length - k;    // kth largest = (n - k)th smallest, 0-indexed
+    int lo = 0, hi = arr.Length - 1;
+
+    while (true)
+    {
+        int p = Partition(arr, lo, hi);       // same Partition as QuickSort, above
+        if (p == targetIndex) return arr[p];
+        if (p < targetIndex) lo = p + 1;      // answer is to the right of the pivot
+        else hi = p - 1;                      // answer is to the left of the pivot
+    }
+}
+```
+
+`QuickSelectKthLargest([3, 2, 1, 5, 6, 4], k = 2)`, so `targetIndex = 6 - 2 = 4`:
+
+| round | lo | hi | pivot index | array after | vs target (4) | next |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | 0 | 5 | 3 | `3,2,1,4,6,5` | `3 < 4` | lo → 4 |
+| 2 | 4 | 5 | 4 | `3,2,1,4,5,6` | `4 == 4` | return `arr[4] = 5` |
+
+Sorting the whole array would have taken more work than these two partitions — each round
+only touches a shrinking window, never the side that's already ruled out. That's the `O(n)`
+average: this is the exact tool behind
+[Kth Largest Element in an Array](/patterns/heap-top-k/kth-largest-element/), the O(n)-average
+alternative to keeping a heap of size K.
+
+**Counting sort** skips comparisons entirely when keys are small non-negative integers: tally
+how many times each value occurs, then write that many copies of each value back out in
+increasing order.
+
+```csharp
+public static int[] CountingSort(int[] arr, int maxValue)
+{
+    int[] counts = new int[maxValue + 1];
+    foreach (int v in arr) counts[v]++;               // tally each value
+
+    int[] result = new int[arr.Length];
+    int idx = 0;
+    for (int v = 0; v <= maxValue; v++)
+        for (int c = 0; c < counts[v]; c++)
+            result[idx++] = v;                        // write `counts[v]` copies of v, in order
+
+    return result;
+}
+```
+
+`CountingSort([4, 2, 2, 8, 3, 3, 1], maxValue = 8)`. Counts array, indexed by value `0..8`:
+`0,1,2,2,1,0,0,0,1`.
+
+| value | count | placed at | result so far |
+| --- | --- | --- | --- |
+| 1 | 1 | index `0` | `1` |
+| 2 | 2 | indices `1..2` | `1,2,2` |
+| 3 | 2 | indices `3..4` | `1,2,2,3,3` |
+| 4 | 1 | index `5` | `1,2,2,3,3,4` |
+| 8 | 1 | index `6` | `1,2,2,3,3,4,8` |
+
+Values `0, 5, 6, 7` never appear above — their counts are `0`, so they contribute nothing to
+the output.
+
+Cost is `O(n + k)` time and space, where `k = maxValue`. That's worse than the comparison
+floor when `k` is huge (sorting a million 64-bit hashes) and strictly better when `k` is small
+(exam scores `0` to `100`, byte values).
+
+Bucket sort generalizes the idea past integers: split the key range into `k` buckets, drop
+each element into its bucket, sort each bucket (insertion sort is common — buckets are small),
+then concatenate. Average case is still `O(n + k)` on roughly uniform input; a pathological
+input that dumps everything into one bucket degrades to whatever that bucket's own sort costs,
+`O(n²)` worst case.
+
+Bucket sort's canonical interview appearance isn't sorting numbers — it's
+[Top K Frequent Elements](/patterns/heap-top-k/top-k-frequent/): bucket index `i` holds every
+value that occurs exactly `i` times, so the bucket count is bounded by the array length
+(`k = n`), and "top K by frequency" collapses to one `O(n)` pass instead of an
+`O(n log n)` sort or an `O(n log k)` heap.
+
+## stability and the .NET toolkit
+
+Stability means equal-key elements keep their relative input order after the sort. It sounds
+academic until you chain a secondary key onto a primary one and need the primary sort to not
+scramble it — or until an interviewer asks "is that guaranteed?" and you don't have an answer.
+
+`Array.Sort` and `List<T>.Sort` run introsort — a hybrid that starts as quicksort, falls back
+to heapsort when recursion goes too deep (the guard against quicksort's `O(n²)` worst case),
+and drops to insertion sort for small partitions. Microsoft's docs explicitly do **not**
+guarantee stability: equal elements can come out reordered, and .NET reserves the right to
+change the algorithm between releases.
+
+`Enumerable.OrderBy` / `OrderByDescending` (LINQ) **are** documented stable — which is the
+entire reason `OrderBy(...).ThenBy(...)` works as a multi-key sort. You don't sort by the
+least-significant key first and work backward; `ThenBy` only ever breaks ties left over by the
+key before it:
+
+```csharp
+var sorted = people
+    .OrderBy(p => p.LastName)      // primary key
+    .ThenBy(p => p.FirstName);     // tiebreaker — only touches ties LastName left behind
+```
+
+Verified on `[("Kim","Ana"), ("Lee","Bo"), ("Kim","Zoe"), ("Lee","Amy")]`: output order is
+`Kim,Ana` → `Kim,Zoe` → `Lee,Amy` → `Lee,Bo`. `Kim` sorts before `Lee` on the primary key;
+within each last name, first name breaks the tie, and nothing crosses a last-name boundary.
+
+Custom comparers: a `Comparison<T>` lambda for a one-off order, `IComparer<T>` via
+`Comparer<T>.Create` when you need to hand the comparer somewhere else:
+
+```csharp
+int[] nums = [5, 3, 8, 1, 9, 2];
+Array.Sort(nums, (a, b) => b.CompareTo(a));    // descending, in place: 9,8,5,3,2,1
+
+string[] words = ["pear", "fig", "apple", "kiwi", "date"];
+Array.Sort(words, Comparer<string>.Create((a, b) =>
+{
+    int byLength = a.Length.CompareTo(b.Length);
+    return byLength != 0 ? byLength : string.CompareOrdinal(a, b);
+}));
+// shortest first, alphabetical on ties: fig, date, kiwi, pear, apple
+```
+
+<Callout kind="tip" label="which one to reach for">
+  Default to `OrderBy` when you need stability or you're chaining keys with `ThenBy`. Default
+  to `Array.Sort` / `List<T>.Sort` when you just need speed on primitives and don't care about
+  tie order — introsort runs in place with a lower constant factor than LINQ's pipeline.
+</Callout>

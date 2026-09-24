@@ -1,0 +1,299 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: atomics-and-cas
+problem: cas-counter
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import Solution from '@components/Solution.astro';
+
+## the question
+
+Six ways to add one to a number several threads share, or — for the last two — to keep a running
+maximum, which `Interlocked` has no dedicated method for at all:
+
+```csharp
+counter++;                                                  // wrong, and here only as a baseline
+Interlocked.Increment(ref counter);                         // one lock-prefixed instruction
+do { old = Volatile.Read(ref counter); }                    // the general CAS loop
+  while (Interlocked.CompareExchange(ref counter, old + 1, old) != old);
+lock (gate) counter++;                                       // a monitor around the same increment
+if (++local == 64) { Interlocked.Add(ref counter, local); local = 0; }   // batch, then publish
+slots[id].Value++;                                           // one counter per thread, one line each
+
+// no Interlocked.Max exists, so a running maximum needs a CAS loop:
+while (candidate > seen) { var prev = CompareExchange(ref max, candidate, seen); … }
+lock (gate) { if (candidate > max) max = candidate; }         // the alternative: always take the lock
+```
+
+<Callout kind="insight" label="predict first">
+  Every one of these questions is answerable from the code, not from a stopwatch.
+
+  **One.** For each of the six, how many `lock`-prefixed (or monitor-fast-path) instructions does
+  it execute per logical increment: always zero, always exactly one, one-or-more depending on
+  contention, or a fraction like one-in-sixty-four?
+
+  **Two.** `counter++` is not in that count for a reason: it is a baseline, not a contender. Why is
+  comparing a broken implementation's instruction count against the correct ones misleading, even
+  before anyone runs anything?
+
+  **Three.** The running maximum: after millions of draws from a wide random range, does the CAS
+  loop's `while (candidate > seen)` pre-check actually reach `CompareExchange` on most calls, about
+  half, or almost none? Reason from what a running maximum does over time, not from the syntax.
+
+  **Four.** Does `MaxLocked` — `lock (gate) { if (candidate > max) max = candidate; }` — have the
+  same skip available to it? Look at what has to happen before the `if` can even be evaluated.
+</Callout>
+
+## the code
+
+`bench/atomics-and-cas/cas-counter.cs`, complete and runnable — it counts, rather than times, how
+often each path actually runs:
+
+<Solution>
+
+```csharp
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
+
+static class CasCounter
+{
+    static int counter;
+    static long max;
+    static readonly object gate = new();
+
+    [StructLayout(LayoutKind.Explicit, Size = 64)]
+    struct PaddedCounter { [FieldOffset(0)] public long Value; }
+    static readonly PaddedCounter[] slots = new PaddedCounter[16];
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    static void Plain() => counter++;                                    // 0 locked instructions — and wrong
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    static void Atomic() => Interlocked.Increment(ref counter);          // exactly 1: lock xadd
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    static void Cas()
+    {
+        int old;                                                        // >= 1: lock cmpxchg, once per attempt
+        do { old = Volatile.Read(ref counter); }
+        while (Interlocked.CompareExchange(ref counter, old + 1, old) != old);
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    static void Locked() { lock (gate) counter++; }                      // >= 1: the monitor's own fast-path CAS
+
+    const int Batch = 64;
+    static int local;
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    static void Batched()                                                // 1 per 64 calls: amortised
+    {
+        if (++local == Batch) { Interlocked.Add(ref counter, local); local = 0; }
+    }
+    static void BatchedFlush() { if (local != 0) { Interlocked.Add(ref counter, local); local = 0; } }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    static void Partitioned(int id) => slots[id].Value++;                // 0 — no other core ever wants this line
+
+    // a running maximum: only CAS when the candidate can possibly win.
+    // `attempts` and `skips` count which branch actually ran — a fact
+    // about the code path taken, not about how long it took.
+    static long attempts, skips;
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    static void MaxCas(long candidate)
+    {
+        long seen = Volatile.Read(ref max);
+        if (candidate <= seen) { Interlocked.Increment(ref skips); return; }   // no CAS at all
+        while (candidate > seen)
+        {
+            Interlocked.Increment(ref attempts);
+            long prev = Interlocked.CompareExchange(ref max, candidate, seen);
+            if (prev == seen) break;
+            seen = prev;
+        }
+    }
+
+    // the alternative: take the lock first, decide inside it
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    static void MaxLocked(long candidate)
+    {
+        lock (gate) { if (candidate > max) max = candidate; }             // always takes the lock
+    }
+
+    public static void Main()
+    {
+        counter = 0;
+        for (int i = 0; i < 1000; i++) Atomic();
+        for (int i = 0; i < 1000; i++) Cas();
+        for (int i = 0; i < 1000; i++) Locked();
+        for (int i = 0; i < 1000; i++) Batched();
+        BatchedFlush();
+        Console.WriteLine($"counter after 4000 correct increments: {counter} (expect 4000)");
+
+        Console.WriteLine("\n=== running maximum: how often does the CAS loop skip the CAS? ===");
+        var rng = new Random(7919);
+        max = 0; attempts = 0; skips = 0;
+        const int N = 4_000_000;
+        for (int i = 0; i < N; i++) MaxCas(rng.Next(1, 1_000_000));
+        Console.WriteLine($"  {N:N0} draws, range [1, 1,000,000)");
+        Console.WriteLine($"  CAS attempted: {attempts,10:N0} ({attempts * 100.0 / N,5:F2}%)");
+        Console.WriteLine($"  CAS skipped:   {skips,10:N0} ({skips * 100.0 / N,5:F2}%)");
+        Console.WriteLine($"  final max: {max}");
+    }
+}
+```
+
+</Solution>
+
+## work it out
+
+**Question one.** Read each body for what it must do to be correct, not for how it performs:
+
+| variant | locked instructions per logical increment | why |
+| --- | --- | --- |
+| `Plain` | 0 | that is the entire bug — nothing holds the line, so nothing is atomic |
+| `Atomic` | exactly 1 | `Interlocked.Increment` is one `lock xadd`, always |
+| `Cas` | 1 or more | one `lock cmpxchg` per attempt; more than one only when another thread's write lands between this thread's read and its swap |
+| `Locked` | 1 or more | the monitor's uncontended fast path is itself a compare-and-swap on the lock word — [what a lock is made of](/systems/locks-internals/) covers that mechanism — so `lock { counter++; }` can never execute *fewer* locked instructions than `Atomic`, and under contention it can additionally hand the thread to the kernel to park, which `Atomic` never does |
+| `Batched` | 1 per 64 calls | the `Interlocked.Add` only runs when the local counter rolls over; the other 63 calls out of every 64 touch a thread-local `int`, no shared state at all |
+| `Partitioned` | 0 | every thread has its own array slot, on its own cache line; no other core ever asks for it, so there is nothing to lock |
+
+**Question two.** `Plain` has fewer locked instructions than everything else — zero — precisely
+because it skips the work that makes the others correct. Counting instructions (or, on the version
+of this page that used to exist here, timing them) without checking correctness first rewards
+whichever implementation does the least work, including the one that does too little to be right.
+That is why `Plain` is a baseline and not a row in the comparison: the fair comparison is only
+between implementations that produce the same, correct answer.
+
+**Question three.** A running maximum only moves in one direction, and each new draw is compared
+against everything seen *so far*, not against a fixed target. Early in the run almost every draw
+raises the maximum, because there is little to beat. As the run continues the maximum climbs
+toward the top of the range it is drawn from, and a fresh uniform draw from that same range has a
+shrinking chance of landing above a maximum that already sits near the top — after enough draws,
+the maximum is typically within a rounding error of the range's ceiling, and a random draw beating
+it becomes rare. So the correct prediction is "almost none" once the run has been going a while,
+even though the loop's `while (candidate > seen)` condition never stops being evaluated.
+
+**Question four.** No. `MaxLocked` has to acquire the monitor — enter the lock's fast-path CAS —
+*before* it can even read `max` to evaluate `candidate > max`. There is no way to ask "would this
+be worth locking for?" without something that is itself synchronized, so every one of its calls
+pays for the acquire whether or not the candidate wins, unlike `MaxCas`'s plain, lock-free
+`Volatile.Read` up front. The two control-flow shapes are not variations on one theme — one has an
+exit ramp before any synchronized instruction, and the other does not:
+
+```text
+   MaxCas(candidate)                         MaxLocked(candidate)
+     │                                          │
+     ▼                                          ▼
+   Volatile.Read(max)   ← free, no line        acquire monitor  ← ALWAYS a locked
+     │                     transfer needed         │                instruction,
+     ▼                                             ▼                win or lose
+   candidate > seen? ──── no ──► return         candidate > max?
+     │ yes                                         │
+     ▼                                             ▼
+   lock cmpxchg(max, …)  ← only on this path    max = candidate (if true)
+     │                                             │
+     ▼                                             ▼
+   done                                          release monitor, done
+
+   MaxCas can decide "nothing to do" for free.
+   MaxLocked cannot decide anything without paying first.
+```
+
+## the answer
+
+Real output. First, that every correct variant reaches the same total — `Batched` needs an
+explicit flush of whatever is left in the local counter, or the last partial batch is silently
+lost, which is itself worth noticing before trusting any batching scheme:
+
+```text
+counter after 4000 correct increments: 4000 (expect 4000)
+```
+
+Then the running maximum, 4,000,000 draws from a fixed random stream in the range `[1, 1,000,000)`:
+
+```text
+=== running maximum: how often does the CAS loop skip the CAS? ===
+  4,000,000 draws, range [1, 1,000,000)
+  CAS attempted:         11 ( 0.00%)
+  CAS skipped:    3,999,989 (100.00%)
+  final max: 999999
+```
+
+Eleven CAS attempts, out of four million calls, reached the maximum this run settled on. Every one
+of the other 3,999,989 calls read `max` with a plain `Volatile.Read`, found the candidate could not
+win, and returned without touching a single locked instruction. `MaxLocked` has no equivalent path:
+it takes the lock on all 4,000,000 calls, because taking the lock is the only way it has to look at
+`max` at all.
+
+## why it works that way
+
+**A locked instruction is not a fixed tax you either pay or don't — it is something the code
+either does zero, one, or many times, and reading the code tells you which without running it.**
+`Plain` and `Partitioned` never execute one. `Atomic` executes exactly one, unconditionally.
+`Cas` and `Locked` execute at least one, and the CAS loop's "at least" can grow under contention
+in a way `Interlocked.Increment` cannot, because `Increment` has no retry to grow. `Batched`
+amortises one locked instruction over sixty-four logical increments by keeping sixty-three of them
+entirely thread-local.
+
+**An optimistic pre-check turns "always synchronize" into "synchronize only when it could
+matter," and only a lock-free read can do that pre-check.** `MaxCas`'s `Volatile.Read` costs
+nothing to contend for — it never asks another core to give up ownership of anything — so it is
+free to run on every call and decide, correctly, that almost none of them need to go further.
+`MaxLocked` cannot ask the same question without first acquiring the very thing it might not need,
+because the data the question depends on (`max`) is only safe to read inside the lock that
+protects it. The general shape — read optimistically, act only if it looks worth it, and let the
+real synchronized operation confirm or reject — is what makes a CAS loop strictly more capable
+than a lock for this kind of problem, not merely a different way to spell the same operation.
+
+<Watch items={[['Interlocked.Increment', 'exactly 1 locked instruction, always'], ['CAS loop', 'at least 1 per attempt; retries add more'], ['lock', 'at least 1 (the monitor CAS), plus kernel parking once contended'], ['batched Interlocked.Add per 64', '1 locked instruction per 64 increments'], ['per-thread counter', '0 — no other core wants the line'], ['running max, this run', '11 CAS calls out of 4,000,000 — the other 3,999,989 never touched a locked instruction']]} />
+
+## what this looks like in prod
+
+The order-of-magnitude question in a code review is never "which primitive is faster" — it is
+"how many of these calls actually need to touch shared state at all." A hit counter, a
+metrics gauge, a cache's approximate size: all of them are candidates for the `Batched` shape,
+publishing a local accumulator every N operations instead of every one. A "have we ever seen a
+value this large" check, a "is this the newest version we've published" guard, a first-writer-wins
+cache slot: all of them are candidates for the `MaxCas` shape, an optimistic read that only pays
+for synchronization on the rare call that can actually change anything.
+
+The `MaxLocked` shape shows up as a lock taken on a hot path to protect a check that is false the
+overwhelming majority of the time — a `lock` wrapping an `if` that rarely fires is a sign the check
+could have been done outside the lock first (a double-checked read), or that the whole operation
+belongs in a CAS loop instead. [Races and deadlock](/systems/concurrency-hazards/) is where
+double-checked locking is covered in full, including the ways people get the pattern wrong when
+they apply it to object construction instead of a single scalar.
+
+## the same idea in other languages
+
+| language | what it's called | the trap |
+| --- | --- | --- |
+| Java | `AtomicLong` for the exact counter, `LongAdder` for the hot one | `LongAdder` *is* the batching-and-partitioning idea in this page's `Batched`/`Partitioned` rows, built into the standard library: it keeps a striped array of cells that are only summed when `sum()` is called, never on the write path. .NET ships no equivalent, so writing the partitioning yourself, as this page's benchmark does, is the normal thing to do in C# |
+| C++ | `std::atomic<T>::fetch_add`, `compare_exchange_weak` in a loop | `compare_exchange_weak` may fail spuriously even when the value matched — legal, and cheaper on load-linked/store-conditional ISAs like ARM. It is only correct inside a retry loop; reach for `_strong` when the compare-exchange is not already in one. C# has no weak form: `Interlocked.CompareExchange` never fails spuriously |
+| Go | `atomic.Int64.Add`, `sync.Mutex` | Go's mutex has an adaptive fast path much like .NET's monitor, and Go programs commonly shard a counter across goroutines and sum at the end rather than share one atomic — the same partitioning idea as `Partitioned` above, more idiomatic there than in C# |
+| Rust | `AtomicUsize::fetch_add` with an explicit `Ordering`, `Mutex<T>` | the memory ordering is a required argument to every atomic operation, so there is no default to get wrong the way C#'s implicit full-fence semantics can hide a choice — `Ordering::Relaxed` is correct and cheapest for a pure statistics counter, where C#'s `Interlocked` always pays for a full fence whether or not the counter needs one |
+
+## common bugs
+
+- **Comparing a broken implementation against correct ones.** `counter++` executes fewer locked
+  instructions than everything else in this exercise because it skips the work that makes the
+  others correct. A comparison that includes it invites exactly the wrong conclusion.
+- **Forgetting to flush a batch.** `Batched` above needs an explicit publish of whatever is left
+  in `local` when the loop ends, or the last partial batch — up to 63 increments here — is lost
+  silently. The same shape shows up in any per-thread accumulator that only ever publishes on
+  rollover.
+- **Putting side effects inside a CAS loop.** The loop body runs once per *attempt*, not once per
+  success. Allocating, logging, or mutating shared state inside it means those happen more than
+  once whenever another thread wins the race in between.
+- **Reaching for a lock to do an optimistic check.** `MaxLocked` has to acquire the monitor before
+  it can even evaluate whether the candidate is worth updating, which means it pays the
+  synchronization cost on every call, including the calls that end up doing nothing. A CAS loop
+  with a plain read up front can decide "nothing to do here" without touching a locked instruction
+  at all.
+- **Assuming `Interlocked.Add` batching is free of races.** The local accumulator (`local` in
+  `Batched`) must itself belong to one thread only — if it is a `static` shared by multiple
+  threads instead of thread-local state, the increment on it is exactly the lost-update bug from
+  [the counter that counted wrong](/systems/atomics-and-cas/lost-updates/), just moved one layer
+  down.

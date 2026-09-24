@@ -1,0 +1,123 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: dynamic-programming
+problem: word-break
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+
+## task
+
+Given a string `s` and a dictionary `wordDict`, return whether `s` can be segmented into a
+space-separated sequence of one or more dictionary words. Words may repeat.
+
+```text
+s = "leetcode", wordDict = ["leet", "code"]  →  true   ("leet" + "code")
+```
+
+## how to think
+
+For a prefix ending at index `i`, ask: is there *some* earlier split point `j` such that the
+prefix up to `j` is itself breakable (`dp[j]`), and the remaining piece `s[j..i]` is a dictionary
+word? If such a `j` exists, `s[0..i]` is breakable; if none does, across every possible `j`, it
+isn't. That's the whole recurrence: `dp[i] = true` if `dp[j] && wordDict.Contains(s[j..i])` for
+any `j < i`. It's the same "try every predecessor" shape as Coin Change, with string prefixes
+standing in for amounts and dictionary words standing in for coins.
+
+Brute-force recursion tries every split point from every position — exponential, and it
+re-derives "is `s[0..j]` breakable?" from scratch every time a later prefix asks the same
+question. Caching that yes/no per prefix (there are only `n+1` distinct prefixes) collapses it to
+O(n²) split checks, each a HashSet lookup.
+
+<Callout kind="note" label="template instance">
+  **Bottom-up tabulation.** State: `dp[i]` = can `s[0..i]` be segmented into dictionary words.
+  Recurrence: `dp[i] = true` if `dp[j] && s[j..i]` is in the dictionary, for some `j < i`. Base
+  case: `dp[0] = true` (the empty prefix). Order: `i` ascending — every `dp[j]` a later state
+  needs is already resolved.
+</Callout>
+
+## solution
+
+```csharp
+public bool WordBreak(string s, IList<string> wordDict)
+{
+    var words = new HashSet<string>(wordDict);   // O(1) membership instead of scanning the list
+    var dp = new bool[s.Length + 1];
+    dp[0] = true;                                 // the empty prefix is trivially breakable
+
+    for (int i = 1; i <= s.Length; i++)
+    {
+        for (int j = 0; j < i; j++)
+        {
+            if (dp[j] && words.Contains(s[j..i]))
+            {
+                dp[i] = true;
+                break;                             // one working split is enough
+            }
+        }
+    }
+    return dp[s.Length];
+}
+```
+
+## trace
+
+`s = "catsandog"`, `wordDict = ["cats", "dog", "sand", "and", "cat"]`. `dp[0] = true`; each row is
+prefix `s[0..i]`, showing the split `j` that succeeded, if any:
+
+| i | prefix | working split | dp[i] |
+| --- | --- | --- | --- |
+| 1 | `c` | none | false |
+| 2 | `ca` | none | false |
+| 3 | `cat` | `j=0`: dp[0] true, `cat` in dict | true |
+| 4 | `cats` | `j=0`: dp[0] true, `cats` in dict | true |
+| 5 | `catsa` | none | false |
+| 6 | `catsan` | none | false |
+| 7 | `catsand` | `j=3`: dp[3] true, `sand` in dict | true |
+| 8 | `catsando` | none (`catsando`, `sando`, `ando`, `o` — none are dictionary words) | false |
+| 9 | `catsandog` | none (`catsandog`, `sandog`, `andog`, `og` — none are words) | false |
+
+Final answer: `dp[9] = false`. Notice `s[6..9]` is `"dog"`, which **is** in the dictionary — but
+`j = 6` is never a usable split because `dp[6]` is false (`"catsan"` isn't itself breakable). A
+dictionary word appearing in the string is necessary but not sufficient: it only counts if it
+starts at a point the string can actually reach.
+
+## why it works
+
+`dp[i]` is true exactly when some prefix of length `i` is a legal concatenation of dictionary
+words, by structural induction on the *last* word in that concatenation: it ends at `i`, starts
+at some `j`, and everything before it (`s[0..j]`) is itself a legal concatenation — which is
+precisely `dp[j]`. The base case `dp[0] = true` anchors an empty concatenation. Checking every
+`j < i` means no valid decomposition is missed; finding any one is sufficient because the
+question is existence, not counting.
+
+The extra factor above the "obvious" O(n²) comes from `s[j..i]` allocating a fresh substring up
+to length `n` on every check — swap to index-based hashing (or slice with `ReadOnlySpan<char>`
+and a span-keyed lookup) to get the true O(n²) time this recurrence's shape promises.
+
+<Watch items={[['time', 'O(n^3)'], ['space', 'O(n)']]} />
+
+## common bugs
+
+- Checking `words.Contains(s[j..i])` without first checking `dp[j]` — finds a dictionary word
+  inside the string that doesn't start at a reachable split point (see the `"dog"` near-miss in
+  the trace).
+- Rebuilding a fresh `HashSet` inside the loop instead of once up front — turns an O(1) lookup
+  into an O(m) scan on every check, where `m` is the dictionary size.
+- Off-by-one on the substring bounds: `s[j..i]` (not `s[j..i+1]` or `s[j-1..i]`) — `i` and `j` are
+  prefix *lengths* here, not plain character indices, and it's easy to blur the two.
+- Missing the early `break` — without it, the inner loop keeps overwriting `dp[i]` with the same
+  `true` on every later match, merely wasteful here but a sign of a misunderstanding that bites
+  harder on problems needing to track *which* split, not just whether one exists.
+
+## variants you can now solve
+
+- **Word Break II** (LC 140) — same reachability check, but collect and return every valid
+  segmentation instead of a single boolean: backtrack from each reachable `j` instead of stopping
+  at the first.
+- [Coin Change](/patterns/dynamic-programming/coin-change/) — the same "any valid predecessor"
+  shape over a numeric range instead of string prefixes.
+- **Concatenated Words** (LC 472) — run this exact `WordBreak` once per word in a list (against
+  the rest of the list as the dictionary) to find which words are themselves concatenations of
+  others.

@@ -1,0 +1,151 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: sliding-window
+problem: longest-substring-without-repeating
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import Cells from '@components/Cells.astro';
+
+## task
+
+Given a string `s`, return the length of the longest substring that contains no repeated
+characters.
+
+```text
+s = "abcabcbb"  →  3   ("abc")
+```
+
+## how to think
+
+Brute force checks every substring for uniqueness — `O(n²)` substrings, `O(n)` to verify each,
+`O(n³)` naively. But if `[left, right-1]` is already known to hold unique characters, the only
+way `right` can spoil that is if `s[right]` is already inside the window.
+
+So expand `right` unconditionally every step; the moment the incoming character collides with
+something already in the window, shrink from `left` — removing characters one at a time — until
+the collision is gone. This is a **longest** problem, so the discipline is shrink-while-invalid:
+hold the window at the biggest size that's still legal, and only give ground when forced.
+
+<Callout kind="note" label="template instance">
+  **Variable window, longest**, shrink-while-invalid. Window state: a `HashSet<char>`.
+  `IsValid()` is "no duplicate in the window", and `seen.Add(c)` returning `false` *is* the
+  invalidity check — no separate query needed. What varies from the skeleton: nothing but the
+  state structure; the validity rule here is membership, not a count threshold.
+</Callout>
+
+## solution
+
+```csharp
+public int LengthOfLongestSubstring(string s)
+{
+    var seen = new HashSet<char>();
+    int left = 0, best = 0;
+
+    for (int right = 0; right < s.Length; right++)
+    {
+        char c = s[right];
+        while (!seen.Add(c))               // Add returns false when c is already in the window
+        {
+            seen.Remove(s[left]);          // shrink while INVALID
+            left++;
+        }
+        best = Math.Max(best, right - left + 1);
+    }
+    return best;
+}
+```
+
+## trace
+
+`s = "abcabcbb"` (indices 0-7: `a b c a b c b b`):
+
+| right | char | shrink this step | left after | window | set after | best |
+| --- | --- | --- | --- | --- | --- | --- |
+| 0 | `a` | — | 0 | `"a"` | `{a}` | 1 |
+| 1 | `b` | — | 0 | `"ab"` | `{a,b}` | 2 |
+| 2 | `c` | — | 0 | `"abc"` | `{a,b,c}` | 3 |
+| 3 | `a` | remove `s[0]='a'` | 1 | `"bca"` | `{a,b,c}` | 3 |
+| 4 | `b` | remove `s[1]='b'` | 2 | `"cab"` | `{a,b,c}` | 3 |
+| 5 | `c` | remove `s[2]='c'` | 3 | `"abc"` | `{a,b,c}` | 3 |
+| 6 | `b` | remove `s[3]='a'`, then `s[4]='b'` | 5 | `"cb"` | `{b,c}` | 3 |
+| 7 | `b` | remove `s[5]='c'`, then `s[6]='b'` | 7 | `"b"` | `{b}` | 3 |
+
+`right = 2`: the window has grown to its answer size before any collision fires —
+
+<Cells
+  data={['a', 'b', 'c', 'a', 'b', 'c', 'b', 'b']}
+  pointers={{ 0: [{ t: 'L', c: 'amber' }], 2: [{ t: 'R', c: 'cyan' }] }}
+  cells={{ 0: 'ok', 1: 'ok', 2: 'ok' }}
+  caption='right=2: window "abc" — length 3, and it turns out to be the answer'
+/>
+
+`right = 3`: `a` collides with the window's own `a` at index 0 — evict it, `left` slides to 1 —
+
+<Cells
+  data={['a', 'b', 'c', 'a', 'b', 'c', 'b', 'b']}
+  pointers={{ 0: [{ t: 'L', c: 'amber' }], 3: [{ t: 'R', c: 'cyan' }] }}
+  cells={{ 0: 'warn', 1: 'win', 2: 'win', 3: 'win' }}
+  caption="right=3: 'a' repeats → index 0 gets evicted, left slides to 1"
+/>
+
+## why it works
+
+The invariant held at every step is *"every character in `[left, right]` is unique"* — it's true
+before the loop starts (empty window), and the `while` restores it before `best` is ever read, so
+`best` only ever measures valid windows. The complexity isn't obvious from the nested loop: it
+looks like `O(n²)` because of the `while` inside the `for`, but `left` only ever moves forward
+and can advance at most `n` times total across the *entire* run — same for `right`. Two pointers,
+each making at most `n` forward steps, is `O(n)` amortized, not `O(n²)`.
+
+The mechanical version above crawls `left` forward one character at a time on a collision. Since
+you already know exactly *where* the earlier occurrence of `c` was, you can jump `left` straight
+past it in one step instead of repeating the removal loop:
+
+```csharp
+public int LengthOfLongestSubstringJump(string s)
+{
+    var lastIndex = new Dictionary<char, int>();
+    int left = 0, best = 0;
+
+    for (int right = 0; right < s.Length; right++)
+    {
+        char c = s[right];
+        if (lastIndex.TryGetValue(c, out int idx) && idx >= left)
+            left = idx + 1;                      // jump left past the previous occurrence in one step
+        best = Math.Max(best, right - left + 1);
+        lastIndex[c] = right;
+    }
+    return best;
+}
+```
+
+Same `O(n)` time — the jump just replaces a `while` loop with one `if`, so `left` never revisits
+ground it's already covered. The `idx >= left` guard matters: without it, a stale `lastIndex`
+from *before* the current window could yank `left` backward and undercount the window.
+
+<Watch items={[['time', 'O(n)'], ['space', 'O(min(n, alphabet))']]} />
+
+## common bugs
+
+- Using `if` instead of `while` around the removal: `seen.Add(c)` failing only tells you `c` is
+  *somewhere* in the window — if `s[left]` isn't `c`, one removal isn't enough, and you need to
+  keep shrinking until it is.
+- Off-by-one on the length: it's `right - left + 1`, not `right - left`.
+- Resetting `left` to `0` on a collision instead of continuing to advance it — throws away all
+  prior progress and turns the algorithm quadratic.
+- In the jump variant, forgetting the `idx >= left` guard — an occurrence recorded before the
+  current window started must not move `left` backward.
+- Reaching for a `Dictionary<char, int>` frequency count when only membership matters — a
+  `HashSet<char>` already answers "have I seen this?" with less bookkeeping.
+
+## variants you can now solve
+
+- [Longest Repeating Character Replacement](/patterns/sliding-window/longest-repeating-character-replacement/)
+  (LC 424) — same shrink-while-invalid shape, but validity swaps set membership for a
+  frequency-count formula.
+- **Longest Substring with At Most K Distinct Characters** (LC 340) — swap the `HashSet` for a
+  frequency dictionary; validity becomes `dict.Count <= k`.
+- **Permutation in String** (LC 567) — a *fixed*-size window (`s1.Length`) whose validity is
+  "frequency counts match exactly" — a hybrid of the fixed and variable templates.

@@ -1,0 +1,406 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: cpu-execution
+problem: call-and-inline-cost
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import Solution from '@components/Solution.astro';
+
+## the question
+
+A method call is two instructions — `call` pushes the return address and jumps, `ret` pops it
+back, and [the topic page](/systems/cpu-execution/) takes both apart. Between them sits the
+paperwork: arguments moved into the registers the calling convention names, live values in
+scratch registers spilled to the stack because the callee is allowed to destroy them, and an
+optimiser that has to stop at the boundary because it cannot see through it.
+
+So take the smallest possible callee, `a + b + c`, and reach it five ways:
+
+| variant | what it is |
+| --- | --- |
+| open-coded | the addition written where it is used — no call at all |
+| inlined call | a normal static method the JIT is free to inline |
+| call, no inline | the identical method with `[MethodImpl(MethodImplOptions.NoInlining)]` |
+| interface, one type seen | called through an interface, where every object at the call site is the same class |
+| interface, two types seen | the same code, the same call site, but two classes take turns |
+
+<Callout kind="insight" label="predict first">
+  Commit to answers you can get to by reasoning about the instructions, not by timing anything.
+  The JIT will inline "inlined call" and "open-coded" down to the same code — do you expect the
+  compiled loop bodies to be identical, or just similar? For "call, no inline": name two things,
+  beyond the `call` instruction itself, that you expect to show up in the generated code that
+  aren't in the inlined version. And for the two interface rows: will the JIT emit *different*
+  machine code for the one-type call site versus the two-type call site, or the *same* code
+  behaving differently at runtime? Write down an answer to that last one before you scroll — it
+  is the one people get backwards.
+</Callout>
+
+## the code
+
+<Solution>
+
+```csharp
+// What a function call costs, in instructions rather than time — the same three additions
+// reached five ways. CallMono and CallPoly are separate methods with separate call sites, so
+// each gets its own profile: CallMono only ever sees Adder, CallPoly alternates Adder/OtherAdder.
+//   dotnet run -c Release bench/cpu-execution/call-and-inline-cost.cs
+using System.Runtime.CompilerServices;
+
+const int N = 4000;
+
+// A. no call at all — the body written where it is used
+static long OpenCoded()
+{
+    long total = 0;
+    for (int i = 0; i < N; i++) total += i + 1 + 2;
+    return total;
+}
+
+// B. a small static method the JIT is free to inline
+static long Inlined()
+{
+    long total = 0;
+    for (int i = 0; i < N; i++) total += Ops.Add(i, 1, 2);
+    return total;
+}
+
+// C. identical method, inlining forbidden — the only difference is the call
+static long NotInlined()
+{
+    long total = 0;
+    for (int i = 0; i < N; i++) total += Ops.AddNoInline(i, 1, 2);
+    return total;
+}
+
+// D. an interface call site that only ever sees one concrete type
+static long CallMono(IAdder[] items)
+{
+    long total = 0;
+    for (int i = 0; i < N; i++) total += items[i & 1].Add(i, 1, 2);
+    return total;
+}
+
+// E. the same shape, but the call site sees two concrete types
+static long CallPoly(IAdder[] items)
+{
+    long total = 0;
+    for (int i = 0; i < N; i++) total += items[i & 1].Add(i, 1, 2);
+    return total;
+}
+
+IAdder[] oneType = [new Adder(), new Adder()];
+IAdder[] twoTypes = [new Adder(), new OtherAdder()];
+
+// Run every variant enough times that tiered compilation promotes each one to fully
+// optimised code before the correctness check — and, separately, before a DOTNET_JitDisasm
+// dump is taken of it. CallMono only ever runs against oneType, CallPoly only ever against
+// twoTypes, so their profiles stay clean and separate.
+long sink = 0;
+for (int w = 0; w < 3; w++)
+{
+    sink += OpenCoded() + Inlined() + NotInlined();
+    sink += CallMono(oneType) + CallPoly(twoTypes);
+}
+
+long a = OpenCoded();
+long b = Inlined();
+long c = NotInlined();
+long d = CallMono(oneType);
+long e = CallPoly(twoTypes);
+
+if (a != b || b != c || c != d || d != e)
+    throw new Exception($"FAIL: variants disagree: open={a} inlined={b} notinlined={c} mono={d} poly={e}");
+
+Console.WriteLine($"PASS all five variants agree: {a} (sink {sink}, ignore)");
+
+interface IAdder { int Add(int a, int b, int c); }
+sealed class Adder : IAdder { public int Add(int a, int b, int c) => a + b + c; }
+sealed class OtherAdder : IAdder { public int Add(int a, int b, int c) => c + b + a; }
+
+static class Ops
+{
+    public static int Add(int a, int b, int c) => a + b + c;
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    public static int AddNoInline(int a, int b, int c) => a + b + c;
+}
+```
+
+</Solution>
+
+## work it out
+
+### the call the JIT could not remove
+
+`DOTNET_JitDisasm` on `Inlined` and `NotInlined`, real output, block labels and offsets kept:
+
+```text
+;  the inlined loop — Program:<<Main>$>g__Inlined|0_1():long (Tier1-OSR)
+G_M000_IG01:
+       push     rbp
+       mov      rbp, rsp
+G_M000_IG02:
+       xor      eax, eax             ; total = 0
+       mov      ecx, 1               ; i = 1 (OSR resumes mid-loop)
+G_M000_IG03:
+       lea      edx, [rax+0x03]      ; i + 1 + 2, folded into one instruction
+       movsxd   rdx, edx
+       add      rcx, rdx             ; total += that
+       inc      eax                  ; i++
+       cmp      eax, 0xFA0           ; 4000
+       jl       SHORT G_M000_IG03
+G_M000_IG04:
+       mov      rax, rcx
+G_M000_IG05:
+       add      rsp, 80
+       pop      rbp
+       ret
+; Total bytes of code 59
+
+;  the same source with inlining forbidden — Program:<<Main>$>g__NotInlined|0_2():long (Tier1-OSR)
+G_M000_IG01:
+       push     rbp
+       sub      rsp, 16
+       mov      qword ptr [rsp+0x58], r15    ; save two callee-saved registers, because
+       mov      qword ptr [rsp+0x50], rbx    ; the call is allowed to destroy the others
+       lea      rbp, [rsp+0x10]
+       mov      r15, qword ptr [rbp+0x20]    ; total now lives in r15
+       mov      ebx, dword ptr [rbp+0x1C]    ; i now lives in ebx
+G_M000_IG02:
+       cmp      ebx, 0xFA0
+       jge      SHORT G_M000_IG04
+G_M000_IG03:
+       mov      edi, ebx              ; argument 1 → rdi
+       mov      esi, 1                ; argument 2 → rsi
+       mov      edx, 2                ; argument 3 → rdx
+       call     [Ops:AddNoInline(int,int,int):int]
+       cdqe                           ; sign-extend the int result to 64 bits
+       add      r15, rax              ; total += it
+       inc      ebx
+       cmp      ebx, 0xFA0
+       jl       SHORT G_M000_IG03
+G_M000_IG04:
+       mov      rax, r15
+G_M000_IG05:
+       add      rsp, 80
+       pop      rbx
+       pop      r15
+       pop      rbp
+       ret
+; Total bytes of code 84
+```
+
+(Both listings say `Tier1-OSR` because promotion happened *during* a running loop — on-stack
+replacement patched the optimised body in mid-flight. The loop body is what matters and it is
+the same shape in the non-OSR version.)
+
+Count instructions rather than guess. The inlined loop body (`IG03`) is six instructions: `lea`,
+`movsxd`, `add`, `inc`, `cmp`, `jl`. The not-inlined loop body is nine: three `mov`s to place
+the arguments, the `call`, `cdqe`, then the same `add`/`inc`/`cmp`/`jl` tail. Two of those three
+extra `mov`s move *constants* — `1` and `2` never change — and still have to be placed fresh
+every iteration, because the callee is compiled once for every caller and cannot know they are
+constant here.
+
+The other difference is in the prologue and epilogue, not the loop body. The inlined version
+keeps `total` in `rcx` and `i` in `eax` — both are among the registers a leaf function is free
+to use without asking permission. The not-inlined version needed `total` and `i` to survive a
+`call`, and a callee is only obliged to preserve the *callee-saved* registers (`rbx`, `rbp`,
+`r12`-`r15`); everything else, it is allowed to destroy. So the JIT moved `total` and `i` into
+`r15` and `rbx` and added `push`/`pop` pairs around the whole function to save and restore the
+caller's own use of those two registers. That is four extra instructions (two pushes, two pops)
+that exist purely because a call now crosses this frame — the same trade the hand-written stack
+frame on [the topic page](/systems/cpu-execution/) makes, paid here by the register allocator
+instead of by `%rbp`-relative memory operands.
+
+### the arithmetic that could not follow
+
+`Add(i, 1, 2)` became `lea edx, [rax+0x03]` when inlined — the optimiser saw the constants `1`
+and `2` at the call site and folded three additions into one instruction, exactly like `add3`'s
+`caller` on the topic page. Across a real call boundary it cannot do that: `AddNoInline` is
+compiled once, for every caller, and from inside it the three parameters are just three
+unknown integers. That is the deeper cost of a call that survives — not the `call`/`ret` pair,
+but the wall it puts up between what the optimiser can see on either side of it.
+
+### the interface calls: predict the shape, not the number
+
+`CallMono` and `CallPoly` are the identical five lines, called against arrays that differ only
+in which classes they hold. The JIT does not know what `items[i & 1]` is at compile time — the
+caller decides that. What it does instead is watch: uninstrumented tier-0 code records which
+concrete types actually show up at each call site, and the optimised recompile is built against
+that profile. `DOTNET_JitDisasm` on both:
+
+```text
+;  Program:<<Main>$>g__CallMono|0_3(IAdder[]):long (Tier1-OSR)
+G_M000_IG03:
+       mov      edi, r15d
+       and      edi, 1
+       cmp      edi, dword ptr [rbx+0x08]     ; bounds check against the array length
+       jae      SHORT G_M000_IG08
+       mov      rdi, gword ptr [rbx+8*rdi+0x10]   ; load items[i & 1]
+       mov      rsi, 0x7110B1C1E870           ; the method-table pointer the profiler saw
+       cmp      qword ptr [rdi], rsi          ; is this object really that class?
+       jne      SHORT G_M000_IG07             ; no  → the cold path
+       lea      r13d, [r15+0x03]              ; yes → the body, inlined right here
+G_M000_IG04:
+       movsxd   rax, r13d
+       add      r14, rax
+       inc      r15d
+       cmp      r15d, 0xFA0
+       jl       SHORT G_M000_IG03
+       ⋮
+G_M000_IG07:                                   ; the cold path: a real interface dispatch
+       mov      esi, r15d
+       mov      r11, 0x7110B0C70028
+       mov      edx, 1
+       mov      ecx, 2
+       call     [r11]IAdder:Add(int,int,int):int:this
+       mov      r13d, eax
+       jmp      SHORT G_M000_IG04
+; Total bytes of code 167
+
+;  Program:<<Main>$>g__CallPoly|0_4(IAdder[]):long (Tier1-OSR)
+;  — same guard, same fast path, same cold path, same 167 bytes —
+```
+
+`CallPoly`'s compiled method is instruction-for-instruction the same shape as `CallMono`'s: a
+bounds check, a load of `items[i & 1]`, a compare against one profiled method-table pointer, a
+branch, an inlined fast path if it matched, a real `call` through the interface if it did not.
+**The two variants compile to the same code.** One method shape, one runtime fork:
+
+```text
+   items[i & 1].Add(i, 1, 2)
+            │
+            ▼
+   bounds check, load the object's method-table pointer
+            │
+            ▼
+   cmp against the ONE type the profiler saw most  ──── miss ──▶  real call through
+            │                                                     the interface,
+           hit                                                    then rejoin
+            │
+            ▼
+   the guarded type's body, inlined and folded
+   (lea r13d, [r15+0x03] — the constants collapsed in)
+            │
+            ▼
+   total += result; i++; loop
+```
+
+This is **guarded devirtualisation**: every .NET
+object carries a pointer to its type's method table in its first eight bytes, and the JIT bets
+on the one type it saw most, checks the bet cheaply, and inlines behind it. What differs between
+`CallMono` and `CallPoly` is not the machine code — it is how often, at runtime, that one `cmp`
+comes back true.
+
+`CallMono`'s array is `[Adder, Adder]`, so `items[i & 1]` is `Adder` every single time: the
+guard passes on all 4,000 iterations, and the `call` block is dead code that never runs.
+`CallPoly`'s array is `[Adder, OtherAdder]`, and `i & 1` alternates 0, 1, 0, 1, … across the
+4,000 iterations — so whichever type the profiler happened to guard for, exactly half the
+array indices are that type and half are not. The guard passes on 2,000 iterations and takes
+the real interface call on the other 2,000, deterministically, because the alternation is
+exact.
+
+## the answer
+
+Running the file confirms all five variants compute the same sum — the correctness check that
+has to hold before any of the reasoning above means anything:
+
+```text
+$ dotnet run -c Release bench/cpu-execution/call-and-inline-cost.cs
+PASS all five variants agree: 8010000 (sink 120150000, ignore)
+```
+
+And the instruction- and byte-counts from the disassembly above:
+
+| variant | instructions per iteration | method size | registers holding `total`/`i` |
+| --- | --- | --- | --- |
+| inlined call | 6 | 59 bytes | `rcx` / `eax` — caller-free registers, no save needed |
+| call, no inline | 9 | 84 bytes | `r15` / `rbx` — callee-saved, pushed and popped around the call |
+| interface, guard hit | 14 (bounds check, type check, folded arithmetic) | 167 bytes, same as the row below | `r14` / `r15`, plus the guard's `cmp` and branch every iteration |
+| interface, guard miss | 20 (the 14 above, minus the folded `lea`, plus the 7-instruction real dispatch) | same 167 bytes | same — the cold block is reached, not recompiled |
+
+`CallMono` never takes a guard miss: its array is `[Adder, Adder]`, so all 4,000 iterations run
+the 14-instruction path. `CallPoly`'s array alternates `Adder`/`OtherAdder`, so exactly 2,000 of
+its 4,000 iterations run the 14-instruction path and 2,000 run the 20-instruction one — same
+compiled method, same 167 bytes, a different count of which block actually executed.
+
+If your prediction from the callout said "different code for one type versus two", that is the
+one worth revisiting: the JIT does not compile a different method for a different call
+pattern here. It compiles one guarded method and lets the guard's pass/fail ratio do the work.
+
+## why it works that way
+
+A call survives being forbidden to inline as exactly two instructions, `call` and `ret`. What
+actually grows the generated code around it is everything the ABI and the optimisation boundary
+force: arguments marshalled into named registers even when they are constants, live values
+moved into callee-saved registers and saved/restored around the call because the callee is free
+to clobber everything else, and arithmetic that could have folded across the call site instead
+staying as separate instructions because the callee is compiled once, blind to every caller.
+Guarded devirtualisation is the same idea from the other side: the JIT cannot inline a call it
+cannot resolve, so it manufactures a resolvable one — a type check plus a direct call — and bets
+on a profile instead of a proof. The bet is encoded once in the machine code; only how often it
+pays off changes with what the call site actually sees.
+
+<Watch items={[['inlined loop body', '6 instructions, 59 bytes total'], ['not-inlined loop body', '9 instructions, 84 bytes total'], ['registers spilled across the call', 'r15, rbx (callee-saved)'], ['guarded-devirt code, 1 type vs 2', 'identical, 167 bytes either way'], ['CallPoly guard pass rate', '2,000 of 4,000 — exact, from the alternation']]} />
+
+## what this looks like in prod
+
+**The `[MethodImpl(MethodImplOptions.NoInlining)]` you added for a stack trace.** People put it
+on a method to keep it visible in traces or to stop a profiler from attributing its time
+elsewhere, then leave it there. On a hot leaf method that permanently pins in the extra
+argument-marshalling and register-saving instructions above; on anything bigger than a few
+lines of arithmetic it is lost in the noise of the callee's own work. Know which situation you
+are in before reaching for it.
+
+**Abstractions that stay monomorphic in production and go polymorphic on a Tuesday.** A service
+with one `IPaymentProvider` implementation runs with the guard passing every time — the fast
+path above, every call. Ship a second provider and the same call site starts taking the cold
+path on whatever fraction of traffic uses it. Nothing in the code review shows this: the
+generated code does not change shape, only how often each branch of it runs. The only way to
+see it is a profile taken before and after.
+
+**"We made everything virtual for testability."** Individually cheap. In a loop that runs many
+times per request, with several such calls per iteration, it is the difference between the JIT
+folding a whole loop body into a handful of instructions and stopping at every call boundary
+instead. The fix is not to abandon interfaces — it is to keep the *hot inner loop* free of them
+and let the abstraction live one level out, the same lesson as the register-spill point on the
+topic page: the cost shows up where many things have to cross a boundary in a tight space, not
+in any one crossing by itself.
+
+**Small methods really are free, and the disassembly is how you know it rather than guess it.**
+The inlined row above compiled to the identical shape open-coding would have produced. The
+question worth asking about a helper method is not "does it cost anything" but "did the JIT
+actually get to remove it" — and that is a `DOTNET_JitDisasm` away, not a belief.
+
+## the same idea in other languages
+
+| language | what does the inlining | the trap |
+| --- | --- | --- |
+| C / C++ | the compiler, at `-O2`, across a translation unit — or across the whole program with link-time optimisation | The `inline` keyword is about the one-definition rule, not about inlining; it is only a hint. And a function whose body lives in another `.cpp` cannot be inlined at all unless link-time optimisation is on, which is a large part of why header-only libraries exist. |
+| Java | HotSpot's C2, profile-driven, exactly like RyuJIT | HotSpot goes further than .NET does: if class-hierarchy analysis proves only one implementation is loaded it inlines with no guard at all, and then **deoptimises and recompiles** when a second class is loaded. Behaviour can change after a plugin, an agent, or a mock loads, with no code change. |
+| Go | the compiler, ahead of time, against a fixed cost budget | Go's inliner is deliberately simple and its budget is small, so whether a function inlines is a property of its size in the compiler's internal nodes. `go build -gcflags=-m` prints its decisions; guessing at them is a waste of time. |
+| Python | nothing inlines a Python function | A call builds an interpreter frame. There is no optimiser that will remove it, so the only fix is fewer calls: move the loop into C, batch the work, or vectorise. |
+
+## common bugs
+
+- **Assuming a forbidden inline changes the arithmetic, not just where it runs.** It does not —
+  `AddNoInline` computes the same three additions as `Add`. What changes is everything *around*
+  the arithmetic: argument marshalling, register saves, and the optimiser's inability to see
+  across the boundary and fold constants.
+- **Reading "the interface call compiled the same either way" as "interfaces are free".** They
+  are free only while the guard keeps passing. A call site that genuinely sees many types in
+  rotation pays the cold path on most of its calls, with the identical machine code as a site
+  that never does.
+- **Believing an inlining decision instead of checking it.** The inliner's budget is not a
+  documented contract and it changes between releases. `DOTNET_JitDisasm` on the method settles
+  it in seconds.
+- **Forgetting that a shared call site pools its profile.** `CallMono` and `CallPoly` above are
+  separate methods on purpose. A single method called from both a mostly-one-type context and a
+  mixed context gets one merged profile for that call site, not two — which is exactly the
+  caveat in the disassembly above about which type ends up guarded.
+- **Concluding from one profiled run which type gets the guard.** The profiler picks whichever
+  type it happened to see enough of first; rerunning the same program can guard a different
+  type without changing behaviour, because the guard's *correctness* never depends on which
+  type it picked, only its hit rate does.

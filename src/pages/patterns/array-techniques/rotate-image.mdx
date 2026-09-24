@@ -1,0 +1,116 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: array-techniques
+problem: rotate-image
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+
+## task
+
+Given an `n x n` matrix, rotate it 90 degrees clockwise, **in place** — no second matrix
+allocated for the result.
+
+```text
+[[1,2,3],       [[7,4,1],
+ [4,5,6],   →     [8,5,2],
+ [7,8,9]]         [9,6,3]]
+```
+
+## how to think
+
+Allocating a fresh `n x n` matrix and copying `matrix[n-1-j][i]` into `result[i][j]` solves this
+in one pass, but "in place" rules that out. The in-place trick splits the rotation into two
+simpler operations, each of which *can* be done in place: **transpose**, then **reverse every
+row**.
+
+Transposing swaps `matrix[i][j]` with `matrix[j][i]` across the main diagonal — rows become
+columns. That alone gives you a counter-clockwise-ish mirror, not the rotation you want; reverse
+each row afterward and the columns end up in the right order for a clockwise turn. Neither step
+needs extra space: transposing only touches each off-diagonal pair once (loop `j` from `i + 1`,
+not from `0`, or you'd swap every pair twice and undo yourself), and reversing a row is a
+standard `Array.Reverse`.
+
+<Callout kind="note" label="template instance">
+  **Matrix walk** skeleton, transpose-then-reverse form. Invariant after the transpose:
+  `matrix[i][j]` now holds the original `matrix[j][i]`. Invariant after the row-reverse:
+  `matrix[i][j]` holds the original `matrix[n-1-j][i]` — the 90-degree clockwise rotation.
+</Callout>
+
+## solution
+
+```csharp
+public void Rotate(int[][] matrix)
+{
+    int n = matrix.Length;
+
+    for (int i = 0; i < n; i++)
+        for (int j = i + 1; j < n; j++)                                  // upper triangle only
+            (matrix[i][j], matrix[j][i]) = (matrix[j][i], matrix[i][j]); // transpose
+
+    for (int i = 0; i < n; i++)
+        Array.Reverse(matrix[i]);                                       // mirror each row
+}
+```
+
+## trace
+
+`matrix = [[1,2,3],[4,5,6],[7,8,9]]`. Transpose swaps every `(i, j)` with `i < j`:
+
+| swap | matrix[i][j] ↔ matrix[j][i] |
+| --- | --- |
+| (0,1) ↔ (1,0) | 2 ↔ 4 |
+| (0,2) ↔ (2,0) | 3 ↔ 7 |
+| (1,2) ↔ (2,1) | 6 ↔ 8 |
+
+```text
+before transpose:      after transpose:
+[1, 2, 3]               [1, 4, 7]
+[4, 5, 6]      →         [2, 5, 8]
+[7, 8, 9]                [3, 6, 9]
+```
+
+Then `Array.Reverse` on each row:
+
+```text
+after transpose:        after row reverse:
+[1, 4, 7]                [7, 4, 1]
+[2, 5, 8]      →          [8, 5, 2]
+[3, 6, 9]                 [9, 6, 3]
+```
+
+`[7, 4, 1]`, `[8, 5, 2]`, `[9, 6, 3]` — matches the 90-degree clockwise rotation exactly.
+
+## why it works
+
+A 90-degree clockwise rotation sends `matrix[i][j]` to `matrix[j][n-1-i]`. Transposing sends
+`matrix[i][j]` to `matrix[j][i]` — it gets the row/column swap right but leaves the column
+index unmirrored. Reversing each row afterward replaces column index `i` with `n - 1 - i` in
+every row, which is exactly the missing piece: the composition of "swap row and column" and
+"mirror the column" is precisely the clockwise rotation formula, done as two in-place passes
+instead of one allocation.
+
+<Watch items={[['time', 'O(n²)'], ['space', 'O(1)'], ['passes', '2']]} />
+
+## common bugs
+
+- Looping `j` from `0` instead of `i + 1` in the transpose — swaps every off-diagonal pair
+  **twice**, which undoes the transpose and leaves the matrix unchanged.
+- Reversing columns instead of rows (or reversing before transposing) — the two operations
+  don't commute; transpose-then-reverse-rows gives clockwise, reverse-rows-then-transpose gives
+  counter-clockwise.
+- Allocating `int[][] result = new int[n][]` "just to be safe" — defeats the in-place
+  requirement; the whole exercise is doing the rotation with the two swap-based passes.
+- Off-by-one on the transpose bound (starting `j` at `0` or at `i` instead of `i + 1`) —
+  either skips swaps or double-swaps the diagonal itself (which is a no-op either way, but
+  double-swapping off-diagonal pairs corrupts the result).
+
+## variants you can now solve
+
+- **[Spiral Matrix](/patterns/array-techniques/spiral-matrix/)** (LC 54) — a different matrix
+  walk from the same family: instead of two fixed passes, it shrinks a boundary layer by layer.
+- **Transpose Matrix** (LC 867) — exactly the first half of this solution, as its own question
+  (and it doesn't require the matrix to be square).
+- **Game of Life** (LC 289) — a different in-place matrix trick: encode both the old and new
+  state of each cell in the same integer, then unpack in a second pass.

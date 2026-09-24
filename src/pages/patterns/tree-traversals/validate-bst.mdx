@@ -1,0 +1,133 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: tree-traversals
+problem: validate-bst
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+
+## task
+
+Given the root of a binary tree, determine if it is a valid binary search tree: every node's
+value is strictly greater than everything in its left subtree and strictly less than everything
+in its right subtree — not just its immediate children.
+
+```text
+     10                10
+    /  \               /  \
+   5    15            5    15
+       /  \                /  \
+      12   20              6   20
+```
+
+left tree: valid · right tree: **invalid** — `6` sits in the root's right subtree but `6 < 10`.
+
+## how to think
+
+The tempting first move is to check each node against its immediate parent and stop there. It's
+wrong, and the counterexample above shows exactly why: node `6` is the left child of `15`, and
+`6 < 15` — that comparison passes. But `6` is also, transitively, in the **root's** right
+subtree, which means it needs to be greater than `10`. A check that only looks one level up
+never asks that question.
+
+The fix is to carry the *entire* legal range down through the recursion instead of just the
+parent's value. Every node inherits an open interval `(lower, upper)` from its ancestors: going
+left tightens the upper bound to the parent's value; going right tightens the lower bound. A
+node is valid only if it sits strictly inside whatever interval it inherited. There's a second,
+equally valid way to see this problem — a BST's inorder traversal is sorted if and only if the
+tree is valid, so you could instead run the [inorder stack from the previous
+page](/patterns/tree-traversals/iterative-traversals/) and check each popped value is strictly
+greater than the last. Both approaches are O(n); bounds-passing avoids building an explicit list.
+
+<Callout kind="note" label="template instance">
+  **Preorder** shape — check the current node, then recurse — but with a twist: instead of
+  nothing traveling down (plain preorder) or a value traveling up (postorder), two bounds travel
+  **down**, shrinking at every step. Invariant: at the call for `node`, `(lower, upper)` is
+  exactly the open interval every value in `node`'s subtree must satisfy, given everything
+  decided by its ancestors so far.
+</Callout>
+
+## solution
+
+```csharp
+public bool IsValidBST(TreeNode? root) => Validate(root, long.MinValue, long.MaxValue);
+
+private bool Validate(TreeNode? node, long lower, long upper)
+{
+    if (node is null) return true;                              // empty subtree is trivially valid
+
+    if (node.Val <= lower || node.Val >= upper) return false;    // must sit strictly inside (lower, upper)
+
+    return Validate(node.Left, lower, node.Val)                  // left subtree: still > lower, now < node.Val
+        && Validate(node.Right, node.Val, upper);                // right subtree: still < upper, now > node.Val
+}
+
+// standard interview definition
+public class TreeNode(int val = 0, TreeNode? left = null, TreeNode? right = null)
+{
+    public int Val = val;
+    public TreeNode? Left = left;
+    public TreeNode? Right = right;
+}
+```
+
+## trace
+
+```text
+        10
+       /  \
+      5    15
+          /  \
+         6    20
+```
+
+| call | node | inherited range | check | verdict |
+| --- | --- | --- | --- | --- |
+| 1 | 10 (root) | (-inf, +inf) | inside | recurse left, then right |
+| 2 | 5 | (-inf, 10) | inside | both children null -> `true` |
+| 3 | 15 | (10, +inf) | inside | recurse left, then right |
+| 4 | 6 | (10, 15) | `6 <= 10` | **`false`** |
+
+Node `6` inherits `(10, 15)` — `15` from its immediate parent, but `10` from the *root*, carried
+down through node `15`'s own call. That inherited `10` is what a parent-only check would never
+see. The moment call 4 returns `false`, the `&&` in call 3 short-circuits — node `20` is never
+even visited — and call 1's conjunction comes back `false`.
+
+## why it works
+
+By induction, `Validate(node, lower, upper)` is correct if it correctly reduces to two smaller
+subtree checks with tightened bounds. The interval `(lower, upper)` passed into any call is
+exactly the set of values that could legally appear anywhere in that subtree, given every
+ancestor's left/right decision on the path from the root. Checking `node.Val` against that exact
+interval — not against any single ancestor — is what makes "greater than everything in the left
+subtree" (a statement about a whole set of nodes) collapse into one bounds comparison per node.
+
+<Watch items={[['time', 'O(n)'], ['space', 'O(h) recursion stack — O(n) worst case, O(log n) balanced']]} />
+
+## common bugs
+
+- Comparing each node only to its immediate parent (or only to its own two children) instead of
+  threading the full inherited range — the exact trap in the trace above.
+- Using `<=`/`>=` as the pass condition instead of `<`/`>` — a BST requires **strict** inequality,
+  so a tree with a duplicate value (two nodes both holding `2`) must come back `false`.
+- Seeding the bounds with `int.MinValue`/`int.MaxValue` instead of `long.MinValue`/
+  `long.MaxValue` — if a node's actual value legitimately *is* `int.MinValue`, the check
+  `node.Val <= lower` fires immediately on a perfectly valid tree, because the sentinel and the
+  real value collide.
+- Short-circuiting incorrectly: `Validate(left) && Validate(right)` must skip the right call
+  entirely once the left one fails — writing them as two separate statements and `&&`-ing the
+  bools afterward still works, but calling both unconditionally does unnecessary work (and, in a
+  variant that also collects invalid nodes, produces a wrong list).
+
+## variants you can now solve
+
+- **Recover Binary Search Tree** (LC 99) — run the inorder-sorted-check alternative from "how to
+  think," but instead of failing fast, remember the two out-of-order values so you can swap them
+  back.
+- **Kth Smallest Element in a BST** (LC 230) — the other half of "inorder on a BST is sorted":
+  once you trust that property, you can *use* it instead of just verifying it, with the
+  [iterative inorder stack](/patterns/tree-traversals/iterative-traversals/) stopped early at the
+  k-th pop.
+- **Insert into a Binary Search Tree** (LC 701) — the same bounds-narrowing walk, but instead of
+  checking a value against the range, you're using BST order to find where a new node belongs.

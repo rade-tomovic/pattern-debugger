@@ -1,0 +1,121 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: hashmap
+problem: longest-consecutive-sequence
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import Cells from '@components/Cells.astro';
+
+## task
+
+Given an unsorted array of integers, find the length of the longest run of consecutive integers
+(the values don't need to be contiguous in the array — just consecutive as integers). Must run
+in `O(n)`.
+
+```text
+nums = [100, 4, 200, 1, 3, 2]  →  4   (the run 1, 2, 3, 4)
+```
+
+## how to think
+
+`O(n)` rules out sorting first (`O(n log n)`), so you can't just walk sorted data counting
+streaks the obvious way. But the *question you actually need answered* — "is `x` in this
+array?" — is exactly the
+[membership shape](/patterns/hashmap/), and `HashSet<T>` answers it in `O(1)`. Dump everything
+into a set, and for any starting value `x` you can walk `x+1, x+2, x+3, ...` and ask the set
+"still there?" until it isn't.
+
+The trap: if you do that walk from *every* element, you re-walk the same run over and over —
+starting from `1`, you count `1,2,3,4`; then starting from `2`, you count `2,3,4` again. That's
+`O(n²)` in the worst case (one giant run). The fix is a single extra check: only start a walk
+from a value that is a **sequence start** — a value with no `x - 1` in the set. Every element
+either *is* a start (and gets walked exactly once) or has a predecessor in the set (and gets
+skipped, because whoever the true start is will walk through it). Every element is visited by
+at most one walk.
+
+<Callout kind="note" label="template instance">
+  **membership** skeleton, extended: same `HashSet<T>.Contains` check as the warm-up, used
+  twice — once to reject non-starts (`Contains(n - 1)`), once to extend a confirmed start
+  (`Contains(n + length)` in a loop). Key: the value itself, no count needed.
+</Callout>
+
+## solution
+
+```csharp
+public int LongestConsecutive(int[] nums)
+{
+    var set = new HashSet<int>(nums);
+    int longest = 0;
+
+    foreach (int n in set)
+    {
+        if (set.Contains(n - 1)) continue;      // not a start -- some earlier value owns this run
+
+        int length = 1;
+        while (set.Contains(n + length)) length++;
+        longest = Math.Max(longest, length);
+    }
+    return longest;
+}
+```
+
+## trace
+
+`nums = [100, 4, 200, 1, 3, 2]` → `set = {100, 4, 200, 1, 3, 2}` (insertion order). Iterating
+the set:
+
+| n | `set.Contains(n-1)`? | action | run walked | longest |
+| --- | --- | --- | --- | --- |
+| 100 | no | start | `100` (length 1) | 1 |
+| 4 | yes (`3` present) | skip | — | 1 |
+| 200 | no | start | `200` (length 1) | 1 |
+| 1 | no | start | `1, 2, 3, 4` (length 4) | 4 |
+| 3 | yes (`2` present) | skip | — | 4 |
+| 2 | yes (`1` present) | skip | — | 4 |
+
+`100` and `200` each start a length-1 run that goes nowhere; `4`, `3`, and `2` all get skipped
+because each has a predecessor already in the set; `1` is the only true start, and its walk
+(`2` in, `3` in, `4` in, `5` not in) produces the length-4 answer.
+
+`1` sits at index `3` in the original array — the walk from there covers indices `3`, `5`, `4`,
+and `1` (values `1, 2, 3, 4`), while `100` and `200` (indices `0` and `2`) are left out:
+
+<Cells
+  data={[100, 4, 200, 1, 3, 2]}
+  pointers={{ 3: [{ t: 'start', c: 'amber' }] }}
+  cells={{ 0: 'dim', 2: 'dim', 1: 'ok', 3: 'ok', 4: 'ok', 5: 'ok' }}
+  caption="1 is the only value with no predecessor in the set -- its walk covers the length-4 run"
+/>
+
+## why it works
+
+Every element is examined by the outer `foreach` exactly once — that part is unavoidably `O(n)`.
+The inner `while` only runs from elements with no predecessor in the set, i.e. true run-starts.
+Because a run of length `k` has exactly one start, the *total* work done across every inner
+`while` loop, summed over the whole outer loop, is bounded by the total number of elements —
+each value is visited by the inner loop at most once, as part of the one run it belongs to. So
+despite the nested loops, the combined cost is `O(n)`, not `O(n²)`.
+
+<Watch items={[['time', 'O(n)'], ['space', 'O(n)']]} />
+
+## common bugs
+
+- Walking from *every* element without the `Contains(n - 1)` start check — correct answer,
+  wrong complexity: silently degrades to `O(n²)` on a large single run.
+- Sorting the array and scanning for streaks — passes small tests, fails the stated `O(n)`
+  requirement, and the interviewer is specifically testing whether you reach for the set.
+- Forgetting duplicates: build the `HashSet` from the array (dedupes automatically) rather than
+  tracking counts — a duplicate value should extend a run by zero, not by one.
+- Off-by-one in the length count: `length` starts at `1` (the start value itself counts), not
+  `0`.
+
+## variants you can now solve
+
+- **Binary Tree Longest Consecutive Sequence** (LC 298) — same "walk forward while the next
+  value exists" idea, but the "next" check is a child pointer instead of a set lookup.
+- **Binary Tree Longest Consecutive Sequence II** (LC 549) — the increasing-*or*-decreasing
+  version; the start-detection instinct becomes "check both neighbors, not just one".
+- **Contains Duplicate** (LC 217) — the plain `HashSet<T>` membership reflex this problem
+  builds on, in its simplest one-line form.

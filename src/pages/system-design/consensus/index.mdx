@@ -1,0 +1,406 @@
+---
+layout: '@layouts/TopicLayout.astro'
+topic: consensus
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+
+## the ground floor
+
+- **term (epoch)** — a monotonically increasing counter, incremented every time an election
+  happens. It exists so a node can tell "newer" from "older" without a clock: any message
+  carrying a higher term wins, unconditionally.
+- **quorum** — a majority of the cluster's voting members, `floor(N/2) + 1`. Every write and
+  every leader election needs one; any two quorums in the same cluster are guaranteed to
+  overlap by at least one node, which is the entire trick.
+- **commit index** — the highest log position that has been written to a quorum. An entry
+  below the leader's own log position but above the commit index exists somewhere durable, but
+  isn't yet safe to apply or return to a client.
+- **lease** — a time-bounded claim ("I am the leader/lock-holder until wall-clock `T`") backed
+  by nothing but a clock. Every failure mode on this page that involves a paused or partitioned
+  node eventually comes back to a lease someone trusted too literally.
+
+## core idea
+
+Consensus is how a set of machines that can each independently crash, pause, or get cut off by
+the network still agree on one value — usually "what is entry number `k` in the replicated
+log". Raft (and Paxos, which it was designed to be a readable version of) solves this by
+routing every decision through a majority: nothing is true until a quorum has durably recorded
+it, and any two quorums must share a node, so the cluster can never durably believe two
+different things at once. The staff-engineer summary: **consensus buys you a single, ordered,
+crash-tolerant log — nothing more, and reads don't get that guarantee for free.**
+
+## how it actually works
+
+### leader election: turning "who decides" into a vote
+
+A Raft cluster has exactly one leader per term, or no leader at all. Every node starts as a
+follower and waits for AppendEntries (log-replication) or heartbeat messages from a leader. If
+a follower hears nothing before its randomized election timeout fires, it increments the term,
+votes for itself, and asks every other node for a vote. A node grants at most one vote per
+term, and — the detail that keeps committed data from vanishing — it will only vote for a
+candidate whose log is at least as up to date as its own. A candidate that wins a majority of
+votes becomes leader for that term and starts sending heartbeats to suppress further elections.
+
+Randomizing the timeout is not cosmetic: if every follower timed out at the same instant they'd
+split the vote every round and never converge. This is also the mechanism behind the failure
+mode called an **election storm** — see "how it fails".
+
+### log replication: the write path
+
+The leader is the only node that accepts writes. Concretely:
+
+```text
+client               leader (term 4)              follower A          follower B
+  |  write X=5             |                            |                  |
+  |----------------------->|                            |                  |
+  |                        | 1. append locally           |                  |
+  |                        |    log[7] = {term:4, X=5}   |                  |
+  |                        |--- AppendEntries(7) ------->|                  |
+  |                        |--- AppendEntries(7) ------------------------->|
+  |                        |                            | append, ack       |
+  |                        |<---------------------------|                  |
+  |                        |                            |                  | append, ack
+  |                        |<--------------------------------------------- |
+  |                        | 2. leader + A = majority of 3 -> log[7] COMMITTED
+  |                        | 3. apply to state machine, X=5 becomes visible
+  |<-----------------------| 4. respond "ok" to client
+  |                        |--- next heartbeat carries commit=7 ---------->| (B learns it's
+  |                        |                                                committed later)
+```
+
+Three things to hold onto: the entry is committed the instant a *quorum* has it durably
+appended — the leader does not wait for every follower. The client is answered only after that
+commit, never after the local append alone. And a follower can be several entries behind the
+commit index at any moment; that lag is normal, not a bug, and it is exactly what makes a raw
+follower read unsafe (next section).
+
+### linearizable reads are not a side effect of the log
+
+This is the trap the folklore skips: Raft makes the *log* linearizable. It does nothing for a
+read that doesn't touch the log. Two separate problems, both real:
+
+- **A follower read can be stale.** A follower only knows what has reached it; it cannot tell
+  the difference between "nothing new has committed" and "something committed and I haven't
+  received it yet".
+- **A leader read can be stale too, if the leader doesn't know it's been deposed.** A node
+  that was elected leader in term 4 keeps believing it is the leader until it hears otherwise —
+  and in a network partition, it may never hear otherwise. Meanwhile the other side of the
+  partition, if it holds a majority, has already elected a new leader and moved the log
+  forward.
+
+```text
+term 4: leader L1, followers F2, F3   (majority of 3 = 2)
+
+ t0   L1 <---> F2 <---> F3          all connected, L1 leads term 4
+
+ t1   network partition splits the cluster
+       L1   |   F2 <---> F3
+
+ t2   F2 and F3 (a majority) time out waiting on L1, elect F2 leader, term 5
+
+ t3   a client on the F2/F3 side writes X=9 -> committed on {F2, F3}
+
+ t4   a client that can only reach L1 issues a READ
+       L1 still believes it is leader (term 4 — it has heard nothing since the split)
+       L1's log does NOT contain the term-5 write
+       a naive local read on L1 returns the STALE value of X
+       nothing in log replication prevented this — only a leadership check would have
+
+ t5   partition heals; L1 receives an AppendEntries/heartbeat carrying term 5
+       term 5 > 4, so L1 steps down to follower immediately
+```
+
+A linearizable read therefore costs a **leadership check**, not just a log lookup, and there
+are exactly two ways to buy one: a **read-index round** — before answering, the leader confirms
+it can still reach a majority (typically piggybacked on a heartbeat round, no log entry needed)
+— or a **leader lease**, where the leader trusts a bounded clock skew and answers locally until
+the lease time is up, skipping the round trip at the cost of depending on clocks agreeing.
+Confirm-then-answer is the safe default; a lease is a deliberate, clock-dependent optimization
+on top of it.
+
+### sizing the quorum — the arithmetic, not a benchmark
+
+Majority size is `floor(N/2) + 1`, and it drives two things: how many simultaneous node
+failures the cluster survives, and how many acknowledgements every write has to wait for.
+
+| `N` (voting nodes) | majority needed | failures tolerated | notes |
+| --- | --- | --- | --- |
+| `3` | `2` | `1` | the common default — smallest odd size with any tolerance |
+| `5` | `3` | `2` | doubles tolerance, every write now waits on one more ack |
+| `7` | `4` | `3` | rarely worth it — write latency keeps climbing, tolerance gain is marginal |
+
+Two things fall straight out of the arithmetic and not out of intuition. **Odd sizes are
+strictly better than the even size below them**: `N=4` also tolerates only `1` failure (majority
+`3`) but pays for a fourth vote on every write, so it is dominated by `N=3`. And **where you put
+the majority matters as much as how big it is**: if two of your three voters sit in the same
+availability zone, losing that zone loses your majority outright, regardless of `N`. Placing a
+majority so that no single failure domain contains it is the actual design decision; the node
+count is secondary. If any member of that majority sits in another region, every commit pays a
+cross-region round trip on the critical path — published cloud-provider figures put a
+cross-region hop in the tens of milliseconds against sub-millisecond within a datacenter, which
+is the number to have in your head when you decide whether a quorum member belongs there at
+all, not something this page claims to have measured.
+
+### two-phase commit: agreement without an election, and without escape
+
+Two-phase commit (2PC) solves a different problem — atomically committing a transaction across
+several independent participants — and it is **not consensus**. There is one coordinator, no
+election, and no majority: every participant must agree, and if the coordinator disappears at
+the wrong moment, there is no quorum to fall back on.
+
+```text
+2PC — coordinator crash between votes and decision
+
+coordinator                 participant A            participant B
+    |--- PREPARE ----------->|                            |
+    |--- PREPARE --------------------------------------->|
+    |                         | lock rows, durably log     |
+    |                         |   "prepared", vote = YES   |
+    |<--- vote YES -----------|                            |
+    |                         |                            | lock rows, durably log
+    |                         |                            |   "prepared", vote = YES
+    |<--- vote YES ---------------------------------------|
+    |
+    X  coordinator crashes HERE — before it durably logs
+       its own COMMIT/ABORT decision
+
+    A and B are now stuck. Each already voted YES, which is a durable
+    promise to do whatever the coordinator ultimately decides — neither
+    may unilaterally commit or abort. Their locks stay held until the
+    coordinator recovers and reads back its own log, or an operator
+    intervenes. This is the block; it is not a bug in the protocol,
+    it is the protocol.
+```
+
+Compare that to Raft: if a Raft leader dies mid-round, a majority of the *remaining* nodes
+elects a new one and the log keeps moving — the protocol has a built-in path around a dead
+decider. 2PC has no such path, because the decider isn't chosen by quorum in the first place;
+it's a fixed role. That single-coordinator design is exactly why 2PC blocks and Raft doesn't.
+
+### sagas and the outbox: giving up atomicity on purpose
+
+A saga replaces one cross-system atomic transaction with a sequence of local transactions, each
+with a **compensating action** to undo it if a later step fails. You trade atomicity — there is
+no instant where the whole thing is provably all-or-nothing — for availability: no step blocks
+waiting on a remote coordinator, and a failure triggers a compensation instead of an indefinite
+lock.
+
+The recurring implementation hazard is the **dual write**: a step that must both change its own
+database and notify the next step (publish a message), where doing one and not the other is
+exactly the kind of half-done state a saga is supposed to prevent. The **outbox pattern** closes
+that gap by writing the event as a row in the same local transaction as the state change, then
+having a separate relay process (polling the table, or reading a change stream) publish it.
+That publish is now atomic with the state change; delivery to the next step is still
+at-least-once, so that step's handler has to be idempotent regardless.
+
+### fencing tokens: making a lock survive a pause it shouldn't have
+
+A distributed lock is a lease, and a lease is a promise bounded by a clock the holder doesn't
+control. A holder that pauses — garbage collection, a hypervisor stealing its CPU, a slow disk
+flush — can wake up after its lease has already been reassigned to someone else, still
+believing it holds the lock, and write anyway. The fix isn't a better lock implementation; it's
+making the *protected resource* reject stale writers. Every successful acquire hands out a
+monotonically increasing **fencing token**; every write to the resource carries its holder's
+token; the resource keeps the highest token it has ever seen and refuses anything lower.
+
+```text
+worker A acquires lock, token = 7
+worker A pauses (GC / VM steal) past its lease TTL
+worker B acquires the (now expired) lock, token = 8
+worker B writes to the resource, token 8 -> resource records "highest seen = 8", write accepted
+worker A wakes up, still thinks it holds the lock, writes with token 7
+resource sees 7 < 8 -> write REJECTED, no matter how confident worker A is
+```
+
+No amount of shortening the lease fixes this — it only shrinks the window, and a pause can
+always be longer than the window. The token is what turns "probably still exclusive" into
+"provably rejected if not".
+
+## the tradeoff
+
+| | majority-quorum consensus (Raft/Paxos) | two-phase commit | saga + outbox |
+| --- | --- | --- | --- |
+| who decides | an elected leader, backed by a quorum | one fixed coordinator | nobody — each service commits locally |
+| minority-node failure | tolerated, cluster keeps progressing | any single participant failure blocks the transaction | a failed step triggers compensation, not a global halt |
+| coordinator/leader failure | new leader auto-elected, log resumes | participants can be stuck holding locks indefinitely | nothing to lose — there was no coordinator |
+| atomicity | one system, one log, real atomic commit | atomic across systems, while it works | none by design — eventual consistency plus explicit undo |
+| cost paid | every write waits on a quorum round trip | every transaction holds locks across every participant until all vote | extra code: idempotent handlers, compensations, an outbox relay |
+
+Default for state that lives inside one system you operate — a KV store, a metadata service, a
+lock manager — is majority-quorum consensus; that's what etcd, Consul, and Kafka's own metadata
+quorum are for, and you should reach for one of those rather than roll your own. Default for a
+business transaction that spans services you don't jointly control the deploys of is a saga
+with an outbox — not 2PC. 2PC only earns its keep when every participant is inside your blast
+radius, transaction lifetimes are short, and you can accept the coordinator itself becoming a
+single point of unavailability (a local, single-datacenter distributed transaction manager,
+watched closely, not a cross-service one over the public internet).
+
+## how it fails
+
+| symptom | cause | what it looks like |
+| --- | --- | --- |
+| stale read immediately after a confirmed write | read served by a node that hasn't confirmed current leadership (or by a follower at all) | "we wrote X then read it back on the next request and got the old value" |
+| throughput drops to zero, repeatedly, then recovers | election timeout tuned too tight for the network, or a leader pauses (long GC) long enough for followers to time out — a new election starts before the old leader even knows it lost | election/term counters climbing on the cluster dashboard, "no leader" errors bursting |
+| a transaction has been "committing" for twenty minutes and rows are locked | 2PC coordinator crashed between collecting votes and broadcasting the decision | stuck transaction alert, lock-wait timeouts on unrelated queries touching the same rows |
+| a job runs twice, or a resource gets two conflicting writes | lock holder paused past its lease TTL, resumed, and wrote without a fencing check | duplicate side effect (a double charge, a double email), or an idempotency-key conflict spike |
+| all writes fail, reads (if you allow stale ones) keep working | a majority of voting nodes are down or partitioned away from each other | cluster health shows "no quorum" / "no leader", write error rate at 100%, read error rate flat |
+
+## in practice
+
+**Kubernetes leader election is Raft you're already relying on.** `kube-apiserver` state and
+the `Lease` objects controllers use to decide "who is the active controller-manager" are backed
+by etcd, which is Raft underneath. If you've ever debugged a controller doing nothing after a
+node was drained, you were debugging a stale-leadership problem in exactly the shape described
+above.
+
+**Kafka's per-partition replication is a quorum-shaped mechanism, but it is not Raft.** A
+partition has one leader and an in-sync replica set (ISR); `acks=all` with `min.insync.replicas`
+waits for the ISR, not for a Raft-style majority vote, and a replica can fall out of the ISR
+and back in without an election. (KRaft mode, which replaces ZooKeeper for cluster *metadata*,
+does use Raft — but that's the controller quorum, not your topic's data path.) Don't assume
+`acks=all` gives you the same failure-tolerance arithmetic as a 3-node Raft cluster; check what
+`min.insync.replicas` is actually set to.
+
+**SQL Server Always On Availability Groups** are the closest thing a .NET engineer has used to
+consensus by another name: a synchronous-commit secondary must acknowledge before the primary's
+transaction commits (a one-node quorum, effectively), and automatic failover is arbitrated by
+Windows Server Failover Clustering's own quorum, not by the availability group itself. Losing
+cluster quorum there produces exactly the "no leader, writes stop" row in the table above.
+
+**MSDTC and `TransactionScope` spanning two connections is textbook 2PC**, and it's why it's
+been increasingly discouraged: Azure SQL Database doesn't support MSDTC-coordinated distributed
+transactions at all, and on-prem it's the classic source of orphaned, "in doubt" transactions
+after a coordinator restart. If a design leans on `TransactionScope` across two databases,
+that's the block described above, waiting to happen during a routine restart.
+
+**Outbox in EF Core** is straightforward: add an `Outbox` table, write the domain row and the
+outbox row in the same `SaveChanges()` call, and have a separate background service (or
+MassTransit's/NServiceBus's built-in outbox support) relay unpublished rows to RabbitMQ or
+Azure Service Bus. The consumer side still needs a dedupe check — an idempotency key stored in
+the same transaction as the side effect — because the relay guarantees at-least-once, never
+exactly-once, delivery.
+
+**Cosmos DB's "Strong" consistency level is a quorum, not marketing copy.** Strong consistency
+in Cosmos DB requires a write to be durably replicated to a majority of the region's replicas
+before it's acknowledged, the same commit rule as Raft; every weaker level (Bounded Staleness,
+Session, Consistent Prefix, Eventual) is a specific, named point on the tradeoff row above —
+know which one your container is actually set to before you promise a caller "read your own
+writes" behavior.
+
+**Retries with Polly don't buy exactly-once either.** A `Polly` retry policy around an
+`HttpClient` call that times out after the server actually processed the request will retry
+into a duplicate — the client can't distinguish "never arrived" from "arrived, response lost".
+The fix is the same one this page keeps returning to: an idempotency key on the call, checked
+server-side, so a retried request is a no-op rather than a second charge.
+
+**Distributed locks in .NET usually means Redis**, via something like RedLock.net, and it's
+worth knowing the debate around it: Redlock's safety argument assumes bounded clock drift and
+bounded pause times, which a GC pause or a slow VM can violate — this is the exact scenario the
+fencing-token diagram above walks through. If the resource you're locking can enforce a fencing
+token itself (an `ETag`/`If-Match` check on a row, a lease ID condition on an Azure Blob lease),
+do that instead of trusting the lock alone. Where you don't need cross-machine locking at all,
+`sp_getapplock` in SQL Server gives you the same "only one at a time" guarantee scoped to a
+transaction, backed by the database's own lock manager instead of a second system to reason
+about.
+
+<Callout kind="trap" label="the folklore, corrected">
+  "Raft/Paxos means every read is strongly consistent" is wrong, and it's the single most
+  common wrong thing said about consensus in an interview. **Consensus makes the log
+  agree — reads only inherit that guarantee if they go through a leadership check.** A
+  follower read is stale by construction. A leader read is stale too, the moment that leader
+  no longer holds a majority and hasn't found out yet. Confirm leadership (a lease or a
+  read-index round), or say explicitly that the read is only eventually consistent.
+</Callout>
+
+## the same idea elsewhere
+
+| this idea | its cousin | the trap |
+| --- | --- | --- |
+| a majority quorum making a Raft cluster agree on one log | cores agreeing on which cached copy of a memory line is valid, via a coherence protocol | [reordering, visibility & the memory model](/systems/memory-model/) — two cores disagreeing and two replicas disagreeing are the same shape at different distances; the difference is that hardware coherence is enforced in nanoseconds by wired-in protocol, not milliseconds by an elected leader |
+| a distributed lock plus a fencing token | a mutex protecting a critical section inside one process | [what a lock is made of](/systems/locks-internals/) — a mutex is enforced by the OS scheduler against threads that share an address space and can't simply vanish and reappear; a distributed lock protects against a *process* that can pause and resume on its own schedule, which is precisely what a mutex's guarantee can never be tricked by |
+| "reject the write if its fencing token is lower than the highest seen" | a compare-and-swap guard against the ABA problem | [atomics & compare-and-swap](/systems/atomics-and-cas/) — both are "don't trust that the world hasn't moved since you last looked", the CAS version done in one instruction on one word, the fencing-token version done as an application-level check on a whole storage system |
+
+## interview drills
+
+**Q.** Your service reads from a Raft-backed store right after writing to it and gets the old
+value back. Walk me through why.
+- *weak answer* — "Raft guarantees consistency, so that shouldn't be possible — must be a
+  client bug." This treats "consensus" and "linearizable reads" as the same guarantee; they
+  aren't.
+- *strong answer* — the read most likely hit a follower, which only has what's replicated to
+  it so far, or hit a leader that no longer holds a majority and hasn't found out. Fix it by
+  routing linearizable reads through a leadership check — a read-index round, or a
+  time-bounded lease — not just "read from whoever answers fastest".
+- *follow-up* — "How would you confirm leadership without adding a log write?" — a read-index
+  round: the leader confirms it can still reach a majority via a heartbeat exchange before
+  answering, no new log entry required.
+
+**Q.** Why not just wrap your two microservices' databases in a two-phase commit instead of
+building a saga?
+- *weak answer* — "2PC is the safe, consensus-backed option, it guarantees atomicity." 2PC
+  isn't consensus at all — it has no quorum and no election.
+- *strong answer* — 2PC has a single coordinator; if it crashes after collecting votes but
+  before broadcasting the decision, every participant that voted yes is stuck holding locks
+  with no legal way to decide on its own. A saga trades atomicity for independent, compensable
+  steps, so a failure is a local decision (run the compensation) instead of a cluster-wide
+  block on a coordinator's recovery.
+- *follow-up* — "Can a participant do anything while blocked?" — it can query the other
+  participants (a cooperative-termination protocol) and sometimes shortcut the wait, but there
+  is no general fix short of the coordinator returning or an operator intervening.
+
+**Q.** You built a nightly-batch lock in Redis so only one worker runs the job. What can still
+go wrong?
+- *weak answer* — "Nothing — once a worker holds the lock, the others can't acquire it." True
+  only until the holder is paused longer than the lease.
+- *strong answer* — a long GC pause or a stolen CPU slice can put the holder past its lease
+  TTL; another worker acquires and starts running, and the first worker can then wake up still
+  believing it holds the lock and write anyway. Fix it with a fencing token on the *protected
+  resource*: a monotonically increasing number handed out per acquire, checked and rejected by
+  the resource if a higher one has already been seen, not just trusted by the lock client.
+- *follow-up* — "Does swapping Redis for ZooKeeper fix this by itself?" — no, any pause-based
+  lease has the hazard; the fencing token fixes it, and ZooKeeper's own monotonic node version
+  happens to make a convenient token.
+
+**Q.** What is CAP actually claiming, for a Raft cluster specifically?
+- *weak answer* — "pick two of consistency, availability, partition tolerance." That phrasing
+  implies a stable choice you make once; CAP is a statement about behavior *during* a
+  partition, not a menu.
+- *strong answer* — during an actual network partition, a system can either keep serving on
+  both sides (availability) and risk divergent answers, or refuse to serve on the side that
+  can't reach a majority (consistency), but not both. A Raft cluster chooses consistency: the
+  minority side simply can't commit, because it can't form a quorum. Day to day, with no
+  partition happening, PACELC is the more useful frame — you're still trading latency for
+  consistency, e.g. whether a write waits for a quorum ack before returning.
+- *follow-up* — "So is Raft a CP or an AP system?" — CP under CAP's own definition, but only
+  during a partition; the label says nothing about normal-operation latency, which is exactly
+  what PACELC adds.
+
+**Q.** A Kafka consumer processed the same message twice and double-charged a customer. Isn't
+Kafka exactly-once?
+- *weak answer* — "Kafka guarantees exactly-once delivery, so this has to be a config bug." It
+  conflates Kafka's internal exactly-once semantics with delivery to an external system.
+- *strong answer* — Kafka's exactly-once semantics cover writes it fully controls — idempotent
+  producers and transactional writes across its own partitions. They stop at the consumer's
+  boundary: calling an external payment API from a consumer is at-least-once delivery, full
+  stop, so that call has to be made idempotent independently of anything Kafka promises.
+- *follow-up* — "How would you make the charge idempotent against redelivery?" — store an
+  idempotency key (the message key, or a generated id) and check-and-insert it in the same
+  transaction as the charge, so the database enforces "already processed", not the consumer's
+  in-memory state.
+
+**Q.** Your 3-node cluster survived one node dying, but when a second one died at the same
+time everything stopped accepting writes even though a node was still up and healthy. Is that
+a bug?
+- *weak answer* — "With one node still running, it should still be able to serve writes." This
+  ignores what quorum actually requires.
+- *strong answer* — no bug: majority of 3 is 2, so losing 2 nodes leaves exactly 1, which can
+  never form a quorum on its own. The system is doing exactly what majority-quorum consensus
+  promises — it stops rather than let the surviving minority silently diverge from what the
+  (possibly still-alive, just partitioned) majority believes. The fix, if this recurs, is
+  either more nodes (5 tolerates 2 losses) or making sure the 3 you have don't share a failure
+  domain that can take out 2 at once.
+- *follow-up* — "Would going to 5 nodes have prevented this specific incident?" — only if the
+  two lost nodes wouldn't also have been 2 of the 5's failure domain; otherwise you've raised
+  the bar, not eliminated the class of incident.

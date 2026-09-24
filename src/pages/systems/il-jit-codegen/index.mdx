@@ -1,0 +1,675 @@
+---
+layout: '@layouts/TopicLayout.astro'
+topic: il-jit-codegen
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import ProblemList from '@components/ProblemList.astro';
+import Solution from '@components/Solution.astro';
+
+## the ground floor
+
+- **machine code** — the bytes an x86-64 core decodes and executes. `add eax, ecx` is three
+  bytes. [What the CPU does with them](/systems/cpu-execution/) is the page underneath this one.
+- **register** — one of the sixteen named 64-bit slots inside the core. Everything the CPU
+  computes on has to be in a register first; memory is where values wait.
+- **IL** — *Intermediate Language* (also written CIL or MSIL): the instruction set the C#
+  compiler actually emits. It is a **stack machine** — no registers, no addresses, no CPU in
+  mind — and it is what lives inside a `.dll`.
+- **assembly** — in .NET, a `.dll` or `.exe`: IL plus *metadata*, the tables describing every
+  type, method and field. Note the collision: this page also says "assembly" for assembly
+  *language*. Where it matters, this page writes "the assembly" for the file and "assembly
+  code" or "machine code" for the instructions.
+- **JIT** — the *just-in-time* compiler inside the runtime. It turns a method's IL into machine
+  code the first time that method is called, and sometimes again later. .NET's is called
+  **RyuJIT**.
+- **tier** — one JIT compilation of a method at a particular quality setting. A hot method gets
+  compiled more than once, at more than one tier, in the same process.
+
+## core idea
+
+There are two compilers between your C# and the CPU, and the one that decides your performance
+runs *inside your process, while it is serving traffic*. Roslyn (`csc`) translates C# to IL and
+performs almost no optimisation worth the name — it does not allocate registers, does not
+inline, does not remove a bounds check. RyuJIT does all of that, per method, at runtime, and it
+does it **twice**: once fast and badly to get the method running, then again slowly and well
+once the method has proved it matters.
+
+| | the C# compiler (Roslyn) | the JIT (RyuJIT) |
+| --- | --- | --- |
+| runs | at build time, on your machine | at run time, in your process |
+| turns | C# into IL and metadata | IL into machine code for *this* CPU |
+| decides | overload resolution, lambda and `async` rewriting, constant literals | registers, inlining, bounds-check removal, unrolling, branch layout |
+| knows | your source | which CPU features exist, which types actually showed up, how often each method ran |
+| what `-c Release` changes | very little in the IL | everything — a Debug build turns tiering off *permanently*, see below |
+
+That split is why "compiled languages are fast and JIT languages are slow" is a category error.
+The JIT is not a handicap the runtime pays; it is a compiler with information a build-time
+compiler cannot have.
+
+## how it actually works
+
+### five lines of C#, 24 bytes of IL, 29 bytes of machine code
+
+One method, followed all the way down. Every listing below is real output from this box, from
+the files in `bench/il-jit-codegen/`.
+
+<Solution>
+
+```csharp
+static int SumLoop(int[] a)
+{
+    int s = 0;
+    for (int i = 0; i < a.Length; i++) s += a[i];
+    return s;
+}
+```
+
+</Solution>
+
+Roslyn turns that into IL. This listing is decoded from the actual method-body bytes in the
+built assembly — `bench/il-jit-codegen/il-dump.cs` reads them with
+`MethodBody.GetILAsByteArray()` and decodes them against the runtime's own opcode table, so
+nothing here is transcribed by hand:
+
+```text
+.method SumLoop   // 24 bytes of IL, maxstack 3, 2 locals
+  .locals  [0] int32
+  .locals  [1] int32
+  IL_0000:  ldc.i4.0            ; push 0
+  IL_0001:  stloc.0             ; s = pop()
+  IL_0002:  ldc.i4.0
+  IL_0003:  stloc.1             ; i = pop()
+  IL_0004:  br.s          IL_0010     ; jump to the test — a for loop checks first
+  IL_0006:  ldloc.0             ; push s
+  IL_0007:  ldarg.0             ; push a
+  IL_0008:  ldloc.1             ; push i
+  IL_0009:  ldelem.i4           ; pop array, pop index, push a[i]
+  IL_000a:  add                 ; pop two, push the sum
+  IL_000b:  stloc.0             ; s = pop()
+  IL_000c:  ldloc.1
+  IL_000d:  ldc.i4.1
+  IL_000e:  add
+  IL_000f:  stloc.1             ; i = i + 1
+  IL_0010:  ldloc.1             ; push i
+  IL_0011:  ldarg.0
+  IL_0012:  ldlen               ; push a.Length
+  IL_0013:  conv.i4
+  IL_0014:  blt.s         IL_0006     ; if i < len, jump to the body
+  IL_0016:  ldloc.0
+  IL_0017:  ret
+```
+
+Four things about IL are worth carrying around, and they are all visible above.
+
+**It is a stack machine.** There are no registers. Every instruction pops its operands off an
+evaluation stack and pushes its result back. `maxstack 3` is the compiler telling the runtime
+how deep that stack ever gets. Real CPUs do not work this way at all, which is exactly the
+point: IL describes *what* to compute without committing to *where* the values live, and the
+JIT makes that decision later for a CPU Roslyn never saw.
+
+**Locals are numbered slots, not names.** `s` is local 0 and `i` is local 1. The names survive
+only in the debug symbols.
+
+**`ldelem.i4` is one instruction, and it is defined to bounds-check.** The IL specification says
+`ldelem` throws `IndexOutOfRangeException` when the index is out of range. Roslyn cannot elide
+that check because IL has no way to express an unchecked array read. Everything you have heard
+about bounds-check elimination in .NET therefore happens *below* this listing — in the JIT.
+
+**Roslyn optimised nothing.** It did not hoist `a.Length` out of the loop, it did not keep `s`
+in anything resembling a register, and in Release configuration this IL is essentially
+identical. The IL is a faithful transcription.
+
+### the JIT compiles a method the first time it is called
+
+Nothing in that assembly is machine code. The runtime installs a stub in every method's slot,
+and the first call to `SumLoop` lands in the stub, which invokes the JIT, which compiles the
+method, patches the slot to point at the fresh code, and jumps into it. The second call goes
+straight there.
+
+```text
+  build time                          run time
+  ──────────                          ────────
+  Program.cs ──csc──▶ Program.dll     first call ──▶ stub ──▶ JIT ──▶ tier-0 code
+                      ├─ IL bytes                                       │
+                      └─ metadata     next ~30 calls ─────────────────▶ │ counted
+                                                                        ▼
+                                      hot ──▶ JIT again ──▶ tier-1 code (optimised,
+                                                            using the counts collected
+                                                            by the tier-0 code)
+```
+
+That first call is not free, and the cost is not hidden anywhere clever — it *is* the JIT
+compiling the method, on the same thread that made the call, before that call can proceed.
+Every frame between your code and `SumLoop` is waiting on the compiler, not on the loop. A
+method called exactly once pays this cost and gets nothing back for it. A method called a
+million times pays it exactly once and amortises it over all the rest — which is the whole bet
+tiering makes.
+
+### tier 0: get it running
+
+Here is what the JIT emitted for `SumLoop` the first time it was called. Real output, unedited,
+from `DOTNET_JitDisasm=SumLoop dotnet run bench/il-jit-codegen/tiered-codegen.cs -c Release`:
+
+```text
+; Assembly listing for method P:SumLoop(int[]):int (Instrumented Tier0)
+; Instrumented Tier0 code
+; rbp based frame
+; compiling with minopt
+
+G_M000_IG01:                ;; offset=0x0000
+       push     rbp
+       sub      rsp, 64
+       lea      rbp, [rsp+0x40]
+       xor      eax, eax
+       mov      dword ptr [rbp-0x34], eax
+       mov      dword ptr [rbp-0x38], eax
+       mov      gword ptr [rbp-0x30], rdi
+
+G_M000_IG02:                ;; offset=0x0016
+       mov      dword ptr [rbp-0x40], 0x3E8
+       xor      eax, eax
+       mov      dword ptr [rbp-0x34], eax
+       xor      eax, eax
+       mov      dword ptr [rbp-0x38], eax
+       jmp      SHORT G_M000_IG04
+
+G_M000_IG03:                ;; offset=0x0029
+       mov      rdi, 0x7EBE0DFEC1F8
+       call     CORINFO_HELP_COUNTPROFILE32
+       mov      rax, gword ptr [rbp-0x30]
+       mov      ecx, dword ptr [rbp-0x38]
+       cmp      ecx, dword ptr [rax+0x08]
+       jae      SHORT G_M000_IG08
+       mov      edx, ecx
+       lea      rax, bword ptr [rax+4*rdx+0x10]
+       mov      eax, dword ptr [rax]
+       add      eax, dword ptr [rbp-0x34]
+       mov      dword ptr [rbp-0x34], eax
+       mov      eax, dword ptr [rbp-0x38]
+       inc      eax
+       mov      dword ptr [rbp-0x38], eax
+
+G_M000_IG04:                ;; offset=0x005B
+       mov      eax, dword ptr [rbp-0x40]
+       dec      eax
+       mov      dword ptr [rbp-0x40], eax
+       cmp      dword ptr [rbp-0x40], 0
+       jg       SHORT G_M000_IG06
+
+G_M000_IG05:                ;; offset=0x0069
+       lea      rdi, [rbp-0x40]
+       mov      esi, 16
+       call     CORINFO_HELP_PATCHPOINT
+
+G_M000_IG06:                ;; offset=0x0077
+       mov      rax, gword ptr [rbp-0x30]
+       mov      eax, dword ptr [rax+0x08]
+       cmp      eax, dword ptr [rbp-0x38]
+       jg       SHORT G_M000_IG03
+       mov      rdi, 0x7EBE0DFEC1FC
+       call     CORINFO_HELP_COUNTPROFILE32
+       mov      eax, dword ptr [rbp-0x34]
+
+G_M000_IG07:                ;; offset=0x0095
+       add      rsp, 64
+       pop      rbp
+       ret
+
+G_M000_IG08:                ;; offset=0x009B
+       call     CORINFO_HELP_RNGCHKFAIL
+       int3
+
+; Total bytes of code 161
+```
+
+161 bytes of machine code for 24 bytes of IL, and four separate things in it are not your
+program:
+
+| what | why it is there |
+| --- | --- |
+| `s` at `[rbp-0x34]`, `i` at `[rbp-0x38]` | tier 0 does not allocate registers; every local gets a frame slot and every use is a load and a store |
+| two `call CORINFO_HELP_COUNTPROFILE32` | **instrumentation**. Tier-0 code counts how often each block runs, so the next compilation can use real numbers. This is Dynamic PGO |
+| `mov [rbp-0x40], 0x3E8` and `call CORINFO_HELP_PATCHPOINT` | a **patchpoint**: a countdown from 1000 iterations, checked every trip, so a long-running loop can be rescued mid-flight — see OSR below |
+| `cmp ecx, [rax+0x08]` / `jae` / `call CORINFO_HELP_RNGCHKFAIL` | the bounds check. `[rax+0x08]` is the array's length field, eight bytes into the object |
+
+Tier-0 code is deliberately unoptimised. Its job is to start executing as soon as possible,
+because most methods in a real program run a handful of times and compiling them well would be
+wasted work.
+
+### tier 1: get it fast
+
+The same process, the same method, once it has been called enough times:
+
+```text
+; Assembly listing for method P:SumLoop(int[]):int (Tier1)
+; Tier1 code
+; optimized code
+; optimized using Dynamic PGO
+; with Dynamic PGO: fgCalledCount is 726400
+
+G_M000_IG01:                ;; offset=0x0000
+       push     rbp
+       mov      rbp, rsp
+
+G_M000_IG02:                ;; offset=0x0004
+       xor      eax, eax                      ; s = 0
+       mov      ecx, dword ptr [rdi+0x08]     ; ecx = a.Length
+       test     ecx, ecx                      ; empty array?
+       jle      SHORT G_M000_IG05
+
+G_M000_IG03:                ;; offset=0x000D
+       add      rdi, 16                       ; rdi = &a[0]
+
+G_M000_IG04:                ;; offset=0x0011
+       add      eax, dword ptr [rdi]          ; s += *p          ← the whole loop
+       add      rdi, 4                        ; p++
+       dec      ecx                           ; trip count--
+       jne      SHORT G_M000_IG04
+
+G_M000_IG05:                ;; offset=0x001B
+       pop      rbp
+       ret
+
+; Total bytes of code 29
+```
+
+161 bytes became 29. `s` is `eax` and never touches memory. The index `i` does not exist any
+more — the JIT rewrote `a[i]` into a moving pointer and turned the loop test into a countdown to
+zero, because `dec`/`jne` sets the flags for free. The instrumentation is gone. **The bounds
+check is gone**, which is the subject of
+[the bounds-check exercise](/systems/il-jit-codegen/bounds-check-elimination/).
+
+`fgCalledCount is 726400` is the JIT telling you what the tier-0 instrumentation counted: this
+method had run 726,400 times when it was recompiled. That number is why the second compilation
+can be aggressive — it is not guessing that the method is hot.
+
+<Callout kind="note" label="an honest note about that listing">
+  In this run the runtime printed the tier-0 listing **twice**, byte for byte identical, before
+  the tier-1 one. It is shown once above. The order of compilations — tier 0 first, tier 1 much
+  later — is what the output shows and what matters here.
+</Callout>
+
+### what "warmed up" means
+
+"Warmed up" is not a vibe — it is a specific, discrete event: the pointer in the method's slot
+gets rewritten from the tier-0 code above to the tier-1 code above, and every call after that
+one runs different bytes. Two conditions gate it, and the runtime checks both:
+
+- **A call count.** The method has to be called some number of times — on the order of a few
+  dozen — before the runtime bothers recompiling it. Most methods in a real program run once or
+  twice and would never earn back the cost of a second, more thorough compile.
+- **A grace period after the process starts.** The runtime does not start counting calls at all
+  until the process has been running for a little while. Startup calls hundreds of methods in a
+  burst; counting from the first instant would trigger a flood of recompilations competing with
+  the work of starting up in the first place.
+
+Both are real knobs (`DOTNET_TC_CallCountThreshold`, `DOTNET_TC_CallCountingDelayMs`) and both
+exist for the same reason: promoting too eagerly wastes compiler time on methods that were
+never going to be hot, and promoting too late leaves a method slow for longer than it needs to
+be. Two details matter more than the exact numbers. The transition is a **step, not a ramp** —
+one call runs the tier-0 code above, the very next call runs the tier-1 code above, because
+promotion is a pointer write, not a gradual improvement. And it is **per method**, not
+per process — a service can be fully warmed up on its hot path and still running tier-0 code on
+a controller it hits once a minute.
+
+### OSR: rescuing a loop that is already running
+
+The patchpoint in the tier-0 listing exists for the method that is called once and runs for a
+minute — a batch job's outer loop. Counting calls will never promote it, because there is only
+one call.
+
+So tier-0 code counts *loop iterations* too. When the countdown at `[rbp-0x40]` hits zero, the
+patchpoint helper compiles an optimised version of the method **starting at that loop**, copies
+the live locals from the tier-0 frame into the new frame, and jumps into it — mid-loop, on the
+same thread, without returning. That is **on-stack replacement (OSR)**. `bench/il-jit-codegen/osr-demo.cs`
+is one call to a method whose loop runs fifty million trips — call-counting can never promote a
+method that is only ever called once, so this is OSR or nothing. Real output, unedited, from
+`DOTNET_JitDisasm=LongLoop dotnet run bench/il-jit-codegen/osr-demo.cs -c Release`:
+
+```text
+; Assembly listing for method P:LongLoop(int[]):long (Tier1-OSR)
+; Tier1-OSR code
+; OSR variant for entry point 0x16
+; optimized code
+
+G_M000_IG01:                ;; offset=0x0000
+       mov      rax, qword ptr [rbp]
+       push     rax
+       mov      rbp, rsp
+       mov      rax, gword ptr [rbp+0x30]
+       mov      rdx, qword ptr [rbp+0x28]
+       mov      edi, dword ptr [rbp+0x24]
+       mov      ecx, dword ptr [rbp+0x20]
+
+G_M000_IG02:                ;; offset=0x0016
+       mov      esi, dword ptr [rax+0x08]
+       jmp      SHORT G_M000_IG04
+
+G_M000_IG03:                ;; offset=0x001B
+       cmp      ecx, esi
+       jae      SHORT G_M000_IG09
+       mov      r8d, ecx
+       movsxd   r8, dword ptr [rax+4*r8+0x10]
+       add      rdx, r8
+       inc      ecx
+
+G_M000_IG04:                ;; offset=0x002C
+       cmp      esi, ecx
+       jg       SHORT G_M000_IG03
+
+; … the outer 50,000,000-trip counter, then …
+
+G_M000_IG08:                ;; offset=0x0045
+       add      rsp, 96
+       pop      rbp
+       ret
+
+; Total bytes of code 81
+```
+
+The label says everything: `(Tier1-OSR)`, `OSR variant for entry point 0x16` — this is not a
+fresh call into `LongLoop`, it is a *resumption*, and its opening instructions
+(`mov rax, [rbp+0x30]` …) are reloading the live locals — the array reference, the running sum,
+both loop counters — out of the tier-0 frame that was already in flight when the switch
+happened. The practical consequence: a `Main` that does all its work in one long loop *does*
+get optimised, but only after the first 1000 iterations of the loop the patchpoint sits in, and
+the transition costs a compile happening mid-flight rather than between calls.
+
+### inlining, and what the JIT does afterwards
+
+Inlining is replacing a call with the callee's body. Its direct saving — the call and the
+return no longer happen at all — is real but small on its own; see
+[the call-cost exercise](/systems/cpu-execution/call-and-inline-cost/) for what a call actually
+costs. The reason inlining is the JIT's most important decision is what becomes possible
+*after* it, when the callee's code is sitting in the caller's expression graph where the
+optimiser can see it.
+
+`bench/il-jit-codegen/inlining.cs` gives eight callees exactly one call site each, prints each
+one's IL size out of its own metadata, and the disassembly of each caller says whether the call
+survived. Four of the eight carry an exception-handling region, because the folklore says all
+four are uninlinable and only one of them is:
+
+| callee | IL bytes | shape | inlined? | caller's machine code |
+| --- | --- | --- | --- | --- |
+| `Small` | 6 | `x * 2 + 1` | yes | 7 bytes |
+| `WithTry` | 15 | same arithmetic, wrapped in `try`/`catch` | **no** | 14 bytes |
+| `TryFinallyWork` | 27 | same arithmetic in a `try`, with a `finally` that increments a static array element | yes | 29 bytes |
+| `UsingReal` | 26 | same arithmetic under a `using`, on a class whose `Dispose` increments a static array element | yes | 29 bytes |
+| `LockMethod` | 52 | same arithmetic inside a `lock` on a static object | yes | 166 bytes |
+| `Guarded` | 21 | argument check that throws, then the arithmetic | yes | 74 bytes |
+| `Big60` | 829 | 60 straight-line arithmetic statements | yes | 984 bytes |
+| `Big90` | 1249 | 90 of them | **no** | 13 bytes |
+
+The folklore is "small methods get inlined". The evidence says a **15-byte method was refused
+while an 829-byte one was accepted**. Four rules are doing that work:
+
+- **A `catch` handler in the callee stops it, at any size.** `WithTry` is six bytes smaller than
+  `Guarded`, computes the same expression, and is the only one of the eight refused for its
+  shape rather than its size. This is the part of the folklore that is still true.
+- **`try`/`finally`, `using` and `lock` do not stop it — not on this runtime.** All three
+  inlined. The `lock` is the convincing case: `CallLockMethod` came out at 166 bytes containing
+  `Monitor:TryEnter_FastPath`, `Monitor:Enter_Slowpath` and a real exception-path funclet that
+  calls `Monitor:Exit_Slowpath`, so the callee's EH region was carried into the caller rather
+  than being folded away before the inliner looked. (In `TryFinallyWork` and `UsingReal` it
+  *was* folded away, because a protected region containing nothing but `x * 2 + 1` cannot
+  throw — which is why the `lock` result is the one that settles the question.) The switch
+  that governs this is real and observable: re-running the same file under
+  `DOTNET_JitInlineMethodsWithEH=0` refuses all four EH callees, and every one of those callers
+  collapses to the 14 bytes `CallWithTry` already had. Whatever was true of earlier runtimes,
+  check it on the one you ship rather than carrying the rule forward.
+- **A `throw` is not an exception handler.** `Guarded` validates its argument and throws; it
+  inlines fine, and the JIT moved the throwing path to a cold block at the *end* of the emitted
+  code so the hot path stays contiguous. Argument validation does not cost you inlining.
+- Size is a budget, not a cliff at 32 or 100 bytes, and it is much larger than people quote.
+  Somewhere between 829 and 1249 bytes of IL, for *this* shape at *this* call site, the JIT
+  decided against it.
+
+And here is the payoff. `CallSmall` is `Small(x) + Small(x + 1)`, i.e. `(2x+1) + (2x+3)`:
+
+```text
+; Assembly listing for method Inl:CallSmall(int):int (Tier1)
+; 0 inlinees with PGO data; 2 single block inlinees; 0 inlinees without PGO data
+
+G_M000_IG02:
+       add      edi, edi              ; edi = 2x
+       lea      eax, [rdi+rdi+0x04]   ; eax = 2x + 2x + 4 = 4x + 4
+       ret
+
+; Total bytes of code 7
+```
+
+Two calls, two multiplications, two additions and one more addition in the source. Two
+instructions in the result, and neither of them is a multiply. That is the real argument for
+inlining: it is the enabling transformation for constant folding, common-subexpression
+elimination and everything else, because an optimiser can only reason about code it can see.
+
+### the four reasons your micro-benchmark is lying to you
+
+Every mechanism above is also a reason a naive "time version A, time version B" comparison can
+report the wrong answer, without either implementation being buggy.
+
+1. **Tiering.** Compare two implementations before either one has been called enough times to
+   promote, and you are comparing two pieces of deliberately unoptimised tier-0 code — not the
+   code either one runs in production. The tier-0 and tier-1 listings above are not the same
+   program run at different speeds; they are two different compiled artifacts, and only one of
+   them is what a warmed-up service actually executes.
+2. **Inlining context.** A callee measured behind an isolated `NoInlining` wrapper — which is
+   how you *have* to measure a call in isolation — compiles differently than the same callee
+   sitting at its real call site, where it might inline and vanish into the `CallSmall` shape
+   above, or hit a size budget the isolated version never faced.
+3. **Dead-code elimination.** If nothing observable consumes a result, and the JIT can see
+   straight through the computation that produced it, the whole thing can be deleted.
+   `bench/il-jit-codegen/dead-code-elimination.cs` calls a method that computes a value and
+   never uses it; once the callee is small enough to inline, here is the entire compiled body:
+
+   ```text
+   ; Assembly listing for method P:CallUnusedResult(int) (Tier1)
+   ; optimized using Synthesized PGO
+   ; 0 inlinees with PGO data; 1 single block inlinees; 0 inlinees without PGO data
+
+   G_M000_IG01:
+
+   G_M000_IG02:
+          ret
+
+   ; Total bytes of code 1
+   ```
+
+   One byte: `ret`. Nothing was computed, because nothing needed to be. A comparison that calls
+   a method purely for its return value and never reads that value can end up timing this — an
+   empty function — on one or both sides.
+4. **Debug versus Release.** Covered in full below: a Debug build never enters tiering at all —
+   it compiles straight to MinOpts, on purpose, and stays there for the life of the process.
+
+None of these four is exotic. All four are things RyuJIT does correctly, on every request your
+service serves — they only become a trap when someone times two code paths without accounting
+for which compiled artifact was actually running.
+
+### Debug is not "Release with symbols"
+
+A Debug build sets `DebuggableAttribute(DisableOptimizations)` on the assembly, and the JIT
+honours it by compiling every method with MinOpts — *forever*. It does not merely start out
+unoptimised and warm up; there is no tier-1 state for it to warm up into, ever. Not even the
+tiering machinery runs — the runtime skips straight past it, because it already knows where
+this method is going to end up. Compiling `bench/il-jit-codegen/tiered-codegen.cs` without
+`-c Release`, with no other flags at all:
+
+```text
+$ DOTNET_JitDisasm=SumLoop dotnet run bench/il-jit-codegen/tiered-codegen.cs
+
+; Assembly listing for method P:SumLoop(int[]):int (MinOpts)
+; Total bytes of code 133
+```
+
+One compilation, straight to MinOpts, with no tier-0 or tier-1 label anywhere in the output.
+133 bytes against 29. Debug code is not tier-0 code
+either — it is what tier 0 would look like if the runtime had also promised never to recompile
+it. Every implementation compared in a Debug build is being compared on the strength of the
+debugger's convenience, not on anything that will ship.
+
+## the mental model
+
+Four sentences, and they cover most of what this page is for.
+
+1. **Roslyn transcribes; the JIT optimises.** If you are wondering whether the C# compiler is
+   clever enough to fix something, the answer is almost always no — and it does not matter,
+   because the compiler that is clever runs later.
+2. **Every hot method is compiled at least twice.** The first version exists to start running;
+   the second one exists to run well and is built from counts the first one collected.
+3. **"Warmed up" is a real state with a real boundary** — a call count plus a start-up grace
+   period, both shown above — and it is a step, a pointer rewrite, not a gradual improvement.
+4. **You can just look.** `DOTNET_JitDisasm=MethodName dotnet run -c Release` prints the exact
+   instructions. Questions like "did it inline", "did the bounds check go away", "is this loop
+   unrolled" have answers in seconds, and the answer is often not the one you would have argued
+   for.
+
+<Watch items={[['IL for the loop', '24 bytes'], ['tier-0 code', '161 bytes'], ['tier-1 code', '29 bytes'], ['array length offset', '+8 bytes into the object'], ['array data offset', '+16 bytes into the object'], ['promotion threshold', 'a call count, plus a start-up grace period']]} />
+
+## why you should care
+
+**The first requests after a deploy run different code than the requests an hour later.** A
+rolling deploy puts a process into a load balancer's rotation with every method at tier 0 — the
+deliberately unoptimised code shown above, no register allocation, extra instrumentation calls
+in every hot loop — while the JIT is also compiling in the background, competing for the same
+cores as your request handlers. That is the shape behind the classic "p99 spikes for the first
+stretch after every deploy, then settles" graph, and it is why warming a process with real
+traffic before it joins the rotation is worth the trouble. It is also why a health check that
+only pings `/healthz` proves nothing: the code path it warms is not the code path you serve.
+
+**Any comparison that ignores the four reasons above is not comparing two speeds of your code.**
+It is comparing whatever artifacts the JIT happened to produce for reasons that have nothing to
+do with which implementation is actually better — which tier each side reached, whether the
+callee inlined at its real call site, whether the result was even consumed, whether it was a
+Debug build. Fix all four and what is left is a fair comparison; ignore any one of them and a
+number can point the wrong way with total confidence.
+
+**Constant factors are decided here.** [Big-O](/foundations/big-o/) tells you which algorithm
+wins as *n* grows; the JIT decides everything about the constant in front. Bounds checks removed
+or kept, a call inlined or not, a value in a register or in a frame slot — none of that is
+visible in the source, and two implementations of the same complexity class can compile to very
+different code for reasons only `DOTNET_JitDisasm` will show you.
+
+**The code review you can now do.** Prefer the loop shape the JIT recognises — the idiomatic
+`for (int i = 0; i < arr.Length; i++)`, not a hand-rolled variant. Do not scatter
+`[MethodImpl(MethodImplOptions.AggressiveInlining)]` — the JIT's default answer is usually
+right, forced inlining grows code and evicts instruction cache, and the table above shows the
+inliner is far more generous than its reputation. Do not wrap a hot little helper in
+`try`/`catch` unless it needs one; that alone makes it uninlinable at any size.
+
+<Callout kind="tip" label="if you need an actual number">
+  This page never times anything, on purpose — the four reasons above are exactly why a raw
+  `Stopwatch` loop is easy to get wrong. If you need a real comparison, use BenchmarkDotNet: it
+  waits for tiering to settle before it starts the clock, keeps every result alive so it cannot
+  be deleted, isolates each benchmark in its own process, and reports allocations alongside
+  time. It can also dump the disassembly of the method it just ran, which is the same technique
+  this page uses by hand.
+</Callout>
+
+## the same idea in other languages
+
+| language | what the machinery is called | the trap |
+| --- | --- | --- |
+| Java | `javac` emits bytecode; HotSpot interprets it, then compiles with C1, then C2 — the same two-tier shape, plus an interpreter below it | HotSpot can **deoptimise**: code compiled on the assumption that only one implementation of an interface exists is thrown away when a second class is loaded, and execution falls back to the interpreter. A comparison that runs long enough to trigger this can change behaviour partway through for that reason alone. |
+| C / C++ | one compiler, at build time; `-O0` through `-O3` pick how hard it tries | There is no tiering, so a C program's first iteration runs the same code as its last — but the compiler will still delete a computation whose result you never use, exactly like reason 3 above. That is why Google Benchmark ships `benchmark::DoNotOptimize`. Same trap, no runtime to blame. |
+| Go | compiled ahead of time to machine code; no JIT, no tiers | Inlining and escape-analysis decisions are frozen at build time and you inspect them with `go build -gcflags=-m` rather than by dumping runtime code. Carrying "it gets faster once it's been running a while" into Go is meaningless; carrying "it never needs a settling-in period" into .NET produces the tiering trap above. |
+| Python (CPython) | source is compiled to bytecode (the `.pyc`) and executed by an interpreter loop | There is no machine code for *your* function to inspect — `dis.dis(f)` shows bytecode, and the only machine code is the interpreter's own. The bytecode never changes shape based on how many times a function ran, so there is no tier-0/tier-1 split to trip over. |
+| JavaScript (V8) | several tiers, promoted on call and loop counts, with inline caches keyed on object shape | A function is compiled against the *shapes* it has seen. Pass an object with a different set of properties and V8 deoptimises and recompiles it — the JS analogue of reason 1 above, except the trigger is a shape change instead of a call count. |
+
+## exercises
+
+The bounds-check exercise below is the JIT observed rather than argued about: two loops that
+look almost identical, and the compiled code that says which one the JIT could actually prove
+safe.
+
+<ProblemList topic="il-jit-codegen" />
+
+## interview drills
+
+**Q.** *Our p99 spikes for about a minute after every deploy and then settles. Where would you
+look?*
+
+- *weak answer* — "cold caches" and stop there. It is a real cause and it is rarely the whole
+  story; the follow-up will be "which cache, and why exactly a minute?".
+- *strong answer* — Name the layers and say how you would separate them. A fresh process runs
+  every method at tier 0 until it has been called enough times *and* the start-up grace period
+  has expired, so hot paths are running deliberately unoptimised code, and the JIT is burning
+  CPU compiling while the process serves traffic. On top of that sit cold in-memory caches,
+  unopened connection pools and an empty file-system cache. The way to tell them apart is to
+  warm the process with real traffic before it joins the load balancer and see which part of
+  the spike disappears first.
+- *follow-up* — "How would you get rid of the JIT part?" ReadyToRun precompiles to machine code
+  at publish time so the first call has something to run, though it is still less optimised
+  than tier 1 and gets recompiled once hot; Native AOT removes the JIT entirely at the cost of
+  dynamic-code features and of the JIT's runtime knowledge of the actual CPU and the actual
+  call pattern.
+
+**Q.** *A colleague swaps a hand-rolled loop for library code, calls it an improvement, and has
+a number from a quick before/after comparison to prove it. What do you check before you accept
+the number?*
+
+- *weak answer* — "Can you re-run it?" Re-running a broken comparison produces the same
+  misleading number very reliably.
+- *strong answer* — Four questions, all about whether the comparison was even looking at real
+  code: was each side actually running tier-1 code, or did one side get more calls before the
+  clock started than the other; is the callee inlined the same way at its real call site as it
+  was in the isolated comparison; is the result of each path actually consumed by something the
+  optimiser cannot see through, or could the whole computation have collapsed the way the
+  dead-code example above did; and was it a Debug build, which never leaves tier 0 no matter how
+  long you wait. Any one of the four can make an honest comparison meaningless.
+- *follow-up* — "How do you check whether the JIT actually kept the work?" Read the disassembly
+  with `DOTNET_JitDisasm` and look at what is actually there. A method whose entire body
+  collapsed to a single `ret` did not run the computation at all — the comparison measured
+  nothing, on that side, at every iteration.
+
+**Q.** *C arrays do not bounds-check. Does that make C# arrays inherently worse for a tight
+numeric loop?*
+
+- *weak answer* — "Yes, that's the price of memory safety." True in principle, and it skips
+  past the mechanism entirely, which is what the interviewer is actually asking about.
+- *strong answer* — Usually there is no check to pay for. The JIT proves the index is in range
+  for the idiomatic `for (int i = 0; i < a.Length; i++)` loop and emits none — the tier-1 code
+  above is four instructions, and not one of them is a comparison against the length. When it
+  cannot prove the index safe, it often clones the loop instead of checking every element: one
+  guard before the loop, then a fast body identical to the proven case. Even in the case where a
+  check does survive per element, it is one predictable, never-taken branch sitting right next
+  to the read, and a predictor that gets a never-taken branch right on every iteration is not
+  costing you a stall.
+- *follow-up* — "When does it actually matter?" When the check blocks a bigger optimisation the
+  JIT would otherwise make on the loop, or in a tight kernel with an indirection in the
+  innermost loop, where a `Span<T>` slice or a raw `ref` gets the proof back — and the raw `ref`
+  gets memory corruption back too if the invariant you were relying on turns out to be wrong.
+
+**Q.** *When would you add `[MethodImpl(MethodImplOptions.AggressiveInlining)]`?*
+
+- *weak answer* — "On hot small methods, to help the JIT." The JIT already inlines those; the
+  attribute mostly changes behaviour where the JIT said no, which is where it had a reason.
+- *strong answer* — Rarely, and only after checking what actually happened without it. The
+  inliner is far more generous than folklore suggests — it accepted an 829-byte-IL callee in
+  the table above — so a refusal usually means something specific: a `catch` handler in the
+  callee (refused here at 15 bytes of IL, while `try`/`finally`, `using` and `lock` callees all
+  inlined), a virtual or interface call it could not devirtualise, or a size budget it decided
+  against. Forcing it grows the caller and pressures the instruction cache, so it is worth it
+  mainly for a small wrapper on a genuinely hot path, verified with `DOTNET_JitDisasm` rather
+  than assumed.
+- *follow-up* — "What stops the JIT inlining a method that is only twenty bytes?" A `catch`
+  handler: the 15-byte `try`/`catch` callee above was refused while an 829-byte callee with no
+  exception handler was accepted. `try`/`finally`, `using` and `lock` callees all inlined on
+  .NET 10 here, `lock` with its exception-path funclet intact — whatever folklore says about
+  those three, check the runtime you actually ship on.
+
+**Q.** *Your profiler blames a method that does not appear in the stack traces, or attributes 40%
+of the time to a line that cannot cost that. What is going on?*
+
+- *weak answer* — "The profiler is wrong." It is usually reporting exactly what it sampled.
+- *strong answer* — Optimised code does not map one-to-one onto source. Inlining moves a callee's
+  cost into its callers and can make the callee vanish from stacks entirely; the reverse also
+  happens, where one caller's frame accumulates the cost of five inlined helpers. Loop rewriting
+  fuses several source statements into single instructions, so the line table becomes
+  approximate. The fix is to read the emitted code for the method in question rather than argue
+  with the line numbers.
+- *follow-up* — "How do you get honest stacks then?" Sample at the instruction level and treat
+  attribution within a method as approximate, or temporarily mark the suspect method
+  `NoInlining` to give it a frame of its own — accepting that you have then changed the thing you
+  are profiling.

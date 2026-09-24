@@ -1,0 +1,94 @@
+---
+layout: '@layouts/TopicLayout.astro'
+topic: greedy
+---
+
+import Callout from '@components/Callout.astro';
+import ProblemList from '@components/ProblemList.astro';
+
+## core idea
+
+Greedy makes one irreversible, locally-best choice per step and never reconsiders it — no
+backtracking, no trying alternatives, no remembering the runner-up. That only pays off when you
+can *prove* the local choice never costs you the global optimum. Skip the proof and greedy still
+runs, still returns an answer, and is sometimes silently wrong — which is what makes it more
+dangerous to reach for on instinct than a pattern that simply fails loudly. The proof almost
+always takes one of three shapes:
+
+| proof style | the argument | example below |
+| --- | --- | --- |
+| exchange argument | swapping the greedy choice for any other choice can't improve the answer | sort-by-end interval scheduling (see intervals) |
+| never-regret | once made, no information that arrives later can make this choice worse than it already is | `Best Time to Buy and Sell Stock`, `Jump Game` |
+| restart-past-failure | if the run dies at `i`, no start between the current candidate and `i` survives either — jump the candidate past all of them | `Gas Station` |
+
+## when to reach for it
+
+- A single forward pass with **one running variable** — a minimum, a frontier, a running total —
+  is enough. You never need to remember every option seen, only the best one so far.
+- The question asks for a max/min produced by an irreversible sequence of choices: "maximum
+  profit from one transaction", "minimum jumps to the end", "can you complete the circuit".
+- You can state the exchange or never-regret argument in one sentence. If you can't, you likely
+  need [dynamic programming](/patterns/dynamic-programming/) instead — DP keeps every option
+  alive until it's provably dominated; greedy throws options away the moment it moves on.
+- Sorting first turns the problem into one clean pass — [intervals](/patterns/intervals/) is the
+  deepest example of this move.
+
+## universal templates
+
+Track & decide — the shape behind three of the four problems below:
+
+```csharp
+public int TrackAndDecide(int[] nums)
+{
+    var best = InitialBest();          // the answer if we stopped right now
+    var running = Seed(nums[0]);       // the one number greedy needs to remember
+
+    for (int i = 1; i < nums.Length; i++)
+    {
+        best = Combine(best, running, nums[i]);   // score this step against what's tracked
+        running = Update(running, nums[i]);       // fold today into the running invariant
+    }
+    return best;
+}
+```
+
+`running` is a minimum (cheapest price seen), a maximum (furthest reachable index), or a
+running sum (fuel remaining) depending on the problem — the shape of the loop never changes,
+only what `Update` and `Combine` compute.
+
+Extend a boundary until it closes — Partition Labels' shape:
+
+```csharp
+public List<int> ExtendUntilClose(string s, Dictionary<char, int> lastIndex)
+{
+    var result = new List<int>();
+    int start = 0, end = 0;
+
+    for (int i = 0; i < s.Length; i++)
+    {
+        end = Math.Max(end, lastIndex[s[i]]);   // widen to cover this item's whole span
+        if (i == end)                            // nothing after i can pull the boundary further
+        {
+            result.Add(end - start + 1);
+            start = i + 1;
+        }
+    }
+    return result;
+}
+```
+
+<Callout kind="insight" label="prove it before you code it">
+  Before writing the loop, say the proof out loud: *"if I'd made a different choice here, could
+  it ever beat this one?"* A clean *no* means greedy is safe. If the honest answer is "well, it
+  depends what comes later" — it doesn't work, and reaching for
+  [dynamic programming](/patterns/dynamic-programming/) is the right move, not a fallback to
+  feel bad about.
+</Callout>
+
+## problems
+
+Four problems, three proof shapes: buy-sell-stock and jump-game are both never-regret arguments
+with different running invariants, gas-station is restart-past-failure, and partition-labels is
+the boundary-close template wearing an interval-merge costume.
+
+<ProblemList topic="greedy" />

@@ -1,0 +1,262 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: atomics-and-cas
+problem: lost-updates
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import Solution from '@components/Solution.astro';
+
+## the code
+
+A metrics collector, arriving in a pull request. Two counters, no locks, and the author has
+thought about threading — the fields are `volatile`, with a comment saying why.
+
+<Solution>
+
+```csharp
+sealed class RequestMetrics
+{
+    // volatile "so the other threads see it"
+    private volatile int _total;
+    private volatile int _errors;
+
+    public void RecordSuccess() => _total++;
+    public void RecordError() { _total++; _errors++; }
+
+    public int Total => _total;
+    public int Errors => _errors;
+}
+```
+
+</Solution>
+
+It is called from every request handler in the service, on whatever thread-pool thread the
+request landed on. The counters are exported to the dashboard once a minute. Nothing else touches
+them.
+
+## find it
+
+<Callout kind="insight" label="before you scroll">
+  There are two defects here and they are different in kind. One is about a single counter, one is
+  about the pair.
+
+  Commit to a shape before reading on. Four threads each call `RecordSuccess` or `RecordError`
+  250,000 times, 1,000,000 calls in total. **Will `Total` read exactly 1,000,000 at the end?** If
+  not, is the shortfall a handful of increments, or a large fraction of them — and does that
+  fraction depend on how long the threads spend racing, or is it fixed by the code?
+
+  The word to distrust is `volatile`. Ask yourself which of the three guarantees — atomicity,
+  visibility, ordering — it gives, and which one this code needs.
+</Callout>
+
+## the failure
+
+Run it. `bench/atomics-and-cas/lost-updates.cs`, five trials, each 4 threads × 250,000 calls, half
+of them errors. Real output from a run:
+
+```text
+=== 1. 4 threads × 250,000 requests each (half of them errors) ===
+  trial 1:  volatile int ++  Total=  438,750 (  561,250 lost)  Errors=  234,436 (of 500,000)   |  Interlocked  Total=1,000,000  Errors=  500,000
+  trial 2:  volatile int ++  Total=  397,799 (  602,201 lost)  Errors=  207,672 (of 500,000)   |  Interlocked  Total=1,000,000  Errors=  500,000
+  trial 3:  volatile int ++  Total=  445,004 (  554,996 lost)  Errors=  241,241 (of 500,000)   |  Interlocked  Total=1,000,000  Errors=  500,000
+  trial 4:  volatile int ++  Total=  466,498 (  533,502 lost)  Errors=  248,613 (of 500,000)   |  Interlocked  Total=1,000,000  Errors=  500,000
+  trial 5:  volatile int ++  Total=  416,718 (  583,282 lost)  Errors=  221,630 (of 500,000)   |  Interlocked  Total=1,000,000  Errors=  500,000
+```
+
+The same file, same threads, same call counts, with `Interlocked.Increment` in place of `++`:
+`Total=1,000,000` and `Errors=500,000`, exactly, in every trial.
+
+**More than half the increments are gone**, in every one of the five trials above. Not a rounding
+error, not a rare interleaving — the common case whenever there are enough cores available
+to race. And a service reporting these numbers would look almost healthy: the error *rate* a
+dashboard would compute from trial 1, 234,436 / 438,750, is 53.4% instead of 50% — wrong, but not
+implausibly wrong.
+
+How much you lose is itself a race outcome, decided by scheduling rather than by anything in the
+program — the five trials above range from 53.3% lost to 60.2% lost, same code, same process,
+back to back. What is stable is that it is always large and never zero; the exact figure is not.
+
+This is where the bug hides, so it is worth being precise about how the failure scales with how
+long the threads overlap. Same class, two threads, 200 trials at each size (fewer at the largest
+sizes, where each trial already takes real time), counting how many trials lost at least one
+update — real output from a run:
+
+```text
+=== 2. 200 trials at each size: how many trials lost at least one update? ===
+      (2 threads, both calling RecordSuccess in a tight loop)
+         10 increments per thread:    0/200 trials wrong, worst loss         0 (  0.0%)
+        100 increments per thread:    0/200 trials wrong, worst loss         0 (  0.0%)
+      1,000 increments per thread:  169/200 trials wrong, worst loss       782 ( 39.1%)
+     10,000 increments per thread:  198/200 trials wrong, worst loss     6,041 ( 30.2%)
+    100,000 increments per thread:   20/20 trials wrong, worst loss    64,752 ( 32.4%)
+  1,000,000 increments per thread:   20/20 trials wrong, worst loss   949,790 ( 47.5%)
+```
+
+Ten and a hundred increments per thread come back at 0/200 in every run of this file — zero
+failures across every trial at those two sizes, run after run. By a thousand
+increments per thread it has already flipped: the majority of trials come back wrong, and it stays
+that way at every larger size tried. The crossover between "never fails" and "usually fails" sits
+somewhere between a hundred and a thousand increments per thread on a machine with cores enough to spare — arithmetic
+decides the two ends of that range, scheduling decides exactly where the middle falls, and the
+exact boundary is not something this file pins down more precisely than that.
+
+**A unit test that spins up two threads and increments ten times each never failed here. Not once,
+across 600 trials.** Neither did a hundred increments each. That is a real reason this bug reaches
+production: the loss is proportional to how long the two threads overlap, and a short loop barely
+overlaps at all. Starting two threads takes real time — microseconds, through the OS scheduler —
+against which ten increments is nothing, so in practice one thread is often finished before the
+other is scheduled onto a core, and there is no window to collide in.
+
+Now the interleaving, forced rather than hoped for. `count++` is a load, an add and a store; the
+file writes those three steps out explicitly and holds thread A between its load and its add
+while thread B runs a whole increment in between. Real output:
+
+```text
+=== 3. one lost update, scripted step by step ===
+    step 1   A: load  -> regA=41                    shared=41
+    step 2   B: load  -> regB=41                    shared=41
+    step 3   B: add   -> regB=42                    shared=41
+    step 4   B: store -> shared=42
+    step 5   A: add   -> regA=42                    shared=42
+    step 6   A: store -> shared=42
+    two increments applied to 41, shared = 42 (expected 43)
+```
+
+| step | thread A | thread B | A's register | B's register | shared |
+| --- | --- | --- | --- | --- | --- |
+| 1 | load | | 41 | — | 41 |
+| 2 | | load | 41 | 41 | 41 |
+| 3 | | add | 41 | 42 | 41 |
+| 4 | | store | 41 | 42 | **42** |
+| 5 | add | | 42 | 42 | 42 |
+| 6 | store | | 42 | 42 | **42** |
+
+Two increments went in. One came out. Nobody read a torn value, nobody saw stale data, no
+exception was thrown — thread A's store was simply based on a number that had stopped being true
+two steps earlier.
+
+## why it breaks
+
+**`volatile` is the wrong guarantee.** "Thread-safe" bundles three separate properties, and
+[the memory model](/systems/memory-model/) takes them apart: atomicity (does this happen all at
+once), visibility (will the other thread ever see it), ordering (will it see my writes in order).
+`volatile` in C# buys visibility and release/acquire ordering. It buys **no atomicity**, and this
+code needs nothing but atomicity. The keyword makes each individual load and each individual store
+really happen against memory — which is exactly what steps 1 through 6 above did.
+
+**The increment is a read-modify-write.** Even when the JIT folds it into a single instruction —
+`inc dword ptr [rax]`, which is what it emits for `Count++` on a static — the core loads, adds
+and stores without holding the cache line across the sequence, so another core can slip in.
+[Atomics and compare-and-swap](/systems/atomics-and-cas/) has that disassembly and the one prefix
+byte that changes it.
+
+**And the second defect is not about either counter.** `_total` and `_errors` are updated in two
+separate operations, so even after both are made atomic, a reader can see `_total` incremented
+and `_errors` not yet. The pair is never guaranteed consistent. That is a race condition rather
+than a data race — the same shape as check-then-act, on
+[races and deadlock](/systems/concurrency-hazards/) — and no per-field primitive fixes it.
+
+## the fix
+
+<Solution>
+
+```csharp
+sealed class AtomicRequestMetrics
+{
+    private int _total;      // no `volatile`: Interlocked already implies a full fence
+    private int _errors;
+
+    public void RecordSuccess() => Interlocked.Increment(ref _total);
+    public void RecordError() { Interlocked.Increment(ref _total); Interlocked.Increment(ref _errors); }
+
+    // Volatile.Read so the reader cannot be handed a value the JIT cached
+    // earlier; on x86-64 this costs nothing over a plain read.
+    public int Total => Volatile.Read(ref _total);
+    public int Errors => Volatile.Read(ref _errors);
+}
+```
+
+</Solution>
+
+`Interlocked.Increment` compiles to `lock inc` (or `lock xadd` when you use the return value): one
+instruction that holds the cache line exclusively from the load to the store, so there is no
+step 2 for another thread to land on. Exact totals in every trial, as the run above shows.
+
+Two things people reach for first, and what is wrong with each:
+
+**`volatile` — already there, and demonstrably not enough.** It is the fix that looks like a fix.
+The broken class in this page *is* the volatile version; it loses the majority of its updates
+under real load. If you see `volatile` on a counter that gets incremented, that is a bug marker,
+not a safety marker — `volatile` was never the guarantee this problem needed.
+
+**`lock` — also correct, and structurally more expensive for no extra correctness here.** A `lock`
+block around the increment does the same load-add-store as `Interlocked`, wrapped in acquire and
+release of a monitor. Uncontended, that monitor's fast path is itself built from a compare-and-swap
+on a word — [what a lock is made of](/systems/locks-internals/) shows the mechanism — so `lock`
+never does less work than `Interlocked` for this job, and once contended it can additionally park a
+waiting thread through the kernel, which `Interlocked` never does. Reach for `lock` only when the
+invariant spans more than the one field an atomic can cover — which is exactly the `Total`/`Errors`
+pair below.
+
+Which is precisely the case for the second defect. If the dashboard needs `Total` and `Errors` to
+be consistent with each other, the pair has to be updated and read under one lock — or packed into
+a single 64-bit value and updated with one `Interlocked.Add` (`errors` in the high 32 bits, `total`
+in the low 32, an increment of `1L << 32 | 1`), which is the trick worth knowing precisely because
+it turns two locations back into one — as long as the low half cannot overflow into the high one,
+which caps it at about four billion requests between resets.
+
+<Watch items={[['loss at 4 threads, this run', 'more than half'], ['tests that catch it at 10 ops/thread', '0/600'], ['what volatile buys', 'visibility + ordering, no atomicity'], ['what fixes it', 'Interlocked.Increment — one lock-prefixed instruction'], ['consistent pair', 'one lock, or pack into one 64-bit CAS']]} />
+
+## what this looks like in prod
+
+The counter is never the thing that pages you. What pages you is a number that does not add up:
+the rate limiter that admitted more requests than its limit, the "processed exactly once" claim
+contradicted by the downstream count, the billing total that is short by a fraction of a percent
+that nobody can reproduce on a developer machine. The service is healthy, the logs are clean, and
+the discrepancy scales with traffic — which is the fingerprint. A bug whose error rate rises with
+load is almost always a window between two operations that used to be one.
+
+Where it comes from, in real .NET code: a hand-rolled cache with a `_hits++` next to a
+`_misses++`; a background job with a `_processed++` in the loop body; a circuit breaker counting
+consecutive failures with `_failures++` and comparing against a threshold; any singleton service
+with an `int` field and a method that touches it. All of them work perfectly under a single
+request at a time, which is how integration tests run.
+
+The cheap audit: grep the codebase for `++` and `+=` on fields of any class registered as a
+singleton, or any static. Every hit is either provably single-threaded or a bug. On a hot path,
+the answer after `Interlocked` is to stop sharing the counter at all — per-partition counters
+summed on read, which [two counters, one cache line](/systems/atomics-and-cas/false-sharing/)
+covers next.
+
+## the same idea in other languages
+
+| language | what it's called | the trap |
+| --- | --- | --- |
+| Java | the same bug; the fix is `AtomicInteger.incrementAndGet` or, for a hot counter, `LongAdder` | Java's `volatile` is *stronger* than C#'s — a volatile write/read pair is sequentially consistent — and it still does not make `x++` atomic. Engineers who know that Java's `volatile` is the strong one are, if anything, more likely to write this bug |
+| C | `x++` on a shared `int`, with or without `volatile` | C's `volatile` gives neither atomicity nor ordering; it only stops the compiler caching the value. The fix is `_Atomic int` or `__atomic_fetch_add`, and nothing in the language warns you |
+| C++ | `std::atomic<int>` with `++`, `fetch_add` | `std::atomic` operations default to `seq_cst`, so the naive fix is correct but pays for a full fence you may not need. The trap is the other direction from C#: relaxing to `memory_order_relaxed` is right for a pure statistics counter and wrong the moment the counter guards anything |
+| Go | `atomic.Int64.Add`, or a mutex, or a channel | the race detector (`go test -race`) finds this class of bug mechanically, which .NET has no built-in equivalent of. If you come from Go and expect the tooling to catch it, nothing in .NET will |
+| Python | `x += 1` under CPython's GIL | the GIL makes each *bytecode* atomic, not each statement, so `x += 1` is `LOAD`/`ADD`/`STORE` with a switch point between any of them and loses updates exactly like this page's C# — just far more rarely, because since CPython 3.2 the interpreter only offers the GIL to another thread on a timer (`sys.setswitchinterval()`, default 5 ms), so the window between the LOAD and the STORE is almost never the one it lands in |
+
+## common bugs
+
+- **Trusting `volatile` to make a counter safe.** It is the single most common wrong fix, and it
+  looks deliberate in a diff. `volatile` gives visibility and ordering; a counter needs atomicity.
+- **Testing with too little overlap and concluding it works.** Two threads and ten increments
+  each never failed here — 600 trials, 600 passes, on code that loses the majority of its updates
+  under real load. If you are writing a test for a concurrency fix, the failing version must fail
+  that test *reliably* first — otherwise you have tested nothing.
+- **Making each field atomic and calling the object thread-safe.** `Interlocked` on `_total` and
+  on `_errors` fixes each counter and leaves the pair inconsistent. Atomic parts, non-atomic
+  whole.
+- **`if (Interlocked.Read(ref n) < limit) Interlocked.Increment(ref n)`.** Two atomic operations
+  with a hole between them: the classic check-then-act. The correct shape is one operation —
+  increment first and compensate, or CAS the value you checked.
+- **Reading the counter with a plain field access after fixing the writes.** The reader can be
+  handed a value the JIT hoisted out of a loop; `Volatile.Read` costs nothing on x86-64 and
+  removes the question.
+- **Reaching for `lock` on a hot counter "because it's the safe default."** It is correct here, and
+  it is never doing less work than `Interlocked` for a single field — the monitor's own fast path
+  is a compare-and-swap, with a wait queue behind it that `Interlocked` never needs.

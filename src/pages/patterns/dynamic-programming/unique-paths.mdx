@@ -1,0 +1,111 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: dynamic-programming
+problem: unique-paths
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+
+## task
+
+A robot sits at the top-left corner of an `m x n` grid and can only move right or down. Return
+how many distinct paths lead it to the bottom-right corner.
+
+```text
+m = 3, n = 3  →  6
+```
+
+## how to think
+
+Every cell `(row, col)` is reached from exactly two places: the cell above it (`row-1, col`) or
+the cell to its left (`row, col-1`) — a robot moving only right/down has no other way in. So the
+number of paths to `(row, col)` is the sum of the paths to those two cells:
+`grid[row][col] = grid[row-1][col] + grid[row][col-1]`. The first row and first column are base
+cases: there's exactly one way to reach any cell on them (a straight line of rights, or a
+straight line of downs).
+
+That recurrence fills a full `m × n` table, but look at what row `row` actually needs: only row
+`row-1` (from above) and values already computed earlier in the current row (from the left).
+Once row `row-1` has been consumed, it's dead weight — collapse the grid to a single row of
+length `n` and update it in place, left to right. Each cell then briefly plays both roles: before
+the update it's still last row's value ("from above"); after it, it becomes this row's value, and
+the next cell reads it as "from the left."
+
+```text
+2D table (m=3, n=3):        the 1D row after each pass:
+1  1  1                     row 0: [1, 1, 1]
+1  2  3          --->       row 1: [1, 2, 3]
+1  3  6                     row 2: [1, 3, 6]
+```
+
+<Callout kind="note" label="template instance">
+  **Bottom-up tabulation**, compressed one dimension. State: `dp[col]` holds the path count for
+  the *current* row's `col` — before the inner update it's still last row's value, after it's
+  this row's value. Recurrence: `dp[col] += dp[col - 1]`. Base case: row `0` is all `1`s.
+</Callout>
+
+## solution
+
+```csharp
+public int UniquePaths(int m, int n)
+{
+    var dp = new int[n];
+    Array.Fill(dp, 1);                 // row 0: exactly one way to reach any cell (all rights)
+
+    for (int row = 1; row < m; row++)
+    {
+        for (int col = 1; col < n; col++)
+        {
+            dp[col] += dp[col - 1];    // dp[col] is still "from above"; add "from the left"
+        }
+    }
+    return dp[n - 1];
+}
+```
+
+## trace
+
+`m = 3, n = 3`:
+
+| row | dp before this row's inner loop | dp after (col 1..n-1 updated left to right) |
+| --- | --- | --- |
+| 0 (base) | — | `[1, 1, 1]` |
+| 1 | `[1, 1, 1]` | `[1, 2, 3]` |
+| 2 | `[1, 2, 3]` | `[1, 3, 6]` |
+
+Inside row 2: `dp[1] += dp[0]` → `2 + 1 = 3`; then `dp[2] += dp[1]` → `3 + 3 = 6`, reading the
+`dp[1]` that was *just* updated this row — exactly the "from the left" term it needs.
+
+Final answer: `dp[2] = 6`.
+
+## why it works
+
+`dp[col]` legitimately represents `grid[row][col]` at the moment `grid[row][col+1]`'s update
+reads it, because of the scan order: walking `col` left to right, by the time `dp[col]` is read,
+it has already been overwritten with *this* row's value (from-above + from-left), while
+`dp[col+1]` hasn't been touched yet this row and still holds *last* row's value — exactly the
+"from above" term it needs. The base row is correct by definition (one straight-line path each),
+and induction on `row` carries correctness forward one row at a time.
+
+<Watch items={[['time', 'O(m·n)'], ['space', 'O(n)']]} />
+
+## common bugs
+
+- Updating `col` right to left, or allocating a fresh array each row — either breaks the trick,
+  since `dp[col-1]` needs to already hold *this* row's value, not last row's.
+- Forgetting to initialize row 0 to all `1`s — the base case isn't `0`; there's always exactly
+  one straight path along an edge.
+- Swapping `m` and `n` — the grid is `m` rows by `n` columns; get the loop bounds backwards and
+  you silently solve a transposed (and usually differently-sized) grid.
+- Reaching for backtracking here first — it works on small grids but is exponential; there are no
+  obstacles in this version, so there's no reason to explore paths instead of counting them.
+
+## variants you can now solve
+
+- **Unique Paths II** (LC 63) — obstacles block certain cells: set `dp[col] = 0` when
+  `grid[row][col]` is an obstacle, otherwise apply the same recurrence.
+- **Minimum Path Sum** (LC 64) — same two-predecessor grid shape, `min` and `+` instead of
+  counting: `dp[col] = grid[row][col] + min(dp[col], dp[col-1])`.
+- [Coin Change](/patterns/dynamic-programming/coin-change/) — a 1D relative of this table: instead
+  of two fixed predecessors per cell, every state has as many predecessors as there are coins.

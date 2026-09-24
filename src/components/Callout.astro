@@ -1,0 +1,40 @@
+---
+/**
+ * Debugger-note style callout (the artifact's `.note` box).
+ * kind: insight (amber) · tip (green) · trap (red) · note (cyan)
+ */
+interface Props {
+  kind?: 'insight' | 'tip' | 'trap' | 'note';
+  label?: string;
+}
+const { kind = 'insight', label } = Astro.props;
+
+const border = {
+  insight: 'border-l-amber',
+  tip: 'border-l-green',
+  trap: 'border-l-red',
+  note: 'border-l-cyan',
+}[kind];
+const labelColor = {
+  insight: 'text-amber',
+  tip: 'text-green',
+  trap: 'text-red',
+  note: 'text-cyan',
+}[kind];
+const heading = label ?? kind;
+---
+
+<div class:list={['bg-panel2 not-prose rounded-r-md border-l-3 px-4 py-3', border]}>
+  <p class:list={['font-mono text-[0.68rem] tracking-[0.12em] uppercase', labelColor]}>
+    {heading}
+  </p>
+  <div class="callout-body mt-1 text-[0.9rem]">
+    <slot />
+  </div>
+</div>
+
+<style>
+  .callout-body :global(p + p) {
+    margin-top: 0.5rem;
+  }
+</style>

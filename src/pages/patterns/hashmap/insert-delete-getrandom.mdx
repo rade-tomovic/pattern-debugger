@@ -1,0 +1,134 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: hashmap
+problem: insert-delete-getrandom
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+
+## task
+
+Design a data structure supporting all of the following in **average `O(1)`**:
+
+- `Insert(val)` — insert `val` if not already present; return whether it was inserted.
+- `Remove(val)` — remove `val` if present; return whether it was removed.
+- `GetRandom()` — return a uniformly random element currently in the structure.
+
+```text
+Insert(1) -> true, Insert(2) -> true, Remove(1) -> true, Insert(2) -> false, GetRandom() -> 2
+```
+
+## how to think
+
+Each operation alone is easy with the wrong structure for the *other* two. A `HashSet<int>`
+gives `O(1)` insert/remove/contains, but there's no `O(1)` way to pick a uniformly random
+element out of it — you'd have to enumerate, `O(n)`. A `List<int>` gives `O(1)` random access
+(`GetRandom` is just `values[rng.Next(values.Count)]`) and `O(1)` append, but removing an
+*arbitrary* value means finding it (`O(n)` scan) and then shifting everything after it
+(`O(n)` shift).
+
+The fix is to run both structures **together**, with the dictionary doing double duty: it's not
+just "have I seen this value" — its value → index. The dictionary tells you *where in the list*
+each value lives, in `O(1)`. That turns "remove an arbitrary value" into "remove the *last*
+element of a list", which is `O(1)`: swap the target with the list's last element, fix up that
+element's index in the dictionary, then pop the tail.
+
+<Callout kind="note" label="template instance">
+  **value → index** skeleton, used for maintenance rather than a single lookup: the dictionary
+  tracks where every live value sits in a parallel `List<int>`, kept in sync on every insert and
+  remove. Invariant: for every `val` in the dictionary, `values[indexOf[val]] == val` — and
+  `values` has no gaps, so `GetRandom` can index it directly.
+</Callout>
+
+## solution
+
+```csharp
+public class RandomizedSet
+{
+    private readonly List<int> values = [];
+    private readonly Dictionary<int, int> indexOf = [];   // value -> its index in values
+    private readonly Random rng = new();
+
+    public bool Insert(int val)
+    {
+        if (indexOf.ContainsKey(val)) return false;
+        indexOf[val] = values.Count;                // will land at the current tail
+        values.Add(val);
+        return true;
+    }
+
+    public bool Remove(int val)
+    {
+        if (!indexOf.TryGetValue(val, out int idx)) return false;
+
+        int lastVal = values[^1];
+        values[idx] = lastVal;                       // move the last element into the hole
+        indexOf[lastVal] = idx;                       // ...and fix its recorded index
+
+        values.RemoveAt(values.Count - 1);            // O(1): dropping the tail, not shifting
+        indexOf.Remove(val);
+        return true;
+    }
+
+    public int GetRandom() => values[rng.Next(values.Count)];
+}
+```
+
+## trace
+
+A sequence of calls, tracking `values` and `indexOf` after each:
+
+| call | returns | values | indexOf |
+| --- | --- | --- | --- |
+| `Insert(1)` | `true` | `[1]` | `{1:0}` |
+| `Insert(2)` | `true` | `[1, 2]` | `{1:0, 2:1}` |
+| `Insert(3)` | `true` | `[1, 2, 3]` | `{1:0, 2:1, 3:2}` |
+| `Insert(2)` | `false` | `[1, 2, 3]` | `{1:0, 2:1, 3:2}` (already present) |
+| `Remove(2)` | `true` | `[1, 3]` | `{1:0, 3:1}` |
+| `Remove(5)` | `false` | `[1, 3]` | `{1:0, 3:1}` (never present) |
+| `Insert(4)` | `true` | `[1, 3, 4]` | `{1:0, 3:1, 4:2}` |
+
+The `Remove(2)` row is the whole trick: `2` lives at `indexOf[2] = 1`. The last element, `3`, is
+copied into slot `1` — `values` becomes `[1, 3, 3]` for an instant — then the tail is dropped,
+leaving `[1, 3]`, and `indexOf[3]` is corrected from `2` to `1` so it still points at `3`'s new
+home.
+
+## why it works
+
+The two structures are kept in lockstep by one invariant: **`values[indexOf[v]] == v` for every
+`v` currently in the set, and `values` has no holes**. `Insert` preserves it by always appending
+(the new value's index is exactly the old tail length). `Remove` preserves it by only ever
+deleting the *physical* last slot — the target value's slot is overwritten with whatever was
+last, and that survivor's dictionary entry is patched in the same step, so the invariant holds
+again before `RemoveAt` even runs. Because `values` is always gap-free, `GetRandom` can pick any
+valid index uniformly with one `Random.Next` call — no rejection sampling, no skipped slots.
+
+<Watch items={[['time', 'O(1) average, all ops'], ['space', 'O(n)']]} />
+
+## common bugs
+
+- Copying the last element into the hole and forgetting to update `indexOf[lastVal]` — the
+  dictionary now points at a stale index, and the next operation on that value corrupts state.
+- Constructing `new Random()` **inside** `GetRandom()` instead of once as a field — on modern .NET
+  (6+) the parameterless constructor draws from a global, already-seeded source, so the numbers
+  stay uniform; the real cost is pointless allocation on every call. On .NET Framework, though,
+  the parameterless constructor seeded from the system clock, so back-to-back construction there
+  really could produce correlated seeds — worth knowing if an interviewer brings it up, but
+  construct it once as a field either way.
+- Using `values.Remove(val)` (a linear scan-and-shift) instead of the swap-with-last idiom —
+  compiles, passes small tests, silently reintroduces `O(n)` removal.
+- `GetRandom` on an empty structure — the problem guarantees it's never called that way, but if
+  asked: `rng.Next(0)` itself returns `0` without throwing, so the actual crash is the list
+  indexer, `values[0]`, on an empty list.
+
+## variants you can now solve
+
+- **[LRU Cache](/patterns/linked-lists/lru-cache/)** (LC 146) — the other classic
+  dictionary-plus-structure design question; there the second structure is a doubly linked list
+  instead of a swap-remove array.
+- **Insert Delete GetRandom O(1) — Duplicates Allowed** (LC 381) — the same idea, but
+  `indexOf` must map each value to a *set of indices* instead of one, since duplicates now
+  share a value but occupy multiple slots.
+- **Design a Hash Set / Hash Map** (LC 705 / 706) — a level below this one: building the
+  `O(1)`-average dictionary itself out of buckets, instead of assuming `Dictionary<TKey,TValue>`.

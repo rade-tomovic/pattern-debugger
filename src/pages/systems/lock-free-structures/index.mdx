@@ -1,0 +1,589 @@
+---
+layout: '@layouts/TopicLayout.astro'
+topic: lock-free-structures
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import ProblemList from '@components/ProblemList.astro';
+import Solution from '@components/Solution.astro';
+
+## the ground floor
+
+- **CAS** — compare-and-swap: one instruction that reads a location, compares it to what you
+  expected, and writes a new value only if they matched. In C# it is
+  `Interlocked.CompareExchange`, and it returns the value that *was* there.
+  [Atomics and compare-and-swap](/systems/atomics-and-cas/) builds it from the hardware up.
+- **cache line** — the 64-byte chunk memory actually moves in, and the unit exactly one CPU
+  core can own for writing at a time. Two fields that fall inside the same 64 bytes cannot be
+  written by two different cores simultaneously — the hardware serializes them no matter what
+  synchronization primitive your code uses. [Caches and the memory
+  hierarchy](/systems/memory-hierarchy/) has the full mechanism.
+- **lock** — an atomic word plus a wait queue plus a way to park a thread in the kernel when it
+  cannot have the word. [What a lock is made of](/systems/locks-internals/) takes one apart.
+- **park / preempt** — a parked thread is one the OS will not schedule until somebody wakes it.
+  A preempted thread is one the OS stopped mid-instruction-stream because its time slice ran
+  out. Both mean *this thread is making no progress right now*, and neither is under your
+  control. [Processes, threads and the kernel](/systems/process-and-thread/) is where that comes
+  from.
+- **ordering** — whether one thread's writes become visible to another in the order they were
+  written. Locks give it to you for free; CAS gives it at the CAS.
+  [The memory model](/systems/memory-model/) is the page for that.
+- **"thread-safe"** — three separate promises mushed into one word: *atomicity* (an operation
+  is indivisible), *visibility* (a write is seen), and *invariants* (the object is never
+  observed mid-update). This page is mostly about the third one, which is the one
+  `ConcurrentDictionary` does not give you across two calls.
+
+## core idea
+
+**Lock-free is a progress guarantee, not a performance claim.** An algorithm is lock-free if,
+whenever threads are running, *at least one of them* completes an operation in a bounded number
+of steps — no matter what the OS does to the others. Freeze any thread anywhere, forever, and
+the rest of the system keeps working. That is the whole promise, and it says nothing about
+speed.
+
+The word "lock" in "lock-free" does not mean the `lock` keyword either. It means *blocking*: a
+state where thread A cannot proceed until thread B does something. A `lock` creates that state,
+which is why holding one and then getting descheduled stops everybody. A CAS loop cannot create
+it, because a thread that stalls mid-loop has published nothing and owns nothing.
+
+| guarantee | what it promises | what it costs |
+| --- | --- | --- |
+| blocking (`lock`, `SemaphoreSlim`) | nothing, if the holder stops | simplest to write, and correct by default |
+| obstruction-free | a thread finishes if it eventually runs alone | rare in practice |
+| **lock-free** | *some* thread always finishes | a CAS loop; individual threads can starve |
+| wait-free | *every* thread finishes in bounded steps | usually needs helping schemes; almost nobody writes these |
+
+## how it actually works
+
+### the guarantee, worked out
+
+Four threads share one Treiber stack: A, B, C keep pushing and popping; D is stopped dead
+*inside one push* — after it has read `_head`, before it has done anything else. That freeze
+could be a page fault, a GC pause, or the scheduler simply moving on to another thread; it does
+not matter which. Walk what each design does about it.
+
+```text
+t0   D: Node? head = Volatile.Read(ref _head);     ← D is frozen here. D has read
+                                                       something. D has WRITTEN nothing and
+                                                       PUBLISHED nothing.
+
+── lock + linked nodes ──────────────────────────────────────────────────────
+   D's Push is: lock (_gate) { node.Next = _head; _head = node; }
+   D froze BEFORE entering the lock in this walkthrough, so the other three
+   are unaffected here. Move the freeze one line later — after
+   `lock (_gate)` succeeds, before the block exits — and every one of A, B, C
+   blocks on Monitor.Enter the moment it calls Push or TryPop. Not spinning:
+   parked, in the kernel, via the same wait mechanism the locks-internals
+   page takes apart. Nothing in the whole process touches this stack again
+   until D wakes up and the monitor is released.
+
+── TreiberStack (CAS) ───────────────────────────────────────────────────────
+   D has read `head`. It owns nothing — Volatile.Read took nothing, and
+   nothing else can see that D read anything.
+   A: node.Next = head_A; CompareExchange(_head, nodeA, head_A) → succeeds.
+      Nothing D did is visible anywhere, so nothing D did can block this.
+   B, C: same, each against whatever the others just published.
+   D eventually wakes, retries its own CompareExchange against the CURRENT
+   _head (not the stale one it read), fails once because the head moved,
+   retries, and succeeds. D lost nothing but one wasted, allocation-free
+   retry.
+```
+
+The difference is not "CAS completes more operations" — it is categorical, not a count. A
+`lock`'s critical section is a resource: whoever holds it *is* the only thread allowed to touch
+the stack, so freezing the holder anywhere inside it freezes every other thread that wants in,
+for as long as the freeze lasts. A CAS loop never hands out that kind of exclusive ownership —
+D's read is not a lease on anything, so D freezing has no effect on anyone who does not also
+happen to read `_head` at the exact same stale value D did.
+
+### the CAS loop, applied to a structure
+
+The [CAS loop](/systems/atomics-and-cas/) you already know updates a number. A Treiber stack is
+the same loop with a *pointer* as the value: the entire structure is one field, `_head`, and
+every operation is "read it, build the new version, swap it in if nobody moved it".
+
+```text
+  thread A: Push(9)                            thread B: Push(4)
+
+  node = [9|·]                                 node = [4|·]
+  head = read _head ──┐                    ┌── head = read _head
+                      ▼                    ▼
+                    _head ──▶ [7] ──▶ [3] ──▶ null
+                      ▲
+  node.Next = head    │   both new nodes now point at [7] — neither is published yet
+                      │
+  A: CAS(_head, [9], expected [7]) → returns [7]  ✓ won   _head = [9]
+  B: CAS(_head, [4], expected [7]) → returns [9]  ✗ lost  (nobody blocked; B just retries)
+  B: node.Next = [9]
+  B: CAS(_head, [4], expected [9]) → returns [9]  ✓ won   _head = [4]
+
+  result:  _head ──▶ [4] ──▶ [9] ──▶ [7] ──▶ [3] ──▶ null
+```
+
+Nothing in that picture is a lock. B's failure costs B one wasted allocation-free retry and
+costs A nothing at all. And if B is frozen between its read and its CAS, A's push still
+succeeds — B's stale `head` simply fails to match when B wakes up.
+
+This is the whole implementation, verified under four threads pushing and four popping in
+[a stack without locks](/systems/lock-free-structures/treiber-stack/):
+
+<Solution>
+
+```csharp
+public sealed class TreiberStack<T>
+{
+    sealed class Node(T value) { public readonly T Value = value; public Node? Next; }
+
+    Node? _head;
+
+    public void Push(T value)
+    {
+        var node = new Node(value);
+        Node? head = Volatile.Read(ref _head);
+        while (true)
+        {
+            node.Next = head;                                   // wire it up BEFORE publishing
+            Node? seen = Interlocked.CompareExchange(ref _head, node, head);
+            if (seen == head) return;                            // won: the node is now the head
+            head = seen;                                         // lost: retry from what is really there
+        }
+    }
+
+    public bool TryPop(out T value)
+    {
+        Node? head = Volatile.Read(ref _head);
+        while (head is not null)
+        {
+            Node? seen = Interlocked.CompareExchange(ref _head, head.Next, head);
+            if (seen == head) { value = head.Value; return true; }
+            head = seen;
+        }
+        value = default!;                                        // empty
+        return false;
+    }
+}
+```
+
+</Solution>
+
+Two details do all the work. **The node is fully built before the CAS**, so no other thread can
+ever observe a half-initialised node — the CAS is the publication, and it is also a full fence,
+so the writes to `Value` and `Next` are visible to whoever reads `_head` next. And **the failure
+path re-reads nothing**: `CompareExchange` already returned the current value, so the retry
+starts from fact rather than from another load.
+
+### what the machine got
+
+`Interlocked.CompareExchange` on an `int` is one instruction. On a *reference* it is not, and
+that is worth seeing. Real JIT output for the `Push` above, trimmed to the loop body, comments
+added, nothing else edited:
+
+```text
+G_M000_IG02:
+       mov      rdi, 0x759AF0A0EBD0
+       call     CORINFO_HELP_NEWSFAST        ; new Node(value) — a pointer bump
+       mov      r14, rax
+       mov      dword ptr [r14+0x10], r15d   ; node.Value = value
+       mov      r15, gword ptr [rbx+0x08]    ; head = _head   (a plain load: x86 loads are acquire)
+       lea      rdi, bword ptr [r14+0x08]
+       mov      rsi, r15
+       call     CORINFO_HELP_ASSIGN_REF      ; node.Next = head — a GC WRITE BARRIER, not a mov
+
+G_M000_IG03:                                 ; ← the retry path
+       mov      r15, rax                     ; head = what the CAS actually returned
+       lea      rdi, bword ptr [r14+0x08]
+       mov      rsi, r15
+       call     CORINFO_HELP_ASSIGN_REF      ; node.Next = head, again
+
+G_M000_IG04:
+       mov      rsi, r14
+       mov      rdx, r15
+       call     System.Threading.Interlocked:CompareExchangeObject(byref,System.Object,System.Object):System.Object
+       cmp      rax, r15                     ; did it return what we expected?
+       jne      SHORT G_M000_IG03            ; no → loop. THIS is the entire "lock-free" part
+```
+
+Three things are visible. The retry loop is one backward branch — no call into a runtime helper,
+no queue, no park. Every reference store goes through `CORINFO_HELP_ASSIGN_REF`, the GC write
+barrier: the collector has to be told that an old object now points at a young one, which is
+[the card table](/systems/gc-internals/) doing its job inside your lock-free algorithm. And the
+CAS itself is a *call*, not an inline instruction, because it stores a reference and therefore
+needs that same barrier.
+
+The same file's `CasInt`, which does the identical loop on an `int` field, compiles to the thing
+you expect:
+
+```text
+G_M000_IG03:
+       mov      ecx, eax
+       lea      edx, [rcx+rsi]
+       mov      eax, ecx
+       lock
+       cmpxchg  dword ptr [rdi], edx         ; the whole operation, one instruction
+       cmp      eax, ecx
+       jne      SHORT G_M000_IG03
+```
+
+Everything the reference version does around its CAS — the helper call, the write barrier — is
+extra instructions the int version simply does not need. What both versions share is the one
+instruction that actually matters for contention: `lock cmpxchg`. That locked instruction is
+what has to acquire ownership of the cache line holding `_head` before it can even attempt the
+compare; the call and the write barrier around it are working on data nobody else is racing for.
+That is the useful shape of the whole topic: contention is a cache-line-ownership cost, and it is
+paid by the locked instruction, not by however much code surrounds it.
+
+### the hard part is reclamation, and the GC already solved it
+
+Write `TryPop` in C++ and you have a bug the C# version cannot have. You popped node `head` and
+returned its value — now who frees it? Another thread may be sitting inside its own `TryPop`,
+holding that exact pointer, about to dereference `head->next`. Free it and that thread reads
+freed memory. Never free it and you have written a leak.
+
+The C++ answers to that question are entire subsystems: **hazard pointers** (every thread
+publishes the pointers it is currently holding; a reclaimer only frees addresses nobody
+published), **epoch-based reclamation** (retire nodes into an epoch and free the epoch once
+every thread has moved past it), or `shared_ptr` with atomic operations, which trades the
+lock-freedom you were building for a different lock hidden inside the reference count. This is
+why "just write it lock-free" is a much bigger sentence in C++ than in C#.
+
+A tracing GC removes the problem outright: a node is reachable from any thread's local variable,
+so it cannot be collected while anyone is looking at it, and its address cannot be recycled for
+a different object. That deletes the use-after-free *and* the worst form of ABA — in C++, a
+freed node's address can come back from `malloc` as a completely different object and compare
+equal to what you read.
+
+<Callout kind="trap" label="the GC does not delete ABA">
+  It deletes address reuse. It does not stop *you* re-publishing the same reference. Pool your
+  nodes, or push an object you already popped, and the classic A → B → A sequence is back, in
+  C#, in managed code. [The ABA problem](/systems/atomics-and-cas/) has that failure scripted
+  and traced. The fix is the same as it is everywhere: version the value, so the CAS compares
+  (reference, stamp) rather than reference alone.
+</Callout>
+
+### lock-free is not pause-free, and in .NET it is not allocation-free
+
+Two honest caveats that the word "lock-free" hides.
+
+**The runtime still stops your threads.** A gen0 collection suspends every managed thread,
+including the one in the middle of a CAS loop. Your algorithm has a progress guarantee against
+*other threads*; it has none against the runtime it lives in. Real output from a run of
+4,000,000 push/pop pairs through the Treiber stack on four threads, counting `GC.CollectionCount(0)`
+before and after:
+
+```text
+Treiber, 4,000,000 push+pop:    8 gen0 collections
+lock + Stack<T>, same work:     0 gen0 collections
+```
+
+The array-backed `lock` + `Stack<T>` allocates nothing per operation — `Stack<T>` grows its
+internal array in doubling jumps and otherwise just writes into it — so it triggers no
+collections at all for the same amount of work. Every `Push` on a `TreiberStack<T>` allocates a
+fresh `Node`.
+
+**A node per push is an allocation per push.** Measured with
+`GC.GetAllocatedBytesForCurrentThread` around 100,000 push/pop pairs, both the hand-rolled stack
+and `ConcurrentStack<T>` charge 32.0 bytes per pair — one object header (16 bytes on 64-bit) plus
+a 4-byte `int` payload plus an 8-byte `Next` reference, rounded up to the runtime's 8-byte object
+alignment. `lock` + `Stack<T>` charges 0.0 bytes per pair, because its backing array is grown in
+occasional doubling jumps rather than once per push. So the lock-free design can be the one that
+generates GC pressure — which turns into p99 latency in a service, exactly as
+[GC internals](/systems/gc-internals/) describes. Being lock-free bought you progress, not free
+lunch.
+
+### `ConcurrentDictionary` is not lock-free, and it never claimed to be
+
+Reads are. Writes take a lock — one of many. The dictionary keeps an array of `Monitor` objects
+and a much larger array of buckets, and bucket *b* is guarded by lock `b % lockCount`. Two
+writers collide only when their keys land on the same stripe.
+
+```text
+  ConcurrentDictionary<string,int>
+
+  _locks:    [0] [1] [2] ...                    ← starts at Environment.ProcessorCount Monitors
+              │   │   │
+  _buckets:  many more than that                ← bucket b is guarded by _locks[b % locks.Length]
+              ▼   ▼   ▼
+             [·] [·] [·]     ...                ← each bucket: a chain of nodes
+
+  TryGetValue : takes NO lock. walks the chain through volatile reads.
+  TryAdd/[]=  : takes ONE lock — the stripe, never the whole table.
+  Count, ToArray, Clear : take ALL of them, one after another.
+  GetEnumerator : takes none — which is why it is not a snapshot of any instant.
+```
+
+The stripe count is not fixed. It starts at `Environment.ProcessorCount` and doubles every time
+the table grows, capped at 1,024 — read out of the live object by reflection, on a 16-core
+container (`Environment.ProcessorCount == 16`):
+
+| entries | buckets | locks |
+| --- | --- | --- |
+| empty | 37 | 16 |
+| 100 | 197 | 64 |
+| 1,000 | 1,931 | 512 |
+| 10,000 | 17,519 | 1,024 |
+| 100,000 | 156,437 | 1,024 |
+
+`ProcessorCount` sets the starting stripe count, so this exact left-hand column moves with core
+count; the shape does not — it starts at core count, doubles as the table grows, and caps at
+1,024 everywhere.
+
+That design is why it scales, and it explains its two famous traps exactly.
+
+**Trap one: `GetOrAdd`'s factory can run more than once.** The factory runs *outside* the
+stripe lock — deliberately, because running arbitrary user code under a lock invites deadlock.
+Several threads racing on a missing key all run the factory; one wins the `TryAdd` and the
+others throw their result away. Two real runs, 200 fresh keys, hammered:
+
+```text
+2 threads, 200 keys: 200 entries, factory ran 382 times   (run 1)
+2 threads, 200 keys: 200 entries, factory ran 383 times   (run 2)
+4 threads, 200 keys: 200 entries, factory ran 740 times   (run 1)
+4 threads, 200 keys: 200 entries, factory ran 723 times   (run 2)
+```
+
+Consistently far more factory calls than keys — roughly twice, at two threads, and roughly
+three-and-a-half times, at four, though the exact count moves with the scheduler and is not
+worth quoting to three figures. If the factory is pure, that is waste. If it opens a connection,
+starts a timer, registers a callback or increments a meter, it is a leak or a corruption — and
+[GetOrAdd ran twice](/systems/lock-free-structures/concurrent-dictionary-traps/) runs it, counts
+the orphans, and fixes it.
+
+**Trap two: two atomic operations are not one atomic operation.** Every individual method is
+thread-safe. `dict[k] = dict[k] + 1` is *three* — a read, an add, and a write — with a window in
+the middle that another thread can and will use. This is the read-modify-write shape from
+[races and deadlock](/systems/concurrency-hazards/), and no amount of concurrent collection
+fixes it, because the collection cannot know that your two calls were meant to be one.
+
+### the boring option that usually wins
+
+If the data is read far more often than it is written, you do not need a clever structure. You
+need an *immutable* one and a single reference store: readers read the reference and then touch
+a snapshot nobody can mutate; a writer builds a whole new snapshot and publishes it with one
+write. Publication is a single aligned reference store, which is atomic, and `Volatile.Write`
+gives it release ordering, so a reader that sees the new reference sees a fully built snapshot.
+
+```csharp
+public sealed class CowMap : Map
+{
+    readonly object _writeGate = new();
+    Dictionary<int, int> _snapshot = new();
+    public override int Get(int k) => Volatile.Read(ref _snapshot).TryGetValue(k, out int v) ? v : -1;
+    public override void Set(int k, int v)
+    {
+        lock (_writeGate)
+        {
+            var copy = new Dictionary<int, int>(_snapshot) { [k] = v };
+            Volatile.Write(ref _snapshot, copy);                 // one reference store publishes it
+        }
+    }
+}
+```
+
+The reader path has no lock, no CAS, no interlocked anything — it is a load. Whatever a reader
+gets back, it is either the old snapshot or the fully-built new one, never a snapshot half
+written into, because nobody ever mutates a snapshot after publishing it.
+
+The cost lives entirely on the write side, and it is structural, not something you have to
+measure to believe: `new Dictionary<int,int>(_snapshot)` walks and copies every entry currently
+in the map. A `Set` on an n-entry map does O(n) work and O(n) allocation, no matter which single
+key changed. Real allocation counts confirm the shape — bytes allocated by one `Set`, as the map
+grows:
+
+```text
+entries      copy-on-write Set
+    100          2,272 B
+  1,000         22,192 B
+ 10,000        202,192 B
+100,000      2,172,752 B
+```
+
+Ten times the entries, roughly ten times the bytes, every step — that is O(n) written in bytes
+instead of Big-O notation. At a handful of writes a minute against a few hundred keys — a
+routing table, a feature-flag set — that copy is cheap enough not to matter and the reader side
+is unbeatable. The moment writes happen per request against a map with real size, the O(n) copy
+on every one of them is the wrong shape.
+
+<Callout kind="tip" label="the boring option, done less boringly">
+  `ConcurrentDictionary` sits between the two extremes: readers pay almost nothing (a volatile
+  chain walk, no lock), and a write touches one stripe rather than a full copy — O(1) amortized,
+  not O(n). It is the right default once writes are frequent enough that copy-on-write's O(n)
+  cost adds up, and you do not need every reader to see one atomic, whole-map snapshot.
+</Callout>
+
+Copy-on-write's O(n) write is not the only way to get an immutable, lock-free-to-read structure,
+though. `System.Collections.Immutable`'s `ImmutableDictionary<K,V>` is a *persistent* structure:
+internally it is a balanced tree of nodes, and `SetItem` rebuilds only the handful of nodes on
+the path from the root to the changed key, reusing every other node by reference — the same
+trick a persistent Red-Black tree or a Clojure/Scala persistent map uses, known as *structural
+sharing*. That turns the O(n) copy into O(log n) work per write. The same allocation experiment,
+run against `ImmutableDictionary<int,int>.SetItem` instead of a full-dictionary copy:
+
+```text
+entries      copy-on-write Set    ImmutableDictionary.SetItem
+    100          2,272 B                   432 B
+  1,000         22,192 B                   600 B
+ 10,000        202,192 B                   768 B
+100,000      2,172,752 B                   992 B
+```
+
+At 100,000 entries the whole-map copy allocates roughly 2,200 times more per write than the
+persistent tree does, and the persistent tree's cost grows by only a few hundred bytes each time
+the map grows by 10×, which is exactly the shape of O(log n) versus O(n). The trade you make for
+it is on the read side: walking a tree to find a key costs more than one dictionary bucket
+lookup, so `ImmutableDictionary` is the answer when writes are too frequent for a full copy but
+you still want every reader looking at an atomic, whole-map snapshot with no lock — reach for it
+before you reach for a hand-rolled copy-on-write map, and reach for `ConcurrentDictionary`
+instead of either once per-key mutation (not whole-map snapshots) is what you actually need.
+
+## the mental model
+
+**Lock-free is about what happens when a thread stops. Nothing else.** Ask the question that
+way and every decision falls out:
+
+| your situation | reach for | why |
+| --- | --- | --- |
+| shared counter or flag | `Interlocked` | one instruction, already lock-free, no structure needed |
+| read-mostly map, written by a refresh | immutable snapshot + `Volatile.Write` | readers execute with no synchronisation at all — a load, nothing else |
+| read-mostly map, written often enough that a full copy is too much | `ImmutableDictionary<K,V>` | structural sharing turns the write into O(log n), still one atomic snapshot per reader |
+| read/write map, per-request writes | `ConcurrentDictionary` | striped locks scale with cores; just never compound two calls |
+| producer/consumer queue | a **bounded** `Channel<T>` | already written, already tested, and the only one of these that pushes back when the consumer falls behind — `ConcurrentQueue<T>` and an unbounded channel have no backpressure at all and will grow until the process dies |
+| a custom structure under real contention | partition it | no shared cache line means no ownership traffic to serialize on, categorically, not just "less" |
+| a custom lock-free structure | almost never | you are signing up to own ABA, memory ordering and a test suite that cannot prove correctness |
+
+Three lines worth keeping:
+
+1. **Lock-free promises progress, not speed.** The guarantee is that some thread always finishes
+   its operation; no convoy, no priority inversion, no thread frozen behind a descheduled lock
+   holder can stop that.
+2. **The unit of contention is the cache line, not the lock.** Two threads CASing one field and
+   two threads taking one lock both serialize on the same 64 bytes — the difference is that the
+   CAS pair never enters the kernel and never parks.
+3. **If the answer isn't `Interlocked`, it is probably partitioning or immutability.** Both are
+   simpler than the lock you were avoiding.
+
+<Watch items={[['cache line', '64 B'], ['Node (int payload)', '32 B'], ['object header, 64-bit', '16 B'], ['CD stripes, empty', '= ProcessorCount'], ['CD stripes, cap', '1,024'], ['CoW Set at n=100,000', '≈2.17 MB'], ['ImmutableDictionary.SetItem at n=100,000', '≈1 KB']]} />
+
+## why you should care
+
+**The metric that moves is p99, not throughput.** A service that takes a lock in a request path
+has a latency tail shaped by the worst thing that can happen to a lock holder: a gen1 collection,
+a page fault, a stolen time slice, an unlucky `await` on the wrong side of the critical section.
+That is exactly the mechanism in "the guarantee, worked out" above — every thread waiting on a
+`lock` is coupled to whatever happened to the holder, and a CAS loop breaks that coupling
+entirely. It is why the fix for a bad tail is often "stop sharing" rather than "lock faster".
+
+**The incident shape** is a cache that opens more connections than it has keys. Somebody wrote
+`_clients.GetOrAdd(tenant, t => CreateClient(t))`, it worked in test with one thread, and in
+production under a cold start the connection pool exhausts because five threads raced for the
+same missing key and four `HttpClient`s were created, used once, and dropped without disposal.
+The dictionary is behaving exactly as documented; the code assumed a guarantee the API never
+made.
+
+**The other incident shape** is a counter that is quietly low. `_hits[key] = _hits[key] + 1`
+on a `ConcurrentDictionary` loses updates under load — [measured directly, with the exact
+window traced](/systems/lock-free-structures/concurrent-dictionary-traps/) on this same page's
+sibling exercise. Nobody notices, because a metric that is wrong in the same direction all the
+time looks like a trend.
+
+**The code review you can now do.** Flag any `GetOrAdd` whose factory does I/O, allocates a
+disposable, or has a side effect — the fix is `Lazy<T>`. Flag any pair of concurrent-collection
+calls that were meant to be one operation, including `ContainsKey` followed by an indexer set,
+and `TryGetValue` followed by a write. Flag `lock` around a pure read of data that changes twice
+a day, and propose a snapshot. And flag hand-rolled lock-free structures in review with one
+question: *what happens when the same reference is pushed twice?* — because that is ABA, and
+the answer is usually "we never thought about it".
+
+**Where the next pages pick this up.** Everything here treats contention as a fact of life;
+[parallelism that actually scales](/systems/parallelism-patterns/) treats it as a design bug and
+partitions it away, which is the answer that beats both a lock and a CAS loop. And every trap on
+this page is a specific instance of the general shapes in
+[races and deadlock](/systems/concurrency-hazards/).
+
+## the same idea in other languages
+
+| language | what it's called | the trap |
+| --- | --- | --- |
+| Java | `AtomicReference.compareAndSet`, and `ConcurrentHashMap` for the map | Java's `computeIfAbsent` is *not* C#'s `GetOrAdd`: it runs the mapping function while holding the bin's lock, so the function runs exactly once per key — but for the same reason, a mapping function that touches the same map is documented to be illegal and can throw or deadlock. Carrying C# habits over means wrapping values in something like `Lazy` that Java's `computeIfAbsent` never needed; carrying Java habits back makes the C# code wrong |
+| C++ | `std::atomic<T*>` with `compare_exchange_weak`, plus `is_lock_free()` to ask whether the type really is | there is no GC, so popping a node and freeing it races against another thread that is holding the same pointer. That is why hazard pointers and epoch reclamation exist, and why a C++ lock-free stack is many times the code of the C# one. `compare_exchange_weak` may also fail spuriously — it must be used in a loop |
+| Go | `sync/atomic` (`atomic.Pointer[T].CompareAndSwap`), `atomic.Value`, and `sync.Map` for read-mostly maps | Go's GC removes the reclamation problem exactly as .NET's does, but `sync.Map.LoadOrStore` takes a *value*, not a factory — so it cannot double-run a factory the way `GetOrAdd` does, and instead you always pay to construct the value you might throw away |
+| Python | `dict.setdefault`, and `queue.Queue` for producer/consumer | the GIL is not a lock you can borrow: it guarantees one thread runs bytecode at a time, not that your statement is one bytecode. `counter += 1` is a load, an add and a store, and the interpreter can switch threads between them, so it loses updates exactly like `d[k] = d[k] + 1` here. `setdefault` is safe because it is one C-level call — and because it takes a value rather than a factory |
+
+## exercises
+
+One builds the canonical lock-free structure and proves it holds under real contention; the
+other is a class where every single method is thread-safe and the class is still broken.
+
+<ProblemList topic="lock-free-structures" />
+
+## interview drills
+
+**Q.** What does "lock-free" mean?
+
+- *weak answer* — "It means no locks, so it's faster." Both halves are wrong, and the follow-up
+  is immediate.
+- *strong answer* — It is a progress guarantee: if threads are running, at least one completes an
+  operation in a bounded number of steps, regardless of what the scheduler does to the others.
+  Practically it means no thread can block another by being descheduled at a bad moment. It says
+  nothing about throughput — under real contention a CAS loop is not obviously ahead of a lock,
+  because both serialize on the same cache line and the CAS loop also burns retries that
+  accomplish nothing.
+- *follow-up* — "So when is it actually better?" When the cost you care about is the tail. No
+  convoy, no priority inversion, and no arbitrarily-long stall because the lock holder took a
+  page fault mid-critical-section.
+
+**Q.** `ConcurrentDictionary` is thread-safe. So this is fine, right? `d[k] = d[k] + 1`
+
+- *weak answer* — "Yes, it's a concurrent collection." This is the single most common
+  concurrency bug in .NET services.
+- *strong answer* — No. Each call is atomic; the pair is not. Two threads read the same value and
+  both write back the same increment, so one update is lost. The fixes are `AddOrUpdate`, or —
+  better for a hot counter — store a small class per key and `Interlocked.Increment` a field
+  inside it, so the dictionary entry itself never changes after it is created.
+- *follow-up* — "Is `AddOrUpdate` atomic then?" The operation is, but its update delegate is a CAS
+  retry loop and can run several times, so the delegate must be pure. Same rule as any CAS loop.
+
+**Q.** Why can `GetOrAdd` run my factory more than once, and what do I do about it?
+
+- *weak answer* — "Wrap it in a lock." That discards the reason you chose the type, and you have
+  just put user code under a lock.
+- *strong answer* — The factory runs outside the stripe lock, so several threads racing on a
+  missing key all run it and only one `TryAdd` wins. It is a deliberate choice: running arbitrary
+  code under a lock invites deadlock. If the factory is pure, the waste is acceptable. If it has
+  a side effect or creates something disposable, store `Lazy<T>` values instead — several `Lazy`
+  objects may be created, but only the winner is ever evaluated, so the expensive factory runs
+  exactly once.
+- *follow-up* — "Which `LazyThreadSafetyMode`?" `ExecutionAndPublication`, the default for that
+  constructor. Know that it caches a thrown exception forever; if the factory can fail
+  transiently, you need `PublicationOnly` or your own retry.
+
+**Q.** You have a routing table read on every request and refreshed once a minute. How do you
+make it thread-safe?
+
+- *weak answer* — "`ConcurrentDictionary`." It works, and it is more machinery than the problem
+  needs.
+- *strong answer* — Immutable snapshot behind a single reference. Readers do one `Volatile.Read`
+  and then touch a dictionary nobody will ever mutate; the refresh builds a whole new dictionary
+  and publishes it with one `Volatile.Write`. A reader's whole synchronization cost is one load —
+  there is nothing else in the path. The cost is O(n) allocation per write, which is irrelevant
+  once a minute and fatal per request; if the write rate ever grows past "occasional refresh",
+  switch the snapshot type to `ImmutableDictionary<K,V>` and keep the same reference-swap pattern.
+- *follow-up* — "How does a reader know it sees a complete snapshot?" The publishing store is a
+  release and the reading load is an acquire, so everything written into the snapshot before the
+  store is visible to any thread that observes the new reference. And the snapshot is never
+  mutated afterwards, so there is nothing else to see.
+
+**Q.** Walk me through a lock-free stack. Where's the bug?
+
+- *weak answer* — Reciting `Push` correctly and stopping there. The interviewer is asking about
+  reclamation and ABA.
+- *strong answer* — Push builds a node, points it at the head it read, and CASes it in; pop CASes
+  the head to `head.Next`. In C# that is correct as written, because every push allocates a fresh
+  node and the GC guarantees a node nobody can reach is not reused while a thread is still
+  looking at it. In C++ the same code is a use-after-free, which is what hazard pointers and
+  epoch reclamation exist for. The bug comes back in C# the moment you pool nodes or re-push a
+  popped object, because then the same reference can reappear at the head and a stale CAS
+  succeeds — ABA.
+- *follow-up* — "How would you fix ABA?" Version the field: CAS a (reference, counter) pair
+  atomically, so re-publishing the same reference still fails the comparison. And before that,
+  ask whether `ConcurrentStack<T>` or a partitioned design removes the need entirely.

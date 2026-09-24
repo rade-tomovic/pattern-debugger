@@ -1,0 +1,141 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: binary-search
+problem: first-and-last-position
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import Cells from '@components/Cells.astro';
+
+## task
+
+Given a **sorted** array of integers that may contain duplicates and a `target`, return
+`[firstIndex, lastIndex]` — the range of indices where `target` occurs — or `[-1, -1]` if it
+doesn't appear. O(log n) is required.
+
+```text
+nums = [5, 7, 7, 8, 8, 8, 10], target = 8  →  [3, 5]
+```
+
+## how to think
+
+Plain binary search finds *a* occurrence of `target`, but with duplicates in play that could be
+any of the three `8`s — landing on one tells you nothing about where the run starts or ends. The
+fix is a small but important change of habit: stop treating a match as the finish line. When
+`nums[mid] == target`, record `mid` as the current best candidate, then keep narrowing in the
+direction you actually care about — shrink `right` toward `mid - 1` if you're hunting the first
+occurrence (there might be an earlier match still to the left), or push `left` toward `mid + 1` if
+you're hunting the last (there might be a later one to the right).
+
+Run that twice — once biased toward "first," once toward "last" — and you have the whole range in
+two O(log n) passes.
+
+<Callout kind="note" label="template instance">
+  **Exact-match** skeleton (`while (left <= right)`), modified: instead of returning on the first
+  hit, record `mid` as the answer-so-far and keep narrowing in the direction of interest
+  (`right = mid - 1` hunting first, `left = mid + 1` hunting last) until the loop's normal exit —
+  `left > right` — ends it.
+</Callout>
+
+## solution
+
+```csharp
+public int[] SearchRange(int[] nums, int target)
+{
+    int first = FindBound(nums, target, findFirst: true);
+    if (first == -1) return [-1, -1];               // absent — skip the second search entirely
+    int last = FindBound(nums, target, findFirst: false);
+    return [first, last];
+}
+
+private int FindBound(int[] nums, int target, bool findFirst)
+{
+    int left = 0, right = nums.Length - 1, result = -1;
+
+    while (left <= right)
+    {
+        int mid = left + (right - left) / 2;
+        if (nums[mid] == target)
+        {
+            result = mid;                    // record the candidate, then keep hunting
+            if (findFirst) right = mid - 1;  // an earlier match might still be to the left
+            else left = mid + 1;             // a later match might still be to the right
+        }
+        else if (nums[mid] < target) left = mid + 1;
+        else right = mid - 1;
+    }
+
+    return result;
+}
+```
+
+## trace
+
+`nums = [5, 7, 7, 8, 8, 8, 10]`, `target = 8`. First the search biased toward the earliest match:
+
+| call | step | L | R | mid | nums[mid] | verdict | move |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| first | 1 | 0 | 6 | 3 | 8 | match — record `3` | `right = 2` |
+| first | 2 | 0 | 2 | 1 | 7 | `7 < 8` — too small | `left = 2` |
+| first | 3 | 2 | 2 | 2 | 7 | `7 < 8` — too small | `left = 3` → loop ends (`left > right`) |
+
+Then the search biased toward the latest match:
+
+| call | step | L | R | mid | nums[mid] | verdict | move |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| last | 1 | 0 | 6 | 3 | 8 | match — record `3` | `left = 4` |
+| last | 2 | 4 | 6 | 5 | 8 | match — record `5` | `left = 6` |
+| last | 3 | 6 | 6 | 6 | 10 | `10 > 8` — too big | `right = 5` → loop ends |
+
+`first = 3`, `last = 5` → `[3, 5]`.
+
+<Cells
+  data={[5, 7, 7, 8, 8, 8, 10]}
+  pointers={{ 0: [{ t: 'L', c: 'amber' }], 3: [{ t: 'M', c: 'purple' }], 6: [{ t: 'R', c: 'cyan' }] }}
+  cells={{ 3: 'win' }}
+  caption="first-search step 1: mid = 3 matches — record it, but keep hunting left (right = 2)"
+/>
+
+<Cells
+  data={[5, 7, 7, 8, 8, 8, 10]}
+  pointers={{ 3: [{ t: 'first', c: 'green' }], 5: [{ t: 'last', c: 'green' }] }}
+  cells={{ 3: 'ok', 4: 'win', 5: 'ok' }}
+  caption="two biased exact-match searches land on first = 3, last = 5"
+/>
+
+## why it works
+
+Each of the two calls is an ordinary exact-match binary search with one rule added: a match
+doesn't end the search, it just becomes the best answer found *so far*, and the search keeps
+looking for a strictly better one in the chosen direction. `right = mid - 1` after a match can
+never skip past an earlier `target` — anything strictly before `mid` that equals `target` is still
+inside `[left, right]` — so the invariant "the leftmost/rightmost occurrence, if it exists, is
+either already recorded or still inside `[left, right]`" holds throughout. The loop still halves
+its range every step, so each call is O(log n); two calls stay O(log n) overall.
+
+<Watch items={[['time', 'O(log n)'], ['space', 'O(1)']]} />
+
+## common bugs
+
+- Reaching for the *boundary* form (`while (left < right)`) instead, computing a "lower bound,"
+  and writing `left = mid` on the branch that discards the low half. Because `mid` floors toward
+  `left`, that leaves `left` unchanged the moment `right - left == 1` — infinite loop. That branch
+  must always be `left = mid + 1`.
+- Returning the moment `nums[mid] == target` (the classic-binary-search habit) — that gives you
+  *a* occurrence, not the first or the last one.
+- Updating `result` outside the `==` branch, or forgetting to initialize it to `-1` — either way
+  you can return an index that doesn't actually hold `target`.
+- Running the second search even when the first one returned `-1` — harmless here since it just
+  finds nothing again, but it's wasted work and a sign the "target absent" case wasn't actually
+  handled.
+
+## variants you can now solve
+
+- **First Bad Version** (LC 278) — the boundary template distilled to its purest form: no array
+  at all, just a monotonic `IsBadVersion(v)` oracle; find the first `true`.
+- **Search Insert Position** (LC 35) — the single-sided version of this same idea: just the first
+  index where `nums[index] >= target`.
+- **[Find Minimum in Rotated Sorted Array](/patterns/binary-search/find-minimum-rotated/)** —
+  another boundary search, this time the flipping condition is "is `nums[mid]` the pivot or past
+  it?" instead of a target match.

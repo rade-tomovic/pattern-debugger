@@ -1,0 +1,122 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: array-techniques
+problem: majority-element
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import Cells from '@components/Cells.astro';
+
+## task
+
+Given an array `nums` of size `n`, return the element that appears **more than `n / 2` times**.
+The problem guarantees such an element always exists.
+
+```text
+nums = [2, 2, 1, 1, 1, 2, 2]  →  2   (appears 4 of 7 times)
+```
+
+## how to think
+
+A [frequency dictionary](/patterns/hashmap/) solves this in one line — count everything, return the max — but that's
+O(n) *space*. The array guarantees a strict majority exists, and that guarantee is strong
+enough to solve it in O(1) space instead: **pair up every occurrence of the majority element
+with an occurrence of something else, and cancel them.** Because the majority element outnumbers
+every other value combined, it's the one thing that can never be fully cancelled out — some
+copy of it always survives to the end.
+
+Boyer-Moore voting turns that into a single pass: keep a `candidate` and a `count`. Seeing the
+candidate again increments the count; seeing anything else decrements it. When the count hits
+zero, the current candidate has been fully "cancelled" by everything unlike it seen so far — so
+the *next* element becomes the new candidate, even if it turns out to be wrong. The vote keeps
+going, and because the true majority always has more votes than everyone else combined, it's
+guaranteed to be whatever `candidate` holds when the array runs out.
+
+<Callout kind="note" label="template instance">
+  **Single-pass running accumulator** skeleton — the vote-cancel flavor instead of Kadane's
+  extend-or-restart flavor. Invariant: at any point, `count` is the (non-negative) net votes
+  for `candidate` after every other value seen so far cancelled an equal number of them out.
+</Callout>
+
+## solution
+
+```csharp
+public int MajorityElement(int[] nums)
+{
+    int candidate = nums[0];
+    int count = 0;
+
+    foreach (int n in nums)
+    {
+        if (count == 0) candidate = n;             // fully cancelled — the next value takes over
+        count += n == candidate ? 1 : -1;
+    }
+    return candidate;
+}
+```
+
+## trace
+
+`nums = [2, 2, 1, 1, 1, 2, 2]`:
+
+| n | count before | candidate | count after |
+| --- | --- | --- | --- |
+| 2 | 0 | candidate ← 2 | 0 + 1 = 1 |
+| 2 | 1 | 2 | 1 + 1 = 2 |
+| 1 | 2 | 2 | 2 - 1 = 1 |
+| 1 | 1 | 2 | 1 - 1 = 0 |
+| 1 | 0 | candidate ← 1 | 0 + 1 = 1 |
+| 2 | 1 | 1 | 1 - 1 = 0 |
+| 2 | 0 | candidate ← 2 | 0 + 1 = 1 |
+
+Final `candidate = 2`.
+
+Notice `candidate` flips to `1` after the fourth element — a wrong guess, made in good faith
+when the vote hit zero — and flips back to `2` by the end. That flip is the "aha": the
+candidate doesn't have to be right the whole way through, only at the finish line.
+
+<Cells
+  data={[2, 2, 1, 1, 1, 2, 2]}
+  cells={{ 0: 'win', 1: 'win', 2: 'warn', 3: 'warn' }}
+  caption="after index 3: count has hit 0 — candidate 2 is fully cancelled by two 1s"
+/>
+
+<Cells
+  data={[2, 2, 1, 1, 1, 2, 2]}
+  cells={{ 0: 'ok', 1: 'ok', 5: 'ok', 6: 'ok' }}
+  caption="the four 2s (green) outnumber the three 1s — candidate settles back on 2 and survives"
+/>
+
+## why it works
+
+Every cancellation pairs two different values — at most one of them the majority. Since the majority element appears
+more than `n / 2` times, it outnumbers *every other value combined* — so no matter how the
+cancellations land, there are never enough non-majority votes to cancel every copy of the true
+majority. Whatever the running candidate is when the array ends, the true majority's net vote
+count across the whole array can never reach zero, which means the algorithm's `candidate`
+must be it by the last comparison. (This guarantee only holds because a strict majority is
+promised to exist — without that, the result is meaningless and needs a verification pass.)
+
+<Watch items={[['time', 'O(n)'], ['space', 'O(1)'], ['passes', '1']]} />
+
+## common bugs
+
+- Trusting the output when a strict majority **isn't guaranteed** — Boyer-Moore always returns
+  *some* candidate, even garbage, if no element actually has more than `n / 2` occurrences; add
+  a verification pass if the guarantee isn't given.
+- Resetting `count` to `1` instead of re-checking on the *next* iteration when it hits `0` —
+  the check-and-reassign has to happen before the increment/decrement, not after.
+- Assuming the candidate is stable throughout the pass — it isn't; it can flip more than once,
+  as the trace above shows, and that's expected, not a bug.
+- Reaching for a `Dictionary<int, int>` count here out of habit — it works, but costs O(n)
+  space the problem doesn't need; recognize the "outnumbers everyone combined" signal.
+
+## variants you can now solve
+
+- **Majority Element II** (LC 229) — find every element appearing more than `n / 3` times.
+  There can be at most two such elements, so the vote generalizes to **two** candidates and
+  two counters, cancelled together.
+- **Check If a Number Is Majority Element in a Sorted Array** (LC 1150) — the array is sorted
+  now, so the majority (if it exists) occupies one contiguous run; binary search its first and
+  last occurrence instead of voting.

@@ -1,0 +1,368 @@
+---
+layout: '@layouts/TopicLayout.astro'
+topic: caching
+---
+
+import Callout from '@components/Callout.astro';
+
+## the ground floor
+
+- **cache-aside** — the application reads the cache first; on a miss it reads the source of
+  truth, writes the result into the cache, and returns it. The cache is populated lazily, by
+  read traffic. This is the default this page argues for.
+- **write-through** — a write goes to the cache, and the cache itself (or a wrapper around it)
+  writes synchronously to the source of truth before the write is acknowledged. The cache is
+  always at least as current as the store, at the cost of paying store latency on every write.
+- **write-behind** (write-back) — a write lands in the cache and is acknowledged immediately;
+  the write to the source of truth happens later, asynchronously, batched. Fast writes, a
+  window in which the durable copy is behind the cache.
+- **TTL** — time-to-live: how long a cached entry is trusted before it is treated as a miss,
+  independent of whether the underlying data actually changed.
+- **eviction** — what happens when the cache is full and a new entry needs room: which
+  resident entry gets thrown out.
+
+## core idea
+
+A cache is a smaller, faster, less durable copy of data that lives somewhere slower. It buys
+latency and offloads read pressure from the source of truth, and it pays for that with a
+question that never fully goes away: for how long, and under what conditions, is the copy
+allowed to be wrong.
+
+Every caching decision is really a decision about that window of wrongness. Sizing, eviction,
+and TTL choose how big the cache is and how long an entry survives; population strategy and
+invalidation choose how an entry gets refreshed and how fast a write becomes visible. Get the
+mechanism right and a cache is close to free performance. Get the window wrong and you have
+traded a slow-but-correct system for a fast-but-occasionally-wrong one, silently.
+
+## how it actually works
+
+### cache-aside is the default
+
+```text
+read path (cache-aside)
+  client -> app: GET /user/42
+  app -> cache: GET user:42
+    miss
+  app -> store: SELECT * FROM users WHERE id = 42
+  app -> cache: SET user:42 = {...}  (with TTL)
+  app -> client: 200 {...}
+
+  -- next request, before TTL expires --
+  app -> cache: GET user:42
+    hit
+  app -> client: 200 {...}          (store never touched)
+```
+
+The store is untouched on a hit, which is the entire value proposition: read load on the
+source of truth is proportional to the miss rate, not the request rate. Nothing about
+cache-aside requires the cache and the store to agree at every instant — only that they
+reconcile within the TTL. That is the whole trick, and it is why cache-aside generalizes: it
+works whether the store is SQL Server, a REST call to another service, or a computed
+aggregate.
+
+Two structural properties fall out of this shape, and both matter more than they look:
+
+- The cache is **optional at read time**. If it is empty or down, cache-aside degrades to
+  "every read hits the store" — slower, not wrong. This is what makes cache-aside safe to
+  introduce into an existing read path with a flag: worst case, you are back to no cache.
+- The cache is **populated by whoever misses**, not by a background process. That is what
+  creates the stampede failure mode below: population work and read traffic are the same
+  event.
+
+### write-through and write-behind are narrower tools
+
+Write-through makes the cache authoritative on the write path too: a write is not acknowledged
+until both the cache and the store have it. This removes the miss-after-write gap entirely —
+useful when a read immediately following a write must never see stale or missing data (a
+session store right after login, an inventory count right after a reservation) — but it puts
+store latency on the hot path of every write, and it buys you nothing on reads that were never
+going to touch that key.
+
+Write-behind removes store latency from the write path by acknowledging the write once the
+cache has it and flushing to the store later, batched. This is the right shape when write
+volume dominates and the store's per-write cost is the bottleneck (a counter incremented
+thousands of times a second, an activity log) — but it means the durable copy can be behind
+the cache by however long the flush interval is, and a crash before flush is a real data-loss
+window, not a theoretical one. Anything you write-behind needs its own durability story (a WAL,
+an idempotent replay source) independent of the cache.
+
+Cache-aside is the right default because it keeps the store as sole source of truth and the
+cache as pure optimization — the failure modes below are specifically about the ways that
+purity gets violated in practice, not about cache-aside being flawless.
+
+### eviction: why LRU is not always right
+
+Bounded caches need an eviction policy once they're full. LRU (evict the least-recently-used
+entry) is the default because recency is a decent proxy for "will be needed again" — but it has
+a specific, well-known blind spot: a single large sequential scan (a batch job walking every
+row, a backup, a report) touches every key exactly once and, under pure LRU, evicts your entire
+working set to make room for data that will never be read again. This is scan pollution, and it
+is why production LRU implementations are rarely pure LRU — Redis's `allkeys-lru` is an
+approximated LRU (sampled, not exact, for speed), and more sophisticated designs (window
+TinyLFU, used in Caffeine) track *frequency* over a longer horizon specifically so one scan
+can't wipe out a hot set built over hours.
+
+<Callout kind="insight" label="capacity arithmetic">
+Sizing a cache is arithmetic from an assumption about the working set, not a guess. Say you
+have 50M daily active users, a session/profile value that averages 2 KB, and you expect roughly
+2% of them concurrently active within a 30-minute TTL window. That's `50,000,000 * 0.02 =
+1,000,000` resident keys, `1,000,000 * 2 KB = ~2 GB` of value bytes, plus per-key overhead
+(Redis's own bookkeeping runs well over 2x the raw value size for small keys) — so budget
+closer to 4-5 GB, not 2. The number that should scare you is not the average size, it's the
+concurrently-resident count at your TTL, because that's what has to fit.
+</Callout>
+
+### TTL jitter
+
+If every key populated in the same burst (a deploy that warms the cache, a batch job that
+refreshes a whole category) is given the same TTL, they all expire at the same wall-clock
+moment. That turns a steady read rate into a periodic all-miss spike hitting the store on a
+schedule — a self-inflicted, perfectly synchronized load test against your own database. The
+fix is jitter: instead of a fixed TTL, pick one from a range (e.g. `baseTtl * (0.85 to 1.15)`)
+so expirations spread out instead of landing in lockstep. Jitter doesn't reduce the *number* of
+misses over time — it spreads them so they stop correlating.
+
+### stampede
+
+A stampede (thundering herd) is the sharper version of the same problem at the level of one
+key: a hot key expires or is evicted, and N concurrent requests all miss at once, all go to the
+store to repopulate it, at the same time, for the same value. Under real traffic this is not
+rare — a single popular product page, a trending post, a config value read on every request —
+and it is a distinct failure from ordinary cache-miss load because it's *coordinated*: the
+store sees N times its normal per-key load in the same instant, for work that produces N
+identical results.
+
+There are two real fixes, and neither is "make the TTL longer" (that only delays the collision):
+
+1. **Request coalescing** (a.k.a. singleflight, or the "cache stampede lock"). The first
+   request to miss takes a short-lived lock on the key (`SET key:lock NX PX 5000` in Redis is
+   the idiom) and does the repopulation; every other concurrent request either waits briefly
+   and retries the cache, or is served the stale value if one is still around. Exactly one
+   request reaches the store per stampede, not N.
+2. **Probabilistic early expiry** (the XFetch approach). Instead of treating TTL as a hard
+   deadline, each read that finds a soon-to-expire entry has a small, *increasing* probability
+   of proactively recomputing it before it actually expires — the probability is a function of
+   how close the entry is to its deadline and how expensive the last recompute was. Statistically,
+   one request refreshes the value comfortably ahead of the wall, and the rest keep getting
+   served the still-valid cached copy.
+
+Coalescing is simpler to reason about and is the first thing to reach for; early expiry is
+better when repopulation is expensive enough that even one blocked-waiting request queue is a
+problem, or when you can't rely on distributed-lock semantics being available.
+
+### negative caching
+
+A cache-aside path that only caches hits has a hole: a key that is legitimately absent from the
+store (a typo'd ID, a not-yet-provisioned resource, an intentionally deleted row) is a miss on
+*every single request*, forever, because nothing ever populates that key. If that lookup is on
+a hot path — an auth check, a feature flag, an existence check before a write — an attacker or
+a buggy client hammering non-existent keys bypasses your cache entirely and drives store load
+proportional to garbage traffic. Negative caching closes the hole: cache the "not found" result
+too, with its own (usually shorter) TTL. The risk you're accepting is the mirror image of
+positive caching's risk — if the key becomes valid (the resource gets created) before the
+negative TTL expires, you can serve "not found" for something that now exists. Shorter TTL on
+negative entries is the standard mitigation, not a full fix.
+
+### invalidation is a distributed-consistency problem
+
+This is the part that's genuinely hard, and it's worth being precise about *why*: the cache and
+the store are two separate systems, and keeping a cached copy and the record it was copied from
+in agreement is the same problem as keeping any two replicas in agreement — there is no atomic
+operation that updates both. You are always doing two writes, and the reader gets to observe
+the state between them.
+
+The standard cache-aside write path is: write the store, then delete (not update) the cache
+key, and let the next read repopulate it. Deleting instead of updating avoids a whole class of
+bugs where the value written to the cache doesn't match what a concurrent transaction actually
+committed. But delete-then-repopulate has its own race, and it's the one that catches people:
+
+```text
+timeline — the classic cache-aside race
+  t0   reader R:  cache.get(key)          -> miss
+  t1   reader R:  store.read(key)         -> value = "v1" (old)
+  t2   writer W:  store.write(key, "v2")  -> store now has v2
+  t3   writer W:  cache.delete(key)       -> cache empty (correctly, briefly)
+  t4   reader R:  cache.set(key, "v1")    -> cache now holds v1, STALE
+  ...  no further write happens
+  tN   every reader gets "v1" until TTL expires
+```
+
+R's read of the store (t1) and W's write (t2) interleaved, but R's cache write (t4) lands
+*after* W's delete (t3) — so the delete, which was supposed to be the last word, isn't. The
+cache is now wrong until TTL, not until the next write, because there may never be a next
+write to that key. This is rare in absolute terms (it needs a read and a write to interleave in
+exactly that order, on the same key) but it is not exotic — high write concurrency on a hot key
+makes it routine, and it is the reason "just delete the cache after you write the DB" is
+necessary but not sufficient. Mitigations (a short second delete after a delay, versioning the
+cached value with the store's write timestamp and rejecting a set with an older version) reduce
+the window; none of them make it zero without adding real coordination — at which point you are
+building consensus, not caching. This is structurally the identical problem replication
+consistency solves for two copies of a database — see [Consistency Models](/system-design/consistency-models/)
+for the same argument made about replicas instead of a cache.
+
+## the tradeoff
+
+| axis | cache-aside | write-through | write-behind |
+| --- | --- | --- | --- |
+| who populates the cache | the reader, on miss | the write path, synchronously | the write path, then flushed async |
+| write latency | store-only (cache untouched) | store + cache, both on critical path | cache only, store latency hidden |
+| miss-after-write gap | yes, until first read repopulates | none — cache is current at ack time | none for reads of the cache; store is stale |
+| durability of the write | as durable as the store, immediately | as durable as the store, immediately | only as durable as the cache until flushed |
+| behavior when cache is down | degrades to store-only reads | write path breaks or must special-case | write path breaks or must buffer elsewhere |
+| best fit | general read-heavy paths | read-after-write correctness on a hot key | write-heavy, store-expensive-per-write |
+
+Cache-aside is the right default for a typical service: it keeps the store as the single
+durable source of truth, degrades gracefully when the cache is unavailable, and requires no
+special handling for keys nobody happens to read. Reach for write-through specifically when a
+read immediately following a write must not be allowed to miss or see a prior value — that's a
+narrow, name-the-key-and-say-why decision, not a blanket policy. Reach for write-behind only
+when you have already identified write throughput to the store as the bottleneck and you have a
+separate durability story for the buffered window — never as a default, because "the cache
+might be all there is of this write for a while" is not a property you want by accident.
+
+## how it fails
+
+| symptom | cause | what it looks like operationally |
+| --- | --- | --- |
+| DB CPU/connections spike in a sharp, repeating sawtooth | TTLs set without jitter, all expiring in the same burst | a periodic spike aligned to a TTL interval, visible in a dashboard as a metronome |
+| one query pattern suddenly saturates the store, tied to a single popular row | stampede on a hot key with no coalescing | store load spikes for identical, redundant work — same query, many times, same instant |
+| the service falls over harder when the cache goes down than when it was never added | the cache silently became load-bearing capacity, not an optimization | an outage ticket says "cache node restarted" and "database fell over" in the same window |
+| a client keeps hammering the same lookup at full rate, no caching benefit | no negative caching, and the key never exists | store load proportional to garbage/typo/probe traffic, not to real usage |
+| reads are fast but occasionally return a value that's one write behind, indefinitely | the delete-then-repopulate race, landing on a hot key | a support ticket saying "I saved my change and it didn't stick," which then self-resolves after a TTL |
+| one cache node is pegged while the rest of the cluster is idle | a hot key concentrated on one shard (consistent hashing reduces *movement*, not *load*) | a per-node CPU/memory graph with one clear outlier, not an aggregate metric |
+
+The unifying failure mode across all six is the same mistake wearing different clothes: treating
+the cache as free, unconditionally-correct capacity instead of a specific mechanism with a
+specific window of staleness and a specific behavior when it's absent, hot, or racing a write.
+
+## in practice
+
+- **Redis / `IDistributedCache`** — the common ASP.NET Core shape is `IDistributedCache` backed
+  by `StackExchange.Redis`, hand-rolling cache-aside: `GetAsync`, miss, load, `SetAsync` with a
+  `DistributedCacheEntryOptions.AbsoluteExpirationRelativeToNow`. Nothing in that abstraction
+  gives you stampede protection or jitter for free — both are your responsibility to add, and
+  it's easy to ship a service where every instance independently reaches for the store on the
+  same miss because nobody added coalescing.
+- **`HybridCache`** — the `Microsoft.Extensions.Caching.Hybrid` package (usable from .NET 8
+  onward as a NuGet package, not tied to the newest runtime) is Microsoft's answer to exactly
+  this gap: a two-tier cache (in-process L1 + a distributed L2 like Redis) with built-in request
+  coalescing, so concurrent misses for the same key collapse into one factory call instead of
+  N. Worth knowing by name specifically because it addresses the stampede problem this page
+  spent a section on, out of the box.
+- **`IMemoryCache`** — the in-process cache. Per-instance, which means every replica behind a
+  load balancer has its own copy, its own TTLs, and its own independent miss/stampede behavior
+  — a stampede fix that coalesces within one process does nothing across five replicas each
+  missing at once. Also has no built-in memory cap by default; `SizeLimit` plus a `Size` on
+  every entry is opt-in, and skipping it is how a long-lived process slowly turns an
+  unbounded `IMemoryCache` into an OOM.
+- **EF Core has no second-level query cache, deliberately.** Engineers coming from NHibernate
+  or Java's JPA/Hibernate expect a transparent query-result cache and are surprised EF Core
+  doesn't have one — this is an intentional design choice by the EF Core team, specifically
+  because a transparent cache hides exactly the invalidation problem this page just walked
+  through, and they'd rather you reach for `IDistributedCache`/`HybridCache` explicitly than
+  get silently stale reads from an ORM feature you didn't know was there.
+- **Cosmos DB's integrated cache** (via the dedicated gateway) caches point reads and queries
+  with its own TTL, sitting in front of the backend — same cache-aside shape, same staleness
+  window, just operated for you rather than hand-rolled.
+- **CDN / edge caching** is the same mechanism one more hop out, keyed by request URL instead
+  of an application key, governed by `Cache-Control`/`ETag` instead of application code. It's
+  worth reaching for specifically because of the cost asymmetry it's built to exploit: a
+  cross-region round trip is, as a published order of magnitude, tens of milliseconds against
+  sub-millisecond within a datacenter, so serving from an edge node near the requester avoids
+  a cost a backend-local cache never had to begin with. See
+  [The Network Path](/system-design/networking/) for what that round trip is actually made of.
+
+## the same idea elsewhere
+
+| here | elsewhere | the trap |
+| --- | --- | --- |
+| a cache key | a CPU cache line ([Caches & the Memory Hierarchy](/systems/memory-hierarchy/)) | the model is identical — a smaller, faster copy with an eviction policy — but here the "coherence protocol" is code you write, not hardware; nothing enforces it for you |
+| a stampede-coalescing lock on a hot key | a mutex protecting a critical section ([What a Lock Is Made Of](/systems/locks-internals/)) | a Redis `SET NX` lock has no owner-thread guarantee, no automatic release on crash, and needs a TTL as its own failure mode — treat it as a lease, not a mutex |
+| a stale read from a cache node that hasn't seen the latest write | one CPU core observing a stale value before a memory barrier ([Reordering, Visibility & the Memory Model](/systems/memory-model/)) | same shape of bug — a reader observing an earlier state than a writer already committed — at a scale where you can't just add a `volatile` |
+| sharding a cache cluster by key | partitioning work across threads ([Parallelism That Actually Scales](/systems/parallelism-patterns/)) | both fail the same way under skew: an even partition function does nothing for an uneven key distribution, and one hot shard/thread caps the whole system regardless of how many others sit idle |
+
+## interview drills
+
+**Q.** Walk me through why you'd default to cache-aside over write-through.
+
+- *weak answer* — "Cache-aside is simpler to implement."
+- *strong answer* — cache-aside keeps the store as the sole durable source of truth and the
+  cache as a pure, optional optimization: if the cache is empty, cold, or down, the system
+  degrades to store-only reads rather than breaking the write path. Write-through puts store
+  latency on every write and couples write availability to cache availability, which is only
+  worth paying when a specific read-after-write correctness requirement demands it.
+- *follow-up* — "When would you actually reach for write-through?" A hot key where a read
+  immediately following a write must never observe a miss or a stale value — a session right
+  after login, an inventory count right after a reservation — where the extra write latency is
+  cheaper than the correctness bug.
+
+**Q.** Your reads started returning stale data intermittently after a deploy that increased
+write concurrency on one key — walk me through why.
+
+- *weak answer* — "The cache must not be invalidating on write." (It is — that's the confusing
+  part, and dismissing it as "not invalidating" misses the actual mechanism.)
+- *strong answer* — describe the delete-then-repopulate race: a reader's store read and a
+  writer's store write interleave, and the reader's cache write lands after the writer's
+  delete, leaving the cache holding a value older than the last committed write, with no future
+  write to that key to correct it. It resolves itself only at the next TTL expiry.
+- *follow-up* — "How would you close the window?" Version the cached value (e.g. with the
+  store row's `updatedAt` or a monotonic version column) and reject a cache `set` whose version
+  is older than what's already cached — it doesn't eliminate the race, but it stops a stale
+  write from clobbering a fresher one that already landed.
+
+**Q.** A single product page just started timing out under load, but your aggregate traffic
+numbers look normal. What's your first hypothesis?
+
+- *weak answer* — "The database is under too much load, scale it up."
+- *strong answer* — a stampede on that page's cache key: it expired or was evicted, and every
+  concurrent request for that page missed at once and hit the store simultaneously for
+  identical work. Aggregate traffic looking normal while one dependency spikes is the signature
+  — check whether the store load is concentrated on one query/key, not spread out.
+- *follow-up* — "How do you fix it without just extending the TTL?" Request coalescing — a
+  short-lived lock so exactly one request repopulates while the rest wait or serve stale — or
+  probabilistic early expiry, so the value gets refreshed ahead of the deadline before N
+  requests can collide on it.
+
+**Q.** Why doesn't consistent hashing fully solve the hot-key problem in a sharded cache?
+
+- *weak answer* — "Consistent hashing balances load across nodes."
+- *strong answer* — consistent hashing's guarantee is about *movement*: when a node joins or
+  leaves, only the keys mapped near it need to relocate, instead of rehashing everything. It
+  says nothing about the *distribution of request volume* across keys — a single hot key still
+  lands on exactly one node (or one small vnode range), and no amount of hashing spreads one
+  key's traffic across multiple machines.
+- *follow-up* — "What actually helps?" Detecting the hot key and handling it specially — a
+  local (in-process) cache in front of the shared cache for that key, or explicit replication
+  of just that key across nodes with client-side random pick among the replicas.
+
+**Q.** You added a cache in front of a slow downstream service. Six months later, the cache
+node crashes and the whole system falls over — worse than before the cache existed. What
+happened?
+
+- *weak answer* — "The cache should have had better uptime / more replicas."
+- *strong answer* — the cache was introduced as a latency optimization but, because it absorbed
+  enough load that nobody sized the downstream service to handle unfiltered traffic anymore, it
+  quietly became load-bearing capacity. The fix isn't just cache reliability — it's treating the
+  cache as a dependency with its own failure mode from day one: either keep the downstream
+  sized to survive a full cache-miss storm, or add explicit load shedding/backpressure for the
+  moment the cache is gone.
+- *follow-up* — "How do you catch this before it's an incident?" Periodically (or via chaos
+  testing) flush or bypass the cache in a controlled way and watch whether the downstream
+  survives at real traffic — the same principle as [Timeouts, Retries & Circuit Breakers](/system-design/reliability/)
+  treating a dependency's failure as a scenario to rehearse, not just handle in theory.
+
+**Q.** What does negative caching protect against, and what does it cost you?
+
+- *weak answer* — "It caches errors so you don't hit the database as much."
+- *strong answer* — without it, a lookup for a key that legitimately doesn't exist is a
+  guaranteed miss on every request forever, because nothing ever populates that key — so any
+  hot path doing existence checks is fully exposed to that traffic, including malicious or
+  buggy probing. Negative caching caches the "not found" result too, usually with a shorter TTL
+  than positive entries. The cost is the mirror-image staleness risk: if the resource is
+  created before the negative TTL expires, you can serve "not found" for something that now
+  exists.
+- *follow-up* — "Why a shorter TTL for negative entries?" Because the base rate of "this key
+  will become valid soon" is usually much higher than "this valid value will change soon" —
+  positive entries are wrong by staying the same, negative entries are wrong by something
+  appearing, and the latter tends to happen on a shorter, more urgent timescale (a user just
+  created the resource they're now trying to read).

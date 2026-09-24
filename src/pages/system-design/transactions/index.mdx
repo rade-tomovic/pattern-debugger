@@ -1,0 +1,314 @@
+---
+layout: '@layouts/TopicLayout.astro'
+topic: transactions
+---
+
+## the ground floor
+
+- **anomaly** — a concrete way two concurrent transactions can observe or produce a result that
+  no *serial* execution of them could have produced. Isolation levels are defined by which
+  anomalies they rule out, not by an abstract strictness score — that framing is the point of
+  this page.
+- **MVCC (multi-version concurrency control)** — a write creates a new version of a row instead
+  of overwriting it in place; a reader is handed the version visible to its own snapshot instead
+  of blocking behind a writer. PostgreSQL, SQL Server (once you turn on row versioning), and
+  Oracle all use some form of this for their default read path.
+- **2PL (two-phase locking)** — the other mechanism: acquire locks as you go, release none until
+  commit. Readers and writers can block each other. This is what SQL Server's plain
+  `READ COMMITTED` does out of the box, before you opt into versioning.
+- **predicate lock** — a lock on the *condition* of a query (`status = 'open'`), not on a row
+  that currently exists, so a row inserted later that matches the condition still conflicts.
+  This is the piece that lets true `SERIALIZABLE` catch phantoms and write skew that row-level
+  locking cannot see coming.
+
+## core idea
+
+ACID is a marketing acronym wrapped around one real engineering decision: how much of the mess
+of true concurrency the database hides from you, and what that hiding costs. Atomicity and
+durability are contracts about a single transaction's own writes; isolation is the axis that is
+actually a spectrum, because hiding concurrency completely — serializability — has a real cost,
+and every level below it is a specific, named exception the database is allowed to show you in
+exchange for going faster.
+
+The sentence to have ready in an interview: an isolation level is not a strictness dial, it is a
+list of anomalies you have agreed to tolerate. Know the list, or you will not recognize the bug
+when it shows up as a support ticket instead of a database-theory question.
+
+## how it actually works
+
+### the anomaly ladder
+
+Four names carry the whole conversation. Each level is defined by which of these it rules out —
+nothing else.
+
+| anomaly | what it looks like |
+| --- | --- |
+| dirty read | you read a row another transaction wrote but has not committed yet, and it later rolls back |
+| non-repeatable read | you read the same row twice in one transaction and get two different values, because another transaction committed a change in between |
+| phantom read | you re-run the same range query in one transaction and a row appears or disappears, because another transaction inserted or deleted a matching row in between |
+| write skew | two transactions each read a consistent snapshot, each write to a *different* row based on what they read, and the combination violates an invariant that neither write alone would have — nothing was overwritten, nothing was dirty, the data is just wrong |
+
+| level | dirty read | non-repeatable read | phantom read | write skew | typical mechanism |
+| --- | --- | --- | --- | --- | --- |
+| `READ UNCOMMITTED` | possible | possible | possible | possible | no locks on reads at all — rare as a real default, common as an accidental opt-in (see `NOLOCK` below) |
+| `READ COMMITTED` | prevented | possible | possible | possible | short locks released per statement, or a fresh MVCC snapshot per statement |
+| `REPEATABLE READ` (the ANSI wording) | prevented | prevented | possible, by the letter of the 1992 standard | possible | rarely implemented literally today |
+| snapshot isolation | prevented | prevented | prevented | **possible** | one MVCC snapshot held for the whole transaction |
+| serializable | prevented | prevented | prevented | prevented | predicate locking, or optimistic conflict detection over the whole read set |
+
+The row that trips people up is snapshot isolation. It satisfies the ANSI criteria for
+`REPEATABLE READ` — no dirty reads, no non-repeatable reads, and no phantoms in the standard's
+narrow sense — while still permitting write skew, because it never looks at what a *different*
+row's transaction is about to do. That gap between "meets the letter of the standard" and
+"actually serializable" is old and well known: it is why the term **anomaly serializable** exists
+separately from **serializable**, and it is why the name a vendor gives a level is not proof of
+what it prevents.
+
+### two mechanisms for the same promise
+
+```text
+2PL (locking)                              MVCC (versioning)
+--------------------------------           --------------------------------
+txn acquires a lock before touching        txn writes create a new version;
+a row; holds it until commit               readers never wait on writers
+
+  T1: LOCK row(42)   ─┐                      T1: UPDATE row(42) → v2 (xmin=118)
+      ... work ...     │ T2 blocks             row(42) version chain, newest first:
+      COMMIT          ─┘ here                    v2  xmin=118 xmax=–     (current)
+  T2: LOCK row(42)  (waits, then proceeds)        v1  xmin=104 xmax=118  (superseded)
+
+readers can block writers and vice versa   T3 started at snapshot=110 → sees v1
+                                            (xmin=104), never v2, even after T1 commits —
+                                            the snapshot is fixed at T3's start, not re-taken
+```
+
+SQL Server's default `READ COMMITTED`, before you enable row versioning, is the left column:
+a `SELECT` takes a shared lock, a concurrent `UPDATE` waits behind it or vice versa. PostgreSQL's
+`READ COMMITTED`, and SQL Server with `READ_COMMITTED_SNAPSHOT` on, is the right column: a
+`SELECT` never blocks a writer, because it is reading an already-committed version, not the row
+itself.
+
+### write skew, concretely
+
+This is the anomaly the brief above calls out by name, because it is the one experienced
+engineers most often get wrong: they know "don't lose an update", they do not reliably recognize
+this shape.
+
+```text
+invariant: at least one doctor must stay on call at all times (on_call_count >= 1)
+starting state: on_call_count = 2  (Alice and Bob both on call)
+isolation level: snapshot isolation (Postgres REPEATABLE READ / SQL Server SNAPSHOT)
+
+  time   Txn A (Alice going off call)         Txn B (Bob going off call)
+  ----   ------------------------------       ------------------------------
+  t0     BEGIN  (snapshot fixed: count=2)
+  t1                                          BEGIN  (snapshot fixed: count=2)
+  t2     SELECT count → 2
+         "2 on call, safe for me to leave"
+  t3                                          SELECT count → 2
+                                               "2 on call, safe for me to leave"
+  t4     UPDATE alice SET on_call = false
+  t5     COMMIT   (count is now 1)
+  t6                                          UPDATE bob SET on_call = false
+  t7                                          COMMIT   (count is now 0 — invariant broken)
+```
+
+Neither transaction read a dirty value. Neither overwrote the other's write — they touched
+different rows. Neither snapshot was stale by the time it was taken. Snapshot isolation delivered
+exactly what it promises — each transaction saw one consistent point-in-time view — and the
+invariant still broke, because nothing in that promise says a snapshot must account for another
+transaction's *concurrent* decision. Only serializable execution — either true predicate locking
+or an optimistic scheme that detects the conflicting read set at commit time — rejects one of
+these two commits.
+
+Note the shape: two reads, a decision based on the read, two independent writes. That is
+check-then-act, and [Concurrency Hazards](/systems/concurrency-hazards/) is where the identical
+race appears one layer down, as two threads each checking a flag before acting on it. Write skew
+is that race wearing a database costume — same bug, different vocabulary, and the fix at both
+layers is the same idea: make the check and the act one atomic step, or make the conflict
+detectable.
+
+## the tradeoff
+
+| choice | what you buy | what you pay | typical mechanism |
+| --- | --- | --- | --- |
+| `READ COMMITTED` | no dirty reads, maximum concurrency, the near-universal default | app code must tolerate non-repeatable reads, phantoms, and write skew | per-statement MVCC snapshot (Postgres, SQL Server with RCSI) or short-held locks (SQL Server without it) |
+| snapshot isolation | one consistent view for the transaction's whole lifetime — reports and multi-step reads stop shifting under you | write skew still gets through; SQL Server burns `tempdb` space holding old row versions for the transaction's duration | one snapshot taken at transaction start, held until commit |
+| serializable | correctness equivalent to *some* serial ordering — write skew included | throughput cost: SQL Server takes range locks that widen contention, PostgreSQL's SSI aborts transactions under conflict and pushes the retry cost onto you | predicate-aware locking, or optimistic conflict detection over the whole read set |
+
+For a typical CRUD service, `READ COMMITTED` — backed by MVCC, not by locking — is the right
+default, and the reason it is the default almost everywhere is that most transactions do not
+actually depend on a second read agreeing with the first. Escalate only when you can name the
+specific invariant at risk, and prefer a narrower fix first: a unique constraint the database
+enforces for you, an explicit `SELECT ... FOR UPDATE` on the exact rows the invariant touches, or
+an optimistic concurrency token (a `rowversion` column, an EF Core concurrency token) for the
+"two users edited the same record" case. Reach for `SERIALIZABLE` only on the specific
+transaction that needs it — treat it as a scarce resource you spend deliberately, not a
+database-wide setting, because both implementations you'll meet (locking and SSI) get slower and
+more failure-prone under contention in different ways.
+
+## how it fails
+
+- **Symptom:** a nightly reconciliation job's totals don't reconcile with themselves — two
+  passes over the same data disagree. **Cause:** `READ COMMITTED` re-snapshots per statement, so
+  a long job that queries the same table twice can see a row change between the two queries.
+  **Fix:** wrap the whole job in one snapshot-isolation or `REPEATABLE READ` transaction, or do
+  it in one query.
+- **Symptom:** a uniqueness invariant is violated in production even though every write passed
+  its own check, and nothing in the audit log looks corrupted. **Cause:** write skew — two
+  transactions each checked a *different* row and each write was individually valid.
+  **Fix:** a database constraint if the invariant is expressible as one, otherwise explicit
+  locking or serializable on that transaction.
+- **Symptom:** after switching a hot path to `SERIALIZABLE`, error rates spike with SQL Server
+  deadlock errors (`1205`) or PostgreSQL serialization failures (`40001`), and nothing else about
+  the load changed. **Cause:** this is not a bug — it is the mechanism working. SQL Server holds
+  range locks for the transaction's duration; PostgreSQL's SSI optimistically lets the
+  transaction run and aborts it at commit if the read set was invalidated. Both need retry logic,
+  neither is free.
+- **Symptom:** on PostgreSQL, table bloat and query latency creep upward over hours with no
+  obvious cause, and the culprit query looks fast. **Cause:** MVCC cannot reclaim an old row
+  version while any open transaction's snapshot might still need it — one long-running
+  transaction (a forgotten `BEGIN`, a batch job, an idle connection in a transaction) pins the
+  vacuum horizon for the whole table, not just its own rows. **Dashboard:** oldest open
+  transaction age, not query duration — the query that never seems to run long is not the one
+  to look at.
+- **Symptom:** a client received a commit acknowledgement, a failover happened seconds later, and
+  the write is gone. **Cause:** durability was conflated with replication. ACID durability means
+  committed and recoverable via that node's own `fsync`ed log — it says nothing about whether a
+  replica had received the write before the node that took it disappeared. That guarantee is
+  [Replication](/system-design/replication/)'s to give, via synchronous replication or a quorum
+  commit, not the transaction's.
+
+## in practice
+
+- **SQL Server** defaults to `READ COMMITTED` implemented with locking — readers and writers
+  block each other — unless the database has `READ_COMMITTED_SNAPSHOT` turned on, which switches
+  reads to a `tempdb`-backed version store (RCSI) with the same isolation semantics but no
+  reader/writer blocking. Azure SQL Database ships with this on by default; most on-premises SQL
+  Server instances do not, which is the exact kind of default mismatch that produces a "why does
+  prod block and staging doesn't" ticket. `SNAPSHOT` isolation is a separate, transaction-level
+  opt-in (`ALLOW_SNAPSHOT_ISOLATION`) — the true snapshot-isolation row in the table above, not
+  the same thing as RCSI.
+- **PostgreSQL** defaults to `READ COMMITTED` with a genuine per-statement MVCC snapshot.
+  `REPEATABLE READ` in Postgres is snapshot isolation, not the 1992-standard wording — it
+  prevents phantoms but not write skew. `SERIALIZABLE` is SSI (serializable snapshot isolation):
+  optimistic, and it will hand you `40001` under contention that a purely locking implementation
+  would have avoided by blocking instead.
+- **Oracle** defaults to `READ COMMITTED` via undo-segment-based read consistency. Its
+  `SERIALIZABLE` level is, by its own documentation, implemented as snapshot isolation — not
+  predicate locking — so it sits in the snapshot-isolation row of the table above despite the
+  name. This is the single clearest instance of "the vendor's name for a level is not proof of
+  what it prevents" you will meet in production.
+- **EF Core** wraps `SaveChanges` in a transaction at whatever isolation level the connection
+  defaults to, unless you call `Database.BeginTransactionAsync(IsolationLevel...)` explicitly —
+  it does not raise the level for you. For the "two users edited the same record" case, an
+  optimistic concurrency token (`[Timestamp]`/`rowversion` on SQL Server, a plain version column
+  elsewhere) is almost always the better fix than raising isolation, because it fails fast on the
+  actual conflicting write instead of paying for stricter isolation on every transaction.
+  Separately: a `TransactionScope` that ends up spanning more than one open connection can
+  silently escalate to a distributed transaction — historically unsupported or limited outside
+  Windows — so treat two connections inside one ambient transaction as a portability trap, not
+  just a performance one.
+- **Cosmos DB** transactions (stored procedures, or the `TransactionalBatch` API) are scoped to
+  operations sharing one logical partition key within one container — there is no cross-partition
+  transaction. That is a [Partitioning](/system-design/partitioning/)-level tradeoff wearing a
+  transactions-page question; the honest answer to "can I get a transaction across these two
+  documents" is "only if you chose the same partition key for both."
+- **Redis** `MULTI`/`EXEC` queues commands and applies them atomically with respect to other
+  clients — no other client's commands interleave — but there is no rollback of commands already
+  applied if a later command in the batch fails at *execution* time (a type error, say); only a
+  queue-time error aborts the whole batch. `WATCH` gives you optimistic concurrency on top of
+  that, not the isolation guarantees a SQL transaction gives you. Assuming `MULTI`/`EXEC` behaves
+  like a database transaction, all-or-nothing on any failure, is the specific footgun.
+- **Kafka, RabbitMQ, Azure Service Bus**: none of these participate in your database's
+  transaction. The recurring bug is the dual write — update the row, then publish the event, and
+  the process dies in between, or the two land in the wrong order under retry. The fix is the
+  outbox pattern (write the event as a row in the same database transaction as the state change,
+  publish it from that table afterward), not a distributed transaction across the database and
+  the broker — see [Consensus](/system-design/consensus/) for exactly why two-phase commit is the
+  wrong tool for that boundary. Kafka's own transactional producer API gives atomicity across
+  partitions *within Kafka* (a read-process-write step committing its output and its consumer
+  offset together) — that guarantee stops at Kafka's edge, it does not extend to your database.
+- **Polly** is where the retry-on-serialization-failure logic belongs once you've chosen
+  `SERIALIZABLE` for a transaction: catch the specific transient exception (SQL Server deadlock
+  `1205`, PostgreSQL `40001`), retry with backoff, and cap the attempts — this is expected traffic
+  for that isolation level, not an incident.
+- The `WITH (NOLOCK)` hint on SQL Server is `READ UNCOMMITTED` for that one query — dirty reads,
+  possible duplicate or missing rows during a page split — reached for as a performance fix by
+  people who have not looked at the anomaly table above.
+
+## the same idea elsewhere
+
+| here | elsewhere | the trap |
+| --- | --- | --- |
+| a row lock held across a transaction | a mutex held across a critical section — [Locks & Mutexes](/systems/locks-internals/) | a row lock held while your app server round-trips to another service is a held lock spanning a network call — the database-transaction version of never holding a lock across I/O |
+| an optimistic concurrency token (`rowversion`, ETag) | hardware compare-and-swap — [Atomics & CAS](/systems/atomics-and-cas/) | it is the same algorithm one layer up: read a version, attempt the write, retry on mismatch — the token is doing exactly what a CAS loop does |
+| write skew | a check-then-act race between two threads — [Concurrency Hazards](/systems/concurrency-hazards/) | same bug, different vocabulary; the fix at both layers is to make the check-and-act atomic, or make the conflict detectable, not to add more logging |
+| two replicas disagreeing on a value | two CPU cores disagreeing before a memory barrier — [The Memory Model](/systems/memory-model/) | isolation is the single-node version of this argument; [Consistency Models](/system-design/consistency-models/) is where it gets a second node |
+| ACID durability | a write surviving a crash on one node, before replication has run | conflating the two is the single most common false claim about durability made in production incident reviews |
+
+## interview drills
+
+**Q.** What does `READ COMMITTED` actually guarantee, and what can still go wrong under it?
+- *weak answer* — "you only ever see committed data, so it's safe." True and incomplete: it
+  says nothing about the transaction's own consistency across multiple reads.
+- *strong answer* — it rules out dirty reads only. The same transaction can see a row change
+  value between two of its own reads (non-repeatable read), and a range query can gain or lose
+  rows between two runs (phantom read), because it takes a fresh snapshot (or fresh locks) per
+  statement, not per transaction.
+- *follow-up* — "does snapshot isolation fix that?" Yes for both of those, but it introduces
+  write skew, which `READ COMMITTED` and snapshot isolation both permit for a different reason:
+  neither one looks at what a concurrent transaction is about to write to a different row.
+
+**Q.** Two transactions each check a business invariant, each pass the check, and the invariant
+ends up violated even though no row was corrupted and no read was dirty. What's going on, and
+what fixes it?
+- *weak answer* — "sounds like a race condition, add a lock somewhere." Not wrong in spirit, but
+  it doesn't name the anomaly or say where the lock needs to go.
+- *strong answer* — this is write skew: both transactions read a consistent snapshot, both wrote
+  to different rows based on what they read, and the combination broke an invariant that
+  spans both rows. Fix it with a constraint the database can enforce directly, an explicit lock
+  on the specific rows the invariant depends on, or serializable isolation for that transaction.
+- *follow-up* — "why not just run everything serializable, then?" Cost and mechanism differ by
+  engine: SQL Server's range locks increase contention under load, PostgreSQL's SSI aborts
+  transactions at commit and pushes retry cost onto the caller. Neither is free, so it's reserved
+  for the transactions that actually need it.
+
+**Q.** Your isolation level is `SERIALIZABLE` and every write is durably committed. After a
+failover, can a client that received a commit acknowledgement still lose that write?
+- *weak answer* — "no — ACID means durable, durable means it's safe." Conflates two different
+  guarantees.
+- *strong answer* — yes, if replication to the node that takes over was asynchronous. ACID
+  durability is a promise about the node that accepted the write: committed and recoverable via
+  its own `fsync`ed log. It says nothing about whether any other node had the write before that
+  node disappeared — that is a replication guarantee, not a transaction guarantee.
+- *follow-up* — "how do you close that gap?" Synchronous replication to at least a quorum before
+  acknowledging the commit — which trades latency for it, the PACELC tradeoff one layer up.
+
+**Q.** After moving an OLTP table from SQL Server's default isolation to `SERIALIZABLE`, deadlock
+errors that never used to happen start showing up under normal load. Why?
+- *weak answer* — "`SERIALIZABLE` is just stricter, it shouldn't cause new bugs." It's not a bug
+  — it's the cost of the guarantee, showing up as contention.
+- *strong answer* — SQL Server implements `SERIALIZABLE` with range locks held for the whole
+  transaction, specifically to stop phantom inserts into any range the transaction scanned. That
+  is a wider, longer-held lock footprint than `READ COMMITTED` ever takes, and it collides with
+  concurrent transactions that never conflicted before. PostgreSQL would show the same problem
+  differently — as `40001` serialization failures, because SSI is optimistic rather than
+  blocking.
+- *follow-up* — "what's the .NET-idiomatic fix short of dropping the isolation level?" Narrow the
+  transaction to the smallest set of statements that need the guarantee, make sure the right
+  index exists so the range lock is tight rather than scanning the whole table, and wrap the
+  operation in Polly for the residual retries.
+
+**Q.** A nightly batch job on PostgreSQL runs one query at a time, nothing looks slow in
+isolation, but table bloat and general query latency creep up for hours afterward. What happened?
+- *weak answer* — "sounds like a missing index, run `EXPLAIN ANALYZE`." Reasonable first move,
+  but it's looking at the wrong metric.
+- *strong answer* — the job holds one transaction open across the whole run. MVCC can't reclaim
+  an old row version while any open transaction's snapshot might still need to see it, so that
+  one long-lived transaction pins the vacuum horizon for every table it could touch, not just the
+  rows it read. Query duration looks fine because no individual query is slow — the transaction
+  is.
+- *follow-up* — "how do you catch this before it pages someone?" Alert on the age of the oldest
+  open transaction / oldest snapshot, not on individual query latency — that's the metric that
+  actually reflects what MVCC is waiting on.

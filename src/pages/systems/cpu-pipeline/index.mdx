@@ -1,0 +1,413 @@
+---
+layout: '@layouts/TopicLayout.astro'
+topic: cpu-pipeline
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import ProblemList from '@components/ProblemList.astro';
+
+## the ground floor
+
+- **An instruction** is a few bytes that tell one core to do one thing; **a cycle** is one tick
+  of that core's clock. [How a CPU runs an instruction](/systems/cpu-execution/) builds both
+  from nothing.
+- **A register** is a named 8-byte slot inside the core. Sixteen general-purpose ones on
+  x86-64, and all arithmetic happens in them, never directly in memory.
+- **A branch** is an instruction that writes the instruction pointer conditionally: `jl`, `jne`,
+  `jg`. Every `if`, every loop, every `foreach`, every array bounds check compiles to one.
+- **L1** is the small cache attached to each core — 32 KiB of data on a typical modern x86-64
+  core. [The memory hierarchy](/systems/memory-hierarchy/) is the full ladder this sits on.
+- **Latency** is how long one operation takes from start to finish. **Throughput** is how many
+  of that operation can be in flight, finishing one after another, at the same time. This page
+  is mostly about how far apart those two numbers can get.
+
+## core idea
+
+A modern core does not run one instruction at a time and then move to the next. It is an
+assembly line with many instructions inside it at once, at different stages of completion,
+issued to execution units out of order as their inputs become ready and put back in program
+order only at the very end. That machinery buys its speed with two bets: it **guesses** which
+way every branch will go long before it can know for certain, and it **reorders** the loads and
+stores it executes as long as no other part of the *same* thread can tell.
+
+Both bets are invisible when they win. The first one, when it loses, throws away every
+instruction the core had already started down the wrong path — that is most of this page. The
+second is invisible to a single thread by construction, and visible to *another* thread the
+moment there is one, which is exactly where [the memory model](/systems/memory-model/) comes
+from.
+
+## how it actually works
+
+### the assembly line
+
+An instruction does not have one single duration. It passes through several stages, and each
+stage can be working on a *different* instruction at the same time — like a car factory where
+one car takes a day to build from start to finish, but a finished car rolls off the end of the
+line far more often than once a day.
+
+```text
+   in-order front end          out-of-order core                in-order end
+  ┌───────┬────────┬────────┬──────────┬──────────┬───────────┬──────────┐
+  │ FETCH │ DECODE │ RENAME │ SCHEDULE │ EXECUTE  │ WRITEBACK │  RETIRE  │
+  └───────┴────────┴────────┴──────────┴──────────┴──────────-┴──────────┘
+      ↑                          │           │                     │
+      │                          │           │                     └─ results become
+   the branch predictor          │           └─ several units in parallel:
+   supplies the next address     │              integer, vector, load, store …
+   BEFORE the branch has run     │
+                                 └─ picks any instruction whose inputs are ready,
+                                    in whatever order that happens to be
+
+   position in the line:  1     2     3     4     5     6     7
+   instr A:              [F ]  [D ]  [E ]  [W ]
+   instr B:                    [F ]  [D ]  [E ]  [W ]
+   instr C:                          [F ]  [D ]  [E ]  [W ]
+   instr D:                                [F ]  [D ]  [E ]  [W ]
+```
+
+Each instruction still takes several stages end to end — that is its **latency** — but a new
+one can enter the front of the line before the last one has left the back, so the line as a
+whole finishes work far faster than "one instruction, wait, next instruction" would. Whether
+your code actually gets that overlap depends on one thing: does the next instruction *need* the
+result the current one hasn't produced yet?
+
+**A dependency chain is a sequence of instructions where each one needs the previous one's
+result before it can start.** Multiply-then-add-then-multiply-again, where each step feeds the
+next, is a chain: no matter how many execution units the core has, only one link of that chain
+can ever be ready to run at once, because every other link is waiting on it.
+
+Here are two loops that do the arithmetic-heavy step of a linear congruential generator — one
+64-bit multiply and one 64-bit add — the only difference being how many independent copies of
+that step run side by side, from `bench/cpu-pipeline/pipeline-ilp.cs`:
+
+```csharp
+static long Chain1(long n, long s)
+{
+    long a = s;
+    for (long i = 0; i < n; i++) a = a * M + C;      // step i+1 needs step i's `a`
+    return a;
+}
+
+static long Chain4(long n, long s)
+{
+    long a = s, b = s + 1, c = s + 2, d = s + 3;    // four chains that never read each other
+    for (long i = 0; i < n; i++) { a = a * M + C; b = b * M + C; c = c * M + C; d = d * M + C; }
+    return a + b + c + d;
+}
+```
+
+`Chain1` is one dependency chain `n` steps long: step `i+1` cannot start until step `i` has
+written `a`. `Chain4` is four independent chains, each `n` steps long, that never read one
+another's values. That is not a guess about what the JIT does with them — it is verbatim
+`DOTNET_JitDisasm` output for the hot loop of each, x86-64, optimised (`Tier1-OSR`) code:
+
+```text
+; Chain1 — one dependent chain
+G_M000_IG03:
+       mov      rdi, 0x5DEECE66D
+       imul     rdx, rdi          ; rdx = rdx * M  — needs the PREVIOUS iteration's rdx
+       add      rdx, 11           ; rdx = rdx + C
+       inc      rcx
+       cmp      rcx, rax
+       jl       SHORT G_M000_IG03
+
+; Chain4 — four independent chains
+G_M000_IG03:
+       mov      r9, 0x5DEECE66D
+       imul     rdx, r9           ; chain a — lives entirely in rdx
+       add      rdx, 11
+       imul     rdi, r9           ; chain b — lives entirely in rdi
+       add      rdi, 11
+       imul     rsi, r9           ; chain c — lives entirely in rsi
+       add      rsi, 11
+       imul     r8, r9            ; chain d — lives entirely in r8
+       add      r8, 11
+       inc      rcx
+       cmp      rcx, rax
+       jl       SHORT G_M000_IG03
+```
+
+Read the registers, not the ratio. `Chain1`'s loop body writes `rdx` and then reads `rdx` on the
+very next `imul` — a real, enforced dependency. `Chain4`'s loop body has four `imul`/`add`
+pairs, and no pair reads a register any other pair writes: `rdx`, `rdi`, `rsi` and `r8` are four
+separate chains that happen to sit in the same loop. **The number of independent chains in the
+source is the number of instructions the out-of-order scheduler can ever have ready to run at
+the same moment**, no matter how many execution units the core has sitting idle. `Chain1` can
+never offer the scheduler more than one ready `imul` at a time; `Chain4` can offer it four.
+
+**A stall is an instruction sitting in the scheduler with nowhere to go because an input is not
+ready yet.** `Chain1` stalls on purpose, every iteration: the next `imul` needs the previous
+`imul`'s result, so the multiplier unit has nothing else it is allowed to start until that
+result exists. That is what "the CPU is fast but your code is slow" usually means underneath —
+not that the machine ran out of instructions, but that it ran out of instructions *whose inputs
+were ready*. The two exercises on this page apply that same idea to a branch instead of an
+arithmetic chain — a branch whose "input" is a guess the front end has to make before the
+answer exists at all.
+
+<Callout kind="insight" label="what unrolling is and is not">
+  `Chain4` is not `Chain1` "unrolled" in the way a compiler unrolls a loop — unrolling copies
+  the *same* dependent chain's body several times to shrink loop overhead; it does not create
+  new independent chains. `Chain4` is four separate data streams that were independent in the
+  source before the JIT ever saw them. [Source to machine code](/systems/il-jit-codegen/) is
+  where real unrolling happens.
+</Callout>
+
+### guessing, because it has to
+
+Now put a branch in the line. `jl` is resolved deep inside the pipeline — in the EXECUTE stage
+above — but FETCH, several stages upstream, has to hand the front end a next address on the
+*very next cycle*. Waiting for the real answer would leave the whole line empty every single
+time your code says `if`, and your code is nothing but `if`s, loops and bounds checks.
+
+So the front end guesses. A **branch predictor** is a hardware table, indexed by the branch's
+address and by the recent *history* of outcomes at that address, holding a small counter per
+entry that says "taken" or "not taken". It hands the guess to FETCH immediately, and everything
+downstream of that guess runs **speculatively**: it executes, but its results are held back
+from architectural state until the branch actually resolves.
+
+```text
+  prediction correct                       prediction wrong
+  ─────────────────                        ────────────────
+  fetch the branch                         fetch the branch
+  fetch the guessed target                 fetch the guessed target
+     …    useful work, several stages         …    work that is about to be thrown away
+  branch resolves: guess was right         branch resolves: guess was wrong
+           nothing happens — the work                the pipeline is FLUSHED: every
+           in flight was already correct              instruction fetched since the
+                                                        guess is discarded, and fetch
+                                                        restarts at the real target
+```
+
+A wrong guess costs whatever the front end managed to fetch and start between the guess and the
+resolution — every one of those instructions is thrown away, and the deeper the line, the more
+that is. [What the branch predictor learns](/systems/cpu-pipeline/sorted-array-branch/) puts a
+real number on that — not a duration, a **count**: it builds the same kind of history-indexed
+table the hardware uses, in software, and counts how many times it guesses wrong on four
+different orderings of the same data.
+
+<Callout kind="insight" label="predictable is not the same as biased">
+  A predictor that only remembered "this branch is usually taken" would fail on any pattern that
+  alternates on a short, fixed period, because a coin-flip-shaped bias is exactly 50/50 over
+  such a pattern. A predictor that remembers the last few *outcomes*, not just the overall
+  bias, can learn a repeating pattern regardless of how fast it flips — which is the entire
+  reason real predictors are history-indexed and not just per-branch counters. Working that
+  out by hand is the whole point of the sorted-array exercise.
+</Callout>
+
+### out of order, and the illusion it maintains
+
+Fetch and decode happen in program order. Execution does not. Once decoded, an instruction goes
+into a pool, and the scheduler picks, every cycle, whichever instructions have their inputs
+ready and a free execution unit — which is frequently not the order you wrote. Two mechanisms
+make that safe:
+
+- **Register renaming.** The sixteen architectural registers you can name in assembly are
+  mapped onto a much larger pool of physical ones, so two unrelated uses of, say, `eax` never
+  collide. This is *not* what made `Chain4` fast above — its four chains already live in four
+  different architectural registers. What renaming buys is that iteration `N+1` of a *single*
+  chain can start being scheduled while iteration `N` is still in flight, even though both
+  write the same named register: those are two different physical registers under the hood, so
+  the only dependency the scheduler still has to respect is the one the arithmetic actually
+  expresses.
+- **In-order retirement.** Results are committed to architectural state — the state a debugger
+  or another thread could observe — strictly in program order, and a speculative instruction's
+  effects are discarded wholesale if the branch it sat behind turns out to have been
+  mispredicted. Exceptions surface at exactly that point too, which is why your stack trace
+  looks perfectly sequential even though nothing underneath it ran that way.
+
+The illusion is complete **for the one thread that issued the instructions**. Nothing you can
+observe from inside a single thread of C# reveals that your loads ran early or that your stores
+are still sitting in a buffer waiting to leave the core.
+
+<Callout kind="insight" label="the hand-off">
+  A store does not go to memory the instant it executes. It goes into the core's **store
+  buffer** first and drains to the cache later, while subsequent loads on the *same* core are
+  free to run before it drains. That is the same speculation-and-reordering machinery this page
+  has been describing, and it is the entire reason a memory model has to exist: your thread's
+  own timeline is not necessarily the timeline another core sees.
+  [Reordering, visibility and the memory model](/systems/memory-model/) is where that becomes
+  your problem, and where `volatile`, `Volatile.Read` and `lock` earn their keep.
+</Callout>
+
+Speculation also leaves fingerprints outside the architectural state. Instructions that were
+executed and then discarded still changed the contents of the cache on their way through, and
+that residue — invisible to your program, visible to a sufficiently patient attacker timing
+cache accesses — is what Spectre-class attacks read. Mispredicted work is architecturally
+invisible and physically not.
+
+### SIMD, in one paragraph
+
+One instruction can also operate on many values at once instead of one. A 256-bit vector
+register holds 32 bytes, and a single instruction can compare all 32 against a threshold, mask
+them, and fold them into an accumulator — [removing the branch](/systems/cpu-pipeline/branchless-rewrite/)
+walks exactly that, by hand, lane by lane. The honest caveat is where it applies: it needs a
+flat, contiguous pass with no early exit and an operation that does not care what order the
+elements are combined in, and RyuJIT does not invent that shape for you the way an ahead-of-time
+C or Rust compiler sometimes will — every scalar C# loop disassembled on this page and on
+[removing the branch](/systems/cpu-pipeline/branchless-rewrite/) came out as ordinary
+one-byte-at-a-time instructions, never a vector register, unless the vector code was written by
+hand. What you get automatically in .NET is the hand-written vector code
+*inside* framework methods like `IndexOf`, `Contains` and `SequenceEqual` — which is the real
+reason those beat an equivalent hand-rolled loop.
+
+## the mental model
+
+```text
+  your source            what the machine does with it
+  ───────────            ─────────────────────────────
+  one instruction   →    several stages, many in flight, executed out of order
+  if (x)            →    a guess made before the answer exists
+  a wrong guess     →    everything fetched since the guess, thrown away
+  a right guess     →    free — nothing downstream even notices
+  a dependency      →    a stall: the unit idles waiting for that one input
+  independent work  →    several chains the scheduler can interleave
+  a store           →    a buffer entry that drains later  → /systems/memory-model/
+```
+
+Three lines worth keeping:
+
+- **A predictor is a table of small counters indexed by recent history, not a single "usually
+  taken" bit.** A pattern that repeats — even one that flips every single element — is
+  learnable once the table has enough history bits to span one period. What defeats it is a
+  pattern with no period at all: true randomness.
+- **Dependencies are the throttle, not raw instruction count.** A dependency chain runs at the
+  speed of one link at a time regardless of how many execution units sit idle around it.
+  Independent work is what lets the machine actually use them.
+- **A store buffer is a queue, not a wire to memory.** Nothing about a single thread's own
+  observations ever reveals that; another thread's observations can.
+
+<Watch items={[['mispredict', 'discards every instruction fetched since the guess'], ['dependency chain', 'one instruction ready at a time, regardless of unit count'], ['predictor memory', 'a table of counters indexed by recent history'], ['a repeating pattern of period P', 'learnable once history ≥ log2(P) bits'], ['true randomness', 'no history width fixes it'], ['store buffer', 'the reason a memory model has to exist']]} />
+
+## why you should care
+
+**"Why is this loop slow, it is only three instructions" now has a short list of usual
+suspects.** When a profiler shows a trivial hot loop taking far more of the sample time than its
+instruction count would suggest, there are three candidates: a cache miss
+([the memory hierarchy](/systems/memory-hierarchy/)), a dependency chain serialising the work,
+or an unpredictable branch. Distinguishing them without hardware performance counters — which
+many hosted and containerised environments simply do not expose — is a matter of changing one
+variable at a time and re-checking: shrink the working set to test the cache theory, split an
+accumulator into independent ones to test the dependency-chain theory, reorder the data to test
+the prediction theory. If reordering the data changes the outcome and nothing else did, it was
+prediction.
+
+**Data layout is a performance decision, not a tidiness decision.** If a hot loop filters
+records by status, whether that loop is cheap or expensive is decided upstream of the loop — by
+the query's `ORDER BY`, by the partition key, by whether you grouped records before iterating
+them. A predicate that is 50/50 on shuffled input and the same predicate on data that arrives
+sorted or grouped are two different loops even though the source code is identical.
+
+**Most branches in real code are already free, and it is worth knowing which.** Bounds checks,
+null checks, `is` type tests, and a loop's own back-edge are overwhelmingly one-directional in
+practice — the predictor locks onto them and they cost nothing once the loop is warm. That is
+part of why array bounds checking is cheap enough for .NET to leave on by default, and why
+deleting a null check is essentially never the optimisation that matters. The branches that
+genuinely cost are the ones whose answer varies on real data: a feature-flag check inside a
+per-item loop where the flag differs per item, a polymorphic dispatch over a mixed collection, a
+validity check on records that are roughly half valid.
+
+**The fix is almost always to move the branch, not to remove it.** Hoist an invariant condition
+out of a loop, split one loop into two so each is internally uniform, partition data so a
+predicate is constant within a partition, batch work by kind before processing it. Every one of
+those replaces many unpredictable per-element decisions with one predictable per-batch decision,
+and none of them requires the arithmetic tricks in
+[removing the branch](/systems/cpu-pipeline/branchless-rewrite/) — which trades a
+*data-dependent* cost for a *fixed* one, and is worth it only when the branch is genuinely
+unpredictable and the body around it is small.
+
+## the same idea in other languages
+
+| language | what it's called | the trap |
+| --- | --- | --- |
+| C / C++ | the same hardware, plus `__builtin_expect` and C++20's `[[likely]]`/`[[unlikely]]` | Those hints do not talk to the branch predictor — no x86-64 instruction does. They tell the *compiler* which path to lay out as the fall-through and which to push out of line. What actually removes a mispredict is the compiler deleting the branch entirely: `gcc -O2` on a simple byte-threshold sum compiles the branch to a `cmov` (no branch — verified in [removing the branch](/systems/cpu-pipeline/branchless-rewrite/)), and with a compile-time-constant loop bound it can go further and vectorise the whole thing, leaving no per-element decision at all — verified in [the sorted-array exercise](/systems/cpu-pipeline/sorted-array-branch/). Whether a branch survives compilation in C is a fact about your flags and your compiler's cost model, not about your CPU. |
+| Java | HotSpot, deciding per method at runtime, with a heuristic you do not control | The JIT (C1 first, then C2 if the method gets hot enough) can turn a small `? :` into a conditional move, but whether it does is a cost-model decision made per compilation, not a language guarantee — the same source can compile differently depending on how the method was warmed up. Assuming "the JIT already made this branchless" without checking the compiled output is the same trap C# programmers fall into with the ternary operator, one exercise over. |
+| Python (CPython) | your `if` is not a machine branch at all | A CPython `if` compiles to bytecode, dispatched one instruction at a time by the interpreter's own loop — an indirect jump through a table of handler addresses. The branch predictor is still there in the silicon, but it is predicting the *interpreter's* dispatch site for whatever bytecode happens to come next, not your source-level `if`. This is why the interpreter loop itself is written to give the predictor a fighting chance (computed gotos on the builds that support them), and why "optimise the branch" is a category error for Python code — the lever is executing less bytecode, full stop. |
+| JavaScript (V8) | a JIT decision, same shape as Java's | V8's optimising compiler (TurboFan) applies its own heuristics to conditionals, and — like HotSpot — will keep a real branch rather than a conditional move when its cost model says so. The same "check the compiled output, don't guess from the syntax" rule applies; V8's `--print-opt-code` is the equivalent of the `DOTNET_JitDisasm` used throughout this topic. |
+
+## exercises
+
+Both exercises start from the same three-line loop and neither one ever changes what it
+computes — only how predictable the decision inside it is, and whether that decision is made
+with a branch at all.
+
+<ProblemList topic="cpu-pipeline" />
+
+## interview drills
+
+**Q.** Sorting an array before a loop that filters it made the loop several times faster, and
+the loop does the same amount of work either way. What happened?
+
+- *weak answer* — "Cache locality, the sorted array is friendlier to the cache." Confident and
+  wrong: it is the same array, the same size, walked in the same order either way, and small
+  enough to sit in L1 regardless of order.
+- *strong answer* — The loop has a data-dependent branch. On sorted data the predicate goes one
+  way for the whole first stretch and the other way for the rest, so a history-indexed
+  predictor gets it right almost every time; on shuffled data it is close to a coin flip and
+  roughly half the branches flush the pipeline. Every flushed guess discards the work the core
+  had already started down the wrong path.
+- *follow-up* — "How would you check that instead of guessing?" Keep the data identical and
+  change only its order. If re-ordering the same values changes the running time, the mechanism
+  is prediction; if it does not, look at the cache instead.
+
+**Q.** A hot loop shows three instructions per element and yet takes far longer than three
+instructions' worth of time. Where does the gap usually live?
+
+- *weak answer* — "It must be memory." Sometimes true, but that is one of three usual suspects
+  and the cheapest one to test, not the automatic answer.
+- *strong answer* — Three candidates: a cache miss, a dependency chain serialising the loop, or
+  an unpredictable branch. Distinguish them by changing one variable at a time: shrink the
+  working set to isolate the cache, split a single accumulator into independent ones to isolate
+  a dependency chain, and reorder the data (same values, different order) to isolate
+  prediction.
+- *follow-up* — "What if the environment exposes no hardware performance counters?" Many
+  containers do not — `perf_event_open` simply fails for hardware events in a lot of hosted
+  environments. The technique above does not need counters: it changes the code or the data and
+  observes which change moves the needle, which is also the technique that works in production
+  when you have no counters to read either.
+
+**Q.** Should we rewrite this `if` as branchless arithmetic?
+
+- *weak answer* — "Yes, branches are expensive." They are not; *unpredictable* branches are. A
+  branchless rewrite pays its arithmetic cost on every element unconditionally, including every
+  element the branch would have skipped for free.
+- *strong answer* — Only when the branch is genuinely unpredictable on real data *and* the loop
+  body is small enough for a fixed extra cost per element to matter. The first move is almost
+  always to make the branch predictable instead — hoist it, split the loop, partition the data —
+  because that wins in every regime and keeps the code readable. Arithmetic branch elimination
+  is a narrow tool for a narrow case, worked through in
+  [removing the branch](/systems/cpu-pipeline/branchless-rewrite/).
+- *follow-up* — "Does the C# ternary operator dodge this for free?" No — check the compiled
+  output rather than trust the syntax. A ternary is control flow with a different spelling; the
+  runtime decides per call site whether it becomes a real branch or a conditional move, and
+  hoping is not a technique.
+
+**Q.** Why does splitting one accumulator into two independent ones speed up a summing loop,
+when it is doing strictly more bookkeeping?
+
+- *weak answer* — "The compiler unrolls it." Unrolling can be part of the story but does not by
+  itself explain a speedup — you can unroll a single dependent chain and it is still one chain.
+- *strong answer* — A single accumulator is a dependency chain: every addition has to wait for
+  the previous addition's result, so the loop can never run faster than one link of that chain
+  at a time, no matter how many arithmetic units the core has. Two independent accumulators are
+  two chains, and the out-of-order scheduler can have a link of each ready at once — verified on
+  this page by reading which physical registers the JIT actually assigned each chain to.
+- *follow-up* — "Where does this bite in real code?" Floating-point reductions, where the
+  compiler is *not* allowed to split the chain for you, because floating-point addition is not
+  associative and reordering it would change the answer. If you want the independent chains,
+  you write them yourself.
+
+**Q.** Your service behaves correctly on x64 and produces occasional wrong results on ARM.
+Where do you start looking?
+
+- *weak answer* — "ARM must have a bug" or "it's a compiler difference." Almost always wrong;
+  the actual cause is nearly always the memory model.
+- *strong answer* — Every core reorders loads and stores; x86-64's stronger ordering hides most
+  memory-model bugs by accident, and ARM's weaker ordering does not. Code with a genuine data
+  race that happens to "work" on x64 can fail on ARM64 without a single line changing. Look for
+  shared mutable state reached without `lock`, `Interlocked`, or `Volatile` — the reordering is
+  not a bug in either CPU, it is the same speculation this page describes, just less generous
+  about hiding the consequences.
+- *follow-up* — "So what actually makes it correct?" Establishing ordering explicitly:
+  [the memory model](/systems/memory-model/) covers acquire/release semantics, `volatile`, and
+  why `lock` gives you ordering without you ever having to reason about any of this directly.

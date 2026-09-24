@@ -1,0 +1,126 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: binary-search
+problem: classic-binary-search
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import Cells from '@components/Cells.astro';
+
+## task
+
+Given a **sorted** array of distinct integers and a `target`, return the index of `target`, or
+`-1` if it isn't present. Do it in O(log n).
+
+```text
+nums = [-1, 0, 3, 5, 9, 12, 20], target = 9  →  4
+```
+
+## how to think
+
+A linear scan is O(n) and never uses the fact that the array is sorted. Sorted order is
+information: compare `target` to the middle element, and the answer to that single comparison
+tells you which entire half of the array can be thrown away. If `nums[mid] < target`, every index
+at or before `mid` is too small to be the answer — gone. If `nums[mid] > target`, every index at
+or after `mid` is too big — gone. Either way you're left with a range half the size, and you
+repeat.
+
+That halving is the whole algorithm. Starting from n elements, you can halve at most `log2(n)`
+times before one element remains, so the loop runs in O(log n) — a 1,000,000-element array takes
+at most 20 comparisons.
+
+The one implementation detail worth saying out loud in an interview: compute the midpoint as
+`left + (right - left) / 2`, not `(left + right) / 2`. The second form can overflow a 32-bit `int`
+when `left` and `right` are both huge; the first never adds two values that are each already
+within bounds.
+
+<Callout kind="note" label="template instance">
+  **Exact-match** skeleton, verbatim — this problem *is* the template. Invariant: if `target` is
+  present, its index always lies within `[left, right]`. Move rule: `nums[mid] < target` →
+  `left = mid + 1`; `nums[mid] > target` → `right = mid - 1`; equal → return `mid` immediately.
+</Callout>
+
+## solution
+
+```csharp
+public int Search(int[] nums, int target)
+{
+    int left = 0, right = nums.Length - 1;
+
+    while (left <= right)
+    {
+        int mid = left + (right - left) / 2;   // overflow-safe midpoint
+        if (nums[mid] == target) return mid;
+
+        if (nums[mid] < target) left = mid + 1;   // nums[mid] and everything left of it is too small
+        else right = mid - 1;                     // nums[mid] and everything right of it is too big
+    }
+
+    return -1;                                 // target isn't in nums
+}
+```
+
+## trace
+
+`nums = [-1, 0, 3, 5, 9, 12, 20]`, `target = 9`:
+
+| step | L | R | mid | nums[mid] | verdict | move |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | 0 | 6 | 3 | 5 | `5 < 9` — too small | `left = 4` |
+| 2 | 4 | 6 | 5 | 12 | `12 > 9` — too big | `right = 4` |
+| 3 | 4 | 4 | 4 | 9 | hit | return `4` |
+
+Step 1 — the middle element is too small, so it and everything before it is eliminated in one move:
+
+<Cells
+  data={[-1, 0, 3, 5, 9, 12, 20]}
+  pointers={{ 0: [{ t: 'L', c: 'amber' }], 3: [{ t: 'M', c: 'purple' }], 6: [{ t: 'R', c: 'cyan' }] }}
+  cells={{ 3: 'warn' }}
+  caption="mid = 3: nums[mid] = 5 < 9 → indices 0-3 can't hold the target"
+/>
+
+Step 3 — after the second comparison narrows the range to a single index, that index is the answer:
+
+<Cells
+  data={[-1, 0, 3, 5, 9, 12, 20]}
+  pointers={{ 4: [{ t: 'hit', c: 'green' }] }}
+  cells={{ 0: 'dim', 1: 'dim', 2: 'dim', 3: 'dim', 4: 'ok', 5: 'dim', 6: 'dim' }}
+  caption="left = right = mid = 4 — found 9 in three comparisons over seven elements"
+/>
+
+## why it works
+
+The invariant "if `target` is in `nums`, its index is always inside `[left, right]`" holds at
+every step, because the only indices ever discarded are ones a comparison has proven can't be the
+answer. `mid` sits strictly between `left` and `right` whenever more than one element remains, so
+the range's size at least halves every iteration. It can't shrink forever without hitting either
+an empty range (`left > right`, target absent) or a single surviving index (which, by the
+invariant, must be the target if one exists) — so the loop terminates with a correct answer either
+way.
+
+<Watch items={[['time', 'O(log n)'], ['space', 'O(1)']]} />
+
+## common bugs
+
+- Using `while (left < right)` here instead of `while (left <= right)` — that skips checking the
+  case where exactly one candidate index remains, silently missing a target that's the very last
+  survivor.
+- `(left + right) / 2` instead of `left + (right - left) / 2` — the textbook overflow bug on huge
+  arrays; worth naming even though `nums.Length` rarely gets close to `int.MaxValue / 2` in
+  practice.
+- Moving both pointers, or moving the "wrong" one — each comparison licenses discarding exactly
+  one side; discard the other and you can throw away the actual answer.
+- Assuming duplicates: LC 704 guarantees distinct values. If duplicates are in play and you need
+  a *specific* occurrence, this exact form won't tell you which one you landed on — see
+  [Find First and Last Position](/patterns/binary-search/first-and-last-position/).
+
+## variants you can now solve
+
+- **[Find First and Last Position](/patterns/binary-search/first-and-last-position/)** (LC 34) —
+  same array shape, but duplicates exist and you want a boundary, not just any hit.
+- **[Search in Rotated Sorted Array](/patterns/binary-search/search-rotated-array/)** (LC 33) —
+  the same exact-match shape, with an extra "which half is actually sorted" decision before the
+  usual comparison.
+- **Search Insert Position** (LC 35) — the *boundary* form of this same array: return where
+  `target` would go if it isn't present.

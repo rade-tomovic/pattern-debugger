@@ -1,0 +1,236 @@
+---
+layout: '@layouts/TopicLayout.astro'
+topic: pattern-recognition
+---
+
+import Callout from '@components/Callout.astro';
+import Cells from '@components/Cells.astro';
+
+## core idea
+
+You don't *derive* the right pattern under interview pressure — you **recognize** it, and
+recognition runs on signals: a handful of words and constraints that name the pattern before
+you've written a line of code. This page is the lookup table for that skill. Read every problem
+statement in three passes:
+
+- **input shape** — sorted array? tree? grid? linked list? intervals? a stream?
+- **question shape** — find one thing, find the longest/shortest, count the ways, enumerate
+  *all* of them, or order by dependency?
+- **constraints** — "contiguous", "in-place", `O(log n)` demanded, the size of n. Constraints
+  are the strongest signal of the three: they exist to rule patterns *out*.
+
+<Callout kind="insight" label="let n set the bar">
+  The constraint block tells you the target complexity before you've read the story. `n ≤ 20`
+  → exponential is *allowed*, think [backtracking](/patterns/backtracking/). `n ≤ ~5,000` →
+  O(n²) survives, a nested loop or 2D [DP](/patterns/dynamic-programming/) is fine. `n ≥ 10⁵`
+  → you need O(n log n) or O(n), so brute force is off the table and one of the linear
+  patterns is the intended answer. And if the input arrives **already sorted**, that's not
+  trivia — someone spent effort telling you, and they want it used.
+</Callout>
+
+## the master table
+
+One row per pattern: the signal that names it, the first question that starts your solution,
+and the cleanest problem to re-read when the row feels shaky.
+
+| the signal | pattern | first question to ask yourself | canonical problem |
+| --- | --- | --- | --- |
+| sorted input + pair/triple/range question, or "in-place" / O(1) space | [Two Pointers](/patterns/two-pointers/) | which move discards candidates without ever discarding the answer? | [Two Sum II](/patterns/two-pointers/two-sum-ii/) |
+| "have I seen this before?", "count occurrences", "group these" — on unsorted data | [HashMap](/patterns/hashmap/) | what key, stored earlier, would answer this in O(1) right now? | [Two Sum](/patterns/hashmap/two-sum/) |
+| longest/shortest **contiguous** substring or subarray meeting a condition | [Sliding Window](/patterns/sliding-window/) | is validity monotonic — does expanding only break it and shrinking only fix it (or the reverse)? | [Longest Substring Without Repeating](/patterns/sliding-window/longest-substring-without-repeating/) |
+| sorted data — or any yes/no question that flips exactly once over a range | [Binary Search](/patterns/binary-search/) | what condition reads false…false…true…true, and where is the flip? | [Classic Binary Search](/patterns/binary-search/classic-binary-search/) |
+| grid or graph: "shortest path" / "minimum moves" → BFS, "all of the region" → DFS | [BFS & DFS](/patterns/bfs-dfs/) | do I need the *nearest* thing (queue) or *everything reachable* (recursion/stack)? | [Number of Islands](/patterns/bfs-dfs/number-of-islands/) |
+| a binary tree where each node's answer combines its children's answers | [Trees & Traversals](/patterns/tree-traversals/) | which traversal visits nodes when I need them — and is it secretly postorder? | [Maximum Depth](/patterns/tree-traversals/maximum-depth/) |
+| `ListNode` input: middle, cycle, kth-from-end, in-place rewiring | [Linked Lists](/patterns/linked-lists/) | do fast/slow pointers or a dummy head delete the special cases? | [Reverse Linked List](/patterns/linked-lists/reverse-linked-list/) |
+| repeated range-sum queries, in-place partitioning, matrix walks | [Array Techniques](/patterns/array-techniques/) | can one or two precomputed passes replace the nested loop? | [Maximum Subarray](/patterns/array-techniques/maximum-subarray/) |
+| nesting, matching, "most recent unresolved thing", "next greater" | [Stack & Queue](/patterns/stack-queue/) | what is waiting to be resolved — and is the wait last-in, first-out? | [Valid Parentheses](/patterns/stack-queue/valid-parentheses/) |
+| "top K", "Kth largest", "K closest", "median of a stream" | [Heap & Top-K](/patterns/heap-top-k/) | do I need the K best (heap of size K) or the full order (sort)? | [Kth Largest Element](/patterns/heap-top-k/kth-largest-element/) |
+| many words + prefix queries: "starts with", autocomplete, word dictionaries | [Trie](/patterns/trie/) | am I asking prefix questions against a fixed word set, repeatedly? | [Implement Trie](/patterns/trie/implement-trie/) |
+| "return **all** combinations / permutations / subsets / paths" — enumerate, not count | [Backtracking](/patterns/backtracking/) | what is one choice, and how do I un-make it on the way back up? | [Subsets](/patterns/backtracking/subsets/) |
+| "how many ways", "minimum cost", "longest non-contiguous…" — count or optimize over overlapping choices | [Dynamic Programming](/patterns/dynamic-programming/) | what state makes the rest of the problem forget how I got here? | [Climbing Stairs](/patterns/dynamic-programming/climbing-stairs/) |
+| dependency order, components without traversal, *weighted* shortest path | [Advanced Graphs](/patterns/advanced-graphs/) | is this ordering (topo sort), grouping (union-find), or weighted distance (Dijkstra)? | [Course Schedule](/patterns/advanced-graphs/course-schedule/) |
+| one irreversible pass of "take the best now" feels like it should work | [Greedy](/patterns/greedy/) | can I argue no-regret — would swapping my choice for any other ever help? | [Best Time to Buy and Sell Stock](/patterns/greedy/best-time-to-buy-sell-stock/) |
+| meetings, bookings, ranges that overlap or merge | [Intervals](/patterns/intervals/) | sort by start (to merge) or by end (to select the most)? | [Merge Intervals](/patterns/intervals/merge-intervals/) |
+| "everything appears twice except…", parity games, O(1) space where a set feels natural | [Bit Manipulation](/patterns/bit-manipulation/) | does XOR cancellation or `n & (n - 1)` map onto the structure? | [Single Number](/patterns/bit-manipulation/single-number/) |
+
+When two rows fire at once — sorted input *and* a pair question lights up both Two Pointers and
+Binary Search — the first-question column is the tiebreak: whichever question you can actually
+answer is your pattern. The most common collision, pointers vs hashmap on pair sums, is big
+enough to have [its own page](/deep-dives/two-sum-family/).
+
+<Callout kind="tip" label="the drill">
+  Cover the pattern column with your hand. Read a signal, say the pattern and the first
+  question out loud, then check. Ten minutes of this the night before an interview is worth
+  more than solving two more problems — naming the pattern in the first minute is what buys
+  you the other thirty-nine.
+</Callout>
+
+## keyword quick-scan
+
+The master table works top-down from structure. This one works bottom-up from vocabulary —
+the give-away words that appear verbatim in statements:
+
+| you read | you think |
+| --- | --- |
+| "sorted" | [binary search](/patterns/binary-search/) if searching, [two pointers](/patterns/two-pointers/) if pairing |
+| "contiguous", "substring", "subarray" | [sliding window](/patterns/sliding-window/) — or [prefix sums](/patterns/array-techniques/range-sum-query/) when negatives are allowed |
+| "in-place", "constant extra space" | [two pointers](/patterns/two-pointers/) — or [XOR](/patterns/bit-manipulation/) if it's about counting |
+| "duplicate", "seen before", "frequency", "group" | [hashmap](/patterns/hashmap/) |
+| "top K", "Kth", "closest", "most frequent" | [heap](/patterns/heap-top-k/) — quickselect and buckets as the follow-up |
+| "all possible", "generate every", "return all" | [backtracking](/patterns/backtracking/) |
+| "how many ways", "fewest", "minimum total cost" | [dynamic programming](/patterns/dynamic-programming/) |
+| "shortest path", "minimum moves", "nearest exit" | [BFS](/patterns/bfs-dfs/) — [Dijkstra](/patterns/advanced-graphs/) once edges carry weights |
+| "islands", "regions", "connected", "provinces" | flood fill via [BFS/DFS](/patterns/bfs-dfs/), or [union-find](/patterns/advanced-graphs/) |
+| "prerequisites", "build order", "depends on" | topological sort — [advanced graphs](/patterns/advanced-graphs/) |
+| "valid parentheses", "nested", "undo the last" | [stack](/patterns/stack-queue/) |
+| "next greater", "next warmer", "days until" | monotonic [stack](/patterns/stack-queue/daily-temperatures/) |
+| "prefix", "starts with", "autocomplete" | [trie](/patterns/trie/) |
+| "meetings", "rooms", "overlapping bookings" | [intervals](/patterns/intervals/) |
+| "appears exactly once", "missing number" | [XOR](/patterns/bit-manipulation/) — [hashset](/patterns/hashmap/) if space is free |
+| "minimum speed / capacity / days such that…" | [binary search on the answer](/patterns/binary-search/koko-eating-bananas/) |
+| "stream", "running", "online queries" | [heaps](/patterns/heap-top-k/) — or a design combo like [LRU Cache](/patterns/linked-lists/lru-cache/) |
+
+<Callout kind="trap" label="keywords lie">
+  A keyword buys you a *hypothesis*, not a verdict. "Sorted" doesn't force binary search —
+  [Two Sum II](/patterns/two-pointers/two-sum-ii/) never bisects anything. "Subarray" doesn't
+  force a window — one negative number breaks the shrink logic, and
+  [Subarray Sum Equals K](/patterns/hashmap/subarray-sum-equals-k/) needs prefix sums instead.
+  Always test the hypothesis against the first-question column before you commit code to it.
+</Callout>
+
+## worked examples
+
+Three problems with no page on this site, classified cold using nothing but the tables above.
+This is the loop to run on every problem you meet from now on.
+
+### 1 — squares of a sorted array (LC 977)
+
+Given an array sorted ascending — possibly containing negatives — return the squares of all
+elements, also sorted ascending, in O(n).
+
+```text
+nums = [-4, -1, 0, 3, 10]  →  [0, 1, 9, 16, 100]
+```
+
+Signal extraction: **"sorted"** fires two rows — but we aren't *searching* for anything, so
+binary search is out and Two Pointers is in. **"O(n)"** kills the lazy answer (square
+everything, `Array.Sort` — O(n log n)); the follow-up is the real question. The wrinkle is the
+negatives: squaring scrambles the middle of the array but not the ends — the largest square
+must sit at one **end** of the input. That's the opposite-ends discard argument from the
+[Two Pointers template](/patterns/two-pointers/): compare the two end squares, and the larger
+one can be committed immediately, because nothing between the pointers can beat it.
+
+<Cells
+  data={[-4, -1, 0, 3, 10]}
+  pointers={{ 0: [{ t: 'L', c: 'amber' }], 4: [{ t: 'R', c: 'cyan' }] }}
+  caption="16 vs 100 — the right end owns the last output slot, and R steps inward"
+/>
+
+```csharp
+public int[] SortedSquares(int[] nums)
+{
+    int n = nums.Length;
+    var result = new int[n];
+    int left = 0, right = n - 1;
+
+    for (int write = n - 1; write >= 0; write--)   // biggest square sits at an END — fill backward
+    {
+        int l = nums[left] * nums[left], r = nums[right] * nums[right];
+        if (l > r) { result[write] = l; left++; }
+        else       { result[write] = r; right--; }
+    }
+    return result;
+}
+```
+
+O(n) time, O(n) for the output you were asked to produce. The recognition took three signals
+and about twenty seconds; the code is the opposite-ends skeleton writing into an output array
+instead of returning a pair.
+
+### 2 — minimum size subarray sum (LC 209)
+
+Given an array of **positive** integers and a `target`, return the length of the shortest
+contiguous subarray whose sum is at least `target`, or 0 if none exists.
+
+```text
+nums = [2, 3, 1, 2, 4, 3], target = 7  →  2   (the subarray [4, 3])
+```
+
+Signal extraction: **"shortest contiguous subarray"** is the [Sliding Window](/patterns/sliding-window/)
+row almost verbatim — and "shortest" selects the discipline: *shrink while VALID, record while
+shrinking*. Now the first question — is validity monotonic? Yes, and the word doing the work is
+**"positive"**: expanding can only raise the sum, shrinking can only lower it, so `sum >= target`
+flips cleanly as the window moves. That word is load-bearing. Allow one negative number and
+monotonicity dies — the window pattern would silently return wrong answers, and you're in
+prefix-sum territory: the [Subarray Sum Equals K](/patterns/hashmap/subarray-sum-equals-k/)
+world for the equals-`k` question. The at-least-`k` version with negatives (LC 862) is a step
+further still — prefix sums alone aren't enough, it needs a monotonic deque on top.
+
+```csharp
+public int MinSubArrayLen(int target, int[] nums)
+{
+    int best = int.MaxValue, sum = 0, left = 0;
+
+    for (int right = 0; right < nums.Length; right++)
+    {
+        sum += nums[right];                        // expand — every element enters once
+        while (sum >= target)                      // shortest → shrink while VALID
+        {
+            best = Math.Min(best, right - left + 1);
+            sum -= nums[left++];                   // record, then give up the left edge
+        }
+    }
+    return best == int.MaxValue ? 0 : best;
+}
+```
+
+On the example, the first valid window is `[2, 3, 1, 2]`; the answer `[4, 3]` is found during
+the final shrink — which is exactly why the record-then-shrink order matters. Every element
+enters and leaves the window at most once: O(n) time, O(1) space.
+
+### 3 — find peak element (LC 162)
+
+Given an array where `nums[i] != nums[i + 1]` for all neighbors, return the index of **any**
+peak — an element greater than both neighbors (treat the edges as having −∞ outside). Required:
+O(log n).
+
+```text
+nums = [1, 2, 1, 3, 5, 6, 4]  →  5   (nums[5] = 6 beats both neighbors)
+```
+
+Signal extraction: the array is **not sorted**, yet the constraint demands **O(log n)** — this
+is the row-four signal that trips almost everyone, because the table's phrasing is "sorted *or*
+a yes/no question with a flip", and the second half is what fires here. Ask the first question:
+what can I check at `mid` that tells me which half to keep? The slope. If
+`nums[mid] < nums[mid + 1]` you're on an uphill — and an uphill *must* end in a peak before the
+array runs out, so a peak certainly exists to the right. Otherwise `mid` is on a downhill or is
+itself a peak, so a peak certainly exists at or left of `mid`. Either way one comparison
+discards half the array while the invariant "a peak lies in `[left, right]`" survives — the
+same boundary form as [Find Minimum in Rotated Sorted Array](/patterns/binary-search/find-minimum-rotated/).
+
+```csharp
+public int FindPeakElement(int[] nums)
+{
+    int left = 0, right = nums.Length - 1;
+
+    while (left < right)                           // boundary template: converge on the flip
+    {
+        int mid = left + (right - left) / 2;
+        if (nums[mid] < nums[mid + 1])
+            left = mid + 1;                        // uphill to the right — a peak is that way
+        else
+            right = mid;                           // mid may BE the peak — never discard it
+    }
+    return left;
+}
+```
+
+On the example this converges to index 5. Note `right = mid`, not `mid - 1` — the classic
+boundary-template detail, because `mid` might be the answer; and `left = mid + 1` is safe
+precisely because `nums[mid]` is strictly smaller than its right neighbor, so `mid` cannot be
+a peak. O(log n) time, O(1) space.
+
+That's the whole skill: signals in, pattern out, first question answered — *then* code. The
+[master cheat sheet](/reference/cheat-sheet/) is this page compressed to one screen for the
+night before; day 7 of the [study plan](/reference/study-plan/) is where you come back and run
+the drill for real.

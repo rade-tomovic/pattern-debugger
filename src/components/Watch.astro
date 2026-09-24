@@ -1,0 +1,20 @@
+---
+/**
+ * Debugger watch panel: a row of `name = value` chips.
+ * Used for complexity (time/space), loop invariants, live state.
+ */
+interface Props {
+  items: [string, string | number][];
+}
+const { items } = Astro.props;
+---
+
+<div class="flex flex-wrap gap-1.5">
+  {
+    items.map(([k, v]) => (
+      <div class="watch-chip">
+        <b>{k}</b> = {v}
+      </div>
+    ))
+  }
+</div>

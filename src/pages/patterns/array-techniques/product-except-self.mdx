@@ -1,0 +1,129 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: array-techniques
+problem: product-except-self
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import Cells from '@components/Cells.astro';
+
+## task
+
+Given an array `nums`, return an array `answer` where `answer[i]` is the product of every
+element in `nums` **except** `nums[i]`. Do it without division, in O(n) time.
+
+```text
+nums = [1, 2, 3, 4]  →  [24, 12, 8, 6]
+```
+
+## how to think
+
+The tempting shortcut — compute the total product, then divide by `nums[i]` for each answer —
+breaks the moment any element is `0` (and breaks worse if two are). Division is off the table,
+so `answer[i]` has to be built from a product that genuinely skips over `nums[i]`, which means
+combining "everything before `i`" with "everything after `i`" *without multiplying by `nums[i]`
+itself*.
+
+Compute both halves as their own passes. A prefix pass gives `answer[i]` = the product of
+everything strictly before `i` — this is the prefix-sum template with multiplication standing
+in for addition. A second pass, walking **backward**, folds in the product of everything
+strictly after `i`. Run the second pass over the same output array and there's no second array
+needed: `answer[i]` already holds the prefix product when the suffix pass reaches it, so
+multiplying in a running suffix product finishes the job in place.
+
+<Callout kind="note" label="template instance">
+  **Prefix sum** skeleton, run twice — once forward building prefix products into `answer`,
+  once backward folding in a running suffix product. Invariant after the forward pass:
+  `answer[i]` = product of `nums[0..i)`. Invariant after the backward pass: `answer[i]` =
+  product of everything except `nums[i]`.
+</Callout>
+
+## solution
+
+```csharp
+public int[] ProductExceptSelf(int[] nums)
+{
+    int n = nums.Length;
+    int[] answer = new int[n];
+
+    answer[0] = 1;                                      // product of zero elements
+    for (int i = 1; i < n; i++)
+        answer[i] = answer[i - 1] * nums[i - 1];         // prefix product of everything before i
+
+    int suffix = 1;
+    for (int i = n - 1; i >= 0; i--)
+    {
+        answer[i] *= suffix;                             // fold in everything after i
+        suffix *= nums[i];                               // extend the suffix product to include i
+    }
+    return answer;
+}
+```
+
+## trace
+
+`nums = [1, 2, 3, 4]` — forward pass (prefix products):
+
+| i | answer[i - 1] * nums[i - 1] | answer[i] |
+| --- | --- | --- |
+| 1 | 1 * 1 = 1 | 1 |
+| 2 | 1 * 2 = 2 | 2 |
+| 3 | 2 * 3 = 6 | 6 |
+
+After the forward pass: `answer = [1, 1, 2, 6]` (`answer[0] = 1` by the sentinel).
+
+<Cells
+  data={[1, 1, 2, 6]}
+  caption="after the forward pass — answer[i] is the product of everything strictly before i"
+/>
+
+Backward pass (fold in the suffix product, `suffix` starts at 1):
+
+| i | answer[i] *= suffix | suffix *= nums[i] | answer (after) |
+| --- | --- | --- | --- |
+| 3 | 6 * 1 = 6 | 1 * 4 = 4 | `[1, 1, 2, 6]` |
+| 2 | 2 * 4 = 8 | 4 * 3 = 12 | `[1, 1, 8, 6]` |
+| 1 | 1 * 12 = 12 | 12 * 2 = 24 | `[1, 12, 8, 6]` |
+| 0 | 1 * 24 = 24 | 24 * 1 = 24 | `[24, 12, 8, 6]` |
+
+<Cells
+  data={[24, 12, 8, 6]}
+  cells={{ 0: 'ok', 1: 'ok', 2: 'ok', 3: 'ok' }}
+  caption="final: each answer[i] is a prefix product and a suffix product, never touching nums[i]"
+/>
+
+## why it works
+
+`answer[i]` after the forward pass holds the product of `nums[0..i)` — everything before `i`.
+The backward pass walks from the end, carrying `suffix`, the running product of everything seen
+so far on that walk (initially nothing, then `nums[n-1]`, then `nums[n-1] * nums[n-2]`, and so
+on). At index `i`, `suffix` holds exactly the product of `nums[(i+1)..n)` — everything after
+`i` — because `i` itself hasn't been folded into `suffix` yet (that happens right after,
+extending it for the *next* iteration). Multiplying the two halves together at `answer[i]`
+gives the product of every element except `nums[i]`, and neither pass ever divides by anything.
+
+<Watch items={[['time', 'O(n)'], ['space', 'O(1) extra'], ['passes', '2']]} />
+
+## common bugs
+
+- Reaching for division (`total / nums[i]`) — fails outright on any `0` in the input, and fails
+  *silently wrong* if there are two zeros (every `answer[i]` should be `0`, but the division
+  path can't even compute `total`).
+- Forgetting the `answer[0] = 1` / `suffix = 1` sentinels — the product of zero elements is 1,
+  not 0; seeding with 0 zeroes out the entire result.
+- Extending `suffix` before multiplying it into `answer[i]` — that folds `nums[i]` into its own
+  answer, which is exactly the value the problem excludes.
+- Allocating a second output array for the suffix pass "to be safe" — the whole point of
+  folding the second pass into the same array is O(1) *extra* space (the output array itself
+  doesn't count against that).
+
+## variants you can now solve
+
+- **[Trapping Rain Water](/patterns/two-pointers/trapping-rain-water/)** (LC 42) — the same
+  prefix/suffix shape (`maxLeft[i]` and `maxRight[i]`), collapsed from two arrays into two
+  converging pointers.
+- **Candy** (LC 135) — the same left-to-right-then-right-to-left two-pass idiom, applied to a
+  greedy "more candy than both neighbors" constraint instead of a running product.
+- **Maximum Product Subarray** (LC 152) — a different family (contiguous subarrays, one pass,
+  tracking running max *and* min) that's easy to confuse with this one on first read.

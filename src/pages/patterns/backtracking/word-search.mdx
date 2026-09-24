@@ -1,0 +1,152 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: backtracking
+problem: word-search
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+
+## task
+
+Given an `m x n` grid of letters and a `word`, return whether `word` can be traced by moving
+between horizontally or vertically adjacent cells, without using the same cell twice within one
+trace.
+
+```text
+board = [['A','B'],['C','D']], word = "ABDC"  →  true   (A -> B -> D -> C, one loop around)
+```
+
+## how to think
+
+Every backtracking problem so far chose from an array. Here the "choice list" is **up to 4
+neighbor cells** — up, down, left, right of wherever you currently stand — and the thing you're
+building isn't a subset or a sequence, it's a *path* through the grid that spells `word` one
+character at a time. The recursion is still choose → explore → un-choose; only the shape of
+"choice" changed.
+
+"No cell twice within one trace" is the part that needs state, and a grid gives you a trick
+Subsets and Permutations didn't have: you don't need a separate `visited` set at all. Overwrite
+the cell you're standing on with a sentinel character (anything that can't appear in `word`,
+`'#'` works), recurse into the neighbors, then **restore the original letter before returning** —
+the board itself *is* the visited-tracking structure, and restoring it is the un-choose step.
+Skip a cell whose letter doesn't match `word[i]`, or that's out of bounds, or that's currently the
+sentinel (meaning you're already standing on it earlier in this same trace) — all three collapse
+into one guard.
+
+<Callout kind="note" label="template instance">
+  **Grid DFS** shape: the choice list is the 4 neighbors of `(r, c)`; `IsValid` is "in bounds,
+  matches `word[i]`, not the sentinel." Invariant: every cell currently marked `'#'` is exactly
+  the set of cells on the current path from the trace's start to `(r, c)`. `IsComplete` is
+  `i == word.Length`, checked *before* touching the grid — an empty remaining word is always a
+  match regardless of what cell you're on.
+</Callout>
+
+## solution
+
+```csharp
+public bool Exist(char[][] board, string word)
+{
+    int rows = board.Length, cols = board[0].Length;
+
+    bool Dfs(int r, int c, int i)
+    {
+        if (i == word.Length) return true;                                           // matched every char
+        if (r < 0 || r >= rows || c < 0 || c >= cols || board[r][c] != word[i])
+            return false;                                                             // out of bounds, mismatch, or already on this path
+
+        char saved = board[r][c];
+        board[r][c] = '#';                 // mark visited by mutating the board — choose
+
+        bool found = Dfs(r + 1, c, i + 1) || Dfs(r - 1, c, i + 1) ||
+                     Dfs(r, c + 1, i + 1) || Dfs(r, c - 1, i + 1);
+
+        board[r][c] = saved;               // un-choose: restore before returning, success or not
+
+        return found;
+    }
+
+    for (int r = 0; r < rows; r++)
+        for (int c = 0; c < cols; c++)
+            if (Dfs(r, c, 0)) return true;
+
+    return false;
+}
+```
+
+## trace
+
+`board = [['A','B'],['C','D']]`, `word = "ABDC"` — small on purpose, so the full call tree fits:
+
+```text
+A B          start at (0,0)='A', trace: A -> B -> D -> C
+C D          (a loop that visits all 4 cells exactly once)
+```
+
+Every `Dfs` call the outer scan makes — it starts at `(0,0)` and never needs a second start cell,
+because this trace succeeds on the first try:
+
+| call | `(r,c,i)` | check | result |
+| --- | --- | --- | --- |
+| 1 | (0,0,0) | `board[0][0]='A'` = `word[0]='A'` | match — mark `#`, explore neighbors |
+| 2 | (1,0,1) | `board[1][0]='C'` ≠ `word[1]='B'` | mismatch → `false` |
+| 3 | (−1,0,1) | row `−1` | out of bounds → `false` |
+| 4 | (0,1,1) | `board[0][1]='B'` = `word[1]='B'` | match — mark `#`, explore neighbors |
+| 5 | (1,1,2) | `board[1][1]='D'` = `word[2]='D'` | match — mark `#`, explore neighbors |
+| 6 | (2,1,3) | row `2` | out of bounds → `false` |
+| 7 | (0,1,3) | `board[0][1]='#'` ≠ `word[3]='C'` | **the sentinel trap**: this cell is on the current path → `false` |
+| 8 | (1,2,3) | col `2` | out of bounds → `false` |
+| 9 | (1,0,3) | `board[1][0]='C'` = `word[3]='C'` | match — mark `#`, explore; its first neighbor (call 10) returns `true` |
+| 10 | (2,0,4) | `i == word.Length` | base case → **`true`** |
+
+Call 9's own `||` chain short-circuits after its first neighbor (call 10, the down direction)
+returns `true`, so it never tries up, right, or left — same as call 4's chain, which skipped its
+remaining three neighbors the same way once call 5 (its first neighbor, down) succeeded. Call 9
+unmarks `(1,0)` and returns `true`; call 5 unmarks `(1,1)` and returns `true`; call 4 unmarks
+`(0,1)` and returns `true`; call 1 unmarks `(0,0)` and returns `true`. The board ends the call
+exactly as it started —
+`[['A','B'],['C','D']]` — because every mark was paired with an unmark on the way back out,
+even on the success path.
+
+Call 7 is the row that matters most: `(0,1)` is `'B'`, and `word[3]` is `'C'` — those don't
+match anyway, but even if they *did*, the sentinel `'#'` sitting in `board[0][1]` would still
+reject it, because `(0,1)` is already spent on this trace (it supplied the `'B'` at `i=1`).
+
+## why it works
+
+The invariant is: at any point during `Dfs(r, c, i)`, the cells currently holding `'#'` are
+exactly the cells on the path from the trace's start to `(r, c)` — no more, no less. Marking on
+entry and restoring on exit maintains that invariant across every call, including failed ones, so
+a sibling branch never sees a stale mark left over from a branch that didn't pan out. Because the
+sentinel can never equal a real letter, revisiting a used cell always fails the `board[r][c] !=
+word[i]` check — which is exactly the "no repeats" rule the problem asks for, enforced without a
+second data structure.
+
+<Watch items={[['time', 'O(rows · cols · 3^L)'], ['space', 'O(L) recursion stack, O(1) extra — the board is reused as the visited set']]} />
+
+## common bugs
+
+- Restoring the cell *only* on the failure path (`if (!found) board[r][c] = saved;`) instead of
+  unconditionally — looks like a harmless optimization, but it leaves the sentinel marks on the
+  board after a *successful* search, handing the caller a corrupted grid the moment anything
+  searches that board again (Word Search II's multi-word loop, for instance). Always restore
+  before returning, success or not.
+- Using a separate `bool[,] visited` array instead of mutating the board — not wrong, but doubles
+  the state you have to keep synchronized, and it's the one thing this specific problem lets you
+  avoid.
+- Checking `i == word.Length` *after* the bounds/mismatch check instead of before — reorders two
+  independent guards, but on the last character it means you index `word[word.Length]` first,
+  which throws.
+- Off-by-one on `rows`/`cols` — using `board.Length` for columns or `board[0].Length` for rows
+  when the grid isn't square silently swaps the bounds check for one axis.
+
+## variants you can now solve
+
+- **[Word Search II](/patterns/trie/word-search-ii/)** (LC 212) — same board DFS, but searching
+  for many words at once; a trie turns "check word by word" into "prune the whole search the
+  moment no remaining word shares this prefix."
+- **Sudoku Solver** (LC 37) — grid backtracking where the goal is *filling* cells under row/
+  column/box constraints instead of *matching* a fixed string; the mark/unmark discipline is
+  identical, `IsValid` just checks three rules instead of one.
+- **Path with Maximum Gold** (LC 1219) — same 4-direction grid DFS with mark/unmark, but instead
+  of returning as soon as one path succeeds, every full path is explored and the best sum wins.

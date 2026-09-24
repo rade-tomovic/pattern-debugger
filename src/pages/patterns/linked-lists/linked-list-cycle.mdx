@@ -1,0 +1,108 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: linked-lists
+problem: linked-list-cycle
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+
+## task
+
+Given the `head` of a linked list, determine whether it contains a cycle — some node's `Next`
+eventually points back to a node already visited, so a naive walk would never terminate.
+
+```text
+head: 3 -> 2 -> 0 -> -4 -> (back to the node valued 2)   →   true
+```
+
+## how to think
+
+The obvious fix is a `HashSet` of visited node references: walk once, and the moment you see a
+node twice, you've found the cycle — O(n) space. You can do it in O(1) space with the same trick
+that finds the middle: two pointers at different speeds. If there's no cycle, the fast one simply
+reaches `null` first and you're done. If there *is* a cycle, the fast pointer wraps around and
+enters the loop again while the slow one is still walking through it for the first time — and
+once both pointers are inside the cycle, the fast one gains exactly one position on the slow one
+every step, so it is mathematically guaranteed to lap it and land on the exact same node.
+
+<Callout kind="note" label="template instance">
+  **Fast/slow** skeleton again — identical code to finding the middle, different question asked
+  of it. Same invariant while there's no cycle; once a cycle exists, the invariant that matters
+  is *"the gap between fast and slow shrinks by exactly one node every step."*
+</Callout>
+
+## solution
+
+```csharp
+public bool HasCycle(ListNode? head)
+{
+    ListNode? slow = head, fast = head;
+
+    while (fast != null && fast.Next != null)
+    {
+        slow = slow!.Next;
+        fast = fast.Next.Next;
+        if (slow == fast) return true;   // reference equality — same node, not same value
+    }
+    return false;
+}
+
+// standard interview definition
+public class ListNode(int val = 0, ListNode? next = null)
+{
+    public int Val = val;
+    public ListNode? Next = next;
+}
+```
+
+## trace
+
+`head: 3 -> 2 -> 0 -> -4`, with the tail (`-4`) pointing back to the node valued `2`:
+
+```text
+3 -> 2 -> 0 -> -4
+     ^-----------|
+```
+
+| step | slow | fast |
+| --- | --- | --- |
+| start | 3 | 3 |
+| 1 | 2 | 0 |
+| 2 | 0 | 2 |
+| 3 | -4 | -4 |
+
+At step 3, `slow` and `fast` are the *same node* (`-4`) — `slow == fast` returns `true`. Notice
+that after the first move, the pointers never occupy the same node until `-4` — the meeting point
+is wherever the gap first hits zero, not necessarily the cycle's start.
+
+## why it works
+
+Say `slow` enters the cycle after some number of steps, and the cycle has length `L`. From that
+point on, every iteration slow's position (mod `L`) increases by 1 and fast's by 2, so the gap
+`(slow's position − fast's position) mod L` — the distance fast still has to close — **decreases
+by exactly 1 every step**: fast gains a net one node on slow each iteration. A gap that starts
+somewhere in `[0, L)` and shrinks by 1 per step must hit exactly `0` within at most `L` iterations.
+When it does, `slow == fast`. If there is no cycle, `fast` simply runs off the end and the loop
+guard stops it — no collision, no cycle.
+
+<Watch items={[['time', 'O(n)'], ['space', 'O(1)']]} />
+
+## common bugs
+
+- Comparing `slow.Val == fast.Val` instead of `slow == fast` — two different nodes can share a
+  value; you need reference equality on the node itself.
+- Checking `slow == fast` **before** the first move — both start at `head`, so that check is
+  trivially true and every input would report a cycle.
+- Writing `fast.Next.Next` without confirming `fast.Next != null` first — throws on a plain
+  odd-length acyclic list the moment `fast` is one node from the end.
+- Reaching for the `HashSet`-of-visited-nodes version out of habit — it's correct, but costs O(n)
+  space; know Floyd's as the O(1) answer this problem is actually testing.
+
+## variants you can now solve
+
+- **Linked List Cycle II** (LC 142) — find the cycle's *start*, not just whether one exists.
+  After `slow` and `fast` meet, reset one pointer to `head` and advance both one step at a time;
+  they meet again exactly at the first node of the cycle.
+- [Middle of the Linked List](/patterns/linked-lists/middle-of-linked-list/) (LC 876) — the same
+  fast/slow loop, minus the collision check.

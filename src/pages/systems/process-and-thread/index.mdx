@@ -1,0 +1,578 @@
+---
+layout: '@layouts/TopicLayout.astro'
+topic: process-and-thread
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import ProblemList from '@components/ProblemList.astro';
+
+## the ground floor
+
+- **Memory** is one flat array of numbered bytes, and an **address** is an index into it —
+  [bits, bytes and addresses](/systems/bits-and-memory/) builds that from nothing.
+- **A register** is a named slot inside the CPU itself, eight bytes wide on x86-64, that
+  instructions operate on directly. There are sixteen general-purpose ones, and they are the
+  fastest storage in the machine.
+- **A core** executes one instruction stream at a time. This box has sixteen.
+- **A page** is the fixed-size chunk the OS hands out and tracks memory in — 4 KiB here — and the
+  **page table** is the per-process map from your addresses to physical ones;
+  [virtual memory](/systems/virtual-memory/) builds both properly.
+- **A program** is a file of bytes on disk. **A process** is what the operating system makes when
+  it loads that file into memory, gives it an identity, and starts running it.
+- **The kernel** is the part of the OS that the hardware trusts: the only code allowed to edit
+  page tables, talk to devices, or read another process's memory.
+
+## core idea
+
+An operating system multiplexes one physical machine among programs that were each written as if
+they owned it. To do that it splits "a running program" into two things people usually say in one
+breath: a **process**, which owns the memory and the handles, and a **thread**, which owns a stack
+and a set of register values and is the thing a scheduler actually puts on a core.
+
+Every hard thing in the rest of this section falls out of that split. Threads inside one process
+share the memory — so they can cooperate, and they can corrupt each other. And the kernel can take
+a core away from any of them between any two machine instructions, which is not the same thing as
+between any two lines of C#.
+
+| what | owned by the process | owned by the thread |
+| --- | --- | --- |
+| address space: heap, globals, loaded code, every mapping | yes, exactly one | no — shared with every sibling thread |
+| stack | no | yes — its own region, 16 MiB of address space each on this box |
+| registers, including the instruction pointer | no | yes — saved and restored on every switch |
+| open handles: files, sockets, pipes | yes, one table per process | no — shared |
+| the unit the scheduler runs | no, a process is never scheduled | yes, this is the thing that runs |
+
+## how it actually works
+
+### what the OS actually does
+
+Four jobs, and only four: hand out CPU time, hand out memory, mediate access to devices, and keep
+processes out of each other's way. Everything you think of as "the OS" is one of those four with a
+convenient API on it.
+
+The correction most people need first: **the kernel is not a program running beside yours,
+competing for the CPU.** Most of the time it is not running at all. It runs when something makes
+it run — your thread deliberately calls into it, your thread faults (a page fault is the common
+one), a device raises an interrupt, the timer fires. On the two paths you cause yourself — the
+syscall and the fault — it runs *on your thread*: same scheduling entity, different privilege
+level, different stack. An interrupt is not like that. It runs on whichever core the hardware
+delivers it to and borrows whatever thread is standing there, which is very often a thread of a
+process that has nothing to do with the device.
+
+There is also one real exception to "not running at all", and you will meet it the first time you
+open `top` during an incident. Linux keeps a set of genuine kernel threads: they are scheduled
+exactly like your threads, they have pids, they show up in `ps` and `top` under their own names,
+and they do compete for the CPU. They are most of the task list — 273 of the 604 tasks on this
+box, all children of `kthreadd`:
+
+```text
+      2 kthreadd            S    spawns and reaps all the others
+     14 ksoftirqd/0         S    deferred interrupt work for core 0 — network receive lives here
+     18 migration/0         S    moves threads between cores for the load balancer
+    144 kswapd0             S    reclaims pages when memory gets tight
+     10 kworker/0:0H-kblockd I<  generic deferred work; there are about 135 kworkers here
+```
+
+So the honest version of the rule is: the kernel does most of its work on your thread, on your
+time, because you asked for it — and keeps a small standing crew for the work that has no thread
+of yours to charge. When `ksoftirqd` or a `kworker` is at the top of `top`, that is real CPU being
+burned, and none of it is attributable to any thread you started.
+
+`top`'s `us`/`sy` split is the closest thing to a direct view of the privilege boundary: `us` is
+time spent executing user-mode instructions, `sy` is time spent in the kernel. Both are machine
+totals summed over every task on the box, kernel threads included, and `top` breaks softirq time
+out into a third bucket, `si`. Pinning kernel time on *your* process takes `/proc/PID/stat`
+instead — the accounting is at the bottom of this page.
+
+### the boundary: user mode and kernel mode
+
+The CPU carries a privilege level. Mainstream operating systems use two of its settings: **ring 0**
+(kernel mode — every instruction is legal) and **ring 3** (user mode — your code). In ring 3 the
+hardware itself refuses to let you load a page-table register, touch a device port, halt the CPU,
+or read an address the page tables have not mapped for you. That is why one program's bad loop
+cannot take out the machine: the isolation is enforced by silicon, not by everyone behaving.
+
+Which leaves a problem: your code genuinely needs the kernel to open files and send packets. The
+door between the two modes is a single instruction. Here it is, disassembled from a statically
+linked binary built on this box (x86-64 Linux, `gcc -O2 -static`) — glibc's generic `syscall()`
+trampoline, the same crossing every direct syscall goes through underneath whatever extra
+bookkeeping its own wrapper (`write`, `read`, …) adds on top:
+
+```text
+0000000000412490 <syscall>:
+  412490:	f3 0f 1e fa          	endbr64
+  412494:	48 89 f8             	mov    %rdi,%rax
+  412497:	48 89 f7             	mov    %rsi,%rdi
+  41249a:	48 89 d6             	mov    %rdx,%rsi
+  41249d:	48 89 ca             	mov    %rcx,%rdx
+  4124a0:	4d 89 c2             	mov    %r8,%r10
+  4124a3:	4d 89 c8             	mov    %r9,%r8
+  4124a6:	4c 8b 4c 24 08       	mov    0x8(%rsp),%r9
+  4124ab:	0f 05                	syscall
+  4124ad:	48 3d 01 f0 ff ff    	cmp    $0xfffffffffffff001,%rax
+  4124b3:	73 01                	jae    4124b6 <syscall+0x26>
+  4124b5:	c3                   	ret
+```
+
+- `endbr64` — a landing pad for indirect branches, part of the CPU's control-flow integrity
+  feature. Not our business here.
+- `mov %rdi,%rax` through `mov 0x8(%rsp),%r9` — pure argument shuffling, and it exists for one
+  specific reason. This function was called with the ordinary C calling convention, which puts
+  arguments in `rdi, rsi, rdx, rcx, r8, r9`. The **kernel's** calling convention for a syscall
+  wants the syscall *number* in `rax` and the arguments in `rdi, rsi, rdx, r10, r8, r9` — note
+  `r10` where C uses `rcx`. That swap is not arbitrary: the `syscall` instruction itself
+  overwrites `rcx` (with the return address) and `r11` (with flags) as part of how it works, so
+  the kernel's own convention avoids `rcx` for arguments, and this block's whole job is moving the
+  syscall number down into `rax` and getting the fourth argument out of `rcx`'s way before that
+  happens.
+- `syscall` — **this is the entire boundary.** Two bytes. It switches the privilege level to ring
+  0 and jumps to a fixed entry point the kernel registered at boot in a model-specific register.
+  Your thread keeps running; it is now running kernel code on a separate, small kernel stack.
+- `cmp`/`jae` — on return, values from `0xfffffffffffff001` up are error codes rather than a
+  result. That comparison — and the errno bookkeeping just past it, trimmed here — is the entire
+  error convention.
+- `ret` — back to your code, in ring 3 again.
+
+That crossing is not free, and it does not cost what people usually guess either — it is not "a
+function call with extra steps" and it is not "a device access." What it actually costs is a
+fixed amount of kernel-entry work that happens on *every* crossing regardless of what you asked
+for: the privilege-level switch itself, saving enough of your register state for the kernel to use
+its own registers safely, and whatever speculative-execution mitigations this CPU's kernel applies
+on every entry and exit. [Crossing into the kernel](/systems/process-and-thread/syscall-cost/)
+works through that fixed cost — and what buffering actually trades it for — by reasoning about it,
+not by racing a clock.
+
+<Callout kind="note" label="not every kernel-looking call is a syscall">
+  Linux maps a small piece of kernel code, the vDSO, into every process's address space so hot
+  read-only questions can be answered without crossing anything. `Stopwatch.GetTimestamp()` is one:
+  a million calls to it produce **zero** `clock_gettime` syscalls under `strace` on this box. If
+  the boundary were free, the vDSO would not need to exist.
+</Callout>
+
+### a process is an address space plus a handle table
+
+Everything a process "has" is one of those two things. Here is a .NET 10 program reading its own
+`/proc` entry on this machine, before it has started a single thread of its own:
+
+```text
+  VmSize: 130872344 kB
+  VmRSS:    24980 kB
+  Threads: 9
+  open handles (fds):   32
+  mapped regions:       265
+```
+
+`VmSize` is address space the process has *claimed*: about 124.8 GiB of it, on a machine with a
+tiny fraction of that in physical RAM. `VmRSS` is what is actually resident in physical memory:
+24.4 MiB. The gap is not a bug and not a leak — reserving address space is nearly free, because an
+address is just a number until something touches it. [Virtual memory](/systems/virtual-memory/) is
+the page that owes you that story; for now, the useful correction is that *the number your
+monitoring calls "memory" is one of these two and you should know which*.
+
+Note also the thread count: a program that has not started a thread of its own is already a
+nine-thread process. The runtime brought its own — GC, finalizer, tiered compilation, diagnostics.
+
+### a thread is a stack, some registers, and a place in a queue
+
+Start two workers, have all three threads print the address of a local variable and the address of
+one shared array:
+
+```text
+  worker A  stack slot @ 0x7548e5b7bad8   shared array @ 0x75492ec24848
+  worker B  stack slot @ 0x7548d7ffead8   shared array @ 0x75492ec24848
+  main      stack slot @ 0x7ffd85f514f8   shared array @ 0x75492ec24848
+```
+
+One heap address, three stack addresses — and the three stacks are nowhere near each other. The
+loader, `mmap`, and address-space randomization scatter thread stacks around the address space on
+purpose, so don't expect them to sit next to one another or to land in the same place twice.
+
+What *is* fixed is the size of one thread's reservation, and it's worth asking the C library for
+it directly rather than guessing from a memory dump:
+
+```text
+  worker A's stack, as glibc built it: base 0x7548e4b7d000  size 16384 KiB  guard 4 KiB
+```
+
+16384 KiB is exactly this box's `ulimit -s` — a thread created without an explicit size inherits
+the process's stack-size limit. The 4 KiB guard is address space glibc sets aside so that
+recursing past your limit runs into memory nothing has mapped for you, rather than into whatever
+happens to sit next in the address space. (`/proc/self/maps` doesn't always show that guard as its
+own isolated line — depending on how the loader laid things out around it, it can appear folded
+into a larger unmapped stretch, which is exactly what it does on this box. The number that doesn't
+depend on how any particular tool renders it is the one glibc just gave us directly.) Recurse deep
+enough on a real thread and you run off the end into unmapped memory, and the process dies with a
+clean fault — `SIGSEGV`, an uncatchable `StackOverflowException` in .NET terms — instead of
+quietly scribbling into whatever object happens to load next at that address.
+
+That address space is *reserved* the moment a thread starts, not *resident*. Only the pages a
+thread actually touches become real memory, which is why a hundred idle threads do not cost you
+1,600 MiB of RAM. They cost you something else, and the something else is further down this page.
+
+One process, in schematic form — this is not a literal address map; the real ordering and the
+gaps between these regions are decided by the loader and by address-space randomization, and they
+change on every run:
+
+```text
+  one process = one address space; every thread below sees all of it
+
+  main thread stack ───────┐  grows down; same idea as any thread's stack, no fixed cap of its own
+  worker A stack (16 MiB) ─┤  grows down; fixed size, reserved when the thread starts
+  worker B stack (16 MiB) ─┤  grows down; fixed size, reserved when the thread starts
+                           │
+  the GC heap ─────────────┤  ← every thread above reaches these same bytes
+  loaded code, JIT output, │
+  runtime data structures  │
+```
+
+The rest of a thread is smaller than people expect: the register values it was using when it last
+stopped (including the instruction pointer, so it knows where to resume, and the stack pointer, so
+it knows which stack is its own), a small kernel-side stack for when it is executing syscalls, and
+an entry in the scheduler's data structures.
+
+### why threads share the heap but never the stack
+
+This is the fact the whole concurrency section is built on, so it is worth being precise about
+*why*, in both directions.
+
+**The heap is shared because sharing is what "one address space" means.** The threads of a process
+are all pointed at the same page tables. A given address resolves to the same physical byte no
+matter which thread asks. There is no mechanism to make it not so — sharing is not a feature the
+runtime added, it is the absence of a boundary.
+
+**Stacks are separate because a stack is a chain of call frames, and each thread is in the middle
+of its own chain of calls.** A call frame holds a function's locals and its return address. If two
+threads shared one stack, the second thread's call would push its frame on top of the first
+thread's locals, and the first thread's `ret` would jump to whatever the second thread wrote. There
+is nothing clever here: one running call chain needs one stack, so each thread gets one.
+
+What makes this worth stating is that thread-private stacks buy you privacy **by addressing
+convention, not by hardware.** Nothing stops one thread from reaching into another's stack if it
+gets the address. Here is the main thread doing exactly that to a live local inside a worker:
+
+```text
+  worker's local is now 42 — main reached into this thread's stack
+```
+
+For day-to-day C# the practical version is: a local variable is thread-private for free, which is
+why nobody locks a loop counter. But the moment a local is captured by a lambda that outlives the
+frame, or promoted into an `async` state machine, or stored in a field, the compiler moves that
+value onto the heap and it becomes shared like everything else. That promotion is invisible in the
+source, and it is where "but it's just a local" bugs come from —
+[stack vs heap](/systems/stack-and-heap/) is the page that shows you the promotion happening.
+
+### the three states a thread is in
+
+A thread is doing exactly one of three things, and Linux will tell you which. Three threads — one
+spinning in a `while` loop, one blocked on a semaphore, one in `Thread.Sleep` — reported out of
+`/proc/self/task`:
+
+```text
+part 1 — thread states (R = on or waiting for a CPU, S = blocked)
+  tid 1150537   spinner  state R
+  tid 1150538   waiter   state S
+  tid 1150539   sleeper  state S
+```
+
+```text
+                       scheduler picks it
+      ┌───────────┐  ───────────────────────→  ┌───────────┐
+      │ runnable  │                            │  running  │
+      │  wants a  │  ←───────────────────────  │  on a core│
+      │   core    │   time slice expired, or   └───────────┘
+      └───────────┘   a higher-priority thread       │
+            ↑         arrived (preemption)           │
+            │                                        │ blocks: read(), lock,
+            │                                        │ Wait(), Sleep()
+            │   what it waited for happened          ↓
+            │   (I/O done, lock released)      ┌───────────┐
+            └──────────────────────────────────│  blocked  │
+                                               │  off-CPU  │
+                                               └───────────┘
+```
+
+Note what Linux does *not* distinguish: `R` covers both running and runnable. A thread that owns a
+core right now and a thread queued behind three others look identical in `/proc`. That is why "CPU
+is at 100%" and "my threads are making progress" are different questions.
+
+A blocked thread consumes no CPU at all. It is a parked stack, a saved register set, and a note in
+some kernel wait queue saying what to poke when the data arrives. That is the whole reason blocking
+feels free — and the whole reason it is not, once you have thousands of them.
+
+### preemption and the time slice
+
+Blocking is the polite way to leave a core. The other way is that the kernel takes it. The kernel
+gives each running thread a slice of CPU time before it reconsiders who runs next — a scheduler
+policy value, not a hardware constant, and one that automatically shrinks as more threads compete
+for the same cores. Deliberately oversubscribe to see the effect: 32 CPU-bound threads that never
+block, twice as many as this box's 16 cores, sampled over a fixed window:
+
+```text
+part 2 — 32 CPU-bound threads on 16 cores (2x oversubscribed), sampled over a fixed window
+  voluntary switches (gave the CPU up)   : 29
+  involuntary switches (CPU taken away)  : 12251
+```
+
+Nobody yielded — 29 voluntary switches across 32 threads over that window is noise. Every other
+switch, all 12,251 of them, is the kernel reaching in and taking the CPU away mid-loop, because
+that is the only way any thread that lost the race for one of the 16 cores this round ever gets a
+turn. That is the shrinking time slice made visible: the more runnable threads there are, the more
+often the kernel has to interrupt someone to give somebody else a turn.
+
+The part that matters for everything downstream: **that switch lands between two machine
+instructions, not between two statements.** `count++` is a load, an add, and a store; the kernel
+neither knows nor cares that you meant them as one thing. Preemption plus a shared heap is exactly
+the recipe for a torn read-modify-write, which is why
+[atomics and CAS](/systems/atomics-and-cas/) exists as a topic at all.
+
+### what a context switch costs
+
+Two threads hand off work to each other — one signals, the other notices and picks it up. There
+are a few different ways to build that handoff, and they are not different amounts of the same
+cost; they are different *mechanisms* entirely, and the ordering between them falls straight out
+of what each one asks the machine to do.
+
+**No handoff at all.** One thread writes a flag and reads it back itself. Nothing crosses
+anywhere — this is a same-thread problem, governed only by ordinary memory ordering.
+
+**A spin handoff between two running threads.** Thread A writes a shared flag; thread B, spinning
+on its own core, reads it. Neither thread asks the kernel for anything — the flag travels through
+cache-coherence traffic between the two cores, the same machinery that keeps any two cores' view
+of memory consistent. Both threads stay `R`-running the whole time.
+
+**A parked handoff.** Thread A calls into the kernel to block until the flag is set (`Wait()` on a
+handle, in .NET terms); thread B sets the flag and *also* calls into the kernel to wake whoever is
+waiting on it. That is two syscalls and two context switches — descheduling A, then rescheduling
+it once the kernel picks it back up — against zero for the spin case. It is a heavier mechanism,
+and it should be: the kernel is doing real bookkeeping here (which thread is waiting on what, who
+else could run meanwhile) that the spin case skips entirely by burning a core instead.
+
+**A spin handoff between two threads pinned to the *same* core.** This is the one people predict
+wrong. Pin both spinners to core 0. Thread A writes the flag and starts spinning to read B's
+reply — except B cannot run at all: it has no core. B only runs once the kernel involuntarily
+preempts A off core 0, and that happens on the scheduler's own timer, not the instant the data
+says it could. Then B runs, writes its own reply, and now *A* cannot run until the next
+involuntary preemption. Progress here does not depend on the write becoming visible; it depends on
+the fairness timer, twice per round trip:
+
+```text
+  same-core spin, threads A and B both pinned to core 0:
+
+  A: write flag=1 ── spins reading flag=2 ──────────────╮  can't see B's write —
+                                                          │  B has no core to run on
+                        [involuntary preemption: A off, B on]
+                                                          │
+  B: ── spins reading flag=1 ── sees it, write flag=2 ───╯  can't see this happen —
+                                                              A has no core either
+                        [involuntary preemption: B off, A on]
+
+  A: sees flag=2, round trip done — but it took two trips through the scheduler's
+     fairness timer to get there, not one cache-coherence message
+```
+
+That is a strictly worse mechanism than parking, because parking's wake is triggered by the
+*event* — the kernel is told exactly when to reschedule the waiter — while same-core spinning's
+"wake" is triggered by *whenever the clock says it's someone else's turn*, with no relationship to
+when the data actually changed. It is why production spin locks spin for a small, bounded number
+of iterations and then park: an unbounded spin is a bet that you will always have a spare core to
+burn, and losing that bet is a different kind of bad, not merely a slower version of winning it.
+
+What the kernel actually does on any of the switches above that go through it: it saves the
+outgoing thread's register file — including the instruction pointer, so it knows where to resume,
+and the stack pointer, so it knows which stack is its own — into that thread's kernel task
+structure; switches to the incoming thread's own small kernel stack; restores its saved registers;
+and returns to user mode at whatever instruction the incoming thread was on. If the incoming thread
+belongs to a *different process*, this also reloads the page-table root register — one real sense
+in which switching between threads of the same process is cheaper than switching between threads
+of different processes, because that reload is skipped entirely.
+
+None of that appears in the list above it: the incoming thread resumes with the CPU's caches and
+its TLB — the small on-chip cache of address translations — still full of the *outgoing* thread's
+data. Its next several memory accesses are misses it would not otherwise have paid.
+[Caches and the memory hierarchy](/systems/memory-hierarchy/) is where that cost becomes visible
+and where "cold cache" stops being a metaphor.
+
+## the mental model
+
+```text
+  process = an address space + a handle table          (what you own)
+  thread  = a stack + registers + a scheduler entry    (what runs)
+
+  shared between threads:  heap, globals, code, open handles
+  never shared:            stack, registers
+
+  what has to move to leave your own code, cheapest mechanism to most expensive:
+    stay on your core, no handoff .......................... nothing crosses at all
+    call into the kernel and return ......................... one privilege-level switch, same thread
+    hand off to a thread on ANOTHER core .................... one cache line, via coherence traffic
+    hand off to a thread the kernel has to WAKE ............. two syscalls, two context switches
+    hand off to a thread pinned to YOUR SAME core ........... waits on the next involuntary
+                                                                preemption, not on the data at all
+```
+
+Three lines to carry around:
+
+1. A process owns memory; a thread owns a stack and runs. Nothing is scheduled except threads.
+2. Threads share everything except stacks and registers — which is simultaneously why they are
+   useful and why they are dangerous.
+3. Crossing into the kernel is cheap but not free; waking another thread through the scheduler is
+   a different, heavier code path than two running threads settling something through cache — and
+   pinning both sides of a handoff to one core turns a data dependency into a dependency on the
+   scheduler's fairness timer instead, which is worse than either.
+
+<Watch items={[['thread stack, this box', '16 MiB reserved'], ['stack guard', '4 KiB'], ['syscall boundary', 'one instruction: `syscall`'], ['cross-process switch reloads', 'the page-table root register'], ['same-process switch reloads', 'registers only — page tables untouched'], ['.NET runtime baseline threads', '9, before you start one yourself']]} />
+
+## why you should care
+
+**Blocking is a thread-count decision, and thread count is a scheduler decision.** A blocked
+thread costs no CPU — it is off every runqueue, parked in a kernel wait queue — but it is not
+free: it holds 16 MiB of reserved address space, a saved register set, and a slot in the pool that
+no queued work item can use. That is the actual mechanism under thread-pool starvation: block the
+pool's threads on `.Result` and work items queue up behind threads that are *asleep*, not busy,
+while the pool grows its thread count slowly and conservatively rather than all at once. Latency
+climbs while CPU stays low, because nothing is running — everything is waiting.
+[Threads and scheduling](/systems/threads-and-scheduling/) takes that incident apart properly; the
+reason it happens is on this page.
+
+Keep that separate from the other failure mode this page already showed you: too many *runnable*
+threads for too few cores. That one looks the opposite in a profiler — CPU stays busy, but every
+thread's turn is short, because now everyone is fighting the scheduler's fairness timer instead of
+waiting on the network. Same page, two different mechanisms, two different symptoms; don't let "the
+pool is unhappy" collapse them into one diagnosis.
+
+**Chatty I/O is a syscall count, and syscall count is visible.** Logging that flushes per line, a
+socket write per message, an explicitly unbuffered `FileStream`, a cache lookup per item inside a
+`foreach` — each of those is a trip through the boundary you just watched compile down to one
+instruction. The metric that moves is *system* CPU time, and it matters a great deal which one you
+read. `sy` in `top` is machine-wide kernel time, summed over every task on the box including the
+kernel threads that have nothing to do with you; `stime` in `/proc/PID/stat` (and per thread in
+`/proc/PID/task/*/stat`) is your process's own share, and that is the number that answers "is it
+me". `si` is a third bucket entirely: softirq time — mostly network receive and I/O completion —
+charged to whichever core took the interrupt and to no process at all. A box with high `sy` while
+your `stime` stays flat is not your service making too many syscalls; the work belongs to something
+else on the machine — a neighbour, or your own packet rate arriving through `si` and `ksoftirqd` —
+and tuning your call counts will not move it. When `stime` is the number climbing with load, then
+it is yours, and no amount of tuning the C# in between the crossings will help; count the
+crossings.
+
+**The incident shape to recognise:** p99 latency doubles under load while CPU utilization sits at
+40%. Utilization counts threads that are *running*; it says nothing about threads that are
+runnable-but-queued or blocked. The questions that separate the two are how many threads the
+process has, how many of them are in state `R`, and whether the switch counters in
+`/proc/PID/task/*/status` are climbing in the `nonvoluntary` column (preemption — too many runnable
+threads) or the `voluntary` one (blocking — too much waiting).
+
+**The code review you can now do:** a `new Thread` per request; a `FileStream` opened with
+`bufferSize: 0` or `1`, or with a buffer far smaller than the writes going through it; a
+`SemaphoreSlim` awaited and then released on a path that can throw, or a `Monitor.Enter` paired
+with an `await` before its `Monitor.Exit`; a synchronous HTTP call inside a `lock`; `Task.Run`
+wrapped around work that never blocks (that is a queue hop and a possible context switch to save
+you nothing); and a "concurrency limit" configured well above the core count, on the theory that
+more threads means more throughput.
+
+Two pages follow directly from this one, and in this order.
+[Stack vs heap](/systems/stack-and-heap/) takes the split you just watched in the address dump and
+makes it precise: which of your values live in the private region, which live in the shared one,
+and what makes the compiler move one to the other behind your back.
+[Threads and scheduling](/systems/threads-and-scheduling/) takes the other half — what .NET builds
+on top of the OS thread, why a `Task` is not one, and how a pool of them starves.
+
+## the same idea in other languages
+
+| language | what it's called | the trap |
+| --- | --- | --- |
+| Java | `Thread` is a real OS thread; since Java 21 a *virtual thread* is a stack the JVM keeps on the heap and multiplexes onto carrier OS threads | virtual threads make blocking cheap again, but in Java 21 through 23 a virtual thread that blocks inside a `synchronized` block pins its carrier thread for the duration — the workaround is a `ReentrantLock` |
+| Go | goroutines are user-space stacks that start small and grow, scheduled by the runtime onto `GOMAXPROCS` OS threads | a goroutine is not a thread: its cheapness is about stack size and user-space scheduling, and a blocking syscall still pays the same crossing this page walks through, and once that syscall has blocked long enough the runtime detaches the goroutine's logical processor (its `P`) and hands it to a different OS thread, so other goroutines keep running while this thread stays parked in the kernel with its goroutine |
+| Python (CPython) | `threading.Thread` really is an OS thread, but the global interpreter lock lets only one of them run bytecode at a time | they help I/O-bound work, because the lock is released around blocking calls, and do nothing for CPU-bound work; `multiprocessing` gets real parallelism by giving you separate address spaces, so nothing is shared unless you serialize it |
+| C / C++ | `pthread_create` or `std::thread` — exactly the OS thread described here, with no runtime on top | you set the stack size yourself with `pthread_attr_setstacksize` and nothing checks it for you; and a data race is undefined behaviour rather than a wrong answer, so the compiler is allowed to optimize as though it cannot happen |
+
+## exercises
+
+Work out what the boundary actually costs, as mechanism, before you reason about how often to
+cross it.
+
+<ProblemList topic="process-and-thread" />
+
+## interview drills
+
+**Q.** We added threads to a CPU-bound service and it got *slower*. What happened?
+
+- *weak answer* — "context switching overhead". True but empty; the follow-up is "how much, and
+  measured how?", and there is no answer under it.
+- *strong answer* — Past the core count, extra runnable threads do not add throughput; they divide
+  the same cores into shorter turns. Each turn now ends in an involuntary switch, and each switch
+  hands the next thread a cold cache. I would check `nonvoluntary_ctxt_switches` per thread and
+  compare thread count to core count before touching the code — and if the work is CPU-bound, the
+  fix is a work queue sized to the cores, not more threads.
+- *follow-up* — "And if it were I/O-bound?" Then blocked threads cost you nothing on the CPU, and
+  the real limit is the far end plus your thread pool's willingness to grow; that is an argument
+  for async, not for more threads.
+
+**Q.** Two threads run the same method. One has a local `int i`. Can the other one corrupt it?
+
+- *weak answer* — "No, locals are on the stack and stacks are private." Right conclusion, and it
+  stops one question short of the truth.
+- *strong answer* — Each thread has its own stack, so each has its own `i`, and no synchronization
+  is needed. But that privacy is an addressing convention, not a hardware boundary: both stacks are
+  in the same address space, and a raw pointer to one thread's frame works fine from another. In
+  C# it matters because the compiler quietly moves captured locals to the heap — once `i` is
+  captured by a lambda or lives in an `async` state machine, it is as shared as any field.
+- *follow-up* — "What makes the compiler move it?" Escape: a closure that outlives the frame, an
+  iterator, or an `async` method, all of which turn locals into fields of a generated class.
+
+**Q.** Walk me from `File.ReadAllText` to the disk.
+
+- *weak answer* — "It calls the OS which reads the file." No mechanism, no cost model.
+- *strong answer* — The managed call ends in a `read`-family syscall: a `syscall` instruction that
+  switches the CPU to kernel mode and enters the kernel on this same thread's kernel stack. The
+  kernel checks the descriptor and looks for the pages in the page cache — the kernel's own
+  in-memory copy of file contents. On a hit it copies into your buffer and returns without the
+  thread ever leaving the CPU — you paid a crossing and a memory copy. On a miss it registers the
+  wait, marks the thread blocked, and picks somebody else to run; your thread stays off the CPU
+  until the device interrupt makes it runnable again. That difference — a hit that costs one
+  boundary crossing versus a miss that costs a full scheduler round trip — is not a matter of
+  degree, it's two different code paths entirely, and it's why the same call can look free in a
+  benchmark and terrible in production.
+- *follow-up* — "Where does async change that?" Not at the syscall; it changes who owns the thread
+  while the wait happens.
+
+**Q.** When would you use a separate process instead of a thread?
+
+- *weak answer* — "Processes are heavier, so basically never."
+- *strong answer* — When you want the isolation you are paying for: a separate address space means
+  a crash, a memory corruption, or a runaway allocation is contained, and the OS can enforce limits
+  per process. That is why browsers put tabs in processes and why plugin hosts and untrusted code
+  get their own. The cost is that nothing is shared any more — communication becomes serialization
+  over a pipe or socket, which is exactly the boundary crossing this page walks through.
+- *follow-up* — "How do two processes share memory then?" They ask the kernel to map the same
+  physical pages into both address spaces; the sharing is explicit and named, which is the point.
+
+**Q.** Your service shows 40% CPU and doubled p99. Where do you look?
+
+- *weak answer* — "Scale out." Maybe, but you have not learned anything, and if the threads are
+  blocked you will pay twice for the same stall.
+- *strong answer* — 40% utilization only counts threads that are *running*. I would first ask
+  whether threads are blocked or queued: thread count versus core count, how many threads are in
+  state `R`, and which switch counter is climbing. Voluntary switches climbing means waiting — a
+  downstream service, a lock, a disk. Involuntary switches climbing with a high thread count means
+  you are oversubscribed and the machine is spending its time on handoffs.
+- *follow-up* — "What if both counters are flat and latency is still bad?" Then nobody is waiting
+  or switching, and the time is going inside your own code — a profiler question, not a scheduler
+  one.
+
+**Q.** What does the kernel actually save on a context switch?
+
+- *weak answer* — "The thread's state."
+- *strong answer* — The register file, including the instruction pointer and stack pointer, into
+  the outgoing thread's task structure, plus its floating-point and vector state; then it switches
+  to the incoming thread's kernel stack and restores the same set. If the incoming thread belongs
+  to a different process it also reloads the page-table root register, making it an address-space
+  switch. What it cannot save or restore is the cache and TLB contents, and that invisible part is
+  often larger than the visible one.
+- *follow-up* — "So how expensive is one?" A full park-and-wake round trip goes through two
+  syscalls and two context switches; a switch between threads of the same process skips the
+  page-table reload a cross-process one has to pay. Don't reach for a number without a specific box
+  in front of you to measure it on — reach for which of those code paths you're actually on,
+  because a parked handoff and a spin handoff are not the same mechanism running at different
+  speeds, they're different mechanisms.

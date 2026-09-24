@@ -1,0 +1,158 @@
+---
+layout: '@layouts/TopicLayout.astro'
+topic: advanced-graphs
+---
+
+import Callout from '@components/Callout.astro';
+import ProblemList from '@components/ProblemList.astro';
+
+## core idea
+
+Plain BFS/DFS answers "can I reach it" and "what's the fewest hops." These four problems need
+something BFS/DFS alone doesn't track: **order** (who must go first), **grouping** (who belongs
+together), and **cost** (which path is cheapest) — so each swaps in one purpose-built structure
+on top of the same traversal skeleton.
+
+```text
+      1
+    ↗   ↘
+  0       3
+    ↘   ↗
+      2
+```
+
+`0` has no prerequisites, `1` and `2` both need `0`, `3` needs both `1` and `2`. That shape —
+edges pointing from prerequisite to dependent — is what all of topological sort reduces to.
+
+| shape | structure | typical trigger |
+| --- | --- | --- |
+| topological sort (Kahn's) | in-degree array + BFS queue | "prerequisites", "dependencies", "can all X be finished" |
+| union-find | parent + size arrays, path compression | "how many groups/components", connections arriving one at a time |
+| Dijkstra | dist array + min-heap, lazy deletion | shortest/cheapest path from one source, **non-negative** weights only |
+
+## when to reach for it
+
+- The prompt says **prerequisite**, **dependency**, or asks whether all of some set can be
+  **completed/finished** → topological sort.
+- The prompt asks **how many** groups/components/provinces fall out of a list of pairwise
+  connections, especially if those connections could arrive incrementally → union-find.
+- Edges carry **weights** and the question is the cheapest/fastest/shortest way from one source
+  to everywhere else → Dijkstra (breaks the moment a weight goes negative).
+- You reach for [BFS or DFS](/patterns/bfs-dfs/) first, and something about the problem — order
+  matters, groups keep merging, edges aren't all equal — doesn't quite fit a plain traversal.
+  That mismatch is the signal you're one level up from there.
+
+## universal templates
+
+Topological sort (Kahn's) — peel off whatever has no unmet dependency, repeat:
+
+```csharp
+public bool CanFinishTemplate(int numNodes, int[][] edges)
+{
+    var graph = new List<int>[numNodes];
+    var inDegree = new int[numNodes];
+    for (int i = 0; i < numNodes; i++) graph[i] = [];
+
+    foreach (var e in edges)
+    {
+        graph[e[0]].Add(e[1]);      // e[0] -> e[1]
+        inDegree[e[1]]++;
+    }
+
+    var queue = new Queue<int>();
+    for (int i = 0; i < numNodes; i++)
+        if (inDegree[i] == 0) queue.Enqueue(i);   // no prerequisites — safe to process first
+
+    int processed = 0;
+    while (queue.Count > 0)
+    {
+        int node = queue.Dequeue();
+        processed++;
+        foreach (var next in graph[node])
+            if (--inDegree[next] == 0) queue.Enqueue(next);  // this dependency is now satisfied
+    }
+    return processed == numNodes;   // fewer than all nodes processed => a cycle exists
+}
+```
+
+Union-find — merge sets as facts arrive, no traversal needed:
+
+```csharp
+public class UnionFind
+{
+    private readonly int[] _parent;
+    private readonly int[] _size;
+
+    public UnionFind(int n)
+    {
+        _parent = new int[n];
+        _size = new int[n];
+        for (int i = 0; i < n; i++) { _parent[i] = i; _size[i] = 1; }
+    }
+
+    public int Find(int x)
+    {
+        if (_parent[x] != x)
+            _parent[x] = Find(_parent[x]);   // path compression: point straight at the root
+        return _parent[x];
+    }
+
+    public bool Union(int a, int b)
+    {
+        int ra = Find(a), rb = Find(b);
+        if (ra == rb) return false;                       // already connected — no-op
+
+        if (_size[ra] < _size[rb]) (ra, rb) = (rb, ra);    // union by size: smaller hangs off bigger
+        _parent[rb] = ra;
+        _size[ra] += _size[rb];
+        return true;
+    }
+}
+```
+
+Dijkstra — BFS where the queue is replaced by a min-heap ordered on distance:
+
+```csharp
+public int[] Dijkstra(int n, List<(int To, int Weight)>[] graph, int src)
+{
+    var dist = new int[n];
+    Array.Fill(dist, int.MaxValue);
+    dist[src] = 0;
+
+    var pq = new PriorityQueue<int, int>();
+    pq.Enqueue(src, 0);
+
+    while (pq.TryDequeue(out int node, out int d))
+    {
+        if (d > dist[node]) continue;    // stale entry from an earlier, worse enqueue — lazy deletion
+
+        foreach (var (to, w) in graph[node])
+        {
+            int nd = d + w;
+            if (nd < dist[to])
+            {
+                dist[to] = nd;
+                pq.Enqueue(to, nd);       // no DecreaseKey: just push a fresher, cheaper duplicate
+            }
+        }
+    }
+    return dist;
+}
+```
+
+Every problem below is one of these three skeletons, unmodified, with a different question asked
+of the final state.
+
+<Callout kind="insight" label="the one question to ask">
+  Before picking a structure, ask: *do I need an ordering, a grouping, or a cost?* Order →
+  topological sort. Grouping → union-find. Cost → Dijkstra. If the answer is "none of those, I
+  just need reachability," you don't need this page at all —
+  [BFS & DFS](/patterns/bfs-dfs/) already has you covered.
+</Callout>
+
+## problems
+
+Kahn's algorithm runs twice — once for a yes/no answer, once for the order itself — then
+union-find and Dijkstra each get one problem:
+
+<ProblemList topic="advanced-graphs" />

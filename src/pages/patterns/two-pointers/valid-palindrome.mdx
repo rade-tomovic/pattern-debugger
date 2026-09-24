@@ -1,0 +1,123 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: two-pointers
+problem: valid-palindrome
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import Cells from '@components/Cells.astro';
+
+## task
+
+Given a string `s`, determine whether it reads the same forwards and backwards once you ignore
+casing and drop everything that isn't a letter or digit.
+
+```text
+s = "A man, a plan, a canal: Panama"  →  true (ignoring case and punctuation/spaces)
+```
+
+## how to think
+
+The brute force builds a cleaned copy — strip punctuation, lowercase everything, compare to its
+own reverse. That's correct and O(n), but it's also O(n) *space* for a string you're not
+otherwise using, and "in-place, O(1) space" is exactly the phrase that should make you reach for
+opposite-end pointers instead.
+
+The only wrinkle versus vanilla Two Sum II is that a pointer can't always compare where it's
+standing — first it has to ask "am I looking at something that counts?" If not, step past it and
+ask again. Once both pointers are parked on real alphanumeric characters, the comparison is the
+same case-insensitive check either way.
+
+<Callout kind="note" label="template instance">
+  **Opposite ends** skeleton. What varies: before each comparison, `left` and `right`
+  independently skip forward/backward over non-alphanumeric characters. Invariant: everything
+  outside `[left, right]` has already been confirmed to match (or safely skipped) — the moment
+  the pointers cross, every character pair has been accounted for.
+</Callout>
+
+## solution
+
+```csharp
+public bool IsPalindrome(string s)
+{
+    int left = 0, right = s.Length - 1;
+
+    while (left < right)
+    {
+        if (!char.IsLetterOrDigit(s[left])) { left++; continue; }
+        if (!char.IsLetterOrDigit(s[right])) { right--; continue; }
+
+        if (char.ToLowerInvariant(s[left]) != char.ToLowerInvariant(s[right])) return false;
+
+        left++;
+        right--;
+    }
+    return true;
+}
+```
+
+## trace
+
+`s = "race a car"` (index 4 and 6 are spaces):
+
+| step | L | R | check | move |
+| --- | --- | --- | --- | --- |
+| 1 | 0 | 9 | `'r'` vs `'r'` — match | `left++`, `right--` |
+| 2 | 1 | 8 | `'a'` vs `'a'` — match | `left++`, `right--` |
+| 3 | 2 | 7 | `'c'` vs `'c'` — match | `left++`, `right--` |
+| 4 | 3 | 6 | `s[R]=' '` not alnum | `right--` only |
+| 5 | 3 | 5 | `'e'` vs `'a'` — **mismatch** | return `false` |
+
+Step 4 — `right` sits on a space, so it steps past it while `left` holds still:
+
+<Cells
+  data={['r', 'a', 'c', 'e', ' ', 'a', ' ', 'c', 'a', 'r']}
+  pointers={{ 3: [{ t: 'L', c: 'amber' }], 6: [{ t: 'R', c: 'cyan' }] }}
+  cells={{ 0: 'dim', 1: 'dim', 2: 'dim', 6: 'dim', 7: 'dim', 8: 'dim', 9: 'dim' }}
+  caption="R is parked on a non-alphanumeric character — skip it, L doesn't move this step"
+/>
+
+Step 5 — both pointers now sit on letters, and they disagree:
+
+<Cells
+  data={['r', 'a', 'c', 'e', ' ', 'a', ' ', 'c', 'a', 'r']}
+  pointers={{ 3: [{ t: 'L', c: 'amber' }], 5: [{ t: 'R', c: 'cyan' }] }}
+  cells={{ 3: 'warn', 5: 'warn' }}
+  caption="'e' != 'a' — one counterexample is enough to return false"
+/>
+
+## why it works
+
+The invariant is symmetric: at the start of every iteration, every character strictly outside
+`[left, right]` has either matched its mirror or been ruled irrelevant. `left` and `right` only
+ever move inward, so the two pointers cross after at most `s.Length` total steps. If they cross
+without a mismatch, there was nothing left to check — the string is a palindrome under the
+ignore-case/ignore-punctuation rule. One disagreement is sufficient to disprove it immediately,
+which is why the function returns `false` the instant it finds one instead of finishing the scan.
+
+<Watch items={[['time', 'O(n)'], ['space', 'O(1)']]} />
+
+## common bugs
+
+- Comparing case-sensitively — forgetting `char.ToLowerInvariant` (or `ToUpperInvariant`) turns
+  `"Aa"` into a false mismatch.
+- Using the culture-sensitive `char.ToLower(c)` instead of the invariant form: on some locales
+  (Turkish is the classic example) case folding doesn't behave the way you'd expect, and an
+  interview solution should never depend on the machine's locale.
+- Only skipping non-alphanumerics on one side — both `left` and `right` need their own
+  independent skip check, not a single shared one.
+- Building a cleaned string first (`new string(s.Where(char.IsLetterOrDigit).ToArray())`) —
+  it works, but it's O(n) space when the problem is explicitly asking for O(1).
+- Forgetting that an empty string, or a string of pure punctuation, is vacuously a palindrome —
+  the loop never runs and the function correctly falls through to `true`.
+
+## variants you can now solve
+
+- **Valid Palindrome II** (LC 680) — same scan, but on a mismatch you get to skip *one*
+  character on either side and check both resulting substrings before giving up.
+- **[Longest Palindromic Substring](/patterns/two-pointers/longest-palindromic-substring/)**
+  (LC 5) — instead of checking one fixed string, you expand outward from every possible center.
+- **[Palindrome Linked List](/patterns/linked-lists/palindrome-linked-list/)** (LC 234) — the
+  same mirror-compare idea, but you have to find the middle and reverse a half first since you
+  can't walk a linked list backwards.

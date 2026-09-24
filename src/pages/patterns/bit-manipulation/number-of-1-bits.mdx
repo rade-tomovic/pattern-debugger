@@ -1,0 +1,120 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: bit-manipulation
+problem: number-of-1-bits
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import Cells from '@components/Cells.astro';
+
+## task
+
+Given a 32-bit unsigned integer `n`, return the number of `1` bits it has (its **Hamming
+weight** / popcount). LeetCode #191 types the parameter as `uint` specifically so sign bits never
+enter the picture.
+
+```text
+n = 182 = 0b10110110  →  5
+```
+
+## how to think
+
+The obvious approach shifts `n` right 32 times, checking `n & 1` at each step — always exactly
+32 iterations, whether `n` has one set bit or thirty-one. That's correct but wasteful: most of
+those iterations do nothing useful when the bits are sparse.
+
+`n & (n - 1)` does better. Subtracting `1` from `n` flips every trailing `0` bit to `1` and flips
+the lowest `1` bit to `0` — think of it as borrowing across the trailing zeros the way decimal
+subtraction borrows across trailing nines. ANDing that against the original `n` keeps every bit
+where both agree, and they only disagree at the one bit that flipped from `1` to `0`. Net effect:
+`n & (n - 1)` is `n` with its lowest set bit cleared, nothing else touched. Loop until `n` hits
+`0`, counting iterations — that's exactly the popcount, and it takes as many steps as there are
+set bits, not 32 regardless.
+
+<Callout kind="note" label="template instance">
+  **Clear the lowest set bit** skeleton, verbatim. Invariant: after `k` iterations, `n` has had
+  its `k` lowest set bits cleared, and `count == k`. Loop ends exactly when every set bit has been
+  cleared — i.e. after exactly `popcount(n)` iterations.
+</Callout>
+
+## solution
+
+```csharp
+public int HammingWeight(uint n)
+{
+    int count = 0;
+    while (n != 0)
+    {
+        n &= n - 1;    // clears the lowest set bit
+        count++;
+    }
+    return count;
+}
+```
+
+## trace
+
+`n = 182 = 0b10110110`:
+
+| step | n before | n − 1 | n & (n−1) | count |
+| --- | --- | --- | --- | --- |
+| 1 | `182` = `0b10110110` | `181` = `0b10110101` | `180` = `0b10110100` | 1 |
+| 2 | `180` = `0b10110100` | `179` = `0b10110011` | `176` = `0b10110000` | 2 |
+| 3 | `176` = `0b10110000` | `175` = `0b10101111` | `160` = `0b10100000` | 3 |
+| 4 | `160` = `0b10100000` | `159` = `0b10011111` | `128` = `0b10000000` | 4 |
+| 5 | `128` = `0b10000000` | `127` = `0b01111111` | `0` = `0b00000000` | 5 |
+
+Loop exits when `n` reaches `0`. Final `count = 5` — matches the five `1`s in `10110110`.
+
+Before the first clear, the rightmost `1` (weight `2`) is next in line:
+
+<Cells
+  data={['1', '0', '1', '1', '0', '1', '1', '0']}
+  cells={{ 6: 'warn' }}
+  caption="n = 182 = 0b10110110 — the lowest set bit (index 6, weight 2) is what n & (n-1) removes"
+/>
+
+After that single AND, only that bit changed:
+
+<Cells
+  data={['1', '0', '1', '1', '0', '1', '0', '0']}
+  cells={{ 6: 'dim' }}
+  caption="n = 180 = 0b10110100 — everything else survived untouched; four set bits remain"
+/>
+
+## why it works
+
+Write `n` as `...1` followed by `z` trailing zero bits — that trailing `1` is the lowest set bit.
+Subtracting `1` needs to borrow from that bit: the `z` trailing zeros become `z` trailing ones,
+and the lowest `1` becomes `0`. Every bit above the trailing zeros is untouched by the borrow. So
+`n - 1` agrees with `n` on every bit above the lowest set bit, disagrees at the lowest set bit
+itself (`1` vs `0`), and disagrees on the trailing zeros (`0` vs `1` — but those are `0` in `n`,
+so ANDing keeps them `0` regardless). AND the two together and only the lowest set bit changes,
+from `1` to `0`. Repeat once per set bit, and the loop terminates exactly when none remain.
+
+<Watch items={[['time', 'O(k)'], ['space', 'O(1)'], ['k', 'number of set bits, ≤ 32']]} />
+
+## common bugs
+
+- Using `int` and a signed right shift (`>>`) if you rewrite this as the shift-and-count brute
+  force — arithmetic shift sign-extends negative numbers, so the loop can run forever on a
+  negative value. C#'s `uint` parameter sidesteps this entirely; if you need it on a signed type,
+  the unsigned right-shift operator `>>>` (C# 11+) is the fix.
+- Looping the shift-and-mask version with `n > 0` instead of `n != 0` — for an unsigned type this
+  particular bug is harmless, but the habit transfers badly to signed code where `n > 0` misses
+  negative values entirely.
+- Reaching for `for (int i = 0; i < 32; i++)` and checking each bit — correct, just always
+  32 iterations instead of `popcount(n)`; fine to mention as the baseline, worth upgrading from.
+- On the job, `System.Numerics.BitOperations.PopCount(n)` is the one-liner — but an interviewer
+  asking this question wants to see you derive the `n & (n - 1)` identity yourself.
+
+## variants you can now solve
+
+- **[Counting Bits](/patterns/bit-manipulation/counting-bits/)** (LC 338) — apply this exact
+  identity across every integer `0..n` at once, reusing smaller answers instead of recomputing
+  each popcount from scratch.
+- **Power of Two** (LC 231) — `n > 0 && (n & (n - 1)) == 0`: a power of two has exactly one set
+  bit, so clearing it must reach zero in a single step.
+- **Hamming Distance** (LC 461) — XOR two numbers first (the differing bits become `1`s), then
+  run this exact loop on the result.

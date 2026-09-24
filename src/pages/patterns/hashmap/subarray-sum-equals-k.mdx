@@ -1,0 +1,125 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: hashmap
+problem: subarray-sum-equals-k
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import Cells from '@components/Cells.astro';
+
+## task
+
+Given an array of integers (positive, negative, or zero) and an integer `k`, return the number
+of contiguous subarrays whose elements sum to `k`.
+
+```text
+nums = [3, 4, 7, 2, -3, 1, 4, 2], k = 7  →  4
+```
+
+## how to think
+
+The brute force checks every `(start, end)` pair and sums each one — `O(n²)` or worse. The key
+observation: define the **running total** `prefix[i]` = sum of `nums[0..i]`. The sum of any
+subarray `nums[i+1..j]` is just `prefix[j] - prefix[i]` — one subtraction instead of re-summing
+a range. (The prefix-sum idea in full generality lives on its own page,
+[Range Sum Query](/patterns/array-techniques/range-sum-query/); here you only need the running
+total, computed on the fly as you scan — no precomputed array required.)
+
+So the subarray ending at `j` sums to `k` exactly when some earlier prefix `prefix[i]` satisfies
+`prefix[j] - prefix[i] == k`, i.e. `prefix[i] == prefix[j] - k`. That's a lookup: "how many
+times have I seen the running total `sum - k` before?" Track every running total you've seen
+**and how many times**, in a dictionary, as you scan once left to right. One critical seed:
+`prefixCount[0] = 1` before you start — that accounts for a subarray starting at index `0`
+itself summing to `k` (its "sum minus an empty prefix" is the whole subarray).
+
+<Callout kind="note" label="template instance">
+  **prefixSum → count** skeleton, verbatim. Key: the running total `sum` seen so far. Invariant:
+  `prefixCount[v]` holds how many prefixes ending before the current index summed to exactly
+  `v`. Seed `prefixCount[0] = 1` so a subarray starting at index 0 is counted correctly.
+</Callout>
+
+## solution
+
+```csharp
+public int SubarraySum(int[] nums, int k)
+{
+    var prefixCount = new Dictionary<int, int> { [0] = 1 };  // empty prefix seen once
+    int sum = 0, count = 0;
+
+    foreach (int n in nums)
+    {
+        sum += n;
+        count += prefixCount.GetValueOrDefault(sum - k);      // earlier prefixes completing sum k
+
+        prefixCount[sum] = prefixCount.GetValueOrDefault(sum) + 1;
+    }
+    return count;
+}
+```
+
+## trace
+
+`nums = [3, 4, 7, 2, -3, 1, 4, 2]`, `k = 7`. Start with `sum = 0`, `count = 0`,
+`prefixCount = {0: 1}`:
+
+| n | sum | need (sum−k) | hit (prefixCount[need]) | count | prefixCount after |
+| --- | --- | --- | --- | --- | --- |
+| 3 | 3 | -4 | 0 | 0 | `{0:1, 3:1}` |
+| 4 | 7 | 0 | 1 | 1 | `{0:1, 3:1, 7:1}` |
+| 7 | 14 | 7 | 1 | 2 | `{0:1, 3:1, 7:1, 14:1}` |
+| 2 | 16 | 9 | 0 | 2 | `{0:1, 3:1, 7:1, 14:1, 16:1}` |
+| -3 | 13 | 6 | 0 | 2 | `{0:1, 3:1, 7:1, 14:1, 16:1, 13:1}` |
+| 1 | 14 | 7 | 1 | 3 | `{0:1, 3:1, 7:1, 14:2, 16:1, 13:1}` |
+| 4 | 18 | 11 | 0 | 3 | `{0:1, 3:1, 7:1, 14:2, 16:1, 13:1, 18:1}` |
+| 2 | 20 | 13 | 1 | 4 | `{0:1, 3:1, 7:1, 14:2, 16:1, 13:1, 18:1, 20:1}` |
+
+Four hits, each is a distinct subarray summing to `7`: `[3,4]` (indices 0-1), `[7]` (index 2),
+`[7,2,-3,1]` (indices 2-5), and `[1,4,2]` (indices 5-7). Notice row six (`n = 1`): `sum` returns
+to `14`, a value already seen once (row three). `prefixCount[14]` is `1` going into that row —
+not because `14` is special, but because a *second* prefix has now landed on it. That's exactly
+why `prefixCount` stores counts, not just "seen or not": if a third prefix ever landed on `14`
+too, it would retroactively pair with both earlier ones the moment `sum - k` hit `14` again.
+
+Row eight, the last hit: the scan sits at index `7`, and the subarray it just closed is
+`[1, 4, 2]`, indices 5 through 7:
+
+<Cells
+  data={[3, 4, 7, 2, -3, 1, 4, 2]}
+  pointers={{ 7: [{ t: 'j', c: 'amber' }] }}
+  cells={{ 5: 'ok', 6: 'ok', 7: 'ok' }}
+  caption="sum = 20, need = sum - k = 13, prefixCount[13] = 1 -- the subarray [1, 4, 2] sums to 7"
+/>
+
+## why it works
+
+`prefixCount[v]` after processing index `j` is the number of prefixes `prefix[i]` (for
+`i <= j`) equal to `v`. A subarray `nums[i+1..j]` sums to `k` exactly when
+`prefix[j] - prefix[i] == k`. So for a fixed `j`, the number of valid starting points `i` is
+precisely `prefixCount[prefix[j] - k]` — read at the moment you finish updating `sum` for `j`,
+*before* inserting `prefix[j]` itself (so a subarray never uses its own end as its own start).
+Summing that count over every `j` counts every valid `(i, j)` pair exactly once, in one linear
+pass.
+
+<Watch items={[['time', 'O(n)'], ['space', 'O(n)']]} />
+
+## common bugs
+
+- Forgetting to seed `prefixCount[0] = 1` — silently undercounts every subarray that starts at
+  index `0`.
+- Adding the current `sum` to `prefixCount` **before** doing the lookup — that lets a subarray
+  of length zero (an index paired with itself) count as a hit.
+- Assuming `nums` is all non-negative and reaching for a sliding window instead — negative
+  values break window monotonicity; only the prefix-sum dictionary handles this in general.
+- Confusing this with [Range Sum Query](/patterns/array-techniques/range-sum-query/): that
+  problem precomputes prefixes to answer many *fixed-range* queries in O(1) each; this one
+  counts *how many* ranges hit a target, which needs the frequency dictionary on top.
+
+## variants you can now solve
+
+- **[Range Sum Query — Immutable](/patterns/array-techniques/range-sum-query/)** (LC 303) — the
+  formal home of the prefix-sum array this problem's running total is a special case of.
+- **Continuous Subarray Sum** (LC 523) — same running-total idea, but the lookup is on
+  `sum % k` (remainder) instead of `sum` itself, to catch multiples of `k`.
+- **Binary Subarrays With Sum** (LC 930) — identical shape on a 0/1 array; often solved with
+  this exact dictionary or an "at most" sliding-window trick.

@@ -1,0 +1,118 @@
+---
+layout: '@layouts/TopicLayout.astro'
+topic: stack-queue
+---
+
+import Callout from '@components/Callout.astro';
+import ProblemList from '@components/ProblemList.astro';
+
+## core idea
+
+A stack remembers the single most recent thing you haven't dealt with yet — last in, first out.
+That's exactly the shape of "innermost closes first" (brackets, tags, nested calls) and of "who
+is still waiting to be resolved by something later" (next-greater-element questions). Queues get
+one problem here too, but only as something you *build*, not something you traverse with — the
+FIFO traversal itself belongs to [BFS & DFS](/patterns/bfs-dfs/). This page is deliberately
+stack-heavy.
+
+| shape | mechanism | typical trigger |
+| --- | --- | --- |
+| LIFO matching | push openers, pop-and-check on closers | brackets/tags/nesting, "is this valid?" |
+| monotonic stack | keep push order increasing or decreasing (strict or with ties, depending on the tie rule); a break resolves whoever's waiting | "next greater/smaller element", span or wait-time questions |
+| stack-backed design | wrap `Stack<T>` (or two of them) behind a class whose invariant survives every push and pop | "design a stack that also...", "implement X using stacks" |
+
+## when to reach for it
+
+- Nesting or matching: brackets, tags, any rule where the innermost thing must resolve before
+  its container can.
+- The answer for index `i` is "the nearest earlier or later element that beats mine" — the
+  next-greater/warmer-day family.
+- The problem says "design" or "implement ... using a stack/queue" and wants specific operations
+  in `O(1)`.
+- Undo/backtrack semantics: the most recent action is the first one you reverse.
+- A brute force would rescan everything to the left (or right) of `i` for every `i` — an `O(n^2)`
+  smell that a stack usually collapses to `O(n)` because each element is pushed and popped once.
+
+## universal templates
+
+LIFO matching — push what you're waiting to close, check it when a closer arrives:
+
+```csharp
+public bool IsValidSequence(string s)
+{
+    var stack = new Stack<char>();
+
+    foreach (char c in s)
+    {
+        if (IsOpener(c))
+        {
+            stack.Push(c);                        // opener: wait for its closer
+        }
+        else if (IsCloser(c))
+        {
+            if (!stack.TryPop(out char top) || !Matches(top, c))
+                return false;                       // nothing waiting, or the wrong opener is on top
+        }
+    }
+    return stack.Count == 0;                        // every opener found its closer
+}
+```
+
+Monotonic stack — indices wait in the stack until something breaks the invariant and resolves them:
+
+```csharp
+public int[] ResolveWithMonotonicStack(int[] values)
+{
+    int[] answer = new int[values.Length];
+    var pending = new Stack<int>();                  // indices whose answer isn't known yet
+
+    for (int i = 0; i < values.Length; i++)
+    {
+        while (pending.Count > 0 && Breaks(values[pending.Peek()], values[i]))
+        {
+            int j = pending.Pop();                    // i resolves whatever j was waiting for
+            answer[j] = Resolve(j, i);
+        }
+        pending.Push(i);                              // i now waits for its own resolution
+    }
+    return answer;                                    // indices still pending never got resolved
+}
+```
+
+Stack-backed design — the stack *is* the data structure; your job is choosing the invariant that
+every `Push`/`Pop` must preserve:
+
+```csharp
+public class StackBackedDesign<T>
+{
+    private readonly Stack<T> _primary = new();
+    // add a second Stack<T> (or any side channel) here when the invariant needs one --
+    // e.g. a running minimum, or a second stack to reverse order for FIFO.
+
+    public void Push(T val)
+    {
+        _primary.Push(val);
+        // update the side channel so the invariant still holds after this push
+    }
+
+    public T Pop()
+    {
+        T val = _primary.Pop();
+        // update the side channel so the invariant still holds after this pop
+        return val;
+    }
+}
+```
+
+Every problem below is one of these three skeletons with a different invariant plugged in.
+
+<Callout kind="insight" label="the one question to ask">
+  Before you push, ask: *"what will I need to know if I pop this later?"* If the honest answer is
+  "nothing beyond the raw value," you want plain LIFO matching. If it's "whether this breaks a
+  rule I've kept true so far," you want a monotonic stack. If it's "some derived fact that must
+  stay in lockstep with the stack itself," you're designing a stack-backed structure.
+</Callout>
+
+## problems
+
+<ProblemList topic="stack-queue" />

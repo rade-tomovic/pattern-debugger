@@ -1,0 +1,145 @@
+---
+/**
+ * Language-aware code block. Wrap one fenced block per language:
+ *
+ *   <Solution>
+ *   ```csharp
+ *   ...
+ *   ```
+ *   ```python
+ *   ...
+ *   ```
+ *   </Solution>
+ *
+ * Every variant renders at build time (full Shiki highlighting, zero JS cost
+ * for single-language blocks' content). With 2+ variants a tab bar appears;
+ * the visible one follows the site-wide language (sidebar picker,
+ * localStorage) with the site default as fallback. Clicking a tab overrides
+ * the choice for THIS block only; changing the global picker clears local
+ * overrides everywhere.
+ *
+ * With exactly one variant, no tab bar renders and the block looks like a
+ * plain code fence — safe to use everywhere today, ready for /add-language.
+ */
+---
+
+<solution-tabs class="block">
+  <div class="mb-0 hidden flex-wrap gap-1.5" data-tabs></div>
+  <div data-panels><slot /></div>
+</solution-tabs>
+
+<style>
+  /* no-JS / pre-hydration fallback: show only the site default language
+     (keep the selector in sync with defaultLang in src/data/languages.ts) */
+  solution-tabs [data-panels] :global(pre:not([data-language='csharp'])) {
+    display: none;
+  }
+  solution-tabs [data-panels] :global(pre:only-child) {
+    display: block;
+  }
+  /* once hydrated, JS decides */
+  solution-tabs[data-ready] [data-panels] :global(pre) {
+    display: none;
+  }
+  solution-tabs[data-ready] [data-panels] :global(pre[data-active]) {
+    display: block;
+  }
+
+  solution-tabs [data-tabs] :global(button) {
+    font-family: var(--font-mono);
+    font-size: 0.75rem;
+    padding: 0.3rem 0.8rem;
+    background: var(--color-panel);
+    color: var(--color-muted);
+    border: 1px solid var(--color-line);
+    border-radius: 6px;
+    cursor: pointer;
+    transition:
+      color 0.15s,
+      border-color 0.15s;
+  }
+  solution-tabs [data-tabs] :global(button:hover) {
+    color: var(--color-ink);
+    border-color: var(--color-muted);
+  }
+  solution-tabs [data-tabs] :global(button[data-active]) {
+    background: var(--color-panel2);
+    color: var(--color-amber);
+    border-color: var(--color-amber);
+  }
+  solution-tabs [data-tabs] + [data-panels] :global(pre) {
+    margin-top: 0.6rem;
+  }
+</style>
+
+<script>
+  import { languages, defaultLang, LANG_STORAGE_KEY, LANG_EVENT } from '@data/languages';
+
+  const labelFor = (id: string) => languages.find((l) => l.id === id)?.label ?? id;
+  const globalLang = (): string => {
+    try {
+      return localStorage.getItem(LANG_STORAGE_KEY) ?? defaultLang;
+    } catch {
+      return defaultLang;
+    }
+  };
+
+  class SolutionTabs extends HTMLElement {
+    #override: string | null = null;
+    #pres: HTMLPreElement[] = [];
+    #tabBar: HTMLElement | null = null;
+    #onGlobalChange = () => {
+      this.#override = null;
+      this.#apply();
+    };
+
+    connectedCallback() {
+      this.#tabBar = this.querySelector('[data-tabs]');
+      this.#pres = [...this.querySelectorAll<HTMLPreElement>('[data-panels] pre')];
+      const langs = [...new Set(this.#pres.map((p) => p.dataset.language ?? ''))].filter(Boolean);
+
+      if (this.#tabBar && langs.length > 1) {
+        for (const lang of langs) {
+          const b = document.createElement('button');
+          b.type = 'button';
+          b.textContent = labelFor(lang);
+          b.dataset.lang = lang;
+          b.addEventListener('click', () => {
+            this.#override = lang;
+            this.#apply();
+          });
+          this.#tabBar.appendChild(b);
+        }
+        this.#tabBar.classList.remove('hidden');
+        this.#tabBar.classList.add('flex');
+      }
+
+      this.setAttribute('data-ready', '');
+      this.#apply();
+      window.addEventListener(LANG_EVENT, this.#onGlobalChange);
+    }
+
+    disconnectedCallback() {
+      window.removeEventListener(LANG_EVENT, this.#onGlobalChange);
+    }
+
+    #apply() {
+      const available = this.#pres.map((p) => p.dataset.language);
+      const wanted = globalLang();
+      const pick =
+        this.#override ??
+        (available.includes(wanted)
+          ? wanted
+          : available.includes(defaultLang)
+            ? defaultLang
+            : available[0]);
+
+      for (const p of this.#pres) p.toggleAttribute('data-active', p.dataset.language === pick);
+      this.#tabBar
+        ?.querySelectorAll('button')
+        .forEach((b) => b.toggleAttribute('data-active', b.dataset.lang === pick));
+    }
+  }
+
+  if (!customElements.get('solution-tabs')) customElements.define('solution-tabs', SolutionTabs);
+</script>

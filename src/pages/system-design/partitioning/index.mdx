@@ -1,0 +1,346 @@
+---
+layout: '@layouts/TopicLayout.astro'
+topic: partitioning
+---
+
+import Callout from '@components/Callout.astro';
+
+## the ground floor
+
+- **partition (shard)** — one slice of the dataset, holding a disjoint subset of the rows or
+  keys, served independently of every other slice. Vendors do not agree on a word: Cosmos DB
+  and Kafka both say "partition", most sharding literature says "shard", they mean the same
+  thing, and this page uses them interchangeably.
+- **partition key (shard key)** — the field, or fields, whose value decides which partition a
+  row belongs to. This is the single highest-leverage decision in the whole topic — get it
+  wrong and every failure mode below (hot keys, scatter-gather reads, expensive rebalancing)
+  is a symptom you are treating instead of the cause.
+- **coordinator / router** — whatever knows the current partition map and sends a request to
+  the right node: a hash function run client-side (a Kafka producer), a proxy that redirects
+  you (Redis Cluster), or a metadata service you ask first (Cosmos DB's gateway).
+- **rebalancing** — moving partitions between nodes as capacity changes. Almost everything in
+  "how it actually works" is either a technique for making this cheap or a failure mode from
+  it being expensive.
+
+## core idea
+
+A single machine has a ceiling: how much disk it can attach, how much RAM it can hold, how
+much concurrent work it can serve. Past that ceiling the only remaining lever is more
+machines, and partitioning is the answer to the question that creates: given more than one
+machine, which one is responsible for a given piece of data. Replication answers a different
+question — how many copies exist — and [replication](/system-design/replication/) is the page
+for that; the two axes compose, and production systems almost always do both at once.
+
+The staff-engineer sentence: partitioning trades "one dataset too big for one machine" for
+"a routing problem and a rebalancing problem", and the entire topic is choosing a partitioning
+scheme whose routing stays cheap and whose rebalancing stays bounded as the cluster changes
+shape.
+
+## how it actually works
+
+### hash partitioning vs range partitioning
+
+Every scheme reduces to answering one question — given a key, which partition owns it — and
+there are exactly two honest ways to answer it.
+
+**Hash partitioning** runs the key through a hash function and uses the result to pick a
+partition. This scatters adjacent keys across the cluster on purpose, which is exactly what
+you want for spreading load evenly, and exactly what you give up for range queries: `WHERE
+user_id BETWEEN 100 AND 200` now has to ask every partition, because consecutive IDs are *not*
+adjacent in hash space.
+
+**Range partitioning** keeps keys in sorted order and assigns contiguous ranges to partitions.
+A range scan touches only the partitions its range spans — one, usually — which is the whole
+reason to choose it. The cost is that a monotonically increasing key (an auto-incrementing ID,
+a timestamp) always appends to the newest range, so all write traffic concentrates on whichever
+partition currently owns the tail. HBase's row-key hotspotting is the canonical case of this,
+and it is why HBase's own docs tell you to salt or hash-prefix a sequential row key rather than
+use it raw.
+
+### consistent hashing: bounding what a membership change moves
+
+Plain `hash(key) % N` looks like hash partitioning but has a fatal property: `N` is in the
+modulus. Change the node count and the modulus changes, so almost every key's assigned node
+changes with it — not just the keys that should logically move to the new node. Scaling a
+cluster by one node becomes a near-total data migration.
+
+Consistent hashing fixes the coupling by hashing nodes onto the same ring as keys, instead of
+hashing keys against the node count. A key belongs to the first node clockwise from its hash
+position. Adding or removing a node only changes ownership of the arc immediately behind it;
+every other key's nearest node is untouched.
+
+```text
+CONSISTENT HASHING RING — hash space 0..359, walked clockwise, wraps at 360
+
+  0        40        95       150       210       260       300      360→0
+  |         |         |         |         |         |         |
+ C2        A1        B1        C1        A2        B2      (wraps to C2)
+
+ key "order-4471" hashes to  47 -> first vnode clockwise is A1 -> node A
+ key "user-9002"  hashes to 302 -> first vnode clockwise is C2 -> node C (wrap)
+
+ NODE D JOINS, placing two vnodes: D1 at 70, D2 at 230
+
+  0    40   70    95   150  210  230  260  300     360→0
+  |    |    |     |    |    |    |    |    |
+ C2   A1   D1    B1   C1   A2   D2   B2   (wraps)
+       \___/\____/          \___/\____/
+      unchanged  moved            unchanged  moved
+      (owned by   from B1         (owned by   from B2
+       A1 still)  to D1            A2 still)  to D2
+
+ only the arcs (A1, D1] and (A2, D2] change owner. every other key's nearest
+ vnode — and therefore its node — never moved. that is the entire point:
+ node count changed, but roughly 1/N of keys moved, not (N-1)/N of them.
+```
+
+`A1`/`A2`, `B1`, `C1`/`C2` are **virtual nodes** — a physical node claims several points on the
+ring, not one. Without them, one physical node can land a large arc purely by hash luck, and
+the arcs stay that lumpy forever; more virtual nodes per physical node smooths the arc sizes
+toward equal, at the cost of a bigger routing table.
+
+<Callout kind="trap" label="the folklore, corrected">
+  Consistent hashing bounds *how many keys move on a membership change*. That is the entire
+  claim. It does not balance load — that is virtual nodes' job, a separate mechanism — and it
+  does nothing at all about a hot key: if one key gets ten times the traffic of its neighbors,
+  it is still one key, still owned by one node, on a ring or off one. "We use consistent
+  hashing so load is balanced" is the single most common wrong sentence in this topic.
+</Callout>
+
+Many real systems skip the ring entirely and get the same bounded-movement property more
+simply: pick a fixed number of logical partitions up front — larger than you will ever have
+nodes, e.g. Cassandra defaults `num_tokens` well past the node count, Kafka topics are created
+with a fixed partition count — and rebalance by reassigning whole partitions to nodes rather
+than rehashing keys. It is the same idea (a layer of indirection between key and node) with a
+coarser, easier-to-reason-about unit of movement.
+
+### the secondary index problem
+
+Partitioning solves point lookups and range scans on the partition key. It does nothing for
+"find the row where `email = 'x'`" when the partition key is `user_id` — and this is the part
+of the topic interviewers actually probe, because both fixes cost something and neither is
+free.
+
+```text
+LOCAL SECONDARY INDEX                    GLOBAL SECONDARY INDEX
+index lives inside each partition,       index is its OWN dataset,
+keyed by the PARTITION key                partitioned by the INDEXED field
+
+ shard 1 (user_id 1-999)                  shard 1 (user_id 1-999)
+ +---------------------------+            +---------------------------+
+ | row: user_id=42            |            | row: user_id=42            |---write #1---+
+ |  email=a@x.com              |           |  email=a@x.com              |             |
+ | local idx: email -> id      |           +---------------------------+             |
+ +---------------------------+                                                       v
+ shard 2 (user_id 1000-1999)               email-index shard (partitioned BY email)
+ +---------------------------+             +---------------------------+
+ | row: user_id=1500          |             | a@x.com -> user_id=42     |<--write #2----
+ |  email=b@y.com              |            +---------------------------+
+ | local idx: email -> id      |            second write, NOT in the same local
+ +---------------------------+             transaction as write #1
+
+query WHERE email = 'b@y.com':             query WHERE email = 'b@y.com':
+ fan out to EVERY shard, ask each           one hash on email, one targeted
+ local index, merge results                 read on the index shard
+
+ cost lands on every READ                   cost lands on every WRITE, plus a
+ (scatter-gather)                           window where the index can point
+                                             at a row that already moved
+```
+
+Local indexes keep the write atomic with the row — same partition, one transaction — and pay
+for it on every read with a scatter-gather fan-out. Global indexes make the read a single
+targeted lookup and pay for it on every write, because the row and its index entry now live on
+different partitions that cannot commit together without a distributed transaction; most
+systems that offer a global secondary index (DynamoDB's GSI is the clearest example) make that
+tradeoff explicit by documenting the index as eventually consistent rather than pretending it
+is free.
+
+### sizing the partition count
+
+Worked from stated assumptions — the arithmetic, not a benchmark.
+
+**Storage-driven.** Assume 500 million rows, 2 KB average row size: `500,000,000 x 2 KB =
+1,000,000,000 KB ≈ 954 GiB` of data. Pick a target partition size that keeps a single
+partition's backup, re-index, and rebalance-migration operations tractable — say 50 GiB.
+`954 / 50 ≈ 20` partitions minimum. Round up for headroom and divisibility (you want partition
+count to divide cleanly across whatever node count you start and grow into) — 32 is a
+reasonable next power-of-two, giving each of an initial 4-node cluster 8 partitions apiece,
+with room to grow to 8, 16, or 32 nodes without ever having to re-shard, only reassign.
+
+**Throughput-driven, not storage-driven.** Cosmos DB documents a per-physical-partition
+throughput ceiling (order of 10,000 RU/s). Assume a workload provisioned at 100,000 RU/s: even
+if the data itself would fit in far fewer partitions by size, the service must create at least
+`100,000 / 10,000 = 10` physical partitions purely to have enough throughput headroom to serve
+the provisioned rate. This is the case that surprises people coming from a single-node
+database: partition count can be a function of your request budget, not your data volume.
+
+## the tradeoff
+
+| axis | hash partitioning | range partitioning |
+| --- | --- | --- |
+| load distribution | even by construction, given a reasonable hash and enough virtual nodes | uneven unless pre-split; sequential keys pile onto one range |
+| range scans | not local — a bounded scan still touches every partition | native — a scan touches only the partitions the range spans |
+| classic hotspot | one hot *key*, unaffected by the scheme either way | one hot *range* — usually "the newest data", from a monotonic key |
+| rebalancing unit | a hash bucket / virtual node, ownership reassigned | a range, split or merged at a boundary |
+| example systems | DynamoDB, Cosmos DB (hash partition key), Cassandra's default partitioner | HBase, Cassandra's clustering columns for the ordered part, time-series databases |
+
+Default to hash partitioning for OLTP-style access — point lookups and writes by key — because
+it gives even load without any pre-splitting work. Reach for range partitioning only when the
+dominant query genuinely needs a sorted scan over a key range (a time series by timestamp, a
+leaderboard by score), and go in accepting that you now own hotspot mitigation explicitly:
+pre-split the ranges before load arrives, or prefix the natural key with a coarse hash byte so
+new writes fan out across several ranges instead of piling onto one. "It depends" only as far
+as: it depends on whether your dominant query is a point lookup or a range scan — everything
+else follows from that answer.
+
+## how it fails
+
+- **Hot partition from a hot key.** Symptom: one partition's queue depth and CPU climb while
+  every other partition sits idle — the aggregate cluster metric looks fine, which is exactly
+  why this is missed until a support ticket names a specific slow customer. Cause: a
+  low-cardinality partition key (tenant ID with one huge tenant, a celebrity account, a
+  trending product ID). Adding partitions does not help — that one key is still, by
+  definition, owned by exactly one partition. The fix breaks the key itself: append a random
+  or round-robin suffix and fan the writes across `N` sub-keys, reading with a fan-in merge, or
+  move the hot key out of the partitioned store into a cache in front of it.
+- **Rebalancing storm.** Symptom: latency degrades cluster-wide, not just on the node being
+  added, right when a scaling event happens. Cause: a naive `mod N` scheme (or a ring with too
+  few virtual nodes concentrating the moved arc on one physical node) moving far more data than
+  the membership change logically requires, saturating the network during the migration
+  window.
+- **Cross-partition transaction failure.** Symptom: "the transfer debited one account and
+  never credited the other." Cause: an operation spanning two partitions has no local
+  transaction to rely on; without a coordinator on top (two-phase commit, or a saga with
+  compensation) a partial failure leaves one side applied and the other not. See
+  [consensus](/system-design/consensus/) for why two-phase commit is not a free fix here — it
+  blocks, it does not make the operation atomic-and-available.
+- **Stale index after rebalancing.** Symptom: an intermittent "not found" for a row that
+  demonstrably exists, correlated with a recent partition reassignment. Cause: a router or a
+  global secondary index still pointing at a partition's old node, or an async index update
+  that has not caught up to a row that already moved.
+- **Split ownership during a rebalance race.** Symptom: duplicate writes, or a write that
+  silently vanishes, right after a topology change. Cause: two nodes each briefly believing
+  they own the same partition because the routing table update and the actual data handoff are
+  not the same atomic event. This is structurally the same race two CPU cores run over a cache
+  line before a memory barrier orders them — see the cross-layer table below — and it needs the
+  same class of fix: a single authority that resolves ownership rather than "whoever acts
+  first wins".
+
+## in practice
+
+- **SQL Server** table partitioning (a partition function plus a partition scheme) splits one
+  table across filegroups on **one instance** — it is not sharding, and conflating the two is
+  the most common mistake a SQL Server engineer brings into this topic. Horizontal sharding
+  across machines is a separate tool: the Elastic Database (Elastic Query / shard map) tooling
+  for Azure SQL, or an app-level shard router you write yourself.
+- **PostgreSQL** has the identical trap: `PARTITION BY RANGE / LIST / HASH` is also
+  single-instance. Actual cross-node sharding needs an extension (Citus) or an app-level
+  scheme; "I partitioned the table" and "I sharded the database" are different sentences that
+  happen to share a keyword.
+- **Cosmos DB** makes the partition key the schema-design decision — it cannot be changed
+  after container creation without a full data migration. A logical partition has a documented
+  storage ceiling (order of 20 GiB), and a physical partition has the documented throughput
+  ceiling used in the arithmetic above; a query without the partition key in the filter is a
+  cross-partition fan-out, billed and latency-charged as one.
+- **Redis Cluster** partitions with 16,384 fixed hash slots, not one slot per node — slots are
+  assigned to nodes and moved in slot-sized chunks during a resharding, never per key. A hash
+  tag (`user:{42}:profile` and `user:{42}:sessions` sharing `{42}`) forces related keys into
+  the same slot so a multi-key operation (a transaction, a `MGET`) does not span nodes.
+- **Kafka** partitions are the unit of both parallelism and ordering, and ordering is a
+  per-partition guarantee only, never a topic-wide one. The default partitioner hashes the key
+  modulo the *current* partition count — not a consistent-hashing ring — so increasing a live
+  topic's partition count silently changes which partition a previously-seen key lands in for
+  every message produced after the resize. Nothing crashes; the "same key stays co-located and
+  in order" assumption just stops holding, quietly, for new messages.
+- **RabbitMQ** does not partition data the way Kafka does by default; spreading one logical
+  queue's throughput across nodes is a plugin (the sharding plugin) or an application-level
+  pattern, not a first-class primitive. Bring Kafka's mental model into a RabbitMQ design and
+  you will look for a partition count that is not there.
+- **EF Core** has no cross-shard query support. Sharding a multi-tenant app in .NET usually
+  means a `DbContext` factory that resolves a connection string from the tenant or shard key at
+  the composition root; any query that must span shards is application-level fan-out code, not
+  a single LINQ expression — the abstraction stops exactly at the shard boundary.
+- **Polly** retry policies need to distinguish "this partition moved, ask the router again"
+  from "this node is just slow", especially mid-rebalance. A naive retry-the-same-connection
+  policy keeps hammering a partition replica that already handed its keys elsewhere; pair the
+  retry with re-resolving the route rather than reusing the failed connection.
+
+## the same idea elsewhere
+
+| elsewhere | the same mechanism | the trap |
+| --- | --- | --- |
+| a CPU cache line — [memory hierarchy](/systems/memory-hierarchy/) | an address maps to a cache set the same way a key hashes to a partition | both give even distribution over *addresses*, never over *access frequency* — a hot cache line and a hot key are the identical failure one layer apart |
+| lock striping — [what a lock is made of](/systems/locks-internals/) | splitting one mutex into `N` mutexes indexed by `hash(key) % N` is partitioning applied to synchronization instead of storage | too few stripes and you have rebuilt one hot lock under a different name — the same hot-key failure, in-process |
+| an ownership race during rebalancing — [the memory model](/systems/memory-model/) | two nodes briefly believing they both own a partition is the cluster-scale version of two cores racing to claim a cache line before a memory barrier orders them | the fix is the same in spirit: a single authority resolves ownership, never "whoever gets there first" |
+| a Kafka or Service Bus consumer group — [parallelism patterns](/systems/parallelism-patterns/) | one topic split into partitions, one consumer per partition, is the exact shape of a thread pool splitting a workload into disjoint chunks | you cannot usefully run more consumers than partitions, for the same reason you cannot usefully run more worker threads than independent chunks of work |
+
+Consistent hashing is also worth naming for what it borrows: it is the interview hashmap idea
+— [hashmap and frequency counting](/patterns/hashmap/) — stretched over a cluster instead of a
+process, with virtual nodes standing in for a good hash function's job of spreading collisions
+evenly.
+
+## interview drills
+
+**Q.** You add a fourth node to a three-node cluster that partitions with plain `hash(key) % N`.
+What happens, and how would you have avoided it?
+- *weak answer* — "the new node takes a share of the keys, some data moves, that's expected."
+  True but misses the actual defect: it treats a near-total remap as a normal, proportionate
+  cost.
+- *strong answer* — changing `N` changes the modulus for every key, not just the ones that
+  should logically move to the new node, so almost the entire keyspace remaps at once instead
+  of the roughly `1/(N+1)` fraction that should move. Consistent hashing (or a fixed, larger
+  partition count reassigned rather than rehashed) decouples "how many nodes" from "which node
+  owns this key" and bounds the movement to the arc near the new node.
+- *follow-up* — "does consistent hashing then guarantee even load?" No — it guarantees bounded
+  movement on a membership change. Even load needs virtual nodes on top, and neither mechanism
+  does anything about one key getting disproportionate traffic.
+
+**Q.** Your team wants a secondary index on `email` for a table partitioned by `user_id`. Walk
+me through the options and what each costs.
+- *weak answer* — "just add an index, the database handles it" — collapses local and global
+  into one thing and misses that the cost moves depending on which one you pick.
+- *strong answer* — a local index, colocated per partition, keeps the write atomic with the row
+  but a lookup by email has to fan out and merge across every partition. A global index,
+  partitioned by email itself, makes the read a single targeted lookup but the write now
+  touches two partitions that cannot commit together locally, so you either accept an
+  inconsistency window or pay for a distributed transaction.
+- *follow-up* — "which does DynamoDB push you toward?" Its Global Secondary Index is
+  asynchronously (eventually) updated for exactly this reason — it is choosing write
+  availability over index freshness, and documents that choice rather than hiding it.
+
+**Q.** One partition key value is generating ten times the traffic of every other key. What do
+you do?
+- *weak answer* — "add more shards" — does not help; that one key is still owned by exactly one
+  shard no matter how many exist.
+- *strong answer* — break the hot key itself: append a random or round-robin suffix to spread
+  its writes across `N` sub-keys, and merge on read; or pull it out of the partitioned path
+  entirely behind a cache.
+- *follow-up* — "does that change your consistency story?" Yes — reading `N` sub-keys and
+  merging at read time trades a single source of truth for an approximate aggregate unless you
+  also reconcile them, and that reconciliation is new design surface, not a free rewrite.
+
+**Q.** Reads against a table keyed by an auto-incrementing order ID started timing out, and
+only for the newest orders. Why, and what do you check first?
+- *weak answer* — "scale up the database" — treats a structural hotspot as a capacity problem.
+- *strong answer* — this is the textbook range-partitioning hotspot: a monotonically increasing
+  key means every new row lands on the same, newest partition, so write and read-your-write
+  traffic both concentrate on one node regardless of cluster size. Check whether the scheme is
+  range-based on that raw ID with no salting, and either hash the key or prefix it with a
+  coarse shard byte so new rows spread across partitions.
+- *follow-up* — "does switching to a random UUID key fix it?" It removes the hotspot and it
+  also removes the ability to range-scan by recency, which the design may have been relying on
+  — name the traded property explicitly rather than presenting it as a free fix.
+
+**Q.** Why doesn't your consensus layer (Raft, say) make a transaction spanning two partitions
+easy?
+- *weak answer* — "Raft gives you consensus, so a distributed transaction across shards is
+  basically solved."
+- *strong answer* — Raft agrees on the order of a single replicated log for one partition's
+  replica set; it says nothing about coordinating an atomic operation across two independently
+  replicated partitions. That still needs two-phase commit or a saga on top, and two-phase
+  commit blocks — if the coordinator dies mid-protocol, participants sit holding locks until it
+  comes back.
+- *follow-up* — "what does the outbox pattern buy you instead of 2PC?" It trades atomicity for
+  availability: the cross-partition effect becomes eventually consistent and safe to retry
+  (idempotent), rather than all-or-nothing in one round trip.

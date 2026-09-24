@@ -1,0 +1,129 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: heap-top-k
+problem: kth-largest-in-stream
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import Cells from '@components/Cells.astro';
+
+## task
+
+Design a class that tracks the kth largest element of a stream, across successive insertions.
+`KthLargest(int k, int[] nums)` initializes the object with `k` and a starting stream `nums`.
+`int Add(int val)` appends `val` to the stream and returns the current kth largest element.
+LeetCode #703.
+
+```text
+KthLargest(3, [4, 5, 8, 2])
+add(3)  -> 4
+add(5)  -> 5
+add(10) -> 5
+add(9)  -> 8
+add(4)  -> 8
+```
+
+## how to think
+
+Re-sorting the whole stream on every insertion is `O(n log n)` per call — hopeless once the
+stream keeps growing. But you don't need the whole order, just one boundary: the kth largest.
+Keep a heap that holds *only* the K largest values seen so far. Because it's a min-heap, its
+root is the smallest member of that club — which, by construction, is exactly the kth largest
+overall. Every insertion either the new value fails to crack the top K (it gets pushed, then
+immediately evicted right back out, net no-op) or it does (it evicts the previous smallest
+member instead).
+
+That's the whole trick: push everything, then evict down to size K. You never need to check
+`val > heap.Peek()` before pushing — a value that doesn't belong gets evicted right back out, so
+the branch would only ever save a no-op push, not change correctness.
+
+<Callout kind="note" label="template instance">
+  **Bounded min-heap (size K)**, kept alive as instance state instead of rebuilt in one pass.
+  Invariant: `_heap` always holds at most K elements — the K largest inserted since
+  construction. What varies: eviction happens on every call to `Add` instead of once at the end
+  of a loop, because the "stream" arrives incrementally across calls.
+</Callout>
+
+## solution
+
+```csharp
+public class KthLargest
+{
+    private readonly int _k;
+    private readonly PriorityQueue<int, int> _heap = new();   // min-heap: root = current Kth largest
+
+    public KthLargest(int k, int[] nums)
+    {
+        _k = k;
+        foreach (var n in nums) Add(n);
+    }
+
+    public int Add(int val)
+    {
+        _heap.Enqueue(val, val);
+        if (_heap.Count > _k) _heap.Dequeue();   // evict the smallest of the club — it dropped out of the top K
+        return _heap.Peek();
+    }
+}
+```
+
+## trace
+
+`k = 3`, construction stream `[4, 5, 8, 2]`, then `add(3)`, `add(5)`, `add(10)`, `add(9)`,
+`add(4)`:
+
+| call | push | heap after push | evicted | heap after evict | returns |
+| --- | --- | --- | --- | --- | --- |
+| ctor: `Add(4)` | 4 | `{4}` | — | `{4}` | 4 |
+| ctor: `Add(5)` | 5 | `{4,5}` | — | `{4,5}` | 4 |
+| ctor: `Add(8)` | 8 | `{4,5,8}` | — | `{4,5,8}` | 4 |
+| ctor: `Add(2)` | 2 | `{2,4,5,8}` | 2 | `{4,5,8}` | 4 |
+| `Add(3)` | 3 | `{3,4,5,8}` | 3 | `{4,5,8}` | 4 |
+| `Add(5)` | 5 | `{4,5,5,8}` | 4 | `{5,5,8}` | 5 |
+| `Add(10)` | 10 | `{5,5,8,10}` | 5 | `{5,8,10}` | 5 |
+| `Add(9)` | 9 | `{5,8,9,10}` | 5 | `{8,9,10}` | 8 |
+| `Add(4)` | 4 | `{4,8,9,10}` | 4 | `{8,9,10}` | 8 |
+
+Nine values arrive in total (4 from construction, 5 from `Add` calls); only the last three —
+8, 9, 10 — survive as the final top-3 club:
+
+<Cells
+  data={[4, 5, 8, 2, 3, 5, 10, 9, 4]}
+  cells={{ 0: 'warn', 1: 'warn', 2: 'win', 3: 'warn', 4: 'warn', 5: 'warn', 6: 'win', 7: 'win', 8: 'warn' }}
+  caption="final heap = {8, 9, 10}; Peek() = 8, the 3rd largest of everything ever inserted"
+/>
+
+## why it works
+
+By induction on the number of values inserted so far: after processing `m` values, the heap
+holds exactly `min(m, k)` elements, and they are the `k` largest among those `m`. It's true
+trivially for the first `k` pushes (nothing has been evicted yet). Each push after that either
+adds a value that isn't in the top K — it gets evicted immediately, heap unchanged — or adds one
+that is, which forces out the *current* smallest member of the club, which by the induction
+hypothesis was correctly the smallest of the previous top K. Either way the invariant holds for
+`m + 1`. The root of a min-heap over a "K largest" set is, by definition, the Kth largest.
+
+<Watch items={[['time', 'O(log k) per Add, amortized'], ['space', 'O(k)']]} />
+
+## common bugs
+
+- Rebuilding a fully sorted structure on every `Add` — correct, but throws away the entire point
+  of bounding the heap; you're back to `O(n log n)` per call.
+- Evicting when `heap.Count >= _k` instead of `> _k` — that caps the heap at `K − 1` elements and
+  every answer comes out one rank off.
+- Forgetting the constructor must itself call `Add` (or replicate its logic) for the starting
+  `nums` — a heap left empty at construction silently under-fills, and `Peek()` on an empty heap
+  throws.
+- Guarding the push with `if (val > heap.Peek())` — looks like an optimization, but it also has
+  to special-case an empty heap, and it buys nothing: an unwanted value gets evicted right back
+  out either way.
+
+## variants you can now solve
+
+- [Kth Largest Element in an Array](/patterns/heap-top-k/kth-largest-element/) (LC 215) — the
+  batch version of exactly this idea: one heap, one pass, no incremental `Add`.
+- [Top K Frequent Elements](/patterns/heap-top-k/top-k-frequent/) (LC 347) — same bounded heap,
+  keyed by frequency instead of raw value.
+- **Top K Frequent Words** (LC 692) — the size-K min-heap again, with a comparator that breaks
+  frequency ties alphabetically.

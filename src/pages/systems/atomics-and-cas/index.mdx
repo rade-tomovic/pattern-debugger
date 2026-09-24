@@ -1,0 +1,500 @@
+---
+layout: '@layouts/TopicLayout.astro'
+topic: atomics-and-cas
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import ProblemList from '@components/ProblemList.astro';
+import Solution from '@components/Solution.astro';
+
+## the ground floor
+
+- **core** — one hardware execution engine with its own registers and its own L1 cache. Several of
+  them share a box, and two threads on two different cores really do run at the same instant, not
+  merely take turns. [Processes, threads and the kernel](/systems/process-and-thread/) builds the
+  thread half of this.
+- **cache line** — the 64-byte block that is the smallest unit of transfer and of ownership
+  between a core and memory. Nothing moves in smaller pieces, and nothing is *owned* in smaller
+  pieces either — which is the whole of this page's second half.
+  [The memory hierarchy](/systems/memory-hierarchy/) is where the line comes from.
+- **read-modify-write** (RMW) — an operation that loads a value, computes a new one from it, and
+  stores it back. `count++`, `sum += x`, `if (x == null) x = new()`. Three steps, and the gap
+  between them is where another thread fits.
+- **store buffer** — the small per-core queue a store lands in before it reaches the cache, so
+  the core does not stall waiting for the line. [The memory model](/systems/memory-model/)
+  covers what it does to visibility; this page cares that a *locked* operation cannot use it.
+- **the three guarantees** — atomicity, visibility, ordering. "Thread-safe" means some subset of
+  them and never says which. This page is almost entirely about the first one.
+  [Reordering and visibility](/systems/memory-model/) owns the other two.
+
+## core idea
+
+An `Interlocked` operation is one machine instruction with a `lock` prefix, and the prefix means
+*this core keeps the cache line to itself from the load until the store*. That is the entire
+mechanism. Everything else — atomic counters, CAS loops, spinlocks, `ConcurrentDictionary`, the
+fast path of `lock` itself — is built on that one guarantee, so understanding this one instruction
+explains all of them.
+
+The guarantee is per cache line, not per variable and not per program. That single fact explains
+both halves of the page: an atomic increment needs nothing from any other core when threads touch
+different lines, and it needs a line transferred between cores every single time when they touch
+the same one — even when the *variables* are logically different.
+
+| | plain `count++` | `Interlocked.Increment` | `lock { count++; }` |
+| --- | --- | --- | --- |
+| what it is | load, add, store | one `lock`-prefixed instruction | acquire, load, add, store, release |
+| atomic | no | yes | yes |
+| touches the kernel | never | never | only when contended |
+| scope of the guarantee | none | one aligned location, at most 8 bytes | everything inside the block |
+| what it cannot do | anything correct | make two operations one | be free of the wait queue under contention |
+
+## how it actually works
+
+Everything below is real program output from files under `bench/atomics-and-cas/`: `index.cs` for
+the lost-update counts and the ABA script, `increment-shapes.cs` for the IL and the disassembly,
+and `rmw.c` for the C cameo.
+
+### `count++` is three operations
+
+Start with the compiler's own output. This is the IL Roslyn wrote for `Count++` on a static `int`,
+printed by `bench/atomics-and-cas/increment-shapes.cs`, which decodes the bytes in its own assembly
+with the runtime's opcode table — nothing here is typed by hand:
+
+```text
+.method PlainStatic   // 13 bytes of IL
+  IL_0000:  ldsfld           Shapes::Count      ; load  — read the field into the stack
+  IL_0005:  ldc.i4.1                            ;         push 1
+  IL_0006:  add                                 ; modify — add them
+  IL_0007:  stsfld           Shapes::Count      ; write — store the result back
+  IL_000c:  ret
+```
+
+Load, modify, write. Two threads that both execute `IL_0000` before either reaches `IL_0007` both
+read the same value, both add one to it, and both store the same result. One increment is gone,
+and nothing crashed — [the counter that counted wrong](/systems/atomics-and-cas/lost-updates/) is
+that failure, in full, with the interleaving printed step by step.
+
+Now the machine code, from the same file with the JIT forced to its fully-optimized tier and its
+disassembly dump pointed at these methods by name (a diffable-output flag replaces address
+constants with the placeholder `0xD1FFAB1E`; nothing else is edited):
+
+```text
+; Shapes:PlainStatic()   —  Count++;
+       mov      rax, 0xD1FFAB1E
+       inc      dword ptr [rax]          ; ← ONE instruction. still three operations.
+
+; Shapes:PlainUse():int  —  Count++; return Count;
+       mov      rax, 0xD1FFAB1E
+       mov      ecx, dword ptr [rax]     ; load
+       inc      ecx                      ; modify
+       mov      dword ptr [rax], ecx     ; write
+       mov      eax, ecx
+```
+
+`PlainStatic` is the one people point at when they argue the increment is atomic: a single
+instruction, so how could a thread get in the middle? It gets in the middle because `inc` on a
+memory operand is *internally* a load, an add and a store, and the core does not hold the cache
+line for the whole sequence — `PlainUse`, one line above, is what those three steps look like when
+the JIT cannot fold them, and it is exactly the same three steps `PlainStatic` executes with no
+name for them. Atomicity is not about instruction count. **One instruction is not one atomic
+operation.**
+
+### what the `lock` prefix actually does
+
+Here is the same pair in C, where nothing is hidden. `bench/atomics-and-cas/rmw.c`, compiled here
+with `gcc -O2 -c` and disassembled with `objdump -dr --no-show-raw-insn` — x86-64, AT&T syntax,
+real output (the `endbr64` landing pads and alignment `nop`s every function gets are trimmed;
+nothing else is):
+
+```c
+void plain_inc(int *p) { (*p)++; }
+void atomic_inc(int *p) { __atomic_fetch_add(p, 1, __ATOMIC_SEQ_CST); }
+int  cas(int *p, int expected, int desired) {
+    return __atomic_compare_exchange_n(p, &expected, desired, 0,
+                                       __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+}
+```
+
+```text
+0000000000000000 <plain_inc>:
+   4:   addl   $0x1,(%rdi)          ; read-modify-write, one instruction, not atomic
+
+0000000000000010 <atomic_inc>:
+  14:   lock addl $0x1,(%rdi)       ; the same instruction plus one prefix byte
+
+0000000000000020 <cas>:
+  24:   mov    %esi,%eax            ; cmpxchg compares against %eax, so put `expected` there
+  26:   lock cmpxchg %edx,(%rdi)    ; if (*p == %eax) *p = %edx else %eax = *p
+  2a:   sete   %al                  ; the flag cmpxchg set: did it swap?
+```
+
+One prefix byte is the entire difference between a counter that is right and a counter that is
+wrong. The JIT emits exactly the same instructions for the C# spellings — `lock inc` when you
+ignore the result, `lock xadd` when you use it, and a bare `xchg` for `Interlocked.Exchange`
+(swapping a register with memory is atomic on x86 with no prefix needed — that is what `xchg`
+means):
+
+```text
+; Interlocked.Increment(ref Count);            → lock inc  dword ptr [rax]
+; return Interlocked.Increment(ref Count);     → lock xadd dword ptr [rax], ecx
+; return Interlocked.Exchange(ref Count, v);   → xchg      dword ptr [rax], ecx
+; Interlocked.CompareExchange(ref Count, d, e) → lock cmpxchg dword ptr [rcx], esi
+```
+
+What the prefix buys, physically: for the duration of that one instruction the core takes the
+cache line into exclusive state and refuses to give it up, and the store cannot sit in the store
+buffer — the operation is not complete until it is globally visible everywhere else. That is why
+an `Interlocked` operation is also a full memory fence for free: nothing can be reordered around a
+step that has to touch every other core before it retires.
+
+<Callout kind="trap" label="the lock prefix locks a line, not the bus">
+  The folklore says an atomic operation "locks the memory bus" and therefore stops the whole
+  machine. That was true of very old x86 and is not true of the mechanism above: the protocol that
+  moves a cache line between cores (MESI and its variants) hands exclusive ownership of *that one
+  line* to whichever core asked for it, and every other line in the system is untouched. Two
+  threads locking two different counters that live on two different lines do not wait on each
+  other at all — they are not touching the same piece of hardware state. The documented exception
+  is a *split lock*: an atomic operation on an operand that straddles two cache lines, which really
+  does force something close to a bus-wide lock and costs far more than a normal locked
+  instruction. Keep your atomics naturally aligned — the CLR aligns any field small enough for
+  `Interlocked` to touch — and it cannot happen.
+</Callout>
+
+### the CAS loop
+
+`Interlocked.Increment` exists because incrementing is common. There is no
+`Interlocked.Multiply`, no `Interlocked.Max`, no `Interlocked.UpdateIfBigger`. For everything the
+API does not have a method for, there is exactly one tool: `CompareExchange`, in a loop.
+
+The full signature, and the thing to memorise about it:
+
+```csharp
+// returns the value that WAS in `location`, whether or not the swap happened
+int Interlocked.CompareExchange(ref int location, int value, int comparand);
+//                                                ↑ the new one  ↑ what you think is there
+```
+
+It returns the *previous* value, not a bool, so the idiom compares the return against what you
+expected. That gives the shape every lock-free algorithm is built from:
+
+```text
+   read the current value            ← a plain (or Volatile) read, no lock needed
+        │
+        ▼
+   compute the new value from it     ← pure, side-effect free, may be thrown away
+        │
+        ▼
+   CompareExchange(loc, new, old)
+        │
+        ├── returned old  → you won.  the value you based your work on was still there
+        │
+        └── returned else → somebody moved it under you. throw your work away,
+                            start again from the value it actually returned
+```
+
+In C#, that is:
+
+<Solution>
+
+```csharp
+// the general shape: apply any pure function to a shared int, atomically
+static int Update(ref int location, Func<int, int> f)
+{
+    int old, want;
+    do
+    {
+        old = Volatile.Read(ref location);   // read what is there now
+        want = f(old);                       // compute from it — no side effects, this may re-run
+    }
+    while (Interlocked.CompareExchange(ref location, want, old) != old);
+    return want;                             // the value we successfully published
+}
+```
+
+</Solution>
+
+The loop body must be *pure*. It can run any number of times, and every run but the last is
+thrown away. A CAS loop that logs, sends, allocates into a shared structure or mutates anything
+else is a bug that only shows up under load — which is the same trap as
+`ConcurrentDictionary.GetOrAdd`'s factory, on
+[lock-free structures](/systems/lock-free-structures/).
+
+How often does the loop actually go round? Counted, for `bench/atomics-and-cas/index.cs` running
+400,000 increments spread over threads on one shared counter, real output:
+
+```text
+=== 2. CAS attempts per successful increment ===
+  1 thread(s): 400,000 increments,          0 retries — 1.000 attempts per increment
+  2 thread(s): 400,000 increments,    164,832 retries — 1.412 attempts per increment
+  4 thread(s): 400,000 increments,    699,526 retries — 2.749 attempts per increment
+```
+
+One thread never retries — nobody else can move the value between its read and its swap. More
+threads on one counter means more chances that somebody else's swap lands in that same window, so
+the retry count rises with contention; it is a fact about how many other threads are racing for
+the same line, not a fixed property of the loop. What does not change is *why* the loop costs what
+it costs: not the retries, but that **every iteration contains its own locked instruction** — a
+`Volatile.Read`, then a full `lock cmpxchg`. A CAS loop that does one thing is at minimum one
+locked instruction, the same floor an `Interlocked.Increment` pays, plus the read and the branch
+around it. Reach for `Interlocked.Increment`/`Add`/`Exchange` when one exists; reach for the loop
+only when it does not.
+
+### the ABA problem
+
+CAS asks one question: *is the value still what I read?* It cannot ask *has nothing happened
+since I read?* If the value went A → B → A while you were away, your CAS succeeds and you act on
+a world that has changed underneath you.
+
+Here is that, scripted, from `bench/atomics-and-cas/index.cs`. It is a stack of three nodes held
+as *indices* into an array — which is exactly what a C++ lock-free stack does with raw pointers, a
+value that gets reused. Real output:
+
+```text
+=== 3. ABA, scripted ===
+  start                    stack: C -> B -> A   head=C
+  thread 2 popped C, popped B, pushed C back
+  before thread 2's CAS…    stack: C -> A   head=C
+  thread 1's CAS returned  popped=C
+  after                    stack: B -> A   head=B
+```
+
+| step | thread 1 (popping) | thread 2 | head | stack |
+| --- | --- | --- | --- | --- |
+| 1 | reads `head` → C | | C | C → B → A |
+| 2 | reads `next[C]` → B | | C | C → B → A |
+| 3 | *paused here* | pops C | B | B → A |
+| 4 | | pops B | A | A |
+| 5 | | pushes C back | C | C → A |
+| 6 | `CompareExchange(head, B, C)` — C is what it expected, so it **succeeds** | | B | B → A |
+
+Thread 1 popped C, which is correct. What is not correct is that it set `head` to B — a node that
+was removed from the stack two steps ago — and lost A entirely. Every individual operation was
+atomic. The algorithm is still wrong.
+
+<Callout kind="insight" label="what the GC takes away, and what it does not">
+  In C++ this bug has a second, worse edge: node C could have been `free`d and its address handed
+  back by `malloc` for a completely different object, so the CAS succeeds on a pointer that no
+  longer means what it meant. That is what hazard pointers and epoch reclamation exist to prevent.
+  A tracing GC removes exactly that: while thread 1 holds a reference to C, C cannot be collected
+  and its address cannot be reused for anything else, so a reference that compares equal really is
+  the same object. **ABA itself is not removed** — the code above is C# and it just failed. If
+  your algorithm can re-publish the same reference (a pooled node, a re-pushed item), pair the
+  value with a version counter and swap the pair as one unit. .NET gives you two ways to do that
+  and neither is a wide compare-and-swap: swap a reference to an immutable `(value, stamp)` record
+  with `Interlocked.CompareExchange` in its generic form, so the stamp travels with the value; or
+  pack both halves into one `long` — the value in the low 32 bits, a stamp that only ever
+  increments in the high 32 — and use the `long` overload, the same packing trick the counter
+  exercise uses to turn two locations back into one. The hardware does have a 128-bit
+  compare-and-swap, `cmpxchg16b`, and .NET 10 exposes no API for it: every
+  `Interlocked.CompareExchange` overload tops out at 64 bits, and the generic form throws
+  `NotSupportedException` for anything that is not a reference, a primitive or an enum.
+</Callout>
+
+### contention: the line is the lock, not the value
+
+Once two cores want the same line, the mechanism per operation looks like this:
+
+```text
+   core 0                    the cache line                    core 1
+     │                    (64 bytes, one owner)                   │
+     │  lock inc  ────────► exclusive on core 0                    │
+     │                            │                                │
+     │                            │  ◄──────── lock inc: "I need it exclusive"
+     │                     invalidate core 0's copy                │
+     │                            │                                │
+     │                     transfer the line ───────────────────►  │
+     │                            │                          exclusive on core 1
+     │  ◄──────── lock inc: "I need it back"                       │
+     │                     …and back it goes                       │
+
+   the counter's VALUE is never the bottleneck. the line's OWNERSHIP is.
+   every locked operation costs one ownership transfer once two cores want it.
+```
+
+A plain, non-atomic write can dodge most of this: an ordinary store lands in the store buffer and
+several of them can drain to the cache in one ownership window, so a core that already holds the
+line runs a burst of increments locally before giving it up, and the transfer is amortised across
+that burst. A `lock`-prefixed instruction cannot use the store buffer — it is not complete until
+globally visible — so it pays for its own ownership transfer, every single time. That is the
+mechanism behind [two counters, one cache line](/systems/atomics-and-cas/false-sharing/): it is not
+that sharing a line is expensive in general, it is that a *locked* operation on a shared line pays
+the full cost of a transfer on every access, while a plain write on the same shared line mostly
+does not.
+
+That is also why the fix for a hot atomic is never a cleverer atomic — it is to stop two cores
+wanting the same line at all. One counter per thread, summed only when somebody asks, is the shape
+[what Interlocked actually does](/systems/atomics-and-cas/cas-counter/) walks in detail, because it
+removes the line-ownership transfer entirely rather than making the transfer cheaper.
+
+**When does `Interlocked` beat `lock`, and when does contention erase the gap?** For guarding one
+aligned location, `Interlocked` never does more work than `lock`: the uncontended fast path of
+`lock` is itself a compare-and-swap on the monitor's own word — [what a lock is made
+of](/systems/locks-internals/) is that mechanism — so `lock { count++; }` executes at least the
+one locked instruction `Interlocked.Increment` does, plus the acquire/release bookkeeping around
+it. `Interlocked` is the strictly cheaper choice whenever the invariant fits in the one location
+it can cover. What contention adds is not present in `Interlocked` at all: once a `lock` cannot
+acquire immediately, the runtime can hand the waiting thread to the kernel to be parked and later
+woken — a path `Interlocked` never takes, because it has no "failed to acquire" state, only more
+attempts. So the two primitives do not converge under contention so much as `lock` gains an extra,
+`Interlocked`-shaped cost (the line transfer) on top of a cost `Interlocked` never had to begin
+with (the possibility of parking). The only reason to reach for `lock` over `Interlocked` at all is
+that the invariant spans more than one location — the exact case [the counter that counted
+wrong](/systems/atomics-and-cas/lost-updates/) ends on, where `Total` and `Errors` have to move
+together.
+
+## the mental model
+
+Three questions, in order, about any shared counter or flag:
+
+1. **Is one operation on it indivisible?** A plain read or write of an aligned `int`, `bool` or
+   reference is. Any read-modify-write — `++`, `+=`, `if (x == null) x = …` — is not, whatever
+   the instruction count says, and `volatile` does not change that.
+2. **Does the API have a method for what I need?** `Increment`, `Decrement`, `Add`, `Exchange`,
+   `CompareExchange`, `And`, `Or`, `Read`. If yes, use it: one locked instruction. If no, a CAS
+   loop with a *pure* body.
+3. **How many cores want this line?** One → nothing to transfer. Several → every locked operation
+   costs one cache-line transfer, and the only real fix is to stop sharing the line.
+
+| what you wrote | what it is | what it costs, structurally |
+| --- | --- | --- |
+| `count++` on a shared field | load, add, store — a lost-update bug | no locked instruction at all; that is the bug |
+| `Interlocked.Increment(ref count)` | `lock inc` — atomic and a full fence in one instruction | one locked instruction, one line-ownership transfer per contending core |
+| a CAS loop | read, compute, `lock cmpxchg`, retry on collision | at least one locked instruction per attempt, plus a read before it |
+| `lock { count++; }` | acquire, load, add, store, release — a CAS on a lock word plus a wait queue | the same line transfer as `Interlocked`, plus kernel involvement once contended |
+| one counter per thread, padded | no line is ever shared | zero cross-core traffic; the only row that adds more threads without adding cost |
+
+<Watch items={[['cache line', '64 B'], ['locked instruction adds', 'lock inc / lock xadd / lock cmpxchg'], ['Exchange prefix', 'none — xchg is implicitly locked'], ['CAS return value', 'the previous value, not a bool'], ['ABA fix', 'version-stamp the value, CAS the pair'], ['128-bit CAS in .NET', 'not exposed (cmpxchg16b has no API)']]} />
+
+## why you should care
+
+**The metric that moves is throughput that stops rising when you add cores.** A service handling
+more traffic on more cores, up to a point, and then flat — with CPUs busy and threads runnable —
+has a shared line somewhere. It does not show up as lock contention in a profiler, because there
+may be no lock: an `Interlocked` counter, a `ConcurrentDictionary` bucket, two hot fields of one
+options object, or an array of per-worker statistics packed tightly enough to fit in one line.
+
+**The incident shape is a metrics or rate-limiting bug that only appears under load**, and it is
+the shape [the counter that counted wrong](/systems/atomics-and-cas/lost-updates/) demonstrates: a
+counter that is quietly short, a rate limiter that lets more through than it should, a "processed
+exactly once" claim that is off by a fraction of a percent. It passes every test, because a test
+rarely holds two threads inside the same few-instruction window long enough to collide.
+
+**The review you can now do:**
+
+- Any `++`, `+=`, `--` or `x = x + 1` on a field two threads can reach. `volatile` on the field
+  is not a fix and is a signal that somebody thought about threads and got it wrong.
+- `Interlocked` used on *one* of the operations in a sequence. Atomic parts do not make an atomic
+  whole: `if (Interlocked.Read(ref n) < limit) Interlocked.Increment(ref n)` is still
+  check-then-act. [Races and deadlock](/systems/concurrency-hazards/) is that family.
+- A CAS loop whose body does anything but compute. Allocating, logging, or mutating inside the
+  loop means it happens once per *attempt*, not once per success.
+- Counters, sequence numbers and per-worker state declared next to each other in one class or one
+  array. That is false sharing waiting for a second core to touch it.
+- A hot `Interlocked` counter at all. If it is per-request, partition it: per-thread or
+  per-partition counters summed on read, which is what `Interlocked` costs *should* be spent on
+  only when a single global number must be exact in real time.
+
+**The hand-off from here.** [The memory model](/systems/memory-model/) said what you lose without
+synchronisation; this page is the one instruction that buys atomicity back.
+[What a lock is made of](/systems/locks-internals/) is the next layer up: a mutex is a CAS on a
+word, plus a queue and a way to park a thread when the CAS fails — the uncontended path is nothing
+this page has not already shown you, and the contended path is what the wait queue exists to
+manage. [Lock-free structures](/systems/lock-free-structures/) is what happens when you refuse to
+park at all and build the whole data structure out of the CAS loop on this page, and
+[parallelism patterns](/systems/parallelism-patterns/) is the honest answer to most of it:
+partition the state so no line is shared.
+
+## the same idea in other languages
+
+| language | what it's called | the trap |
+| --- | --- | --- |
+| Java | `java.util.concurrent.atomic` — `AtomicInteger`, `AtomicLong`, `VarHandle`; `LongAdder` for hot counters | `AtomicInteger.incrementAndGet` is the same `lock xadd`, but Java also ships `LongAdder`, which *is* the per-thread-cell trick from this page's mental-model table, built in. If a counter is hot and only read occasionally, reaching for `AtomicLong` where `LongAdder` exists is the mistake. .NET has no `LongAdder`, so you write the partitioning yourself |
+| C | `_Atomic` types and `atomic_fetch_add` since C11; GCC's `__atomic_*` builtins | C's `volatile` is not related to any of this — it gives no atomicity and no ordering, so `volatile int x; x++` in C is the same lost-update bug as in C#, with no compiler complaint. The cameo above shows the real answer compiling to `lock addl` |
+| C++ | `std::atomic<T>` with `compare_exchange_strong` / `compare_exchange_weak` | the CAS is `compare_exchange(expected, desired)` where `expected` is an in/out **reference**: on failure it is overwritten with the actual value, which is convenient and catches people who wrote the loop expecting `expected` to be untouched. And `_weak` may fail spuriously — legal, cheaper on some ISAs, only safe inside a loop |
+| Go | `sync/atomic`, and since Go 1.19 the typed wrappers `atomic.Int64`, `atomic.Pointer[T]` with `CompareAndSwap` | on 32-bit platforms the *old* function-based 64-bit atomics require the operand to be 64-bit aligned and Go only guarantees that for the first word of an allocated struct — a documented footgun the typed `atomic.Int64` wrapper exists to remove. Go's atomics are sequentially consistent, so there is no per-operation memory-order parameter to get wrong |
+| Python | CPython's GIL serialises bytecode; `itertools.count()` is the usual atomic-counter workaround | the GIL makes each bytecode atomic, not each statement: `x += 1` on a shared int is `LOAD`, `ADD`, `STORE` with a switch point between any of them, so it loses updates exactly like this page's C#. Since CPython 3.2 the hand-off is time-driven — `sys.setswitchinterval()`, a default of 5 milliseconds — rather than a bytecode count, so the window is rare but not gone, and free-threaded builds remove the accidental protection entirely |
+
+## exercises
+
+Three, in the order the bug usually finds you: the counter that is wrong, the primitive that
+fixes it and what each one is doing to be correct, and a cost that has nothing to do with your
+logic at all.
+
+<ProblemList topic="atomics-and-cas" />
+
+## interview drills
+
+**Q.** Is `count++` atomic? It compiles to a single instruction.
+
+- *weak answer* — "No, it's three operations: read, modify, write." Correct and incomplete — the
+  interviewer's follow-up is exactly the premise of the question, and "three operations" does not
+  survive being shown a single `inc dword ptr [rax]`.
+- *strong answer* — No. It is a read-modify-write, and whether the compiler emits one instruction
+  or three makes no difference: `inc` on a memory operand still loads, adds and stores internally,
+  and the core does not hold the cache line for the whole sequence. Atomicity on x86 comes from
+  the `lock` prefix, which keeps the line exclusive from load to store. `Interlocked.Increment`
+  emits `lock inc`; `count++` emits `inc`.
+- *follow-up* — "Does `volatile` fix it?" No. `volatile` gives visibility and release/acquire
+  ordering, not atomicity — `volatile int` and `++` is still a lost-update bug, and the field
+  being `volatile` usually means somebody already thought about threads and stopped one step
+  short.
+
+**Q.** Does an atomic operation "lock the bus"? What does the `lock` prefix actually do on
+current hardware?
+
+- *weak answer* — "Yes, it stops every other core." That was x86 behaviour decades ago and is not
+  how cache-coherent multicore hardware works today.
+- *strong answer* — No. The `lock` prefix asks the cache-coherence protocol for exclusive
+  ownership of the one 64-byte line the operand lives in, holds it for the instruction, and does
+  not complete until that is globally visible. Two atomics on two different lines never contend —
+  they are asking for ownership of different hardware state. The exception is a *split lock*, an
+  operand straddling two lines, which really does escalate to something close to a bus-wide stall.
+- *follow-up* — "So when does an atomic actually get expensive?" When another core wants the same
+  line at the same time. The cost is proportional to how many cores are contending for one line,
+  not to how many atomic operations exist in the program.
+
+**Q.** We moved a per-request counter from `lock` to `Interlocked` and throughput did not improve.
+Why?
+
+- *weak answer* — "The contention must be somewhere else." Possible, and it is a guess rather
+  than a model.
+- *strong answer* — Because under real contention both primitives are paying the same thing: the
+  cache line holding the counter has to be transferred between cores once per operation, and that
+  transfer is what dominates. `lock` additionally can park a thread in the kernel when it cannot
+  get in; `Interlocked` never does. Swapping the primitive removes the kernel involvement, not the
+  line transfer, which was the actual cost.
+- *follow-up* — "How would you confirm that before changing code?" Look at whether the counter is
+  written by more than one thread at a time on the hot path. If it is, the fix is not a different
+  primitive on the same shared location — it is to stop sharing the location: per-thread or
+  per-partition counters, summed on read.
+
+**Q.** What is the ABA problem and does .NET have it?
+
+- *weak answer* — "It's when a value changes and changes back, but the GC means we don't have to
+  care." Half right, and the half that is wrong is the important half.
+- *strong answer* — CAS only checks that the value is what you read, not that nothing happened.
+  If it went A → B → A, the swap succeeds on a structure that has changed. .NET removes the
+  *memory-reclamation* half of the classic C++ version — a node you still reference cannot be
+  freed and its address cannot be reused for a different object, which is what hazard pointers
+  exist to prevent — but it does not remove ABA itself. Re-publish the same reference, for example
+  from a node pool, and it comes back. The fix is a version stamp CAS'd together with the value.
+- *follow-up* — "So when do you actually hit it?" Object pools and index- or handle-based
+  structures, where the identity you compare is deliberately reused.
+
+**Q.** Two threads, two independent counters, no shared data. Throughput does not scale the way
+you'd expect. What is your first hypothesis?
+
+- *weak answer* — "The scheduler is putting them on the same core." Testable, but on a multi-core
+  box that is not what usually happens, and it does not explain a consistent, reproducible slowdown.
+- *strong answer* — False sharing: the two counters are inside the same 64-byte cache line, so
+  every locked write by one thread forces a line-ownership transfer that invalidates the other
+  thread's copy, and the line ping-pongs. It is independent of the logic — the variables are
+  different, the line is not. I would check the field offsets or the array stride, then pad each
+  counter to its own 64-byte line and re-test.
+- *follow-up* — "Does it also hit plain, non-atomic writes on the same line?" Much less, because
+  an ordinary store can sit in the store buffer and several of them drain to the cache in one
+  ownership window — the transfer gets amortised across a burst of writes. A locked instruction
+  cannot be buffered; it must be globally visible before it retires, so it pays for a transfer on
+  every single access. That asymmetry is why false sharing is described in terms of atomics and
+  locks, not plain field writes.

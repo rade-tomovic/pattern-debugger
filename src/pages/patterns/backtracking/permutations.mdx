@@ -1,0 +1,153 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: backtracking
+problem: permutations
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+
+## task
+
+Given an array of **distinct** integers, return every possible ordering (permutation) of them.
+
+```text
+nums = [1, 2, 3]  →  [[1,2,3],[1,3,2],[2,1,3],[2,3,1],[3,1,2],[3,2,1]]
+```
+
+## how to think
+
+Subsets gave every element exactly one decision (include or skip). Permutations is a different
+shape: every element gets used exactly once, but **order matters**, so at every level of the
+recursion you're not deciding yes/no about one fixed element — you're choosing *which* of the
+still-available elements goes next. That's why the branching factor shrinks as you go: level 0
+has `n` choices, level 1 has `n - 1` (whichever wasn't just taken), level 2 has `n - 2`, and so
+on down to 1 — multiply those out and you get `n!`, which is exactly the number of leaves.
+
+The bookkeeping problem this creates is "which elements are still available," and the clean fix
+is a `used[]` array parallel to `nums`: before choosing `nums[i]`, check `used[i]`; after
+choosing it, flip it on; after backtracking out of that choice, flip it back off. The un-choose
+step now has two parts instead of one — pop the path *and* free the slot — but each is still a
+single, cheap, exactly-reversible line.
+
+<Callout kind="note" label="template instance">
+  **Pick from remaining pool** shape: at every level the loop scans *all* `n` original elements
+  but skips any with `used[i] == true`. Invariant: `path` is a permutation-prefix of exactly the
+  elements marked used; when `path.Count == nums.Length`, every element has been placed exactly
+  once.
+</Callout>
+
+## solution
+
+```csharp
+public IList<IList<int>> Permute(int[] nums)
+{
+    var result = new List<IList<int>>();
+    var path = new List<int>();
+    var used = new bool[nums.Length];
+
+    void Backtrack()
+    {
+        if (path.Count == nums.Length)
+        {
+            result.Add(new List<int>(path));   // COPY — path keeps mutating after this
+            return;
+        }
+
+        for (int i = 0; i < nums.Length; i++)
+        {
+            if (used[i]) continue;             // this element is already somewhere in path
+
+            used[i] = true;
+            path.Add(nums[i]);                 // choose
+
+            Backtrack();                        // explore
+
+            path.RemoveAt(path.Count - 1);      // un-choose (path)
+            used[i] = false;                    // un-choose (availability)
+        }
+    }
+
+    Backtrack();
+    return result;
+}
+```
+
+## trace
+
+`nums = [1, 2, 3]` — branching factor `3, 2, 1` per level, `3! = 6` leaves:
+
+```text
+()
+├─ choose 1 → (1)
+│    ├─ choose 2 → (1,2) ── choose 3 → (1,2,3)  *complete*
+│    └─ choose 3 → (1,3) ── choose 2 → (1,3,2)  *complete*
+├─ choose 2 → (2)
+│    ├─ choose 1 → (2,1) ── choose 3 → (2,1,3)  *complete*
+│    └─ choose 3 → (2,3) ── choose 1 → (2,3,1)  *complete*
+└─ choose 3 → (3)
+     ├─ choose 1 → (3,1) ── choose 2 → (3,1,2)  *complete*
+     └─ choose 2 → (3,2) ── choose 1 → (3,2,1)  *complete*
+```
+
+Every choose event, in call order:
+
+| call | depth before | `i` | value chosen | path after choose | result |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 0 | 0 | 1 | `[1]` | recurse |
+| 2 | 1 | 1 | 2 | `[1,2]` | recurse |
+| 3 | 2 | 2 | 3 | `[1,2,3]` | complete → **add [1,2,3]** |
+| 4 | 1 | 2 | 3 | `[1,3]` | recurse (2 was un-chosen first) |
+| 5 | 2 | 1 | 2 | `[1,3,2]` | complete → **add [1,3,2]**; unwind to `()` |
+| 6 | 0 | 1 | 2 | `[2]` | recurse |
+| 7 | 1 | 0 | 1 | `[2,1]` | recurse |
+| 8 | 2 | 2 | 3 | `[2,1,3]` | complete → **add [2,1,3]** |
+| 9 | 1 | 2 | 3 | `[2,3]` | recurse |
+| 10 | 2 | 0 | 1 | `[2,3,1]` | complete → **add [2,3,1]**; unwind to `()` |
+| 11 | 0 | 2 | 3 | `[3]` | recurse |
+| 12 | 1 | 0 | 1 | `[3,1]` | recurse |
+| 13 | 2 | 1 | 2 | `[3,1,2]` | complete → **add [3,1,2]** |
+| 14 | 1 | 1 | 2 | `[3,2]` | recurse |
+| 15 | 2 | 0 | 1 | `[3,2,1]` | complete → **add [3,2,1]**; done |
+
+Call 4 is the row that shows `used[]` earning its keep: after call 3 adds `[1,2,3]`, the
+unwind clears `used[2]` then `used[1]` (in that order) as the recursion returns to depth 1 with
+`path = [1]` — `used[0]` stays `true` the whole time, since we're still inside `1`'s subtree.
+Back at depth 1, the `for` loop simply continues from where it left off, `i = 2`, and `nums[2] = 3`
+is available again exactly because its `used` flag was just cleared.
+
+## why it works
+
+Induction on remaining depth. At depth `d`, exactly `n - d` elements have `used[i] == false`;
+the loop tries each one, and because `used`/`path` are restored to their depth-`d` state before
+trying the next `i`, every branch at that level sees the same pool of `n - d` candidates. By
+induction each of those branches correctly enumerates every ordering of the remaining `n - d - 1`
+elements, so the whole tree enumerates every ordering of all `n` — no repeats, because `used[]`
+forbids picking the same index twice on one path, and none missing, because every unused index
+gets its turn in the loop.
+
+<Watch items={[['time', 'O(n! · n)'], ['space', 'O(n) auxiliary (+ O(n · n!) for the output)']]} />
+
+## common bugs
+
+- Forgetting `used[i] = false` on the way back — once an element is marked used it never frees
+  up again, and every branch after the first returns early with fewer than `n!` results.
+- Checking `nums[i] == nums[path[^1]]` or similar value-based dedup by accident when the array
+  is stated to be distinct — that's the *fix* for Permutations II, and applying it here silently
+  drops valid permutations.
+- Using an index-based loop over `nums` directly (`for (int i = start; ...)`, Combination Sum's
+  shape) instead of scanning all `n` and skipping `used[i]` — order matters here, so a later
+  element sometimes needs to come *before* an earlier one, which a `start`-index loop can't do.
+- Copying `path` into `result` before the base case triggers — the record-at-every-node mistake,
+  adding every prefix as a "permutation" instead of only the complete ones at
+  `path.Count == nums.Length`.
+
+## variants you can now solve
+
+- **Permutations II** (LC 47) — duplicates in the input; sort first, then skip `nums[i]` when
+  it equals `nums[i - 1]` **and** `nums[i - 1]` is currently unused (the "unused" condition is
+  what prevents skipping a legitimately-needed duplicate).
+- **[Subsets](/patterns/backtracking/subsets/)** (LC 78) — the size-agnostic sibling: instead of
+  placing every element exactly once, each one gets a binary in/out decision.
+- **N-Queens** (LC 51) — pick-from-remaining-pool over board columns instead of array values,
+  with `IsValid` checking diagonals and rows instead of a `used[]` flag.

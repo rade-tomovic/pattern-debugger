@@ -1,0 +1,131 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: binary-search
+problem: koko-eating-bananas
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import Cells from '@components/Cells.astro';
+
+## task
+
+Koko has `piles` piles of bananas and `h` hours before the guards return. Each hour she picks one
+pile and eats up to `speed` bananas from it — if the pile has fewer than `speed` left, she
+finishes that pile and the rest of the hour goes unused. Find the minimum integer `speed` that
+lets her clear every pile within `h` hours.
+
+```text
+piles = [3, 6, 7, 11], h = 8  →  4
+```
+
+## how to think
+
+Nothing here looks like binary search at first glance — there's no sorted array to search inside.
+But look at what happens to the hours needed as `speed` increases: `CanFinish(speed)` — "does
+`speed` bananas/hour finish in time?" — only ever gets easier to satisfy as `speed` goes up. It's
+`false` for every speed below some threshold and `true` for every speed at or above it; it never
+flips back. That's a monotonic condition over a bounded range of candidate answers
+(`speed` from `1` to `max(piles)`), which is exactly what the boundary template needs — you're
+just searching *values*, not array indices.
+
+So: binary search the answer. Guess a `speed`, check feasibility with one linear pass over
+`piles`, and narrow toward the smallest feasible one — identical shape to finding a boundary in an
+array, with `CanFinish` standing in for the array comparison.
+
+<Callout kind="note" label="template instance">
+  **Boundary** skeleton (`while (left < right)`) — the same shape as
+  [Find Minimum in Rotated Sorted Array](/patterns/binary-search/find-minimum-rotated/), except
+  `left`/`right` span *candidate speeds* (`1..max(piles)`) instead of array indices, and the
+  condition is `CanFinish(mid)` instead of an array comparison. Invariant: the minimum feasible
+  speed always lies within `[left, right]`.
+</Callout>
+
+## solution
+
+```csharp
+public int MinEatingSpeed(int[] piles, int h)
+{
+    int left = 1, right = piles.Max();   // speed 1 is the slowest that makes progress;
+                                          // max(piles) always finishes in piles.Length hours
+    while (left < right)
+    {
+        int mid = left + (right - left) / 2;
+        if (CanFinish(piles, mid, h))
+            right = mid;                  // mid works — try to go slower
+        else
+            left = mid + 1;               // mid is too slow — need to go faster
+    }
+
+    return left;
+}
+
+private bool CanFinish(int[] piles, int speed, int h)
+{
+    long hours = 0;
+    foreach (int pile in piles)
+        hours += (pile + speed - 1) / speed;   // ceiling division: hours to clear this pile
+    return hours <= h;
+}
+```
+
+## trace
+
+`piles = [3, 6, 7, 11]`, `h = 8`, `right` starts at `max(piles) = 11`:
+
+| step | L | R | speed (mid) | hours | verdict | move |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | 1 | 11 | 6 | `1+1+2+2 = 6` | `6 <= 8` — feasible | `right = 6` |
+| 2 | 1 | 6 | 3 | `1+2+3+4 = 10` | `10 > 8` — too slow | `left = 4` |
+| 3 | 4 | 6 | 5 | `1+2+2+3 = 8` | `8 <= 8` — feasible | `right = 5` |
+| 4 | 4 | 5 | 4 | `1+2+2+3 = 8` | `8 <= 8` — feasible | `right = 4` → loop ends (`left == right`) |
+
+`left = 4` — the minimum feasible speed. The pointers here walk *candidate speeds*, so the cells
+below show the range `1..11`, not the piles array:
+
+<Cells
+  data={[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]}
+  pointers={{ 0: [{ t: 'L', c: 'amber' }], 5: [{ t: 'M', c: 'purple' }], 10: [{ t: 'R', c: 'cyan' }] }}
+  cells={{ 5: 'win' }}
+  caption="speed 6 finishes in 6h (<= 8) — feasible, so keep it and try slower: right = mid"
+/>
+
+<Cells
+  data={[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]}
+  pointers={{ 3: [{ t: 'ans', c: 'green' }] }}
+  cells={{ 0: 'dim', 1: 'dim', 2: 'dim', 3: 'ok', 4: 'dim', 5: 'dim', 6: 'dim', 7: 'dim', 8: 'dim', 9: 'dim', 10: 'dim' }}
+  caption="left = right = 3 (speed 4) — the minimum feasible eating speed"
+/>
+
+## why it works
+
+`CanFinish` is monotonic in `speed`: any speed faster than a working speed also works, since a
+higher rate can only reduce (or leave unchanged) the hours any given pile needs. That single fact
+is the license to binary search — the true/false boundary is a single flip point over `[1,
+max(piles)]`, and the boundary skeleton finds exactly that flip. Both ends of the initial range are
+provably valid to search within: speed `1` is a legal (if slow) starting point, and speed
+`max(piles)` always finishes every pile in exactly one hour each, so it's a safe upper bound
+guaranteed to satisfy any `h >= piles.Length` (which the problem guarantees).
+
+<Watch items={[['time', 'O(n log(max(piles)))'], ['space', 'O(1)']]} />
+
+## common bugs
+
+- Integer division truncates: `pile / speed` silently rounds *down*, undercounting hours whenever
+  a pile doesn't divide evenly. It must be ceiling division: `(pile + speed - 1) / speed`.
+- Setting `right` to something other than `piles.Max()` — too small a bound can exclude the true
+  answer, and the search will silently converge on a speed that isn't actually fast enough.
+- Accumulating `hours` in an `int` — with up to 10^4 piles of up to 10^9 bananas each, the sum can
+  overflow a 32-bit int well before you'd notice; accumulate in `long`.
+- Starting `left` at `0` instead of `1` — speed `0` means eating nothing, ever; `CanFinish(0, ...)`
+  either divides by zero or never finishes, not just "slow."
+
+## variants you can now solve
+
+- **[Find Minimum in Rotated Sorted Array](/patterns/binary-search/find-minimum-rotated/)** — the
+  same boundary shape over array indices instead of a value range; compare the two side by side to
+  see the abstraction clearly.
+- **Capacity To Ship Packages Within D Days** (LC 1011) — identical shape: binary search a
+  capacity, and a feasibility check counts the days needed.
+- **Minimum Number of Days to Make m Bouquets** (LC 1482) — the same "binary search the answer"
+  recipe with a different, greedier feasibility check.

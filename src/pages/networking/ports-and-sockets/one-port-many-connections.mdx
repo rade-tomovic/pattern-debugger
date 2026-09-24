@@ -1,0 +1,268 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: ports-and-sockets
+problem: one-port-many-connections
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import Solution from '@components/Solution.astro';
+
+## the question
+
+One process opens a listening socket on `127.0.0.1`, port 0 — so the kernel picks the port. Three
+clients then connect to it, concurrently, from the same process on the same machine. The server
+accepts all three and prints, for each accepted socket, both halves of its four-tuple:
+`LocalEndPoint` and `RemoteEndPoint`.
+
+Because everything is on loopback, three of the four fields are pinned before the program even
+runs: the source address is `127.0.0.1`, the destination address is `127.0.0.1`, and the
+destination port is whatever the listener was given. Exactly one field is left free.
+
+<Callout kind="insight" label="predict first">
+  Commit to three answers before you scroll.
+
+  1. Of the four fields in each connection's tuple, which one differs between the three
+     connections — and therefore which one the kernel is actually using to tell them apart?
+  2. What will the three `LocalEndPoint` values be: three different ports, or the same one three
+     times?
+  3. How many TCP sockets exist on the *server* side of this program once all three are accepted?
+     Count them exactly, including the listener.
+
+  The third one is the question people get wrong, and the number is small.
+</Callout>
+
+## the code
+
+<Solution>
+
+```csharp
+using System.Net;
+using System.Net.Sockets;
+
+// One listening socket. Port 0 is not a port — it means "kernel, allocate me an
+// unused one", from the same ephemeral range connect() draws from.
+using var listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+listener.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+listener.Listen(backlog: 16);
+
+var server = (IPEndPoint)listener.LocalEndPoint!;
+Console.WriteLine($"listening on {server}");
+
+// Three clients, all dialling the SAME destination endpoint, all at once. None of
+// them binds anything, so connect() allocates each one an ephemeral local port.
+var clients = new Socket[3];
+var dials = new Task[3];
+for (int i = 0; i < 3; i++)
+{
+    clients[i] = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+    dials[i] = clients[i].ConnectAsync(server);
+}
+await Task.WhenAll(dials);
+
+// Note where we are: every handshake has completed and not one accept() has run.
+Console.WriteLine("all three connected — before a single accept() call");
+
+// accept() takes a completed connection off the accept queue and returns a NEW
+// socket for it. The listener is untouched and still listening on the same port.
+// The accepted sockets are held rather than disposed at the end of each iteration,
+// so that all four server-side objects exist at once — which is what is being counted.
+var accepted = new List<Socket>();
+for (int i = 1; i <= 3; i++)
+{
+    var conn = await listener.AcceptAsync();
+    accepted.Add(conn);
+    Console.WriteLine($"accepted #{i}  local={conn.LocalEndPoint}  remote={conn.RemoteEndPoint}");
+}
+
+Console.WriteLine($"listener is still {listener.LocalEndPoint}");
+foreach (var c in accepted) c.Dispose();
+foreach (var c in clients) c.Dispose();
+```
+
+</Solution>
+
+## work it out
+
+Start with what the kernel has to do when the first client's SYN arrives. It builds a key out of
+the protocol and the two headers, and looks for a socket. Write the three connections out as keys
+and the answer is forced:
+
+| # | protocol | source address | source port | destination address | destination port |
+| --- | --- | --- | --- | --- | --- |
+| listener | TCP | — | — | `127.0.0.1` | P |
+| 1 | TCP | `127.0.0.1` | E₁ | `127.0.0.1` | P |
+| 2 | TCP | `127.0.0.1` | E₂ | `127.0.0.1` | P |
+| 3 | TCP | `127.0.0.1` | E₃ | `127.0.0.1` | P |
+
+`P` is the listener's port, allocated once by `bind()` and identical in all four rows. The two
+addresses are `127.0.0.1` everywhere, because both ends are this machine. So the *only* thing
+that can make those three keys distinct is E₁, E₂, E₃ — three ephemeral source ports the kernel
+allocated at `connect()` time, and it will not hand out a value that would collide with an
+existing tuple.
+
+Now the socket count, which is the part worth being pedantic about. Trace the objects:
+
+```text
+  bind() + listen()
+      → 1 LISTENING socket   local 127.0.0.1:P   peer = wildcard   (never carries data)
+
+  connect() ×3
+      → 3 CLIENT sockets     local 127.0.0.1:Eₙ  peer 127.0.0.1:P
+
+  the kernel completes 3 handshakes on its own, with no accept() involved
+      → 3 completed connections sit in the ACCEPT QUEUE
+
+  accept() ×3
+      → 3 CONNECTED server sockets, one per queue entry:
+            local 127.0.0.1:P     ← the listener's port, reused verbatim
+            peer  127.0.0.1:Eₙ    ← the field that made the key unique
+
+  server side total: 1 listening + 3 connected = 4
+  this process total: 4 + 3 client sockets      = 7
+```
+
+Two things in that trace deserve their own sentence.
+
+**The handshakes completed before any `accept()` ran.** `accept()` does not participate in the
+handshake — the kernel finishes all three on its own and parks the results in the accept queue.
+That is why `Task.WhenAll(dials)` returns while the accept loop has not started, and it is the
+same mechanism that makes an overloaded server look silent rather than refusing: the client is
+genuinely connected to a socket the application has not picked up yet.
+
+**`accept()` returns a new socket and consumes nothing.** The listener's local half is copied into
+each accepted socket, not moved out of it. Nothing is allocated, reserved or spent on the server's
+side of the tuple; the only new numbers in the whole exercise are E₁, E₂, E₃, and the client
+allocated all three. The program holds the three accepted sockets in a list instead of disposing
+each at the end of its iteration, so the four above are four objects that genuinely coexist.
+
+## the answer
+
+What this would print, with placeholder ephemeral ports — the actual values differ on every run,
+because E₁, E₂, E₃ are whatever the kernel has free:
+
+```text
+listening on 127.0.0.1:39251
+all three connected — before a single accept() call
+accepted #1  local=127.0.0.1:39251  remote=127.0.0.1:45318
+accepted #2  local=127.0.0.1:39251  remote=127.0.0.1:38602
+accepted #3  local=127.0.0.1:39251  remote=127.0.0.1:51074
+listener is still 127.0.0.1:39251
+```
+
+Read the two columns. **Every `local` is identical** — `39251` three times, the same port the
+listener was given and still holds. **Every `remote` is distinct**, and all three values fall
+inside `32768–60999`, the ephemeral range from `/proc/sys/net/ipv4/ip_local_port_range` on the
+Linux box these pages were written on.
+
+So the three predictions:
+
+1. The **source port** is the only field that differs, and therefore the only field doing any
+   distinguishing. The other three are constants across all three connections.
+2. The three `LocalEndPoint` values are the **same port, three times**. If your prediction was
+   "three different ports", the model underneath it was that a connection needs its own port on
+   both ends — and that model would make a busy server run out of ports, which servers do not do.
+3. **Four** sockets on the server side: one listening plus three connected. Not three, and not
+   one — the listening socket and the connected sockets are different kernel objects with
+   different shapes, and the listener is still there and still usable afterwards.
+
+Nothing guarantees the accepts come out in the order the loop dialled. The accept queue is fed in
+handshake-completion order, and three concurrent `connect()` calls complete in whatever order the
+kernel gets to them, so a listing where the second accept carries the third client's port is
+entirely ordinary.
+
+The same three connections as the box sees them, which is the view you will actually be reading
+during an incident:
+
+```text
+  ANNOTATED SCHEMATIC — not a captured session. The shape `ss -tan` prints for the
+  state above (`-a`, because LISTEN rows are omitted by default), with the same
+  placeholder ports used above.
+
+  State   Local Address:Port     Peer Address:Port
+  LISTEN  127.0.0.1:39251        0.0.0.0:*         ← one listening socket, peer is a wildcard
+  ESTAB   127.0.0.1:39251        127.0.0.1:45318   ┐
+  ESTAB   127.0.0.1:39251        127.0.0.1:38602   ├ same local half, three different peers,
+  ESTAB   127.0.0.1:39251        127.0.0.1:51074   ┘ three separate sockets
+  ESTAB   127.0.0.1:45318        127.0.0.1:39251   ┐
+  ESTAB   127.0.0.1:38602        127.0.0.1:39251   ├ the client ends of the same three
+  ESTAB   127.0.0.1:51074        127.0.0.1:39251   ┘ connections — loopback shows both
+```
+
+Seven rows, one per socket: the listener, plus each of the three connections twice — once from
+each end — because on loopback both ends live on this host. Off loopback you would see only the
+first four.
+
+## why it works that way
+
+The rule is one sentence: **the four-tuple is the identity of a connection, and a server port is
+not a resource that connections consume.**
+
+The server's port appears identically in every key, so it carries zero bits of distinguishing
+information. All of that information comes from the client's half. Which means the finite pool —
+the ephemeral range — is spent on the side that *initiates*, one port per connection, and a
+listening server never spends any. What a server spends instead is a file descriptor and some
+socket memory per connected socket, which is a limit you raise with `ulimit`, not with more
+ports.
+
+That asymmetry is the whole reason connection reuse matters in one direction and not the other.
+A client that opens and closes a connection per call burns an ephemeral port each time and holds
+it through `TIME_WAIT` after closing; a server accepting on one port has nothing equivalent to
+run out of. It is also why "we ran out of ports" is nearly always a story about an outbound
+caller, even when it gets reported against the service being called.
+
+<Watch items={[['sockets on the server side', '4 — one listening plus three connected'], ['server ports consumed by 3 connections', '1 — the one the listener already had'], ['client ephemeral ports consumed', '3 — one per connection'], ['the field that distinguishes them', 'the source port; the other three are constant'], ['what accept() does', 'returns a new socket, leaves the listener unchanged'], ['ephemeral range, this Linux box', '`32768–60999`']]} />
+
+## what this looks like in prod
+
+The healthy version of this is a listing you have to read correctly. Hundreds of `ESTAB` rows
+sharing one local `address:port` is what a working server looks like, not a leak — that is
+precisely the picture this exercise printed, scaled up. The number worth counting on that side is
+sockets against the file-descriptor limit, not ports.
+
+The unhealthy version is the mirror image, and it is on the *outbound* side of the same box: a
+large and growing count of `TIME-WAIT` rows whose **local** port is ephemeral and whose peer is
+one specific dependency — a database, an internal API, a cache. That is a connection-per-call
+client, and it will eventually fail `connect()` with `EADDRNOTAVAIL`, arriving in .NET as a
+`SocketException` with `SocketError.AddressNotAvailable` and a message about assigning an address
+rather than about ports. The fix is on the client: pool and reuse the connection.
+[Ports and sockets](/networking/ports-and-sockets/) has the full incident and the two folk
+remedies to avoid; [the network path](/system-design/networking/) has the pooling design.
+
+The third shape is the one this exercise showed accidentally, by connecting three clients before
+calling `accept()` once. If a real server's accept loop stops running — threads blocked on
+something synchronous — connections keep completing their handshakes in the kernel and queueing.
+Clients see connections that established fine and then produce nothing, and your request count
+sits below what they say they sent. That is a thread-pool problem wearing a network costume;
+[processes, threads and the kernel](/systems/process-and-thread/) is where the blocked threads
+are.
+
+## the same idea in other languages
+
+| language | what it's called | the trap |
+| --- | --- | --- |
+| Java | `ServerSocket.accept()` returns a new `Socket`; the `ServerSocket` itself has no remote endpoint at all, exactly like the listening socket here | `new ServerSocket(port)` binds the **wildcard** address, so Java servers default to reachable while ASP.NET Core's default URL is loopback — carrying either default across languages produces a different bug in each direction |
+| Go | `net.Listen("tcp", addr)` then `ln.Accept()` returns a `net.Conn` with `LocalAddr()` and `RemoteAddr()` — the same two halves this page prints | the address string hides the bind address in punctuation: `":8080"` is the wildcard and `"localhost:8080"` is loopback-only, and the difference is one word in a string literal that reviewers skim past |
+| Python | `sock.accept()` returns a `(conn, addr)` pair — the new socket and the peer's tuple, which is the same split with the remote half handed to you separately | the boilerplate every tutorial copies, `setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)`, means "bind over `TIME_WAIT`" on Linux and something with materially different consequences on Windows, and it is pasted in without either being stated |
+| C | `accept()` returns a new file descriptor; the listening descriptor is unchanged, which is the mechanism .NET, Java and Go are all wrapping | the port in `struct sockaddr_in` must be network byte order — `sin_port = htons(8080)` — and omitting `htons` does not fail, it binds a byte-swapped port that looks like a mystery until you read the listing |
+
+## common bugs
+
+- **Assuming accepts come out in the order the clients dialled.** They come out in
+  handshake-completion order, which three concurrent `connect()` calls do not fix. Any code that
+  pairs the *n*th accepted socket with the *n*th client by position is relying on something the
+  kernel never promised.
+- **Reading `listen(backlog)` as a connection limit.** It bounds the queue of completed
+  connections *waiting for `accept()`*, not the number of connections the server may hold. A
+  backlog of 16 does not cap you at 16 concurrent clients; it caps how many may be parked
+  un-accepted at one instant.
+- **Expecting the accepted socket's local port to be new.** It is the listener's port, copied.
+  People who predict a fresh port here have quietly assumed the server allocates one per
+  connection, which is the belief that produces "the server ran out of ports".
+- **Concluding from a loopback run that the source *address* is what varies.** Here it cannot be
+  — both ends are `127.0.0.1`. Off loopback the address usually differs too, which makes it easy
+  to credit the wrong field. The port is the field guaranteed to be distinct, because the kernel
+  allocates it specifically to keep the tuple unique.
+- **Thinking the listener is consumed by accepting.** It is a separate kernel object with a
+  different shape — local half only, no peer, no data — and it is still listening on the same port
+  after all three accepts, which the last printed line exists to show.

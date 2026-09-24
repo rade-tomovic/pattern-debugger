@@ -1,0 +1,492 @@
+---
+layout: '@layouts/TopicLayout.astro'
+topic: osi-model
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import Solution from '@components/Solution.astro';
+
+## the ground floor
+
+- **Packet, header, payload, host, hop, protocol, best-effort delivery** are all built from
+  nothing in [what a network actually is](/networking/network-basics/). This page assumes every one
+  of them and does not redefine them.
+- **A header is fields at fixed offsets** —
+  [what a network actually is](/networking/network-basics/) established that. It is the entire
+  trick this page runs on: knowing the layout lets you read the third field without understanding
+  the fourth, and skip past all of them to reach a payload you know nothing about.
+- **The kernel** is the part of the OS the hardware trusts —
+  [processes and threads](/systems/process-and-thread/) builds it properly. Most of what follows
+  lives inside it. Your process holds one end of a socket, and every touch of it is a syscall.
+- **MTU** — the largest payload one link will carry in a single frame. 1500 bytes on standard
+  Ethernet. Named here because the arithmetic below needs it, worked properly on
+  [the link layer](/networking/link-layer/).
+
+## core idea
+
+Nobody can change the whole internet at once, so the internet was built as layers: each layer
+solves one problem, talks only to its counterpart at the same layer on the far machine, and treats
+everything beneath it as a pipe that mostly works. The OSI model is the seven-name vocabulary
+everyone uses for those layers, and the TCP/IP stack — four layers — is what your machine actually
+runs.
+
+The mechanism that makes layering real is **encapsulation**: on the way out, each layer takes the
+thing above it, treats it as an opaque blob, and glues its own header on the front; on the way in,
+each layer reads its own header, throws it away, and hands the rest up. The sentence worth
+carrying is that **a layer can only act on what its own header lets it see** — which is why a
+router can forward a packet it cannot read and a firewall can allow a connection it will never
+understand.
+
+## how it actually works
+
+### the seven layers, one honest line each
+
+| # | name | what it is actually for |
+| --- | --- | --- |
+| 7 | application | the message you meant to send — a request, a query, a mail |
+| 6 | presentation | agreeing how the message is represented: encoding, compression, encryption |
+| 5 | session | starting, checkpointing and tearing down a longer-lived conversation |
+| 4 | transport | getting the message to the right *program* on the far host, and deciding whether "reliably" is part of the deal |
+| 3 | network | getting a packet across networks it has never seen, using an address that means something everywhere |
+| 2 | data link | getting a frame across exactly one link, to a device on that link |
+| 1 | physical | turning bits into voltage, light or radio, and back |
+
+Two of those rows are honest about intent and dishonest about reality. Nothing in your machine
+implements layer 5 or layer 6 as a separate thing — more on that below.
+
+### the four layers that actually exist
+
+The stack your kernel ships is the TCP/IP model, and it has four layers because that is how many
+pieces of software there are:
+
+| TCP/IP layer | what it does | who implements it |
+| --- | --- | --- |
+| application | HTTP, DNS, SMTP, SSH, gRPC, TLS | your process and its libraries |
+| transport | TCP, UDP — ports, and reliability or the lack of it | the kernel |
+| internet | IPv4, IPv6, ICMP — addressing and forwarding | the kernel |
+| link | Ethernet, Wi-Fi, ARP — one hop | the kernel driver plus the NIC hardware |
+
+The correspondence to OSI is loose exactly where you would expect. TCP/IP's application layer
+swallows OSI 5, 6 and 7 whole. TCP/IP's link layer swallows OSI 1 and 2, because the driver and the
+hardware are not separable in any way that matters to you. The middle two line up cleanly, and that
+is why "layer 3" and "layer 4" are the two numbers people use correctly in conversation and the
+others are mostly decoration.
+
+### encapsulation, byte for byte
+
+Here is a small HTTP GET, written out with its line endings visible. Every line ends with a
+carriage return and a line feed — two bytes, drawn here as `⏎` — and a blank line ends the headers:
+
+```text
+GET /health HTTP/1.1⏎            22 bytes
+Host: api.example.internal⏎      28
+User-Agent: dotnet/10⏎           23
+Accept: */*⏎                     13
+⏎                                 2   ← the blank line that ends the headers
+                                ───
+                                 88 bytes of application data
+```
+
+`api.example.internal` and every address below are examples, not a real host.
+
+That 88 bytes is what your code handed to the socket. Nothing else in the stack cares what it says.
+Here is what happens to it on the way down:
+
+```text
+one small HTTP GET on its way out — 88 bytes becoming 146 bytes on the wire
+
+  layer 7 · application · the message your code wrote
+     ┌──────────────────────┐
+     │ 88-byte HTTP request │
+     └──────────────────────┘
+
+  layer 4 · transport · TCP prepends 20 bytes → a 108-byte SEGMENT
+     source port, destination port, sequence number, ack number, flags, window, checksum
+     ┌────────────┬──────────────────────┐
+     │ TCP hdr 20 │ 88-byte HTTP request │
+     └────────────┴──────────────────────┘
+
+  layer 3 · network · IP prepends 20 bytes → a 128-byte PACKET
+     version, total length, TTL, protocol = 6 (TCP), source IP, destination IP, checksum
+     ┌────────────┬────────────┬──────────────────────┐
+     │ IP hdr 20  │ TCP hdr 20 │ 88-byte HTTP request │
+     └────────────┴────────────┴──────────────────────┘
+
+  layer 2 · data link · Ethernet prepends 14 and appends 4 → a 146-byte FRAME
+     destination MAC, source MAC, EtherType = 0x0800 (IPv4) ... and a trailing checksum
+     ┌────────────┬────────────┬────────────┬──────────────────────┬───────┐
+     │ Eth hdr 14 │ IP hdr 20  │ TCP hdr 20 │ 88-byte HTTP request │ FCS 4 │
+     └────────────┴────────────┴────────────┴──────────────────────┴───────┘
+
+  layer 1 · physical · those 146 bytes clocked onto the medium, preceded by 8 bytes of preamble
+     and start-of-frame delimiter and followed by an idle gap — none of which the frame
+     counts as part of itself
+```
+
+Read the widths off that picture, because they are the numbers worth memorising. An Ethernet header
+is 14 bytes: six for the destination MAC address, six for the source MAC address, two for the
+EtherType. The frame check sequence on the end is 4 more. An IPv4 header with no options is 20
+bytes; an IPv6 header is always 40. A TCP header with no options is 20 bytes; a UDP header is 8,
+always, because UDP has almost nothing to say.
+
+So 54 bytes of headers and a 4-byte trailer carry 88 bytes of request. **58 of the 146 bytes on
+that wire are not your data.** That ratio is fixed per message, not per byte, which is the whole
+argument for sending fewer, larger messages rather than more, smaller ones.
+
+<Callout kind="note" label="both headers can be bigger than that">
+  20 bytes is the *minimum* IPv4 and TCP header, and the diagram uses it because it makes the
+  arithmetic legible. Both have a 4-bit length field counting 32-bit words, so both can run to 60
+  bytes with options. On an established connection Linux commonly has the TCP timestamp option
+  negotiated, which with its alignment padding takes the TCP header to 32 bytes rather than 20. If
+  you are ever counting bytes for real, count the header length field — do not assume 20.
+</Callout>
+
+### and back up, in reverse
+
+The receiving machine runs the same picture backwards. What makes each step possible is that every
+header carries a field naming *what is inside it* — the whole stack is demultiplexing, all the way
+up:
+
+```text
+the same 146 bytes arriving at the server
+
+  wire → layer 2   The NIC recomputes the frame checksum and drops the frame on a mismatch.
+                   The destination MAC is this NIC's (or a broadcast), so it is kept.
+                   Strip 14 + 4.                                       →  128 bytes remain
+                   ── EtherType field says 0x0800: "what follows is IPv4" ──┐
+                                                                            ↓
+  layer 2 → 3      IP checks the header checksum and that the destination address is ours.
+                   Strip 20.                                            →  108 bytes remain
+                   ── protocol field says 6: "what follows is TCP" ──────────┐
+                                                                             ↓
+  layer 3 → 4      TCP checks its checksum and looks up the four-tuple
+                   (source IP, source port, destination IP, destination port)
+                   to find which socket this belongs to. Strip 20.      →   88 bytes remain
+                   ── destination port says 80: "this belongs to that socket" ──┐
+                                                                                ↓
+  layer 4 → 7      The 88 bytes are appended to that socket's receive buffer, and a
+                   thread blocked in a read wakes up and copies them out.
+```
+
+Three fields do all the work: **EtherType, IP protocol number, destination port.** Each one is a
+small integer whose only job is to name the layer above so the bytes can be handed to the right
+piece of code. `0x0800` is IPv4 and `0x86DD` is IPv6; protocol 6 is TCP, 17 is UDP, 1 is ICMP.
+
+That last step — port number to socket — is doing more than it looks like, because a port is not
+owned by a process the way people assume; the match is on the whole four-tuple.
+[Ports and sockets](/networking/ports-and-sockets/) is the page that owes you that, and the reason
+one listening port serves thousands of simultaneous connections.
+
+### what each layer is allowed to know
+
+This table is the page. Every argument you will ever have about firewalls, load balancers and
+"why can't the network just retry it" is settled by the *cannot see* column.
+
+| layer | addresses it uses | what it can see | what it cannot see | example protocols | what operates here |
+| --- | --- | --- | --- | --- | --- |
+| 7 application | names and URLs | the message: method, path, headers, body | anything about hops, routes or retransmission | HTTP, DNS, SMTP, SSH, gRPC, TLS | your process; a proxy, API gateway or WAF |
+| 6 presentation | none of its own | — | — | nothing implements this separately | — |
+| 5 session | none of its own | — | — | nothing implements this separately | — |
+| 4 transport | port numbers, 16 bits each — plus layer 3's addresses, to make the four-tuple | which socket the four-tuple names, sequence and ack numbers, flags, window | what the bytes it carries mean | TCP, UDP | NAT, stateful firewalls, layer-4 load balancers |
+| 3 network | IP addresses — 32 bits for v4, 128 for v6 | the two endpoints of the whole path, TTL, which protocol is inside | ports, connection state, anything about a "connection" at all | IPv4, IPv6, ICMP | routers |
+| 2 data link | MAC addresses, 48 bits, flat | the two devices on *this one link*, and the EtherType | anything one hop further on | Ethernet, Wi-Fi, ARP, PPP | NICs, switches, wireless access points |
+| 1 physical | none | voltage, light, radio | that any of it means anything | 1000BASE-T, fibre optics, the 802.11 radio | cables, transceivers, repeaters, the long-dead hub |
+
+Two consequences fall straight out of it and are worth saying plainly.
+
+**A router rewrites the frame and leaves the packet alone.** At each hop the layer-2 header is
+thrown away entirely and a new one is built for the next link, with new MAC addresses, because MAC
+addresses only mean anything on the link they were used on. The IP header survives the whole
+journey with its TTL decremented. Nothing above layer 3 is even looked at.
+[IP addresses, subnets and routing](/networking/ip-and-routing/) is where that becomes a forwarding
+decision.
+
+**MAC addresses are flat, and that is why IP exists.** Forty-eight bits burned into a NIC at the
+factory carry no structure at all — you cannot look at one and say which direction it is in. An IP
+address does carry structure, which is what makes a routing table possible. Getting from one to the
+other, for the *next hop* rather than the destination, is ARP's job, and it belongs to
+[the link layer](/networking/link-layer/).
+
+### what each layer's chunk is called
+
+| layer | the proper name for one chunk |
+| --- | --- |
+| application | a message (or a request, a query, a record — the protocol names it) |
+| transport | a **segment** on TCP, a **datagram** on UDP |
+| network | a **packet** |
+| data link | a **frame** |
+
+<Callout kind="trap" label="the word packet means two things">
+  In a spec, "packet" means the layer-3 chunk specifically — the thing with the IP header on it. In
+  a corridor, an incident channel, and most of this site, "packet" means "some chunk of bytes going
+  past". Both usages are normal and neither is going away. When it matters — and it matters when
+  you are reading a capture, arguing about MTU, or answering an interview question about
+  fragmentation — say frame, packet, segment or datagram, and everyone will know exactly which
+  header you mean.
+
+  While you are collecting overloaded words: "address" now means three separate things to you. A
+  MAC address names a device on one link, an IP address names an interface across the whole
+  internet, and a memory address is an index into
+  [one flat array of bytes](/systems/bits-and-memory/). Nothing about the first two is an index
+  into anything.
+</Callout>
+
+### where the model is wrong
+
+The seven layers are the surviving artifact of a losing effort. OSI was standardised alongside a
+full protocol suite intended to *be* the internet; TCP/IP was already running, already free to
+implement, and won. The protocols are gone from ordinary use. The model outlived them, because it
+turned out to be a good vocabulary even for the stack that beat it.
+
+Three specific things it gets wrong, all of which will come up:
+
+- **Layers 5 and 6 have no separate implementation.** There is no session module and no
+  presentation module in your kernel. What people file under presentation — TLS, JSON
+  serialization, gzip, character encoding — is ordinary application code in libraries.
+- **TLS is not layer 6, whatever the diagram says.** It runs over a TCP connection, is negotiated
+  by the application, and presents the application above it a byte stream that looks exactly like
+  the one TCP presented. That makes it an application-layer protocol that happens to be
+  general-purpose. It is worth knowing that people will *call* it layer 6, and worth not arguing
+  about it. [The protocols on top](/networking/application-protocols/) covers what it adds;
+  [the network path](/system-design/networking/) covers what its handshake costs.
+- **Layering is recursive, and the ladder metaphor hides it.** A VPN, an overlay network, or a
+  cloud provider's virtual network puts an entire frame or packet inside another packet's payload.
+  The result is a stack with two of some layers in it:
+
+```text
+a tunnelled frame — the same ladder, pushed twice
+
+  ┌─────────┬─────────┬─────────┬─────────┬─────────┬─────────┬─────────┬─────┐
+  │ outer   │ outer   │ outer   │ tunnel  │ inner   │ inner   │ payload │ FCS │
+  │ Eth hdr │ IP hdr  │ UDP hdr │ hdr     │ IP hdr  │ TCP hdr │         │     │
+  └─────────┴─────────┴─────────┴─────────┴─────────┴─────────┴─────────┴─────┘
+  └─── what the physical network reads ───┘
+                                           └── opaque payload to it ───┘
+```
+
+  Every router along the outer path forwards this as an ordinary UDP datagram — that is the shape
+  drawn here; other tunnels wrap in IP-in-IP or GRE instead — and never learns there is a second IP
+  header inside it. That is the feature. The cost is that the outer headers
+  eat into the underlying link's 1500 bytes, so the *inner* interface has to advertise a smaller
+  MTU. On the Linux box these pages were written on, `/sys/class/net/eth0/mtu` reads **1400** and
+  `/sys/class/net/lo/mtu` reads **65536** — a hundred bytes below the Ethernet default on the real
+  interface, and loopback not being a wire at all.
+
+Three more places the model creaks, named so you recognise them: ARP is used *by* layer 3 but speaks
+directly to layer 2 and belongs cleanly to neither; MPLS is so awkward to place that the industry
+calls it "layer 2.5"; and QUIC does transport work — connections, ordering, retransmission — from
+user space, on top of UDP, which puts a transport protocol at the application layer.
+
+### where the layers are in your own code
+
+The .NET types stack up in the same order, and stop in the same place your process's authority
+stops:
+
+<Solution>
+
+```csharp
+using System.Net;
+using System.Net.Http;
+using System.Net.Sockets;
+
+// layer 7 — a message: a method, a target, headers, a body. HttpClient owns all of it,
+// and HttpResponseMessage.StatusCode is layer 7 answering layer 7.
+using var http = new HttpClient();
+using var response = await http.GetAsync("http://api.example.internal/health");
+
+// layer 4 — a byte stream to one (address, port) pair. Socket owns ports and sequencing
+// and has no idea what a "GET" is; the string below is just bytes to it.
+using var socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+
+// layer 3 — the deepest header field managed code gets to name: the destination address.
+await socket.ConnectAsync(new IPEndPoint(IPAddress.Parse("192.0.2.10"), 80));
+
+byte[] request = "GET /health HTTP/1.1\r\nHost: api.example.internal\r\n\r\n"u8.ToArray();
+await socket.SendAsync(request.AsMemory(), SocketFlags.None);
+
+// layers 2 and 1 — no managed type exists, and that is the point. The kernel picks the
+// route, resolves the next hop's MAC, and the NIC frames it and clocks it out. Your
+// process is never consulted and could not override it if it wanted to.
+```
+
+</Solution>
+
+There is no `EthernetFrame` class and there never will be. To write a layer-3 header yourself you
+need a raw socket, which on Unix needs privilege — the kernel owns those headers because letting
+any process forge a source address would end badly. The one field of a lower layer you routinely
+*do* control is the destination address, and the one you routinely control by accident is the local
+one: binding to `127.0.0.1` rather than `0.0.0.0` is a layer-3 decision made in one line of config,
+and [ports and sockets](/networking/ports-and-sockets/) will show you why it is the outage people
+inflict on themselves most often.
+
+## the mental model
+
+```text
+  every layer does the same three things, and only these three:
+
+    going down     take what the layer above gave you, treat it as opaque bytes,
+                   prepend your header, hand it to the layer below
+    coming up      read your header, use its "what is inside" field to pick who
+                   gets it next, strip your header, hand up the rest
+    sideways       talk only to your peer at the same layer on the other machine
+
+  the field that names the layer above, at every step:
+
+    Ethernet EtherType   0x0800 → IPv4        0x86DD → IPv6      0x0806 → ARP
+    IP protocol number   6 → TCP              17 → UDP           1 → ICMP
+    TCP/UDP dest port    → whichever socket the four-tuple matches
+
+  the sizes worth carrying:
+
+    Ethernet header 14 + FCS 4      standard payload MTU 1500, max frame 1518
+    IPv4 header 20 (no options)     IPv6 header 40, fixed
+    TCP header 20 (no options)      UDP header 8, always
+    MAC 48 bits    IPv4 32 bits    IPv6 128 bits    port 16 bits
+```
+
+Three lines to carry around:
+
+1. **Seven layers are the vocabulary; four are the software.** Layers 5 and 6 are not implemented
+   anywhere, and TLS — the thing people point at when they say layer 6 — is application code.
+2. **Encapsulation is prepend-on-the-way-down, strip-on-the-way-up**, and each header carries a
+   small integer naming what is inside it. That chain of integers is how a frame arriving at a NIC
+   ends up as bytes in your `Read` buffer.
+3. **A layer can only act on what it can see.** A switch cannot know an IP address, a router cannot
+   know a port, a layer-4 balancer cannot know a URL path. Every one of those is a design
+   constraint, not an oversight.
+
+<Watch items={[['Ethernet header + trailer', '14 + 4 bytes'], ['IPv4 / IPv6 header', '20 (no options) / 40 fixed'], ['TCP / UDP header', '20 (no options) / 8'], ['standard Ethernet payload MTU', '1500 bytes'], ['address widths', 'MAC 48 · IPv4 32 · IPv6 128 · port 16 bits'], ['layers named vs implemented', '7 vs 4'], ['an 88-byte GET, on the wire', '146 bytes']]} />
+
+## why you should care
+
+**The layer number is how an incident gets routed to the right person.** When someone says "this is
+a layer 4 problem, not layer 7", they have made a specific, checkable claim: nothing ever parsed an
+HTTP message, so there will never be a status code, and the application logs are the wrong place
+to be standing. The corollary is just as useful — a `502` or a `401` came *back*, which means the
+whole stack underneath worked and something read your request. You do not need a packet capture to
+know that; you need to know which layer produces which kind of evidence.
+
+**Your exception types already name the layer.** In .NET, a `SocketException` carrying
+`SocketError.HostNotFound` never got past resolving a name, which is layer 7 work even though it
+feels like infrastructure — DNS is an application protocol like any other, and
+[DNS](/networking/dns/) is its own page for that reason. `SocketError.ConnectionRefused` means
+layer 4 completed a round trip and the far end said no: something is there. `SocketError.TimedOut`
+means nothing came back at all: the packet was dropped somewhere below, by a security group, a
+routing hole, or a wrong address. Those two are different diagnoses with different fixes and they
+get conflated constantly. `HttpRequestException` is usually layer 7 reporting a failure that
+happened underneath it — read its inner exception, which is where the honest answer is.
+[Seeing the network](/networking/network-troubleshooting/) turns this into a checklist you can work
+top to bottom.
+
+**Header cost is per message, and that changes designs.** The 58 bytes of framing on that GET are
+paid again for every message, whatever its size — a 10-byte heartbeat puts 68 bytes on the wire,
+10 of them yours. That is the mechanical reason batching wins and chattiness hurts, and it is a
+statement about byte counts, not about speed. It is also the reason a payload that grows past the
+path MTU behaves discontinuously rather than gradually: the moment the IP packet exceeds the path
+MTU it no longer fits in one frame, and either it is fragmented, or it is dropped and the sender is
+supposed to be told so by an ICMP message. Filter that ICMP and you get the classic black hole
+where small requests succeed and large ones hang forever.
+[IP addresses, subnets and routing](/networking/ip-and-routing/) owns path MTU discovery;
+[the link layer](/networking/link-layer/) owns where 1500 came from.
+
+**Layer numbers are also how infrastructure describes itself, and the numbers are literal.** A
+"layer 4 load balancer" forwards by four-tuple and cannot route on a URL path, because the URL is
+inside bytes it never parses; a "layer 7" one terminates the connection and reads the request,
+which is why it can route on a header and why it becomes a TLS endpoint. That trade — and its cost
+in connections and handshakes — is [the network path](/system-design/networking/)'s subject, not
+this page's. Same for congestion control, connection reuse, and HTTP/2 versus HTTP/3: those all
+live one level up, on top of everything here.
+
+That is the case for still learning a seven-layer model whose bottom two are hardware, middle two
+are the kernel's, and fifth and sixth do not exist. It is not a description of running software. It
+is the shared vocabulary that lets a network engineer, a platform engineer and you agree on which
+third of the path you are arguing about — in an incident channel, in a design review, and in every
+interview that starts with "walk me through what happens when you type a URL".
+
+## the same idea elsewhere
+
+| where the same shape shows up | what does the wrapping | the trap |
+| --- | --- | --- |
+| ASP.NET Core middleware | each middleware wraps the next, may add to the request going down and to the response coming back up | registration order *is* the behaviour: middleware added after a terminal one never runs, exactly like a layer never handed the payload |
+| `Stream` decorators — `GZipStream` over a `FileStream` | each wrapper adds its own framing around the bytes below and knows nothing about theirs | you must dispose the outer wrapper to flush its framing; the inner stream cannot tell that the outer one has finished |
+| a message envelope on a queue | the broker routes on envelope headers and never parses the body | anything the router needs must be in the envelope — a routing key hidden in the JSON body is the queue-shaped version of expecting a switch to read your URL |
+| SMTP: the envelope recipient versus the `To:` header | delivery uses the envelope; the message headers are for the endpoint that opens it | they can disagree, which is exactly how BCC works and exactly why "but my name isn't in the To: line" proves nothing about who received it |
+| a container or VM overlay network | a whole inner frame carried inside an outer UDP datagram | the inner MTU must be lowered to leave room for the outer headers, or full-size packets vanish silently |
+
+## interview drills
+
+**Q.** Someone in the incident channel says "this is a layer 4 problem, not layer 7." What have they
+just claimed, and how would you check it?
+
+- *weak answer* — "Layer 4 is TCP, so it's a TCP problem." That is naming the layer, not making a
+  claim, and the follow-up will be "so what do you look at?"
+- *strong answer* — They have claimed the failure happens before anything parses an HTTP message,
+  so no status code will ever exist and the application logs will show nothing. I would check
+  whether connections are being *refused* or *timing out*, because those are different: a refusal
+  means something answered and said no, so the address and route are fine and a listener is
+  missing or a firewall is rejecting; a timeout means nothing came back at all, so suspect a
+  dropped packet — a security group or a wrong address. If a status code is coming back at all,
+  they are wrong, because something read the request.
+- *follow-up* — "Where does a TLS failure sit?" Not cleanly at any OSI layer. It runs over an
+  established TCP connection and is negotiated by the application, so it fails *after* layer 4
+  succeeded and *before* your request was ever sent — which is why a certificate problem looks like
+  a connection problem in metrics and like an application problem in logs.
+
+**Q.** Walk me through what happens to one HTTP GET between the socket write and the wire.
+
+- *weak answer* — "It goes down the stack and each layer adds a header."
+- *strong answer* — Say it with the byte counts. An 88-byte request goes to TCP, which prepends a
+  20-byte header — ports, sequence, ack, flags, window — making a 108-byte segment. IP prepends 20
+  bytes with the source and destination addresses, TTL, and a protocol field set to 6 meaning TCP,
+  making a 128-byte packet. Ethernet prepends 14 bytes — destination MAC, source MAC, EtherType
+  0x0800 — and appends a 4-byte checksum, making a 146-byte frame. The receiver undoes it in
+  reverse, and at each step it knows who to hand the remainder to because the header it just read
+  named the layer above.
+- *follow-up* — "What changes at the first router?" The frame is discarded and rebuilt for the next
+  link with different MAC addresses; the IP header survives with its TTL decremented; TCP is never
+  examined. That is the whole difference between routing and switching.
+
+**Q.** Why does everyone teach seven layers when the internet has four?
+
+- *weak answer* — "OSI is the theory and TCP/IP is the practice." True and empty; the next question
+  is why anyone kept the theory.
+- *strong answer* — OSI was the reference model for a competing protocol suite that lost to TCP/IP.
+  The protocols are gone; the model survived as vocabulary. The implemented stack is four layers —
+  link, internet, transport, application — and layers 5 and 6 have no separate implementation at
+  all. What people file under presentation is ordinary library code: TLS, JSON, gzip, encoding. The
+  numbering survives because "layer 3" and "layer 7" are genuinely useful shorthand for which part
+  of the path you mean.
+- *follow-up* — "So which layer is TLS?" People say 6. Honestly it is an application-layer protocol
+  over TCP that hands the application above it a byte stream indistinguishable from the one TCP
+  handed it — which is precisely why it could be bolted onto HTTP without changing HTTP.
+
+**Q.** A container's interface reports an MTU of 1400 instead of 1500. What is going on, and what
+breaks if it is wrong?
+
+- *weak answer* — "Someone set it lower." Possible, but it does not explain why anyone would.
+- *strong answer* — Something is encapsulating these packets. An overlay network or a VPN puts the
+  whole inner packet inside an outer packet's payload, and the outer headers have to fit inside the
+  underlying link's 1500 bytes — so the inner MTU is reduced to leave room. It is this page's
+  encapsulation applied twice. If it is *not* reduced, full-size inner packets do not fit once
+  wrapped and get dropped; and if the ICMP message that would tell the sender is filtered, the
+  sender never learns, so small requests succeed and large ones hang. That asymmetry — small fine,
+  large hanging — is the fingerprint.
+- *follow-up* — "Why does this show up on a POST and not a GET?" Because the request only exceeds
+  the path MTU once it has a body. It is a size threshold, not a protocol difference.
+
+**Q.** Your service reaches the database from your laptop but not from the pod. Which layers do you
+eliminate, and in what order?
+
+- *weak answer* — "Check the firewall." Maybe, but you have skipped three cheaper questions and you
+  will not know what the answer proves.
+- *strong answer* — Work up the stack, because each rung eliminates everything below it. Does the
+  name resolve *inside the pod*, and to the same address it resolves to on my laptop? That is layer
+  7 and it is where split-horizon DNS bites. If yes: is that address one the pod's routing table
+  can reach — same subnet, or a gateway that covers it? That is layer 3. If yes: does anything
+  answer on the port, and does it refuse or time out? That is layer 4, and the answer distinguishes
+  a missing listener from a dropped packet. Only when all three pass do I look at the payload,
+  credentials, or TLS.
+- *follow-up* — "The name resolves to a different address inside the cluster. Which layer is that?"
+  Layer 7 — DNS is an application protocol, and a split-horizon answer is a configuration fact, not
+  a routing one. Nothing below it is broken, which is why every other check would have passed.

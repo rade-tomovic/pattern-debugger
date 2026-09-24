@@ -1,0 +1,480 @@
+---
+layout: '@layouts/TopicLayout.astro'
+topic: parallelism-patterns
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import ProblemList from '@components/ProblemList.astro';
+
+## the ground floor
+
+- **core** — one hardware execution unit. A modern server has many, and the operating system,
+  the GC and every other process on the box are also using them.
+  [Processes, threads and the kernel](/systems/process-and-thread/) is where that split lives.
+- **contention** — two or more threads wanting the same thing at the same time: a lock, an
+  atomic variable, or just a cache line. [What a lock is made of](/systems/locks-internals/)
+  is the price list.
+- **cache line** — the 64-byte block that is the unit of transfer between cores and memory. Two
+  threads writing anywhere inside one line fight over the whole line, even if they never touch
+  the same bytes — [the memory hierarchy](/systems/memory-hierarchy/) builds it up, and
+  [two counters, one cache line](/systems/atomics-and-cas/false-sharing/) works the mechanism in
+  full.
+- **throughput vs latency** — throughput is work finished per unit of time, latency is how long
+  one item takes. Parallelism buys throughput. It usually costs a little latency per item, and
+  this page is about the ways it can cost a lot, or cost throughput too.
+- **partition** — splitting the *state*, not just the work, so that no two threads write to the
+  same place. This is the answer to almost every problem below.
+- **backpressure** — a fast stage being made to wait for a slow one. The alternative to
+  backpressure is not "going faster"; it is an unbounded queue.
+
+## core idea
+
+Adding threads only shortens the part of the work that is actually parallel, and it charges you
+for every point where the threads meet. Amdahl's law bounds the first effect: with a 5% serial
+section you cannot beat 20×, no matter how many cores you buy. The second effect has no bound in
+that direction at all — meeting points can make the whole program *slower* than one thread,
+because the traffic two threads generate keeping each other informed about shared state grows
+faster than the work does.
+[Why more threads can be slower](/systems/parallelism-patterns/scaling-curve/) works through
+exactly that shape, address by address.
+
+| model | what it says | its prediction floor |
+| --- | --- | --- |
+| Amdahl | speedup is `1 / (s + (1 - s) / N)` for a serial fraction `s` | never below 1.0 — Amdahl can only fail to help |
+| Universal Scalability Law | speedup is `N / (1 + α(N-1) + βN(N-1))` — a contention term and a *coherence* term | can go below 1.0 and keep falling, because the coherence term `βN(N-1)` grows with the square of `N` |
+
+Both Greek letters are coefficients fitted to a curve, not quantities you can read off the
+source. `α` is the fraction of the work that serialises — Amdahl's `s` under another name, the
+*contention* coefficient. `β` is the cost of one pair of threads keeping each other informed
+about shared state — the *coherence* coefficient — and it is charged once per ordered pair, which
+is where the `N(N-1)` comes from. `α` alone flattens the curve; `β` is what bends it back down.
+
+The whole engineering job is turning the second model into the first: remove the shared writes
+until the only thing limiting you is the serial fraction, then attack the serial fraction.
+
+## how it actually works
+
+### Amdahl's law, with the arithmetic done
+
+Split the work into a serial fraction `s` that only one thread can do and a parallel remainder.
+On `N` threads the time is `s + (1 - s) / N` of the one-thread time, so the speedup is
+`1 / (s + (1 - s) / N)`. Work the arithmetic through at `s = 0.05` and three things fall out that
+are worth carrying around, none of them requiring a stopwatch:
+
+- As `N` goes to infinity the speedup goes to `1 / s` — **20×** at `s = 0.05`. You reach half of
+  that ceiling, 10×, at `N = 19`: `1 / (0.05 + 0.95 / 19) = 10.0`. Every core past that is buying
+  a share of the remaining 5%.
+- The marginal core stops paying early. One thread to two takes the speedup from 1.000 to 1.905
+  — the second core delivered 0.905 of a core. Thirty-two threads to sixty-four takes it from
+  12.549 to 15.422, a gain of 2.873 for thirty-two more cores — under a tenth of a core each.
+- At `s = 0.05` and `N = 4`, Amdahl's own arithmetic gives `1 / (0.05 + 0.95 / 4) = 3.478×` as the
+  most four threads can ever return, no matter how well they are scheduled. That number is a
+  ceiling derived from one fraction, not a promise that any real program reaches it — the next
+  section is what stops a program reaching even that.
+
+Amdahl is the *optimistic* model. It assumes the parallel part is perfectly parallel and the
+threads never interact. It has no term for what happens when they do — the next section is that
+term.
+
+### past the peak: the mechanism Amdahl has no word for
+
+Take a workload with **no serial section at all** — every thread runs an identical loop
+incrementing a counter — and give every thread the *same* counter to increment with
+`Interlocked.Increment`. Amdahl's floor for a slowdown is 1.0: with `s = 0`, `1 / (0 + 1/N)` is
+just `N`, and adding threads can only help. A shared counter routinely does worse than one
+thread, and Amdahl has no term that can produce that, because Amdahl only counts *time*, never
+*traffic*.
+
+`Interlocked.Increment` is a single `lock`-prefixed instruction —
+[atomics and compare-and-swap](/systems/atomics-and-cas/) has the disassembly — and the way the
+CPU makes it atomic is to hold the counter's cache line in **exclusive** state for the
+instruction's duration: no other core may hold a readable or writable copy of that line while
+one core owns it. Four threads sharing one counter are four cores trying to hold the same
+64-byte line exclusively, one at a time, in a tight loop:
+
+```text
+   one shared counter, four cores, one cache line
+
+   core 0 ── owns line ──▶ increments ──▶ hands line to whichever core asks next
+                                              │
+        ┌─────────────────────┬──────────────┼──────────────┐
+        ▼                     ▼               ▼              ▼
+     core 1 waits         core 2 waits    core 3 waits    (core 0 wants it back
+     for the line          for the line    for the line     for its NEXT increment)
+
+   every arrow is a message on the inter-core interconnect, not a memory access.
+   the number of possible (owner, waiter) pairs is N(N-1) — the Universal Scalability
+   Law's coherence term, βN(N-1), is counting exactly this.
+```
+
+Add a core and you have not added a worker to this loop; you have added another claimant to a
+resource only one core can hold at a time, and the queue of claimants is what the extra core
+actually joins. The Universal Scalability Law's peak — the thread count past which throughput
+*falls* — is `N* = sqrt((1 - α) / β)`. Its practical reading is simpler than its algebra: **there
+is a peak, it is often a small number, and nothing about the source code tells you where it is
+except reasoning about what is shared, or measuring the actual workload you care about.** For a
+counter with nothing else in the loop, the peak is at one thread — every additional core is pure
+overhead.
+
+[Why more threads can be slower](/systems/parallelism-patterns/scaling-curve/) walks this exact
+shape by address: which counters land on which 64-byte line, what the JIT emits for a contended
+increment versus an uncontended one, and why a counter that *looks* private in the source can
+still share a line with three others.
+
+### partitioning: the fix that removes the term rather than shrinking it
+
+Every alternative to a shared write is a way of not doing it. In increasing order of how
+completely they remove the coherence term:
+
+| shape | what two threads share | coherence cost per operation |
+| --- | --- | --- |
+| one counter, under `lock` | the counter's line, plus the lock's own word | a line transfer, *and* a kernel wait when contended |
+| one counter, `Interlocked` | the counter's line | a line transfer on every increment |
+| per-thread counters, packed adjacent in an array | nothing logically — but four 8-byte `long`s fit in one or two 64-byte lines | a line transfer on every increment anyway — the array's *layout* shares what the source code does not |
+| per-thread counters, 64 bytes apart | nothing, and nothing physically either | zero — each thread's line is never requested by another core |
+| a thread-local accumulator, published once at the end | nothing until the single publish | one locked instruction for the *whole loop*, not one per increment |
+
+The second row from the bottom is the trap, and it is worth stating exactly why: the source code
+for that row has **no shared variable**. Thread `t` writes only `array[t]`; no two threads ever
+write the same address. It still costs a coherence transfer on every increment, because the
+cache-coherence protocol tracks 64-byte lines, not C# variables, and four adjacent 8-byte `long`s
+do not span four lines. [Two counters, one cache line](/systems/atomics-and-cas/false-sharing/) is
+the full autopsy of that gap between "logically private" and "physically private".
+
+The bottom row is what partitioning really means when you push it all the way: the counter stops
+being memory at all until the very end. A thread-local accumulator (`long c = 0; c++;` in a
+register, published with one `Interlocked.Add` after the loop) issues **one** locked instruction
+for its entire share of the work, where the shared-counter version issues one **per increment**.
+Verified with `DOTNET_TieredCompilation=0 DOTNET_JitDisasm`, real output for the two loop bodies
+(offsets and the prologue trimmed, comments added):
+
+```text
+; the shared counter — one lock-prefixed instruction PER INCREMENT
+G_M000_IG04:
+       lock
+       inc      qword ptr [rax]        ; rax is the counter's fixed address
+       dec      edi
+       jne      SHORT G_M000_IG04
+
+; the local accumulator — the loop touches no memory at all
+G_M000_IG04:
+       inc      rax                    ; the "counter" is a register
+       dec      edi
+       jne      SHORT G_M000_IG04
+G_M000_IG05:
+       mov      rcx, <address>
+       lock
+       add      qword ptr [rcx], rax   ; ONE locked instruction, after the loop, not in it
+```
+
+That is a count, not a timing: for a loop of `n` increments the shared version issues `n` locked
+instructions and the local-accumulator version issues one. Whatever a locked instruction costs on
+a given core, paying for it once is cheaper than paying for it `n` times, and the ratio between
+"once" and "n times" is exactly `n` — arithmetic, not a benchmark.
+
+<Callout kind="insight" label="the rule">
+  Contention is a property of the *data layout*, not of the algorithm. Before you tune a lock,
+  ask whether the thing behind it needs to be shared at all — per-thread, per-partition or
+  per-request state that is combined once at the end removes the question instead of answering it.
+</Callout>
+
+### granularity: `Parallel.For` and the partitioner
+
+`Parallel.For(0, n, body)` invokes `body` once per index. That is one delegate call per element,
+and if the element's work is a single array read and add, the call is bigger than the work.
+
+Instrumented rather than timed — counting how many times the body actually runs, for the same
+one-million-element loop, `Parallel.For` versus `Parallel.ForEach` over
+`Partitioner.Create(0, n)`:
+
+```text
+Parallel.For(0, 1,000,000, body)               body invoked 1,000,000 times
+Parallel.ForEach(Partitioner.Create(0,1,000,000))  body invoked 49 times
+```
+
+Both loops touch every element exactly once, checked by summing the elements each body actually
+saw. `Partitioner.Create`'s default chunking is documented as a small multiple of
+`Environment.ProcessorCount` rather than a fixed number, which is why the count above is 49 and
+not some rounder figure — the point is not the exact number, it is that it is a small multiple of
+the core count rather than a multiple of the element count. Forty-nine delegate calls instead of a
+million, on identical work, is a difference of four orders of magnitude in how often the
+delegate-call and per-call bookkeeping gets paid.
+
+<Callout kind="trap" label="the granularity rule">
+  A parallel chunk has to do enough real work to be worth its own delegate call and the
+  partitioner's own bookkeeping. A single array element never clears that bar; a range of
+  thousands almost always does. [The cost ladder](/systems/locks-internals/lock-cost-ladder/) has
+  the fast-path-versus-slow-path shape for the primitives underneath, if the hand-off itself is
+  ever the suspect. "Parallelise the inner loop" is almost always the wrong instinct;
+  parallelise the outer one.
+</Callout>
+
+What the range form does **not** buy is a better inner loop, and it is worth being exact about
+that, because the folklore says otherwise. The range lambda's inner loop still bounds-checks
+every element — real disassembly, offsets and prologue trimmed:
+
+```text
+; sequential loop: bound is arr.Length — the JIT proves it in range, drops the check
+G_M000_IG03:
+       movsxd   rdi, dword ptr [rcx]
+       add      rax, rdi
+       add      rcx, 4
+       dec      edx
+       jne      SHORT G_M000_IG03
+
+; range-partitioned loop: bound is a Tuple field — the JIT cannot relate it to the
+; array, so the check stays on every iteration
+G_M000_IG04:
+       cmp      ecx, 0xF4240           ; i against the array length
+       jae      SHORT G_M000_IG06      ; bounds check, every iteration
+       movsxd   rsi, dword ptr [rdi+4*rcx+0x10]
+       add      rax, rsi
+       inc      ecx
+       cmp      ecx, edx               ; i against range.Item2 — the loop condition
+       jl       SHORT G_M000_IG04
+```
+
+The *sequential* loop gets
+[bounds-check elimination](/systems/il-jit-codegen/bounds-check-elimination/) because the JIT can
+relate its bound to the array it indexes — a `for (i = 0; i < arr.Length; i++)` over that exact
+array. The range lambda's limit is `range.Item2`, a field of a `Tuple`, which the JIT cannot
+relate to anything, so the check survives. That is a real codegen difference, and it is not the
+reason the range form wins on this page. **The delegate-call count is** — forty-nine calls
+instead of a million, on the same work, is the entire story; a slightly cheaper inner loop is a
+rounding error next to that.
+
+### balance: why the runtime steals work instead of dividing it
+
+Equal *index ranges* are not equal *work*. Take 4,000 items where item `i` costs `i` units — a
+triangular workload, which is what you get whenever cost depends on the size of the thing being
+processed. The total work is `Σ i` for `i` from 0 to 3,999, which is `3,999 × 4,000 / 2 =
+7,998,000` — arithmetic, not a run. Split it into four contiguous ranges of 1,000 and the last
+range, items 3,000 to 3,999, carries `Σ i` for that slice: `(3,000 + 3,999) × 1,000 / 2 =
+3,499,500` — **43.75%** of the total, in one quarter of the threads. The best possible speedup for
+that static split is therefore `7,998,000 / 3,499,500 = 2.29×`, no matter how many cores exist,
+because three threads finish early and stand around waiting for the fourth. That ceiling is
+derivable from the workload's own definition before a single thread runs.
+
+`Parallel.For`'s default partitioner does not hand out four equal ranges; it hands out small
+chunks and grows them, so a thread that finishes its chunk early comes back for more. The pool's
+work-stealing deques (covered in
+[threads, tasks and the scheduler](/systems/threads-and-scheduling/)) let an idle worker steal
+from the *head* of a busy worker's local queue while the owner pushes and pops from the tail — so
+the two ends of the same deque rarely collide, and a thread that runs out of work does not sit
+idle while another thread's queue is still full.
+
+The two effects pull against each other, and that tension *is* the tuning problem:
+
+```text
+   chunk too small                                    chunk too large
+   ├──────────────────────────────────────────────────────────────┤
+   one delegate call per element              a few large, unequal static ranges
+   all overhead, no imbalance                 no overhead, all imbalance
+
+                        the middle: chunks big enough to amortize
+                        the hand-off, small enough that the last
+                        one does not decide the finish time
+```
+
+### the queue between two stages, and why it must be bounded
+
+Partitioning splits work that is all of one kind. A pipeline is the other shape: stages of
+different kinds, connected by queues, each stage running concurrently on a different item.
+`Channel<T>` is .NET's queue for this, and the only decision that really matters when you create
+one is its capacity.
+
+```text
+   producer  ──write──▶ ┌───────────────┐ ──read──▶  consumer
+   fast                 │ capacity = 64 │            slow
+                        └───────────────┘
+                             ▲
+                             └── full: the producer's WriteAsync does not complete
+                                 until the consumer takes one out. THAT is backpressure —
+                                 the queue's bound becomes the producer's speed limit.
+
+   producer  ──write──▶ ┌ ─ ─ ─ ─ ─ ─ ─ ┐ ──read──▶  consumer
+   fast                 │  unbounded    │            slow
+                        └ ─ ─ ─ ─ ─ ─ ─ ┘
+                             ▲
+                             └── never full: the mismatch between the two rates is
+                                 stored instead of signalled, one message at a time,
+                                 for as long as the process has heap left to give it
+```
+
+An unbounded queue does not make a slow consumer faster. It converts a *rate* mismatch into a
+*memory* leak, and it hides the mismatch from every metric except memory until the failure is
+unrecoverable — every queued message is fully reachable, so the GC cannot reclaim any of it; it
+is doing exactly what reachability means, on a heap that is mostly backlog.
+[A pipeline with backpressure](/systems/parallelism-patterns/producer-consumer/) runs both
+versions under a fixed heap limit and shows one of them die with nothing to show for the memory
+it used.
+
+That last move — batch to amortize synchronization — is the general shape behind the
+local-accumulator row above, why database drivers pipeline statements instead of round-tripping
+one at a time, and why writing a log line per item is a throughput bug: a hand-off that happens
+once for a hundred items pays its cost once, not a hundred times.
+
+<Callout kind="trap" label="two things reasoning has to cover that one box can't demonstrate">
+  **NUMA.** On a two-socket server each socket has its own local memory controller, and a core
+  can still reach memory attached to the other socket — but every access, and every coherence
+  message for a line the other socket is fighting over, crosses the inter-socket link. A shared
+  counter that already costs a cross-core message on one socket costs strictly more once the two
+  contending cores are on different sockets.
+
+  **SMT (hyperthreading).** The OS reports two logical processors per physical core with SMT
+  enabled, but a logical processor is not a second copy of the core: the pair shares that core's
+  decode/execute pipeline, its execution ports, and usually its L1 and L2 cache. A workload that
+  scales cleanly up to the physical core count typically flattens, not doubles, past it — the
+  `(physical cores + 1)`th thread is not a fresh core, it is time-slicing the execution units of
+  a core that already has a tenant. Two threads fighting over a cache line pay the coherence cost
+  no matter which logical processors they land on; two threads that are not fighting over
+  anything still compete for one core's pipeline the moment they are SMT siblings.
+
+  Amdahl's serial fraction sets the ceiling. Coherence traffic — the mechanism above — can pull
+  the curve below 1.0 long before you reach either limit. NUMA and SMT are the two ways the same
+  curve gets worse again once you are spread across more silicon than one socket, or more logical
+  processors than physical cores.
+</Callout>
+
+## the mental model
+
+Three questions, in order, for any "make it parallel" task:
+
+1. **What fraction is actually serial?** That fraction, not the core count, sets your ceiling.
+   `1 / s` is the most speedup that exists for you, full stop.
+2. **What do the threads share?** Every shared *write* is a coherence cost that grows with the
+   square of the participants. Shared *reads* scale — any number of cores can hold the same line
+   at once, as long as nobody writes. The fix is to stop sharing, not to lock better.
+3. **How big is one piece of work?** A hand-off (a delegate call, a queue push, a lock acquire)
+   costs something fixed per piece. A piece too small to clear that cost loses to doing it on one
+   thread; batch until it clears it.
+
+| symptom | the model that explains it | the move |
+| --- | --- | --- |
+| speedup flattens below the core count | Amdahl — a serial section | find the serial section; it is usually one lock or one I/O |
+| throughput *falls* as threads are added | USL coherence — a shared line | partition the state; pad it; publish once |
+| parallel version slower than sequential | granularity — hand-off count exceeds the work | bigger chunks, range partitioners |
+| three threads idle while one finishes | imbalance — static split on uneven work | dynamic partitioning, work stealing |
+| memory climbs, no metric shows a stall | an unbounded queue absorbing a rate mismatch | bound the queue and let it push back |
+
+<Watch items={[['Amdahl ceiling', '1/s'], ['USL peak thread count', 'sqrt((1-α)/β)'], ['coherence term', 'βN(N-1) — grows with the square of N'], ['cache line', '64 B'], ['Parallel.For calls, 1M items', '1,000,000'], ['same work, range-partitioned', '49 calls'], ['static-split ceiling, triangular 4k-item workload', '2.29× — by arithmetic']]} />
+
+## why you should care
+
+**The metric that moves is throughput per core, and it is the one nobody graphs.** A service that
+scales sub-linearly when its instance size doubles has a coherence problem somewhere, and every
+dashboard that shows only total throughput will report the same deploy as growth. Compute
+requests per second per core across a deploy that changed instance size; if that number fell, you
+found a shared write, whether or not total throughput went up.
+
+**The incident shape is a scale-up that made things worse.** Somebody doubles the pod's CPU limit
+or the container's core count to fix a latency problem, and p99 gets worse rather than better.
+The usual culprits are a static counter or cache updated per request, a `ConcurrentDictionary`
+hot key, a shared `Random`, or a logging sink that serializes on one lock. All of them look fine
+in code review; all of them are the coherence mechanism above.
+
+**The other incident shape has no CPU symptom at all**: memory climbing steadily under load while
+CPU, latency and error rate look normal, until the pod is OOM-killed and restarts clean. That is
+an unbounded queue — `Channel.CreateUnbounded`, an unbounded `BlockingCollection`, `Task.Run` in a
+loop with nothing limiting concurrency, or an `ActionBlock` with the default unlimited capacity.
+The consumer is slower than the producer, and the queue is quietly doing your capacity planning
+for you, badly.
+
+**The code review you can now do:** flag `Channel.CreateUnbounded` and ask what makes the
+producer slow down; flag `Parallel.For` over a body that does less work than a delegate call and
+partitioner bookkeeping cost; flag a static or singleton field written on every request; flag
+`Parallel.ForEach` over I/O-bound work — it burns pool threads on blocking calls, which is
+[thread-pool starvation](/systems/threads-and-scheduling/threadpool-starvation/), and
+`Parallel.ForEachAsync` with a `MaxDegreeOfParallelism` is what you actually want; and stop
+flagging locks on the grounds that "locks are slow" — an *uncontended* lock is one atomic
+compare-and-swap and nothing else, no kernel call, no wait queue. The problem is the sharing that
+made it contended, not the lock.
+
+## the same idea in other languages
+
+| language | what it's called | the trap |
+| --- | --- | --- |
+| Java | the parallel streams framework and `ForkJoinPool`, with the same work-stealing deques | `parallelStream()` uses the *common* pool by default, whose size is `availableProcessors() - 1` and which is shared with every other library in the process — so one blocking task inside a parallel stream starves unrelated code, the same failure `Parallel.ForEach` over I/O causes in .NET. Java also ships `LongAdder`, which is the per-thread-cell partitioning above, built in; .NET has no equivalent and you write it yourself |
+| Go | goroutines over `GOMAXPROCS` OS threads, with channels as the pipeline primitive | `make(chan T)` with no size is *unbuffered*, which means every send blocks until a receiver takes it — maximum backpressure, the opposite default from `Channel.CreateUnbounded`. `make(chan T, n)` gives a bounded buffer; there is no unbounded channel in Go at all, which removes this page's flagship bug by construction |
+| Python | `threading` for concurrency, `multiprocessing` for parallelism | in CPython the global interpreter lock lets only one thread execute bytecode at a time, so CPU-bound threads give no speedup at all — Amdahl with `s = 1`. Parallelism means separate processes, which means the partitioning here is not an optimisation but the only design available, and combining results costs serialization |
+| C/C++ | OpenMP for loop parallelism, `std::thread` and `std::atomic` underneath | OpenMP's `schedule(static)` is the equal-index-ranges shape above — the default in many implementations, and the reason so much scientific code stops scaling well before the core count on unbalanced workloads; `schedule(dynamic, chunk)` is the `Parallel.For` behaviour. The chunk size is yours to pick, and picking 1 reproduces the per-item disaster |
+
+## exercises
+
+One works out why the exact same total work can take longer on four threads than on one; the
+other kills a process with a queue that had no bound.
+
+<ProblemList topic="parallelism-patterns" />
+
+## interview drills
+
+**Q.** We added threads and it got slower. What is going on?
+
+- *weak answer* — "Context switching overhead" or "too many threads for the cores". That explains
+  a *plateau* and some noise; it does not explain the same total work getting slower with more
+  threads on it, which is what actually happens with a shared write.
+- *strong answer* — Something is shared and written. Every write to a shared cache line has to
+  take that line exclusively, and the number of pairs of threads fighting over it grows with `N²`,
+  so past a small `N` you are paying more in coherence traffic than you gain in workers. Amdahl
+  cannot predict a slowdown at all — its floor is 1.0 — so a measured slowdown is by itself proof
+  that the problem is sharing, not serialization. I would look for a static counter, a shared
+  cache entry, or two hot fields that happen to share a 64-byte line.
+- *follow-up* — "How do you find which line?" Partition the suspect state per thread and re-check
+  — if the curve straightens, that was it. Failing that, `perf` counters for cache-line transfers,
+  or bisecting by padding one field at a time.
+
+**Q.** How many threads should this run on?
+
+- *weak answer* — "`Environment.ProcessorCount`." That is the default `Parallel.For` already
+  uses, and it is the right answer only for CPU-bound work with no shared writes.
+- *strong answer* — It depends which resource is the bottleneck. CPU-bound with no sharing: core
+  count, and past that, physical core count rather than logical — SMT siblings share one core's
+  pipeline. CPU-bound with a hot shared structure: the peak may be at two threads, and nothing in
+  the source tells you where without checking. I/O-bound: the number is set by the downstream
+  service's capacity, not by cores, and it belongs in a semaphore or a bounded channel rather than
+  in a thread count.
+- *follow-up* — "What if the work is a mix?" Separate them into stages with a bounded queue
+  between, so each stage can be sized for its own bottleneck. That is what a pipeline is for.
+
+**Q.** What is wrong with `Channel.CreateUnbounded`?
+
+- *weak answer* — "It could use a lot of memory." True but toothless; the follow-up is "we have
+  16 GB".
+- *strong answer* — It removes the only feedback path between a slow consumer and a fast producer.
+  With a bound, a producer that outruns the consumer waits, and the slowdown appears immediately
+  in the producer's own latency metrics where you will see it. Without one, the mismatch is
+  absorbed silently into the heap at the difference in rates, and the first signal you get is an
+  OOM kill with no useful stack. An unbounded queue is a bet that the mismatch is temporary, and
+  nothing in the code enforces the bet.
+- *follow-up* — "When is unbounded correct?" When the producer is itself bounded — a fixed set of
+  items — or when dropping is unacceptable and you have already bounded the producer upstream.
+  `BoundedChannelFullMode.DropOldest` is often the honest choice for telemetry.
+
+**Q.** You have `Parallel.For` over an array and it is slower than the serial loop. Why?
+
+- *weak answer* — "The array is too small." Sometimes true, but a body doing one add per element
+  loses to a serial loop even over millions of elements.
+- *strong answer* — Because `Parallel.For` invokes the body delegate once per index, so a body
+  that does one add pays a delegate call and partitioner bookkeeping on every single element —
+  overhead per element for work that is a couple of instructions. The fix is to make the unit of
+  work bigger, not the loop faster: `Parallel.ForEach` over `Partitioner.Create(0, n)` ranges, with
+  a plain inner `for` loop, cuts the delegate-call count from one per element to a small multiple
+  of the core count.
+- *follow-up* — "What else does the range form buy?" Less than you'd think, and it is worth
+  knowing that: the inner loop still bounds-checks every element, because its limit is a tuple
+  field rather than `arr.Length` — you only get the pointer-walking loop if you slice a `Span`
+  first. The win is almost entirely the delegate-call count.
+
+**Q.** Where does Amdahl's law stop applying?
+
+- *weak answer* — "It applies to fixed problem sizes; Gustafson's law is for growing ones." Correct
+  and rehearsed; it dodges the practical failure.
+- *strong answer* — It stops applying wherever the threads interact, because it models only a
+  serial fraction and assumes the parallel part is free of interaction. Real systems have a
+  coherence cost that grows with the square of the thread count, which is what the Universal
+  Scalability Law adds, and that term is why measured curves have a peak and then descend —
+  something Amdahl structurally cannot express, since its floor is always 1.0.
+- *follow-up* — "So what is Amdahl good for?" Deciding whether to bother. If the section you are
+  about to parallelise is 20% of the runtime, the whole project cannot pay more than 1.25×, and
+  you should be optimising something else.

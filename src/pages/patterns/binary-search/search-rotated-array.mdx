@@ -1,0 +1,133 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: binary-search
+problem: search-rotated-array
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import Cells from '@components/Cells.astro';
+
+## task
+
+A sorted array of distinct integers was rotated at some unknown pivot. Given `target`, return its
+index, or `-1` if it isn't present. O(log n) is required.
+
+```text
+nums = [4, 5, 6, 7, 0, 1, 2], target = 0  →  4
+```
+
+## how to think
+
+You still want an exact match, so the loop shape doesn't change from classic binary search — what
+changes is the *discard rule*. At any `mid`, one of the two halves — `[left, mid]` or
+`[mid, right]` — is guaranteed to be genuinely sorted, because a single rotation only breaks order
+once, and it can only live in one of the two halves.
+
+So the move is: figure out which half is sorted (compare its endpoints — `nums[left] <= nums[mid]`
+means the left half is), then ask the cheap question you already know how to answer: does `target`
+fall inside that sorted half's value range? If yes, binary search continues into it exactly like
+the classic algorithm. If no, `target` — if it exists at all — must be in the *other* half, which
+gets the same treatment next iteration.
+
+<Callout kind="note" label="template instance">
+  **Exact-match** skeleton (`while (left <= right)`), same loop shape as classic binary search —
+  what varies is the discard rule: identify the sorted half first, then discard the *other* half
+  whenever `target` provably can't be in the sorted one.
+</Callout>
+
+## solution
+
+```csharp
+public int Search(int[] nums, int target)
+{
+    int left = 0, right = nums.Length - 1;
+
+    while (left <= right)
+    {
+        int mid = left + (right - left) / 2;
+        if (nums[mid] == target) return mid;
+
+        if (nums[left] <= nums[mid])                    // left half [left..mid] is sorted
+        {
+            if (nums[left] <= target && target < nums[mid])
+                right = mid - 1;                         // target's range is inside the sorted left half
+            else
+                left = mid + 1;                           // it isn't — the answer is in the other half
+        }
+        else                                              // right half [mid..right] is sorted instead
+        {
+            if (nums[mid] < target && target <= nums[right])
+                left = mid + 1;                            // target's range is inside the sorted right half
+            else
+                right = mid - 1;
+        }
+    }
+
+    return -1;
+}
+```
+
+## trace
+
+`nums = [4, 5, 6, 7, 0, 1, 2]`, `target = 0`:
+
+| step | L | R | mid | nums[mid] | sorted half | target in it? | move |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | 0 | 6 | 3 | 7 | left `[4..7]` (`nums[L]=4 <= nums[mid]=7`) | `0` in `[4, 7)`? no | `left = 4` |
+| 2 | 4 | 6 | 5 | 1 | left `[0..1]` (`nums[L]=0 <= nums[mid]=1`) | `0` in `[0, 1)`? yes | `right = 4` |
+| 3 | 4 | 4 | 4 | 0 | — | hit | return `4` |
+
+<Cells
+  data={[4, 5, 6, 7, 0, 1, 2]}
+  pointers={{ 0: [{ t: 'L', c: 'amber' }], 3: [{ t: 'M', c: 'purple' }], 6: [{ t: 'R', c: 'cyan' }] }}
+  cells={{ 0: 'warn', 1: 'warn', 2: 'warn', 3: 'warn' }}
+  caption="nums[L]=4 <= nums[mid]=7 → left half [0..3] is sorted, but 0 isn't in [4,7) — discard it"
+/>
+
+<Cells
+  data={[4, 5, 6, 7, 0, 1, 2]}
+  pointers={{ 4: [{ t: 'hit', c: 'green' }] }}
+  cells={{ 4: 'ok' }}
+  caption="left = right = mid = 4 → nums[4] = 0, found in three comparisons"
+/>
+
+## why it works
+
+A once-rotated sorted array has exactly one break in order. Splitting it at any `mid` puts that
+break inside at most one of the two halves — so one half is *always* genuinely sorted, and a
+sorted half is something plain binary search already knows how to search: just check whether
+`target` falls inside its `[low, high)` value range. If it doesn't, `target` — if present — has to
+be in the other half, which gets split the same way on the next iteration. Every step still
+discards at least half the range, so it's still O(log n); the only addition is the branch that
+decides which half deserves the trust.
+
+<Watch items={[['time', 'O(log n)'], ['space', 'O(1)']]} />
+
+## common bugs
+
+- Using `<` instead of `<=` in `nums[left] <= nums[mid]` — when `left == mid` (a two-element
+  range), that single element must count as "sorted"; getting this wrong misclassifies tiny
+  ranges and can route the search into the wrong half.
+- Reversing the half-open range check — the sorted left half's test is
+  `nums[left] <= target && target < nums[mid]`, deliberately excluding `nums[mid]` since it was
+  already checked above; using `<=` on both ends is redundant (the `==` case already returned) and
+  hides the reasoning — and becomes an actual bug the moment the short-circuit below is removed or
+  reordered.
+- Dropping the `nums[mid] == target` check because the range tests "will find it anyway" — they
+  won't: the half-open range test `target < nums[mid]` deliberately excludes `mid`, so when
+  `nums[mid]` *is* the target the code discards it (`left = mid + 1`) and the search returns `-1`.
+  The short-circuit is the only path that can return a hit.
+- Applying this exact logic to an array with duplicates — LC 33 guarantees distinct values.
+  Duplicates make `nums[left] == nums[mid]` ambiguous about which half is actually sorted (that's
+  LC 81, and it needs a linear fallback).
+
+## variants you can now solve
+
+- **[Find Minimum in Rotated Sorted Array](/patterns/binary-search/find-minimum-rotated/)** (LC
+  153) — same array shape, a simpler question: just find the pivot, no target to match.
+- **Search in Rotated Sorted Array II** (LC 81) — duplicates allowed; when
+  `nums[left] == nums[mid] == nums[right]` you can't tell which half is sorted and must fall back
+  to shrinking both ends by one.
+- **[Koko Eating Bananas](/patterns/binary-search/koko-eating-bananas/)** — a completely different
+  discard rule, proof that "binary search" is a loop *shape*, not a fixed comparison.

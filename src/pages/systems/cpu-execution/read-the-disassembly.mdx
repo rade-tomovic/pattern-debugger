@@ -1,0 +1,384 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: cpu-execution
+problem: read-the-disassembly
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import Solution from '@components/Solution.astro';
+
+## the source
+
+Five lines that could not be simpler. They are in C rather than C# for one reason: a C
+compiler leaves a file on disk that `objdump` can read, while the JIT's output exists only in
+the memory of a running process. We will get the JIT to hand its version over at the end, and
+the two turn out to be the same code.
+
+```c
+int sum_to(int n)
+{
+    int total = 0;
+    for (int i = 1; i <= n; i++)
+        total += i;
+    return total;
+}
+```
+
+```text
+$ gcc -O0 -fno-stack-protector -c sumto.c -o sumto0.o
+$ objdump -d --no-show-raw-insn sumto0.o
+```
+
+`-O0` means "no optimisation": it is the compiler transcribing your source, statement by
+statement, which is exactly what you want the first time you read machine code.
+`--no-show-raw-insn` drops the instruction bytes so the column of mnemonics lines up.
+
+`-fno-stack-protector` needs a sentence, because the obvious guess about it is wrong here.
+Ubuntu's gcc defaults to `-fstack-protector-strong`, which stores a canary value in the frame
+and checks it before returning — but only in functions that contain an array or a local whose
+address is taken. `sum_to` has neither, so no canary is emitted with or without the flag: it
+costs this function exactly zero instructions. What the flag does change is the frame layout.
+Compile the same file both ways on this box and gcc puts `total` at a different offset with the
+flag than without it, with `i` taking the other slot. The flag is passed here only to pin the
+offsets the table below refers to.
+
+<Callout kind="insight" label="before you read on">
+  Sixteen instructions come out of those five lines. Guess two things first: how many of them
+  touch memory, and how many are the loop body. Then check yourself against the table below —
+  the gap between your guess and the answer is the thing this page is for.
+</Callout>
+
+## what the machine got
+
+Real output, unedited:
+
+```text
+0000000000000000 <sum_to>:
+   0:   endbr64
+   4:   push   %rbp
+   5:   mov    %rsp,%rbp
+   8:   mov    %edi,-0x14(%rbp)
+   b:   movl   $0x0,-0x4(%rbp)
+  12:   movl   $0x1,-0x8(%rbp)
+  19:   jmp    25 <sum_to+0x25>
+  1b:   mov    -0x8(%rbp),%eax
+  1e:   add    %eax,-0x4(%rbp)
+  21:   addl   $0x1,-0x8(%rbp)
+  25:   mov    -0x8(%rbp),%eax
+  28:   cmp    -0x14(%rbp),%eax
+  2b:   jle    1b <sum_to+0x1b>
+  2d:   mov    -0x4(%rbp),%eax
+  30:   pop    %rbp
+  31:   ret
+```
+
+Two things to know before the table, because both trip people up permanently.
+
+**This is AT&T syntax: the destination is on the right.** `mov %edi,-0x14(%rbp)` moves *from*
+`edi` *to* the memory at `rbp - 0x14`. Intel syntax, which Microsoft's tools and the .NET JIT
+print, puts the destination first — the same instruction is `mov [rbp-0x14], edi`. Nothing
+else differs; every operand pair is simply reversed.
+
+**Locals have no names, only offsets from `rbp`.** The compiler assigned each variable a slot
+in the frame and from here on that slot *is* the variable. The offsets count *backwards* from
+the frame pointer because the stack grows downward, and they are written in hex for the reason
+[hex exists at all](/systems/bits-and-memory/) — byte boundaries are visible in it:
+
+| slot | holds | why there |
+| --- | --- | --- |
+| `-0x4(%rbp)` | `total` | the slot gcc happened to assign it in this build |
+| `-0x8(%rbp)` | `i` | the next 4-byte slot down |
+| `-0x14(%rbp)` | `n` | the incoming argument, spilled out of `edi` |
+
+Read that first column as a fact about *this* build and no more. Which local lands in which
+slot is an artefact of the compiler's internal ordering, not a rule about declaration order.
+Only the argument slot has a reason behind it: `n` arrives in `edi` under the calling
+convention and `-O0` spills every incoming argument to the frame so a debugger can find it.
+
+## line by line
+
+Every instruction, and the source line that caused it:
+
+| instruction | what it does | source |
+| --- | --- | --- |
+| `endbr64` | a landing pad marking this as a legal indirect-branch target (a security feature, not your code) | none |
+| `push %rbp` | save the caller's frame pointer on the stack | the opening brace |
+| `mov %rsp,%rbp` | this function's frame starts here | the opening brace |
+| `mov %edi,-0x14(%rbp)` | argument 1 arrived in `edi`; store it into the frame | `int sum_to(int n)` |
+| `movl $0x0,-0x4(%rbp)` | write 0 into the `total` slot | `int total = 0;` |
+| `movl $0x1,-0x8(%rbp)` | write 1 into the `i` slot | `for (int i = 1; …` |
+| `jmp 25` | jump straight to the test — a `for` loop checks before its first iteration | `…; i <= n; …` |
+| `mov -0x8(%rbp),%eax` | load `i` into a register, because memory cannot be added to memory | `total += i;` |
+| `add %eax,-0x4(%rbp)` | add it into the `total` slot: read, add, write back | `total += i;` |
+| `addl $0x1,-0x8(%rbp)` | increment the `i` slot in place | `…; i++)` |
+| `mov -0x8(%rbp),%eax` | load `i` again — the previous load was three instructions ago and `-O0` never remembers | `…; i <= n; …` |
+| `cmp -0x14(%rbp),%eax` | compute `i - n` and set the flags; the result is thrown away | `…; i <= n; …` |
+| `jle 1b` | if that comparison said less-or-equal, jump back to the loop body | `…; i <= n; …` |
+| `mov -0x4(%rbp),%eax` | load `total` into `eax`, where the ABI says return values live | `return total;` |
+| `pop %rbp` | restore the caller's frame pointer | the closing brace |
+| `ret` | pop the return address into `rip` and continue in the caller | the closing brace |
+
+Sixteen instructions. **Nine of them name a stack slot as an operand**, and three more —
+`push`, `pop`, `ret` — touch the stack implicitly, so twelve of the sixteen go to memory. The
+loop body, the part that runs `n` times, is the six instructions from `1b` to `2b`, and five of
+those six are memory accesses, for an operation that in the source is one `+=`.
+
+## why it looks like that
+
+### `-O0` is a transcription, and that is the feature
+
+At `-O0` the compiler binds every variable to a memory slot and keeps it there. It is not being
+stupid; it is being *debuggable*. If `total` lives at a fixed offset from `rbp` for the entire
+function, then a debugger stopped anywhere can print it, change it, and have the change take
+effect — and every source line maps to a contiguous run of instructions you can single-step
+through. That property is worth a lot while you are finding a bug and nothing at all while you
+are serving traffic.
+
+### `-O1`: the same loop, in registers
+
+Same source file, one flag changed. The instructions and offsets below are objdump's; the `;`
+comments in this listing and the next one are added here, because objdump prints none.
+
+```text
+$ gcc -O1 -fno-stack-protector -c sumto.c -o sumto1.o
+
+0000000000000000 <sum_to>:
+   0:   endbr64
+   4:   test   %edi,%edi          ; n <= 0?
+   6:   jle    2c <sum_to+0x2c>   ; then the answer is 0, skip everything
+   8:   add    $0x1,%edi          ; edi = n + 1, the value i must reach
+   b:   mov    $0x1,%eax          ; eax = i   = 1
+  10:   mov    $0x0,%edx          ; edx = total = 0
+  15:   data16 cs nopw 0x0(%rax,%rax,1)   ; padding so the loop starts on an aligned address
+  20:   add    %eax,%edx          ; total += i          ← the whole loop body
+  22:   add    $0x1,%eax          ; i++
+  25:   cmp    %edi,%eax          ; i == n + 1 ?
+  27:   jne    20 <sum_to+0x20>
+  29:   mov    %edx,%eax          ; return total
+  2b:   ret
+  2c:   mov    $0x0,%edx          ; the n <= 0 path
+  31:   jmp    29 <sum_to+0x29>
+```
+
+The frame is gone — `push %rbp` and the slots with it — because nothing needs an address any
+more. `total` is `edx`, `i` is `eax`, the statement `total += i` is now a single instruction,
+and the whole loop is four real instructions plus the alignment padding in front of it, which
+never executes as part of the loop — it exists so the loop's first instruction starts on an
+address the fetch hardware likes, and costs nothing once execution reaches `add %eax,%edx`.
+Two smaller changes are worth noticing because they are what optimisers spend their time on:
+the test `i <= n` was rewritten as `i != n + 1` with the bound computed once before the loop,
+which is the canonical shape that lets later passes reason about the trip count — and is the
+reason `-O2` is able to unroll it below. And the `n <= 0` case was moved to a cold block at the
+bottom, keeping the hot path contiguous in memory.
+
+### `-O2`: the one-to-one mapping breaks
+
+```text
+$ gcc -O2 -fno-stack-protector -c sumto.c -o sumto2.o
+
+0000000000000000 <sum_to>:
+   0:   endbr64
+   4:   test   %edi,%edi
+   6:   jle    40 <sum_to+0x40>
+   8:   lea    0x1(%rdi),%ecx        ; ecx = n + 1, the bound
+   b:   xor    %edx,%edx             ; total = 0
+   d:   and    $0x1,%edi             ; is n odd?
+  10:   mov    $0x1,%eax             ; i = 1
+  15:   je     30 <sum_to+0x30>      ; n even → straight into the paired loop
+  17:   mov    $0x2,%eax             ; n odd → peel one iteration: i = 2 …
+  1c:   mov    $0x1,%edx             ;                       … total = 1
+  21:   cmp    %ecx,%eax             ; was n == 1? then we are already done
+  23:   je     3b <sum_to+0x3b>
+  25:   data16 cs nopw 0x0(%rax,%rax,1)   ; padding to align the paired loop
+  30:   lea    0x1(%rdx,%rax,2),%edx ; total = total + 2i + 1  ← TWO iterations
+  34:   add    $0x2,%eax             ; i += 2
+  37:   cmp    %ecx,%eax
+  39:   jne    30 <sum_to+0x30>
+  3b:   mov    %edx,%eax
+  3d:   ret
+  3e:   xchg   %ax,%ax               ; padding, aligns whatever comes after this function
+  40:   xor    %edx,%edx
+  42:   mov    %edx,%eax
+  44:   ret
+```
+
+The loop is now unrolled by two. `total + i + (i+1)` is `total + 2i + 1`, and x86's address
+arithmetic instruction computes exactly that shape in one go: `lea 0x1(%rdx,%rax,2),%edx` means
+`edx = rdx + rax*2 + 1`. `lea` is doing arithmetic, not addressing — it is the standard trick
+for "multiply by 2, 4 or 8 and add something", with no memory involved at all.
+
+Unrolling by two only works when the trip count is even, so the compiler peeled the odd case:
+`and $0x1,%edi` asks whether `n` is odd and, if it is, does iteration 1 by hand before entering
+the paired loop. That is why there is more code above the loop than in the loop. Unrolling is
+worth doing because it halves the loop bookkeeping and gives the core two independent additions
+to work on in the same stretch of instructions, which is
+[the pipeline's](/systems/cpu-pipeline/) subject rather than this page's.
+
+**Ask which source line `lea 0x1(%rdx,%rax,2),%edx` came from and the question no longer has an
+answer.** It is two iterations of `total += i`, plus half of `i++`, fused into one instruction.
+This is the moment the debugger's line table starts pointing at surprising places, and it is
+the whole reason optimised stack traces look wrong.
+
+### the same instructions, counted rather than timed
+
+The three builds are not different arithmetic — they are the same five lines, wearing more or
+less machinery. Counting what each build makes the loop body do, instead of timing it, tells
+the same story with no stopwatch involved:
+
+| build | loop-body instructions | of those, memory operands | frame? |
+| --- | --- | --- | --- |
+| `-O0` | 6 (`1b`-`2b`) | 5 | yes — `push`/`pop %rbp` |
+| `-O1` | 4 | 0 | no |
+| `-O2` | 4, doing 2 iterations each | 0 | no |
+
+Every build computes the identical sum. What changes is how many of the CPU's steps are spent
+moving `total` and `i` to and from memory rather than doing arithmetic on them, and, at `-O2`,
+how many source iterations one pass through the loop actually covers. The `-O0` loop's body
+carries two chains that each round-trip through a stack slot every iteration — `add
+%eax,-0x4(%rbp)` reads `total` out of its slot and writes it back, and `addl $0x1,-0x8(%rbp)`
+does the same to `i` — where `-O1` and `-O2` do the equivalent arithmetic entirely in registers,
+which is exactly the register-versus-memory gap from [the topic page](/systems/cpu-execution/),
+now seen at three optimisation levels on the same five lines instead of two hand-written loops.
+
+### and what the JIT does with the same five lines
+
+Written in C#, the loop is character-for-character the same. The runtime will print what it
+generated for it — no decompiler, no external tool. Two details in the file below are load
+bearing: `SumTo` is a static method on a named class, so the JIT gives it a name the dump
+filter can match, and something actually calls it, because a method that is never invoked is
+never compiled and therefore never printed.
+
+<Solution>
+
+```csharp
+using System.Runtime.CompilerServices;
+
+static class P
+{
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    public static int SumTo(int n)
+    {
+        int total = 0;
+        for (int i = 1; i <= n; i++)
+            total += i;
+        return total;
+    }
+
+    static void Main() => Console.WriteLine(SumTo(1000));
+}
+```
+
+</Solution>
+
+That file is checked in as `bench/cpu-execution/read-the-disassembly-jit.cs`.
+`DOTNET_TieredCompilation=0` skips tier 0, so the first compilation is already the optimised
+one. Real output, unedited:
+
+```text
+$ DOTNET_JitDisasm=SumTo DOTNET_TieredCompilation=0 dotnet run -c Release sumto.cs
+500500
+; Assembly listing for method P:SumTo(int):int (FullOpts)
+; Emitting BLENDED_CODE for generic X64 + VEX on Unix
+; FullOpts code
+; optimized code
+; rbp based frame
+; fully interruptible
+; No PGO data
+
+G_M000_IG01:                ;; offset=0x0000
+       push     rbp
+       mov      rbp, rsp
+
+G_M000_IG02:                ;; offset=0x0004
+       xor      eax, eax
+       mov      ecx, 1
+       test     edi, edi
+       jle      SHORT G_M000_IG04
+       align    [0 bytes for IG03]
+
+G_M000_IG03:                ;; offset=0x000F
+       add      eax, ecx
+       inc      ecx
+       cmp      ecx, edi
+       jle      SHORT G_M000_IG03
+
+G_M000_IG04:                ;; offset=0x0017
+       pop      rbp
+       ret
+
+; Total bytes of code 25
+```
+
+That is Intel syntax — destination first. The `G_M000_IGnn` labels are the JIT's basic blocks:
+`IG01` is the prologue, `IG02` puts `total` in `eax` and `i` in `ecx` and takes the early exit
+when `n` is not positive, `IG03` is the loop, `IG04` the epilogue. Strip the labels and the
+offsets and it is the same four-instruction loop gcc reached at `-O1`: the body, an increment, a
+compare, a branch, with `total` and `i` both in registers and no frame slots at all. RyuJIT kept
+the source's `i <= n` test where gcc rewrote it to `i != n + 1`, and RyuJIT did not unroll where
+gcc at `-O2` did — that second difference is the only structural gap left between them.
+
+If you try this and get no listing at all, the filter did not match. `DOTNET_JitDisasm` matches
+the JIT's own name for the method, and a local function declared inside top-level statements is
+compiled as something like `Program:g__SumTo|0_0` — which is why the file above uses a static
+method on a class `P`, and why `DOTNET_JitDisasm='*SumTo*'` is the wildcard that rescues the
+other shape. The second way to get silence is a method nothing calls: uncompiled means
+unprinted.
+
+The point is not that .NET's codegen matches gcc's. It is that once the JIT has done its job,
+"managed code" is x86-64 instructions in registers like anything else — the overhead people
+expect to find here is not in the loop, it is in what the code does with objects and memory,
+which is where the rest of this section goes.
+
+<Watch items={[['instructions at -O0', '16'], ['of those, memory operands', '9'], ['loop body at -O0', '6 instructions, 5 memory'], ['loop body at -O1 / -O2', '4 instructions, 0 memory'], ['-O2 unrolled by', '2'], ['JIT loop body', '4 instructions, matches -O1']]} />
+
+## what this looks like in prod
+
+You will not disassemble anything on a normal Tuesday. You will read disassembly on the three
+days a year when nothing else answers the question, and those days go much better if the syntax
+is not also new to you:
+
+- **A crash dump with no useful managed stack.** The disassembly around the faulting `rip`,
+  plus the registers, is often the whole story: which register held the null, which call was in
+  flight.
+- **A profiler that attributes an implausible share of time to a line that cannot possibly cost
+  that.** At `-O2`-class optimisation the line table is approximate. The instruction-level view
+  tells you what the sample really landed on, which is usually a memory access several source
+  lines away.
+- **"Did it inline / did it eliminate the bounds check?"** These are questions about generated
+  code, and `DOTNET_JitDisasm` answers them in seconds where reasoning does not. The bounds-check
+  half of that lives in [IL, the JIT and code generation](/systems/il-jit-codegen/).
+- **A benchmark that is too fast to be true.** Disassembling the loop is how you find out the
+  compiler deleted the work whose result you never used.
+
+And one thing worth carrying from the counted table above: `dotnet run file.cs` produces Debug
+code with the optimiser off, on identical source to `dotnet run -c Release file.cs`. Any
+measurement taken in a Debug build is a measurement of the debugger's convenience, not of your
+code — see [the topic page](/systems/cpu-execution/) for what a Debug build actually generates.
+
+## the same idea in other languages
+
+| language | how you see the machine code | the trap |
+| --- | --- | --- |
+| C / C++ | `objdump -d` on the object file or binary; `gcc -S` for assembly text | Disassembling an unlinked `.o` shows unresolved call targets as garbage: in this page's other example `call add3` printed as `call 47 (caller+0x27)` — the address of the *next* instruction — because the linker had not filled the relocation in yet. Always disassemble the linked binary. |
+| Java | `javap -c` for bytecode; machine code needs `-XX:+PrintAssembly` plus an `hsdis` plugin that is not bundled with the JDK | `javap` output is bytecode, not instructions. It is the exact analogue of IL, and reading it tells you nothing about what C2 finally emitted. |
+| Go | `go tool objdump`, or `go build -gcflags=-S` | Go prints its own portable pseudo-assembly — registers spelled `AX`, `SP`, and its own mnemonics — not GNU or Intel syntax. It looks like x86 and is not. |
+| Python | `dis.dis(f)` gives CPython bytecode | There is no machine code for your function to look at. The interpreter's C loop is the machine code, and it is the same code for every function you write. |
+
+## common bugs
+
+- **Reading `.o` files and believing the call targets.** An unlinked object still has empty
+  relocations, so every `call` points at the instruction after itself. It looks like an infinite
+  loop and is an artefact.
+- **Mixing up AT&T and Intel operand order.** `mov %eax,%edx` and `mov eax, edx` move in
+  opposite directions. objdump and gcc default to AT&T, .NET and Windows tools to Intel; both
+  will happily print instructions you read backwards.
+- **Drawing conclusions from `-O0` or from tier-0 JIT output.** Both are transcriptions meant
+  for a debugger. If you did not pass `-O2`, or you dumped before the method was promoted to
+  full optimisation, you are reading code that will never run in production.
+- **Assuming one source line equals one instruction run.** After unrolling and vectorisation,
+  one instruction can be several iterations of your loop, and one source line can be spread over
+  three basic blocks — which is why optimised line numbers in a stack trace are approximate.
+- **Benchmarking a function whose result is unused.** The compiler is entitled to delete it, and
+  at `-O2` it will. A snippet that only computes a value and never uses it is not evidence about
+  anything the compiler was allowed to remove.

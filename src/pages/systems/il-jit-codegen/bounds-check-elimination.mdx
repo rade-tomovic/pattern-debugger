@@ -1,0 +1,313 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: il-jit-codegen
+problem: bounds-check-elimination
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import Solution from '@components/Solution.astro';
+
+## the question
+
+Two methods that sum an `int[]`. The first takes the length from the array; the second takes it
+as a parameter, the way a method that works on the first `n` elements of a buffer usually does.
+Both loops read every element with `a[i]`, and every `a[i]` in C# is checked — the runtime must
+throw `IndexOutOfRangeException` before an out-of-range read happens, and the IL instruction
+that does the read (`ldelem.i4`) is *defined* to check. Roslyn cannot remove that check; it has
+no way to express an unchecked array read in IL. Whatever happens to it happens later, in the
+JIT.
+
+<Callout kind="insight" label="predict first">
+  Both loops compile down through the same JIT, on the same array. Predict: does the compiled
+  loop for `ByLength` still contain a bounds check? Does the compiled loop for `ByCount`? And
+  for whichever one still has to check something at run time — does it check once, or once per
+  element?
+</Callout>
+
+## the code
+
+<Solution>
+
+```csharp
+public static int ByLength(int[] a)
+{
+    int s = 0;
+    for (int i = 0; i < a.Length; i++) s += a[i];
+    return s;
+}
+
+public static int ByCount(int[] a, int n)
+{
+    int s = 0;
+    for (int i = 0; i < n; i++) s += a[i];
+    return s;
+}
+```
+
+</Solution>
+
+## work it out
+
+Here is the IL for both methods, decoded out of the built assembly by
+`bench/il-jit-codegen/il-dump.cs` — the two are identical apart from where the loop bound comes
+from:
+
+```text
+.method ByLength   // 24 bytes of IL          .method ByCount   // 22 bytes of IL
+  IL_0000:  ldc.i4.0                            IL_0000:  ldc.i4.0
+  IL_0001:  stloc.0                             IL_0001:  stloc.0
+  IL_0002:  ldc.i4.0                            IL_0002:  ldc.i4.0
+  IL_0003:  stloc.1                             IL_0003:  stloc.1
+  IL_0004:  br.s          IL_0010               IL_0004:  br.s          IL_0010
+  IL_0006:  ldloc.0                             IL_0006:  ldloc.0
+  IL_0007:  ldarg.0                             IL_0007:  ldarg.0
+  IL_0008:  ldloc.1                             IL_0008:  ldloc.1
+  IL_0009:  ldelem.i4     ← the checked read    IL_0009:  ldelem.i4     ← the same read
+  IL_000a:  add                                 IL_000a:  add
+  IL_000b:  stloc.0                             IL_000b:  stloc.0
+  IL_000c:  ldloc.1                             IL_000c:  ldloc.1
+  IL_000d:  ldc.i4.1                             IL_000d:  ldc.i4.1
+  IL_000e:  add                                 IL_000e:  add
+  IL_000f:  stloc.1                             IL_000f:  stloc.1
+  IL_0010:  ldloc.1                             IL_0010:  ldloc.1
+  IL_0011:  ldarg.0                             IL_0011:  ldarg.1   ← n, instead of
+  IL_0012:  ldlen         ← a.Length                                  a.Length
+  IL_0013:  conv.i4                             IL_0012:  blt.s         IL_0006
+  IL_0014:  blt.s         IL_0006               IL_0014:  ldloc.0
+  IL_0016:  ldloc.0                             IL_0015:  ret
+  IL_0017:  ret
+```
+
+Now walk the proof the JIT has to construct, not the code, before looking at what it emitted.
+For any `a[i]`, it needs two facts: `i >= 0` and `i < a.Length`.
+
+**`ByLength`.** `i` starts at 0 and only ever increases, so `i >= 0` is free. The loop's own
+exit condition *is* `i < a.Length` — the same comparison the check needs is already sitting
+right there, run every trip, one instruction before the read. Array length is immutable in
+.NET once an array exists, so nothing inside the loop body can invalidate that fact between the
+comparison and the read. Every fact the check needs is already proven by code that already
+runs. The check is dead weight and the JIT can delete it.
+
+**`ByCount`.** The loop's exit condition is `i < n`. `n` is just an `int` parameter — nothing in
+the method signature, and nothing the JIT can see at this call site, connects it to
+`a.Length`. The relation might hold on every call a real program makes, but "might hold on every
+call I've seen" is not a proof, and the JIT does not guess. It cannot delete the check without
+a proof. What it *can* do is test the one relation it actually needs — `a.Length >= n` — a
+single time, before the loop starts, and keep two copies of the loop body: one that trusts the
+test and runs unchecked, one that does not and checks every element. That is **loop cloning**.
+
+## the answer
+
+Real output, unedited, from
+`DOTNET_JitDisasm="ByLength ByCount" dotnet run bench/il-jit-codegen/bounds-check-shapes.cs -c Release`.
+Both listings are the tier-1 versions — the fully optimised code each method settles into once
+the runtime decides it is hot.
+
+```text
+; Assembly listing for method B:ByLength(int[]):int (Tier1)
+; optimized code
+; with Dynamic PGO: fgCalledCount is 5813
+
+G_M000_IG01:                ;; offset=0x0000
+       push     rbp
+       mov      rbp, rsp
+
+G_M000_IG02:                ;; offset=0x0004
+       xor      eax, eax
+       mov      ecx, dword ptr [rdi+0x08]
+       test     ecx, ecx
+       jle      SHORT G_M000_IG05
+
+G_M000_IG03:                ;; offset=0x000D
+       add      rdi, 16
+
+G_M000_IG04:                ;; offset=0x0011
+       add      eax, dword ptr [rdi]
+       add      rdi, 4
+       dec      ecx
+       jne      SHORT G_M000_IG04
+
+G_M000_IG05:                ;; offset=0x001B
+       pop      rbp
+       ret
+
+; Total bytes of code 29
+```
+
+Four instructions in the loop, and not one of them is a comparison against the length —
+exactly what the reasoning above predicted.
+
+```text
+; Assembly listing for method B:ByCount(int[],int):int (Tier1)
+; optimized code
+; with Synthesized PGO: fgCalledCount is 5824
+
+G_M000_IG01:                ;; offset=0x0000
+       push     rbp
+       mov      rbp, rsp
+
+G_M000_IG02:                ;; offset=0x0004
+       xor      eax, eax
+       xor      ecx, ecx
+       test     esi, esi
+       jle      SHORT G_M000_IG07
+
+G_M000_IG03:                ;; offset=0x000C
+       test     rdi, rdi
+       je       SHORT G_M000_IG08
+
+G_M000_IG04:                ;; offset=0x0011
+       mov      edx, dword ptr [rdi+0x08]
+       cmp      edx, esi
+       jl       SHORT G_M000_IG08
+
+G_M000_IG05:                ;; offset=0x0018
+       add      rdi, 16
+
+G_M000_IG06:                ;; offset=0x0020
+       add      eax, dword ptr [rdi]
+       add      rdi, 4
+       dec      esi
+       jne      SHORT G_M000_IG06
+
+G_M000_IG07:                ;; offset=0x002A
+       pop      rbp
+       ret
+
+G_M000_IG08:                ;; offset=0x002C
+       mov      edx, dword ptr [rdi+0x08]
+
+G_M000_IG09:                ;; offset=0x0030
+       cmp      ecx, edx
+       jae      SHORT G_M000_IG10
+       mov      r8d, ecx
+       add      eax, dword ptr [rdi+4*r8+0x10]
+       inc      ecx
+       cmp      ecx, esi
+       jl       SHORT G_M000_IG09
+       jmp      SHORT G_M000_IG07
+
+G_M000_IG10:                ;; offset=0x0044
+       call     CORINFO_HELP_RNGCHKFAIL
+       int3
+
+; Total bytes of code 74
+```
+
+Read that second listing structurally and the shape *is* the answer: **there are two loops in
+it.** `IG06` is the same four-instruction loop as `ByLength`, no check. `IG09` is a
+seven-instruction loop with a check in it, entered only on the path that could not be proven
+safe. Which one runs is decided once, at `IG03`–`IG04`, before either loop starts — not once
+per element, once per *call*.
+
+| block | instructions | what it is |
+| --- | --- | --- |
+| `IG02` | `test esi, esi` / `jle` | is `n` zero or negative? then return 0 |
+| `IG03` | `test rdi, rdi` / `je IG08` | is `a` null? the fast loop is not allowed to assume it is not, so a null goes to the slow path where the check will throw properly |
+| `IG04` | `mov edx, [rdi+0x08]` / `cmp edx, esi` / `jl IG08` | **the whole bounds check, done once**: is `a.Length >= n`? If yes, every index from 0 to `n-1` is provably in range |
+| `IG05`–`IG06` | 4-instruction loop | the fast loop — byte-for-byte the same body as `ByLength` |
+| `IG08`–`IG09` | 7-instruction loop with `cmp ecx, edx` / `jae` | the slow loop, entered only when the guard failed. It checks every element, so the correct exception still gets thrown at the correct index |
+| `IG10` | `call CORINFO_HELP_RNGCHKFAIL` | the runtime helper that throws `IndexOutOfRangeException`. It never returns, which is why `int3` follows it |
+
+## why it works that way
+
+The general rule is: **the JIT removes a check only when it can prove the check would never
+fire, using facts already established by code that runs unconditionally on the path to the
+read.** `ByLength`'s own loop condition supplies that proof for free. `ByCount` cannot supply
+it — `n` carries no relationship to `a.Length` that the JIT can see — so the JIT falls back to
+proving it *once per call* instead of never, which is still far cheaper than proving it on
+every element.
+
+The same question, asked eleven different ways, shows the rule is consistent rather than
+coincidental. Every shape below is in `bench/il-jit-codegen/bounds-check-shapes.cs`, compiled in
+one run, each called 400,000 times so all of them reach tier 1:
+
+| loop shape | check in the hot loop | code bytes | how |
+| --- | --- | --- | --- |
+| `for (int i = 0; i < a.Length; i++)` | none | 29 | proved outright |
+| `foreach (int v in a)` | none | 29 | identical code — `foreach` over an array *is* that loop |
+| `for (int i = 0; i <= a.Length - 1; i++)` | none | 27 | proved outright |
+| `int len = a.Length; for (int i = 0; i < len; i++)` | none | 31 | proved: the length cannot change, so the copy is as good as the original |
+| `for (int i = 0; i < n; i++)` | none | 74 | cloned: one guard, two loops |
+| `a.AsSpan(0, n)` then `i < span.Length` | none | 62 | the slice itself does the check, once |
+| `s += a[i] * b[i]`, bounded by `a.Length` | none | 93 | cloned on `b.Length >= a.Length` |
+| the same, after `if (b.Length < a.Length) throw` | none | 95 | your guard proves it; no clone needed |
+| `for (int i = a.Length - 1; i >= 0; i--)` | none | 54 | cloned — the backwards loop is *not* proved outright |
+| `s += a[idx[i]]` | **one per element** | 61 | nothing can be proved about a value read from memory |
+| the same via `Unsafe.Add(ref r, idx[i])` | none | 48 | you removed it by hand, and the safety with it |
+
+Three of those are worth stopping on. **Caching `a.Length` in a local proves nothing new** —
+the JIT already knew the length could not change, so the cached copy earns 2 extra bytes of
+code and no fewer checks. **`foreach` over an array is not a different loop from `for`** — it
+compiles to the identical 29 bytes. And the **backwards loop is the surprise**: counting down
+from `a.Length - 1` produces a cloned loop, not a proved one — the JIT's proof for the forward
+case does not transfer to counting down, even though the set of indices touched is identical.
+
+The `s += a[idx[i]]` row is the interesting failure case: `idx[i]` is a value read from another
+array at run time, and the JIT has no way to reason about what a memory read might produce. It
+cannot prove the index in range, and there is no simple relation to test once the way there was
+for `ByCount`, so the check survives inside the loop, once per element — the disassembly for
+that shape shows exactly two extra instructions in the loop body, `cmp` immediately followed by
+a never-taken `jae` to the throw helper, sitting right next to the read they guard.
+
+<Watch items={[['ldelem is checked', 'by definition, in the IL spec'], ['proved loop', '0 checks, 29 bytes'], ['cloned loop (ByCount)', 'one guard + 2 loop bodies, 74 bytes'], ['surviving per-element check', 'cmp + jae, 2 instructions'], ['array length field', 'offset +8'], ['array element data', 'offset +16']]} />
+
+## what this looks like in prod
+
+The useful version of this knowledge is not "bounds checks are free". It is that **you can make
+the JIT's job possible, and that is nearly always cheaper than removing the check yourself.**
+
+- **Pass a `Span<T>`, not an array and a count.** `a.AsSpan(0, n)` validates once at the slice
+  and then every loop over `span.Length` is provably safe — the same fix as the `ByCount` guard,
+  written by the framework, with a type that stops the length and the buffer drifting apart.
+- **Hoist the relation yourself when two arrays are involved.** `if (b.Length < a.Length) throw`
+  before the loop turns a cloned loop into a proved one, gives callers a better exception than
+  `IndexOutOfRangeException` from somewhere in the middle of your parse, and costs one
+  comparison instead of one per element.
+- **Do not reach for `Unsafe.Add` or `fixed` for a per-element check you have not confirmed
+  survives.** Most loops never keep a check at all — the table above proves that — so removing
+  one by hand is frequently removing nothing. The risk you take on in exchange is an
+  out-of-bounds *write* that corrupts an unrelated object and surfaces as an impossible bug
+  hours later, in a different thread. If you do it anyway, do it behind an API that validates
+  once at the boundary.
+- **Where it does pay is where the check blocks something bigger** — a loop the JIT would
+  otherwise vectorise or unroll, or an indirection in the innermost loop of a parser or codec.
+  That is a small, identifiable set of methods, and `DOTNET_JitDisasm` tells you whether you are
+  looking at one of them.
+- **Read the disassembly before optimising, not after.** Half the "obvious" rewrites in this
+  area — caching `Length`, switching `foreach` to `for`, counting down instead of up — are shown
+  above to change nothing, or to make it worse.
+
+## the same idea in other languages
+
+| language | what it does with array indexing | the trap |
+| --- | --- | --- |
+| Java | Every array access is checked, and HotSpot's C2 removes them the same way: it proves the index in range where it can, and otherwise hoists a predicate out of the loop and keeps a fallback path | Java's fallback is an *uncommon trap* that deoptimises back to the interpreter rather than a cloned loop. When the trap fires often, the method is recompiled without the assumption — so a JVM method can quietly start running interpreted code again when your data starts violating an assumption the compiler had made. |
+| C / C++ | No checks. `a[i]` is an address computation and nothing else | There is no fallback loop, no exception, and no signal that anything went wrong. An out-of-range write lands in whatever object happens to be next in memory. This is what C# is buying with the check. |
+| Go | Checked like C#, with its own bounds-check elimination pass; `go build -gcflags="-d=ssa/check_bce/debug=1"` prints which checks it could not remove | The compiler tells you where the remaining checks are — but Go has no JIT, so the answer is fixed at build time and cannot use anything learned at run time the way tier-1 code can. |
+| Rust | Checked by default; the idiomatic escape is iterators, which are checked once and then compile to pointer walks | `get_unchecked` exists and requires `unsafe`, which is the point: the language makes you write down that you are taking the risk, where C#'s `Unsafe.Add` looks like an ordinary method call. |
+| Python | `list[i]` is checked on every access and raises `IndexError` | The check sits underneath the interpreter's own per-operation overhead, which dwarfs it. There is no comparable win to chase here at all. |
+
+## common bugs
+
+- **Believing bounds checks always cost something.** The idiomatic loop above pays nothing —
+  there is no check left to pay for — and even the worst case in the table, a check that
+  genuinely survives, is two instructions sitting next to work the loop was doing anyway.
+- **"Optimising" by caching `a.Length` in a local.** 31 bytes against 29, no check removed in
+  either version — the JIT already knew the length could not change. It also makes the loop
+  *harder* to read, and if the local and the array ever drift apart it is exactly how a check
+  stops being removable.
+- **Reading a listing before the method reaches tier 1 and concluding the JIT is bad at this.**
+  The tier-0 listing of the idiomatic loop still has a full bounds check in it, plus
+  instrumentation calls — that is what runs for a method's first stretch of calls, before it is
+  replaced.
+- **Assuming a surviving check is a branch-misprediction risk.** It is a branch that is never
+  taken, sitting next to a hot loop the predictor sees over and over; the predictor gets it
+  right on essentially every iteration. What you pay is the two instruction slots the check
+  occupies, not a stalled pipeline — see
+  [branch prediction](/systems/cpu-pipeline/) for what an actual mispredict costs, which this
+  is not one of.
+- **Rewriting with `Unsafe.Add` and keeping the array parameter public.** The check you removed
+  was the one enforcing your method's contract. Take it out and the validation has to move to
+  the boundary — and it has to actually be there.

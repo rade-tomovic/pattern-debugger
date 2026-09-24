@@ -1,0 +1,390 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: concurrency-hazards
+problem: check-then-act
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import Solution from '@components/Solution.astro';
+
+## the code
+
+An inventory class from a warehouse service. It is documented as thread-safe, and the
+documentation is nearly true: every public method takes the same private lock, and every one of
+them is individually correct. The last method is the one that reserves stock for an order.
+
+<Solution>
+
+```csharp
+public sealed class Inventory
+{
+    readonly Dictionary<string, int> _stock = new();
+    readonly object _gate = new();
+
+    public void Restock(string sku, int qty) { lock (_gate) _stock[sku] = _stock.GetValueOrDefault(sku) + qty; }
+    public int  Count(string sku)            { lock (_gate) return _stock.GetValueOrDefault(sku); }
+    public void Remove(string sku, int qty)  { lock (_gate) _stock[sku] = _stock.GetValueOrDefault(sku) - qty; }
+
+    public bool TryReserve(string sku, int qty)
+    {
+        if (Count(sku) < qty) return false;    // check
+        Remove(sku, qty);                      // act
+        return true;
+    }
+}
+```
+
+</Solution>
+
+Nothing is unsynchronised. The dictionary is never touched outside the lock. There is no
+`volatile` missing, no `Interlocked` needed, no second lock to order. Evidence for everything
+below is `bench/concurrency-hazards/check-then-act.cs`:
+
+```text
+dotnet run bench/concurrency-hazards/check-then-act.cs race
+dotnet run bench/concurrency-hazards/check-then-act.cs trace
+dotnet run bench/concurrency-hazards/check-then-act.cs semaphore
+```
+
+## find it
+
+<Callout kind="insight" label="before you scroll">
+  `TryReserve` is four lines and contains no lock of its own. Count the critical sections it
+  enters, and write down what a second thread is allowed to do **between** them.
+
+  Then predict a number: four threads, one unit in stock, all four calling `TryReserve(sku, 1)` at
+  once, 20,000 independent rounds. In how many rounds does more than one thread get told yes? And
+  the follow-up that decides whether you have really found it: does swapping the `Dictionary` for
+  a `ConcurrentDictionary` fix it, make it worse, or change nothing?
+</Callout>
+
+## the failure
+
+Four threads, one unit of stock, 20,000 independent rounds — each round resets the inventory,
+releases all four threads through a `Barrier`, and counts how many were told yes:
+
+```text
+=== 4 threads, 1 unit in stock, 20,000 independent rounds ===
+    a round is oversold when more than one thread was told yes
+  Inventory.TryReserve            (lock per method) oversold   9835 / 20000  (49.17%)  worst round: 4 threads told yes, total sold 32,766 of 20,000 units
+  ConcurrentInventory.TryReserve  (lock-free reads) oversold  19853 / 20000  (99.27%)  worst round: 4 threads told yes, total sold 78,195 of 20,000 units
+  Inventory.TryReserveFixed       (one lock, both)  oversold      0 / 20000  ( 0.00%)  worst round: 0 threads told yes, total sold 20,000 of 20,000 units
+```
+
+| 4 threads, 1 unit, 20,000 rounds | rounds oversold | units sold |
+| --- | --- | --- |
+| `Inventory.TryReserve` — a lock in every method | 9,835 (49.17%) | 32,766 of 20,000 |
+| `ConcurrentInventory.TryReserve` — `ConcurrentDictionary`, lock-free reads | 19,853 (99.27%) | 78,195 of 20,000 |
+| `Inventory.TryReserveFixed` — one lock spanning both steps | 0 (0.00%) | 20,000 of 20,000 |
+
+The exact percentage moves between runs — how often four threads land inside the same window
+depends on where the OS scheduler puts them, not on anything the code controls. What holds in
+every run: the fixed row is exactly zero, every time, and the concurrent-dictionary row is worse
+than the locked row, every time — never the reverse, because swapping in a lock-free read only
+removes the accidental staggering the next section explains, it never adds synchronisation back.
+The "units sold" column is where the fixed row makes its own case — exactly 20,000 units out of
+20,000 available, one per round, every round.
+
+12,766 units sold that did not exist, out of 20,000, in the row above — and the worst rounds sold
+the same single widget to all four threads. Now the same bug slowed down until every step is
+visible. Two threads, one unit, and a `Barrier` sitting in the gap between the check and the act,
+logged with a monotonic step counter — not a clock — so this is real cross-thread order, not a
+duration:
+
+```text
+  [  1] tid   1  stock(WIDGET-1) = 1
+  [  2] tid   4  thread A: Count() -> 1   (lock taken and RELEASED)
+  [  3] tid   5  thread B: Count() -> 1   (lock taken and RELEASED)
+  [  4] tid   4  thread A: 1 >= 1, so reserving
+  [  5] tid   5  thread B: 1 >= 1, so reserving
+  [  6] tid   5  thread B: Remove() done, told the customer YES
+  [  7] tid   4  thread A: Remove() done, told the customer YES
+  [  8] tid   1  stock(WIDGET-1) = -1   <- one unit, two customers
+```
+
+| step | thread A | thread B | lock held by | `_stock["WIDGET-1"]` |
+| --- | --- | --- | --- | --- |
+| 1 | `Count()` enters the lock, reads 1, **releases** | — | A, then nobody | 1 |
+| 2 | — | `Count()` enters the lock, reads 1, **releases** | B, then nobody | 1 |
+| 3 | `1 >= 1` is true — decides to reserve | — | nobody | 1 |
+| 4 | — | `1 >= 1` is true — decides to reserve | nobody | 1 |
+| 5 | — | `Remove()` enters the lock, writes 0, releases | B, then nobody | 0 |
+| 6 | `Remove()` enters the lock, writes −1, releases | — | A, then nobody | −1 |
+| 7 | returns `true` — order confirmed | returns `true` — order confirmed | nobody | −1 |
+
+Every row that touches `_stock` does so under the lock. The class's own invariant — stock is never
+negative, and a unit is promised to at most one caller — is broken anyway, at step 6, by code that
+never violated its locking discipline once.
+
+## why it breaks
+
+A lock does not protect data. It protects an **invariant over a span of time**, and it protects it
+only for as long as you hold it. `TryReserve` holds the lock twice and holds it across nothing:
+
+```text
+   TryReserve(sku, 1)
+   ├── Count(sku)     [ take lock ] read 1 [ release lock ]
+   │                                                        ← the window. anything may happen here.
+   ├── decision: 1 >= 1, reserve
+   └── Remove(sku, 1) [ take lock ] write [ release lock ]
+
+   the invariant "the stock I checked is still there" is TRUE inside each bracket
+   and UNPROTECTED between them — which is where the whole decision lives.
+```
+
+The value `Count` returned is a *fact about the past* the moment the lock is released. `TryReserve`
+then makes a decision on that stale fact and acts on it. That is check-then-act, and it is the
+shape that survives code review because each half looks impeccable.
+
+This is why "thread-safe" is a word that has to be qualified before it means anything. `Inventory`
+is thread-safe in the only sense its author checked — no data race, no corrupted dictionary, no
+torn read. It is not *atomic at the granularity its callers need*, and those are different claims:
+
+| claim | what it means | does `Inventory` have it |
+| --- | --- | --- |
+| no data race | no unsynchronised access to shared memory | yes |
+| internally consistent | the `Dictionary` is never observed mid-mutation | yes |
+| operations composable | a caller can build a correct compound operation from the public API | **no** |
+
+The third row cannot be fixed from outside. That is the whole point: the class chose the size of
+its atomic steps when it chose its method boundaries, and the callers are stuck with that choice.
+
+**The reflex is to conclude the `Dictionary` is the problem**, and reach for the concurrent one:
+
+<Solution>
+
+```csharp
+public sealed class ConcurrentInventory
+{
+    readonly ConcurrentDictionary<string, int> _stock = new();
+
+    public void Restock(string sku, int qty) => _stock.AddOrUpdate(sku, qty, (_, v) => v + qty);
+    public int  Count(string sku)            => _stock.GetValueOrDefault(sku);
+    public void Remove(string sku, int qty)  => _stock.AddOrUpdate(sku, -qty, (_, v) => v - qty);
+
+    public bool TryReserve(string sku, int qty)
+    {
+        if (Count(sku) < qty) return false;    // still a check
+        Remove(sku, qty);                      // still a separate act
+        return true;
+    }
+}
+```
+
+</Solution>
+
+Every individual operation here is atomic — `AddOrUpdate` really is an atomic read-modify-write,
+and `GetValueOrDefault` really is an atomic read. The oversell rate went **up** — from 49.17% of
+rounds with a lock in every method to 99.27% with the concurrent dictionary, which is to say
+almost every round instead of about half of them.
+
+The mechanism is not "no lock" — `ConcurrentDictionary` still locks on the write path. It takes one
+*stripe* lock, the `Monitor` guarding the bucket the key hashes to, never the whole table
+([how the striping works](/systems/lock-free-structures/)). What changed is the **check**:
+`GetValueOrDefault` goes through `TryGetValue`, which takes no lock at all and walks the bucket
+chain through volatile reads. In the `Inventory` version all four threads' `Count` calls queue on
+one `Monitor`, and that queueing accidentally staggers them — a thread that waited its turn to read
+has often lost the race to act by the time it gets there. Take the queue away and the four checks
+happen genuinely simultaneously, so all four see 1, and all four proceed. A collection that is
+thread-safe per operation removes the accidental queueing, it does not add the missing
+synchronisation — and removing that queueing is exactly what widens the window: the four checks
+now land close enough together that all four see the same stale value instead of taking turns.
+
+[Lock-free structures](/systems/lock-free-structures/) covers the rest of that family — including
+that `GetOrAdd`'s factory can run more than once, which is the same lesson from the library's side.
+
+## the fix
+
+Move the invariant inside the class, and make the critical section span the whole decision:
+
+<Solution>
+
+```csharp
+public bool TryReserveFixed(string sku, int qty)
+{
+    lock (_gate)
+    {
+        if (Count(sku) < qty) return false;    // check
+        Remove(sku, qty);                      // act — same lock, still held
+        return true;
+    }
+}
+```
+
+</Solution>
+
+Zero oversold rounds out of 20,000, and exactly 20,000 units sold from 20,000 units of stock.
+
+The reason those three lines are legal is worth naming, because it is the thing that stops working
+in the next section: **`Monitor` is reentrant.** `Count` and `Remove` each execute
+`Monitor.Enter(_gate)` while this thread already owns `_gate`. `Monitor` keeps the owning thread
+and a recursion count, sees the same thread, increments the count and lets it through. Without
+that property the fix would be a self-deadlock and you would have to duplicate the bodies as
+private "lock already held" helpers.
+
+Two fixes get proposed before that one, in every review of this bug.
+
+**Expose the lock so callers can compose.** A public `SyncRoot`, or documenting "take the
+inventory's lock around compound operations". It works, and it is how the .NET 1.1 collections were
+designed, which is a good hint about why nobody does it any more. You have made your lock part of
+your public API: every caller can now hold it for as long as they like, take it in any order
+relative to other locks, and forget to take it at all — and every deadlock they create is a bug
+report against you. It also cannot be reviewed, because the correctness of a call site now depends
+on code you cannot see.
+
+**Give up and make the caller retry.** `if (!inv.TryReserve(...)) retry;` does not help, because
+the bug is not that reservation failed — it is that it *succeeded* when it should not have. A
+retry loop around an operation that reports success incorrectly makes exactly no difference. This
+one is worth naming because it is a reflex that works for optimistic-concurrency bugs and does
+nothing at all here.
+
+**The async rewrite has a trap in it.** The moment this method needs to `await` something — a database write, an outbox publish — the
+`lock` has to go, because you cannot `await` inside one. The mechanical translation is
+`SemaphoreSlim`, and the mechanical translation is broken:
+
+<Solution>
+
+```csharp
+public sealed class SemaphoreInventory
+{
+    readonly Dictionary<string, int> _stock = new();
+    readonly SemaphoreSlim _gate = new(1, 1);
+
+    public int Count(string sku) { _gate.Wait(); try { return _stock.GetValueOrDefault(sku); } finally { _gate.Release(); } }
+    public void Remove(string sku, int qty) { _gate.Wait(); try { _stock[sku] = _stock.GetValueOrDefault(sku) - qty; } finally { _gate.Release(); } }
+
+    public bool TryReserveFixed(string sku, int qty)
+    {
+        _gate.Wait();                            // takes the one permit
+        try
+        {
+            if (Count(sku) < qty) return false;  // Count waits for a permit this thread is holding
+            Remove(sku, qty);
+            return true;
+        }
+        finally { _gate.Release(); }
+    }
+}
+```
+
+</Solution>
+
+One thread. No contention. No second caller anywhere in the process. Logged with a step counter,
+not a clock:
+
+```text
+  [  1] tid   1  stock(WIDGET-1) = 5
+  [  2] tid   1  one thread, no contention, calling TryReserveFixed
+  [  3] tid   4  worker: entering TryReserveFixed
+  [  4] tid   1  main: worker returned before the watchdog fired? False
+  [  5] tid   1  main: worker state = Background, WaitSleepJoin   alive = True
+  [  6] tid   1  WATCHDOG: the thread is waiting for a permit it is holding itself. killing the process.
+```
+
+`SemaphoreSlim` counts permits; it does not track owners. The thread took the only permit, then
+asked for it again, and is now waiting for itself. The correct async shape separates "public,
+acquires" from "private, assumes held":
+
+<Solution>
+
+```csharp
+readonly SemaphoreSlim _gate = new(1, 1);
+
+public async Task<bool> TryReserveAsync(string sku, int qty)
+{
+    await _gate.WaitAsync().ConfigureAwait(false);
+    try
+    {
+        if (CountLocked(sku) < qty) return false;      // private: assumes the permit is held
+        RemoveLocked(sku, qty);
+        await _journal.WriteAsync(sku, qty).ConfigureAwait(false);   // the reason we went async
+        return true;
+    }
+    finally { _gate.Release(); }                       // finally, always — one leak is a permanent outage
+}
+
+int  CountLocked(string sku)            => _stock.GetValueOrDefault(sku);
+void RemoveLocked(string sku, int qty)  => _stock[sku] = _stock.GetValueOrDefault(sku) - qty;
+```
+
+</Solution>
+
+Note what that `await` inside the critical section now costs: the permit is held across I/O, so
+every other reservation queues behind a network round trip instead of behind a few CPU
+instructions. Correct, and a serialisation cost you're accepting on purpose — which is the trade
+the `lock`-based version never let you make, because it could not compile.
+
+<Watch items={[['critical sections in the bug', '2'], ['critical sections in the fix', '1'], ['oversold, locked-per-method, one run', '49%'], ['oversold, ConcurrentDictionary, one run', '99%'], ['oversold, fixed', '0.00%'], ['Monitor reentrant', 'yes'], ['SemaphoreSlim reentrant', 'no']]} />
+
+## what this looks like in prod
+
+The symptom is never a stack trace. It is data that cannot exist: a stock level of −1, two orders
+holding the same serial number, two rows where a unique index should have permitted one, a wallet
+balance that disagrees with the sum of its ledger entries. It shows up in a reconciliation job, in
+a support ticket, or in the database's own constraint violation — days later, from a code path
+that ran correctly ten million times.
+
+The rate is the cruel part. The run above oversold roughly half of its rounds because a `Barrier`
+deliberately aligned four threads on one SKU. In production the alignment comes from your traffic: the last unit
+of a popular item, the moment a promotion starts, the retry storm after a partial outage. The bug
+is exactly correlated with the events you least want it during, and completely absent from your
+load tests, which spread requests evenly over a large key space and never contend on the last unit.
+
+The place it hides in a .NET codebase is the "helper method on a thread-safe object" — anything
+of the shape:
+
+```text
+if (!cache.ContainsKey(k)) cache.Add(k, Build(k));          // two operations
+if (queue.Count > 0)       item = queue.Dequeue();          // two operations
+if (!File.Exists(p))       File.Create(p);                  // two operations, different process
+if (user.Balance >= cost)  user.Balance -= cost;            // two operations, maybe two machines
+```
+
+Every one is check-then-act, and the last two are the reminder that the shape is not about locks at
+all. The same bug spans processes (`File.Exists` then `Create`) and machines (read a balance, write
+it back) — which is why the database version has its own vocabulary: that is what `SELECT … FOR
+UPDATE`, optimistic concurrency tokens and `INSERT … ON CONFLICT` exist to solve. Same shape,
+different layer.
+
+**The review rule** that catches all of it: an `if` whose condition reads shared state, followed by
+a write to that state, must be inside one critical section — and if the state belongs to somebody
+else's object, the compound operation belongs on *that* object, as one method. When you find
+yourself wanting to lock around a thread-safe class, its API is at the wrong granularity.
+
+## the same idea in other languages
+
+| language | what it's called | the trap |
+| --- | --- | --- |
+| Java | the same bug against `Collections.synchronizedMap`, whose every method is synchronized and whose compound operations are still unsafe | `ConcurrentHashMap` answered it by adding the compound operations as atomic methods — `putIfAbsent`, `computeIfAbsent`, `merge`. The lesson is the fix on this page: the compound operation has to live *inside* the thing that owns the lock |
+| Go | `sync.Map` and a plain map behind a `sync.Mutex` have the identical property: per-operation safety, no composition | `go test -race` will not find it. The race detector reports unordered memory accesses, and here every access is properly ordered by the same mutex — the bug is in which spans are covered, which no detector can infer |
+| Python | `dict` operations are individually atomic under the GIL, so `d[k] = v` is safe and `if k not in d: d[k] = v` is not | the GIL makes this bug *rarer*, not absent — the interpreter can switch threads between bytecodes, and the check and the act are different bytecodes. Rarer is worse: it survives testing |
+| SQL | the same shape across a network: `SELECT` then `UPDATE` in two statements | the database gives you tools C# does not — `SELECT … FOR UPDATE` to hold a row lock across both, a `WHERE stock >= 1` predicate on the `UPDATE` itself so the check and the act are one statement, or an optimistic version column. The last one is the pattern worth stealing back into C#: make the write itself conditional |
+
+## common bugs
+
+- **Reading "thread-safe" in the docs and concluding "composable".** `ConcurrentDictionary`,
+  `Interlocked`, `ImmutableList` and `Channel<T>` are all thread-safe and none of them makes your
+  two-step operation atomic. The proof is on this page: swapping in a `ConcurrentDictionary` made
+  the failure rate go up, not down — the lock-free read removes the accidental staggering that was
+  quietly saving the locked version.
+- **Fixing it by locking at the call site.** It works only if *every* call site does it, with the
+  same lock, forever, including the ones written next year. The invariant belongs to the class, so
+  the critical section does too.
+- **Shrinking the critical section for performance without checking what it spans.** "Just take
+  the lock around the dictionary access" is exactly how the bug on this page is introduced, usually
+  by someone optimising a lock that showed up in a profile. An uncontended `lock`'s fast path is a
+  handful of instructions with no kernel transition
+  ([how a lock is built](/systems/locks-internals/)) — the span is the thing to think about, not
+  the count.
+- **Translating `lock` to `SemaphoreSlim` mechanically when a method goes `async`.** The permit is
+  not reentrant, so any locked method calling another locked method self-deadlocks on one thread
+  with no contention at all. Split into public-acquires and private-assumes-held helpers.
+- **Forgetting `finally` around `SemaphoreSlim.Release`.** `lock` releases on every exit path
+  including exceptions; a semaphore does not. One missing `Release` on an error path leaks the
+  permit permanently, and the class stops working for the lifetime of the process — an outage that
+  starts hours after the exception that caused it.
+- **Testing with a uniform key distribution.** Spreading load over 10,000 SKUs makes this bug
+  effectively unobservable. The test that finds it aims every thread at *one* key and rendezvouses
+  them, which is what the code on this page does — and it is a test you can write for your own
+  compound operations in about ten lines.

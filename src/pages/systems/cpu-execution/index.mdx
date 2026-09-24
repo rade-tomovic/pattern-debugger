@@ -1,0 +1,651 @@
+---
+layout: '@layouts/TopicLayout.astro'
+topic: cpu-execution
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import ProblemList from '@components/ProblemList.astro';
+
+## the ground floor
+
+- **Memory** is one flat array of numbered bytes and an **address** is an index into it —
+  [bits, bytes and addresses](/systems/bits-and-memory/) builds that from nothing.
+- **Machine code** is bytes sitting in that same array. An **instruction** is one of them
+  decoded: a few bytes that say "add these two things", "load from there", "jump".
+- **A core** is one engine that executes instructions. This box has four, and everything on
+  this page happens inside one of them.
+- **A register** is a named storage slot inside the core itself, 8 bytes wide on x86-64.
+  There are sixteen general-purpose ones — 128 bytes in total, and the fastest storage in the
+  machine by a wide margin.
+- **A cycle** is one tick of the core's clock — the unit everything below is counted in.
+- **A thread** is a stack plus a set of register values;
+  [processes, threads and the kernel](/systems/process-and-thread/) owns that story.
+
+## core idea
+
+A CPU is one loop that never stops: read the bytes at the address in the instruction pointer,
+work out what they say, do it, advance the pointer. Everything you have ever heard about
+modern processors — caches, pipelines, branch predictors, out-of-order execution — is an
+optimisation of that loop, bolted on under the rule that the answers must come out as if the
+loop had run one instruction at a time in order.
+
+Two consequences shape every line of C# you write. First, values have to be inside the core to
+be computed on. An x86 instruction may name one memory operand — you will see
+`add %eax,-0x4(%rbp)` below — but the load, the arithmetic and the store back all still happen
+as separate steps against memory, where the register version does the same arithmetic against
+a name baked into the instruction and nothing else. Second, the loop has no concept of a
+function. `call` and `ret` are two ordinary instructions that move the instruction pointer and
+push or pop one 8-byte value on the stack, and *that* is what a method invocation is made of.
+
+## how it actually works
+
+### registers: where the work actually happens
+
+The x86-64 core has sixteen general-purpose registers. They have names, not addresses, and
+they are baked into the instruction encoding — `add %eax,%edx` assembles here to the two bytes
+`01 c2`, both operands named inside those two bytes, so there is no lookup to do.
+
+| register | what it is for on Linux x86-64 |
+| --- | --- |
+| `rax` | scratch; also where a function leaves its return value |
+| `rdi`, `rsi`, `rdx`, `rcx`, `r8`, `r9` | integer/pointer arguments 1-6, in that order |
+| `rbx`, `rbp`, `r12`-`r15` | callee-saved: a function that uses them must put them back |
+| `r10`, `r11` | scratch, free for anyone to clobber |
+| `rsp` | the stack pointer — the address of the top of the current thread's stack |
+| `rip` | the instruction pointer: the address of the next instruction to run |
+| `rflags` | the results of the last comparison, which is how branches decide |
+
+That table is not x86 trivia — it is the **calling convention**, the treaty that lets code
+compiled by different compilers call each other. Every C function, every .NET method, and
+every syscall on this machine passes its first argument in `rdi`.
+
+The point of a register is that an instruction operating on one needs nothing but its name.
+`volatile` in C means "this variable must be read and written in memory every time", which is
+exactly how you take a register away from the compiler — so putting the identical loop through
+both spellings is a direct look at what a register buys you:
+
+```c
+#define N       4096            // 16 KiB of ints — fits in L1d, so this is not a cache test
+
+static int a[N];
+
+__attribute__((noinline)) int sum_register(void)
+{
+    int total = 0;                       // compiler is free to keep this in a register
+    for (int i = 0; i < N; i++)
+        total += a[i];
+    return total;
+}
+
+__attribute__((noinline)) int sum_memory(void)
+{
+    volatile int total = 0;              // volatile = must live in memory, reloaded every time
+    for (int i = 0; i < N; i++)
+        total += a[i];
+    return total;
+}
+```
+
+That is C, not C#, so that `volatile` can force the issue — the full file is
+`bench/cpu-execution/register-vs-memory.c`. Compiled with
+`gcc -O2 -fno-stack-protector -fno-tree-vectorize`, the two loop bodies come out as:
+
+```text
+sum_register:                          sum_memory:
+  add    (%rax),%edx                     mov    -0x4(%rsp),%edx     ; reload the total
+  add    $0x4,%rax                       add    $0x4,%rax
+  cmp    %rcx,%rax                       add    -0x4(%rax),%edx     ; add the array element
+  jne    <sum_register+0x20>             mov    %edx,-0x4(%rsp)     ; write the total back
+                                         cmp    %rcx,%rax
+                                         jne    <sum_memory+0x20>
+```
+
+The left loop keeps the total in `%edx` for the whole loop and touches memory once per
+element, to read the array. The right loop does the identical addition, but bookends it with a
+load and a store to the same 4-byte stack slot — three memory operations instead of one, for
+one `+=`. Count the operand kinds and the shapes line up exactly with the two forms of `+=`:
+the register version's `total` never leaves a register between iterations, so the instruction
+that updates it *is* the update; the memory version's `total` has to be fetched fresh every
+time and written back before the next iteration can see it, because nothing else remembers
+what it was.
+
+<Callout kind="insight" label="what this means for your C#">
+  You cannot place variables in registers from C#, and you should not want to. What you
+  control is how many live values a piece of code juggles at once: sixteen registers, minus
+  the ones with fixed jobs, is not many. A loop body carrying twenty live locals will have
+  some of them **spilled** to the stack — written out to make room — and every spilled value
+  starts paying the load-then-store round trip in the listing above instead of just being a
+  register name. That is the real reason a 300-line method with everything inlined into it can
+  end up doing more memory traffic than the same code split up.
+</Callout>
+
+### fetch, decode, execute
+
+The loop itself, one iteration:
+
+```text
+  ┌──────────────────────────────────────────────────────────────────┐
+  │                                                                  │
+  │   FETCH      read bytes at the address in rip                    │
+  │              (from the L1 instruction cache — code is data)      │
+  │      ↓                                                           │
+  │   DECODE     work out what those bytes mean: which operation,    │
+  │              which registers, how long the instruction was       │
+  │      ↓                                                           │
+  │   EXECUTE    do it — add, load, store, compare, jump             │
+  │      ↓                                                           │
+  │   rip += length of the instruction                               │
+  │              (unless the instruction was a jump, call or ret,    │
+  │               whose entire job is to write a new value into rip) │
+  │                                                                  │
+  └──────────────────────────────────────────────────────────────────┘
+```
+
+Three things in that picture surprise people.
+
+**`rip` is a register, and a branch is just a write to it.** There is no "control flow"
+mechanism separate from data. You cannot assign `rip` with a `mov`, but `jne` writes it
+conditionally, `call` writes it and pushes the old value, and `ret` pops a value into it. A
+corrupted stack can therefore send execution anywhere, which is the entire premise of
+stack-smashing attacks.
+
+**Decode is real work on x86.** x86-64 instructions are 1 to 15 bytes long, so the CPU cannot
+know where instruction *n+1* starts until it has decoded instruction *n*. You can see the
+variable length in any disassembly by watching the addresses — the ARM64 encoding below is the
+contrasting case, where every instruction is 4 bytes and the addresses step by exactly 4.
+
+**The real loop does not run one instruction at a time.** A modern core fetches and decodes
+several instructions per cycle, breaks them into micro-operations, and executes several of them
+at once, out of order, as their inputs become ready. Everything on this page describes that
+machinery in aggregate — how it actually overlaps instructions is
+[the pipeline's](/systems/cpu-pipeline/) subject, and the fact that it reorders your loads and
+stores is where [the memory model](/systems/memory-model/) comes from.
+
+### the clock, and what one cycle buys you
+
+A **clock** is the oscillator that drives the core: a signal that ticks, and on every tick the
+hardware is allowed to advance every instruction currently in flight by one step. A **cycle**
+is one of those ticks — the unit the rest of this page counts in, and the reason nobody quotes
+an instruction's cost in nanoseconds on a page like this one is that the clock rate is not a
+fixed number. It moves with temperature, with how many cores on the chip are busy, and on many
+chips with whether the code is using wide vector instructions — that is what "turbo boost"
+means, and it is the first reason a timing you took on your laptop does not reproduce on a
+colleague's.
+
+What a cycle buys an instruction is not fixed either — it depends on what that instruction is
+waiting for. Chain a sequence of adds where each one needs the *previous* instruction's result
+before it can start:
+
+```text
+add $1, %rax     ; step 2 cannot start until step 1's rax is ready
+add $1, %rax     ; step 3 cannot start until step 2's rax is ready
+add $1, %rax     ; ...
+```
+
+No matter how many arithmetic units the core has, or how far ahead it can look, it cannot run
+step 2 before step 1 has finished producing the value step 2 needs. A chain of a billion adds
+shaped like this advances by exactly one add's worth of progress per cycle it is given, the
+whole way through, because there is never a second one in the chain ready to run alongside it.
+That is a **dependency chain**, and it is the sharpest way to see what "a cycle buys you"
+really means: not "one instruction", but "one step of forward progress on whatever is ready" —
+which, for a chain like this one, is one instruction at a time no matter how wide the core is.
+Untangling chains like it, by running independent ones side by side, is most of what
+[the pipeline](/systems/cpu-pipeline/) does.
+
+### an ISA is a contract, not a design
+
+The **instruction set architecture** is the list of instructions a CPU promises to
+understand, what registers exist, and what each instruction does. It is a contract between
+whoever generates code and whoever executes it. Nothing about the silicon is in it: two chips
+a decade apart, with completely different internals, both implement x86-64 and both run the
+same bytes.
+
+The same three-line C function, compiled here:
+
+```c
+int add3(int a, int b, int c) { return a + b + c; }
+```
+
+```text
+$ gcc -O2 -fno-stack-protector -c add3.c -o add3.o
+$ objdump -d --no-show-raw-insn add3.o
+
+0000000000000000 <add3>:
+   0:   endbr64
+   4:   add    %esi,%edi
+   6:   lea    (%rdi,%rdx,1),%eax
+   9:   ret
+```
+
+Arguments arrive in `rdi`, `rsi`, `rdx` — the same table as above — and the answer goes back in
+`eax`, the low 32 bits of `rax`. That is x86-64's contract. AArch64, the ISA every Apple
+Silicon Mac and every ARM-based cloud instance implements, is a different contract for the same
+job: arguments arrive in `w0`-`w7`, the answer goes back in `w0`, and — the detail worth
+carrying — every instruction is exactly 4 bytes, where the x86-64 output above is 1, 2 and 3
+bytes. (There is no ARM64 cross-compiler on the machine that built this page, so that is a
+statement about the published AAPCS64 calling convention and encoding, not a listing pasted
+from a compile run here — unlike the x86-64 block above it.) That single difference — variable
+versus fixed instruction length — is why x86 decoders are complicated and why ARM64 cores can
+fetch a fixed number of instructions per cycle without first having to find where each one
+starts.
+
+You care because your C# does not target either one. It targets IL, and the JIT picks the ISA
+at startup on the machine it finds itself on — which is how the same DLL runs on an x64 server
+and an ARM64 laptop, and why the machine code you are looking at in a profiler is not in your
+build output. [IL, the JIT and code generation](/systems/il-jit-codegen/) is that story.
+
+### the stack pointer, a call frame, and what call actually does
+
+`rsp` holds the address of the top of the current thread's stack, and the stack grows
+**downward** — pushing subtracts from `rsp`. A **call frame** (or stack frame) is the slice of
+stack belonging to one in-progress call: the return address, whatever registers the callee had
+to preserve, and its locals.
+
+`call target` does exactly two things: push the address of the *next* instruction onto the
+stack, then set `rip` to `target`. `ret` does one: pop into `rip`. That is the whole mechanism.
+Here it is happening, from real output on this box — `outer` calls `inner`, and `inner` prints
+the return address the CPU pushed for it:
+
+```c
+#include <stdio.h>
+
+void inner(void)
+{
+    int local = 0;
+    printf("inner  &local = %p   return address = %p\n", (void *)&local, __builtin_return_address(0));
+}
+
+void outer(void)
+{
+    int local = 0;
+    printf("outer  &local = %p\n", (void *)&local);
+    inner();
+}
+
+int main(void) { outer(); return 0; }
+```
+
+```text
+$ gcc -O0 -fno-stack-protector -fno-pie -no-pie retproof.c -o retproof && ./retproof
+outer  &local = 0x7ffea818927c
+inner  &local = 0x7ffea818925c   return address = 0x401197
+
+$ objdump -d --no-show-raw-insn retproof | awk '/<outer>:/,/^$/'
+0000000000401169 <outer>:
+  401169:  endbr64                        ; control-flow-integrity landing pad, not logic
+  40116d:  push   %rbp
+  40116e:  mov    %rsp,%rbp
+  401171:  sub    $0x10,%rsp
+  401175:  movl   $0x0,-0x4(%rbp)
+  40117c:  lea    -0x4(%rbp),%rax
+  401180:  mov    %rax,%rsi
+  401183:  mov    $0x402032,%edi
+  401188:  mov    $0x0,%eax
+  40118d:  call   401040 <printf@plt>
+  401192:  call   401136 <inner>          ; ← the call instruction lives here
+  401197:  nop                            ; ← and this is the address it pushed
+  401198:  leave
+  401199:  ret
+```
+
+The return address `inner` found on the stack, `0x401197`, is exactly the address of the
+instruction following the `call` at `0x401192`. Nothing symbolic happened: a number was pushed.
+And `inner`'s local sits 32 bytes *below* `outer`'s, because the stack grew down into fresh
+space for the new frame.
+
+One frame, in exactly the layout the disassembly below builds:
+
+```text
+  higher addresses
+       ...                       ← the caller's locals
+  ┌───────────────────────────┐
+  │  arguments 7, 8, …        │  the first six came in registers; the rest are pushed
+  ├───────────────────────────┤
+  │  return address           │  ← pushed by `call` itself
+  ├───────────────────────────┤
+  │  saved rbp                │  ← rbp points here once the prologue has run
+  ├───────────────────────────┤
+  │  the callee's locals      │  addressed as -0x4(%rbp), -0x8(%rbp), …
+  │  spilled registers        │
+  └───────────────────────────┘  ← rsp, the top of the stack
+  lower addresses                   the next call's frame starts here
+```
+
+Now the whole thing at once: two tiny functions, compiled with `gcc -O0` so nothing is
+optimised away, linked, and disassembled with `objdump -d --no-show-raw-insn`:
+
+```text
+int add3(int a, int b, int c) { return a + b + c; }
+int caller(int x)             { int local = add3(x, x + 1, x + 2); return local * 2; }
+
+0000000000401156 <caller>:
+  401156:  endbr64                        ; landing pad again — ignore it
+  40115a:  push   %rbp                    ; save the caller's frame pointer
+  40115b:  mov    %rsp,%rbp               ; this frame starts here — prologue done
+  40115e:  sub    $0x18,%rsp              ; reserve 24 bytes for locals
+  401162:  mov    %edi,-0x14(%rbp)        ; -O0 spills the argument x into the frame
+  401165:  mov    -0x14(%rbp),%eax        ; reload it …
+  401168:  lea    0x2(%rax),%edx          ; …compute x + 2 into edx  = argument 3
+  40116b:  mov    -0x14(%rbp),%eax
+  40116e:  lea    0x1(%rax),%ecx          ; x + 1
+  401171:  mov    -0x14(%rbp),%eax
+  401174:  mov    %ecx,%esi               ; argument 2 → rsi
+  401176:  mov    %eax,%edi               ; argument 1 → rdi
+  401178:  call   401136 <add3>           ; push 0x40117d, jump to add3
+  40117d:  mov    %eax,-0x4(%rbp)         ; the answer came back in eax → local
+  401180:  mov    -0x4(%rbp),%eax
+  401183:  add    %eax,%eax               ; local * 2
+  401185:  leave                          ; mov %rbp,%rsp ; pop %rbp — frame destroyed
+  401186:  ret                            ; pop the return address into rip
+
+0000000000401136 <add3>:
+  401136:  endbr64
+  40113a:  push   %rbp
+  40113b:  mov    %rsp,%rbp
+  40113e:  mov    %edi,-0x4(%rbp)          ; -O0 writes all three arguments to the frame
+  401141:  mov    %esi,-0x8(%rbp)
+  401144:  mov    %edx,-0xc(%rbp)
+  401147:  mov    -0x4(%rbp),%edx          ; and reads them straight back
+  40114a:  mov    -0x8(%rbp),%eax
+  40114d:  add    %eax,%edx
+  40114f:  mov    -0xc(%rbp),%eax
+  401152:  add    %edx,%eax                ; answer in eax, where the ABI says it goes
+  401154:  pop    %rbp
+  401155:  ret
+```
+
+Thirteen instructions to add three numbers, because `-O0` means "put every variable in memory
+where a debugger can see it". Recompiled with `-O2`, the same two functions are:
+
+```text
+0000000000401170 <add3>:
+  401170:  endbr64
+  401174:  add    %esi,%edi
+  401176:  lea    (%rdi,%rdx,1),%eax
+  401179:  ret
+
+0000000000401180 <caller>:
+  401180:  endbr64
+  401184:  lea    0x3(%rdi,%rdi,2),%eax    ; (x) + (x+1) + (x+2) = 3x + 3, in one instruction
+  401188:  add    %eax,%eax                ; …times two
+  40118a:  ret
+```
+
+`caller` no longer calls anything. `add3` was inlined, the three additions were folded into one
+`lea`, and the entire frame — push, sub, leave — disappeared, because with nothing to spill
+there is nothing to make room for. Learning to read that difference is
+[the disassembly exercise](/systems/cpu-execution/read-the-disassembly/).
+
+### and your C# gets the same treatment
+
+RyuJIT emits x86-64 under the same calling convention. Here are the same two functions written
+in C#, with the runtime asked to print what it generated — real output, with only the basic
+block labels removed:
+
+```text
+$ DOTNET_JitDisasm="Caller Add3" DOTNET_TieredCompilation=0 dotnet run -c Release \
+    bench/cpu-execution/call-frame-jit.cs
+
+; Assembly listing for method P:Caller(int):int (FullOpts)
+       push     rax                      ; 8 bytes, purely to re-align rsp to 16 for the call
+       lea      edx, [rdi+0x02]
+       lea      esi, [rdi+0x01]
+       call     [P:Add3(int,int,int):int]
+       add      eax, eax
+       add      rsp, 8
+       ret
+; Total bytes of code 20
+
+; Assembly listing for method P:Add3(int,int,int):int (FullOpts)
+       lea      eax, [rdi+rsi]
+       add      eax, edx
+       ret
+; Total bytes of code 6
+```
+
+Six bytes of machine code, arguments in `rdi`/`rsi`/`edx`, answer in `eax` — instruction for
+instruction the same shape as what gcc produced for the C. There is no managed-code penalty
+hiding in a method call; a C# method that survives to full optimisation is machine code with
+the same ABI as everything else on the machine. (`Add3` survived as a separate function at all
+only because the example forbade inlining. Left alone, the JIT deletes the call exactly as gcc
+did.)
+
+### so a call is not free — but it is cheap
+
+`call` and `ret` are two cheap instructions. The cost is the paperwork around them: arguments
+have to be marshalled into the registers the ABI names, values sitting in scratch registers
+have to be saved because the callee is allowed to destroy them, and the callee's body cannot be
+optimised together with yours — the compiler has to stop at the boundary, which is exactly what
+you can see happen to the `Add3`/`Caller` listing above the moment inlining is forbidden:
+[the call-and-frame exercise](/systems/cpu-execution/call-and-inline-cost/) walks that
+listing instruction by instruction, and what changes when the call is through an interface
+instead of a concrete type.
+
+That paperwork is nothing next to a method that does real work, and it is everything next to a
+method that adds two numbers. That is precisely why inlining exists, and why every fast runtime
+spends so much effort on it.
+
+That is the primer's floor. Two questions fall straight out of it and each has its own page:
+*how* does a core retire several instructions in roughly one cycle —
+[the pipeline](/systems/cpu-pipeline/) — and what does it cost when the value an instruction
+wants is not in the cache — [the memory hierarchy](/systems/memory-hierarchy/). The first of
+those also ends up explaining why two threads can disagree about what memory says, which is
+where [the memory model](/systems/memory-model/) begins.
+
+## the mental model
+
+```text
+   registers  ── 16 slots, 128 bytes total          ← the work happens here, by name
+       ↑ ↓
+    L1 cache  ── 32 KiB per core, close but not free      ← the stack top lives here
+       ↑ ↓
+       RAM    ── gigabytes, far away                      ← /systems/memory-hierarchy/
+
+   rip  = which instruction is next        ← call and ret write this
+   rsp  = top of this thread's stack       ← call and ret move this by 8
+```
+
+Three lines worth keeping:
+
+- **The CPU works out of registers.** Every value your code touches gets hauled in and pushed
+  back out. Code stays simple when values stay in registers, and gains extra load/store
+  instructions the moment they spill to memory.
+- **A function call is a push, a jump, and a promise about registers.** Nothing more. The
+  price is the argument shuffling and the lost optimisation across the boundary, not the two
+  instructions.
+- **Dependency, not instruction count, decides how much a cycle buys.** Independent
+  instructions can share a cycle; each link in a dependency chain has to wait for the one
+  before it, no matter how many execution units the core has spare.
+
+<Watch items={[['GP registers', '16 × 8 bytes'], ['stack grows', 'downward — push subtracts from rsp'], ['call pushes', 'the return address, then jumps'], ['ret pops', 'that address back into rip'], ['first three int args', 'rdi, rsi, rdx (System V x86-64)'], ['x86-64 instruction length', '1-15 bytes'], ['AArch64 instruction length', 'fixed, 4 bytes']]} />
+
+## why you should care
+
+**Your stack traces are this mechanism.** A stack trace is the chain of return addresses `call`
+left on the stack, walked backwards and mapped through symbols. That is why a release build
+shows fewer frames than you wrote: inlined methods never pushed a return address, so there is
+nothing to walk. When a trace shows a method you are sure was on the path but the line numbers
+are wrong, you are seeing optimised code where source lines and instructions are no longer in
+one-to-one correspondence.
+
+**A `StackOverflowException` is uncatchable by policy, not by physics.** The stack region ends
+in a *guard page* — a page the OS marks as inaccessible — so the instant a prologue writes past
+the bottom, the hardware faults and the runtime knows precisely what happened. It could unwind
+from there. Since .NET Framework 2.0 it deliberately does not.
+
+Four lines are enough to see it. The handler never fires and nothing after the `try` runs, yet
+the process still prints a full managed stack on its way out — the exact depth moves between
+runs on this box (523,754 frames one run, 523,803 the next), so read the count as a magnitude,
+not a fixed number:
+
+```csharp
+static int Recurse(int n) => Recurse(n + 1) + 1;
+
+try { Console.WriteLine(Recurse(0)); }
+catch (Exception e) { Console.WriteLine("caught: " + e.GetType().Name); }
+Console.WriteLine("after");
+```
+
+```text
+Stack overflow.
+Repeated 523754 times:
+--------------------------------
+   at Program.<<Main>$>g__Recurse|0_0(Int32)
+--------------------------------
+   at Program.<Main>$(System.String[])
+```
+
+That last part is where the folk answer goes wrong in both directions. "There is no room left
+to build the handler's frame" sounds like physics; the printed trace looks like it refutes that,
+since something clearly walked the stack. Neither reading is right. The trace is not evidence
+that the exhausted stack had room — it is evidence that the runtime arranged in advance never to
+need any. On Linux the CLR gives each thread a small **alternate signal stack** and registers its
+`SIGSEGV` handler with `SA_ONSTACK`, so the guard-page fault is delivered onto that separate
+stack instead of onto the one that just ran out. Straced on this box, that is exactly the
+sequence, ending with the fault itself:
+
+```text
+$ strace -f -e trace=sigaltstack,rt_sigaction dotnet run -c Release so.cs
+[pid …] rt_sigaction(SIGSEGV, {sa_handler=…, sa_flags=SA_RESTORER|SA_ONSTACK|SA_RESTART|SA_SIGINFO, …}, …) = 0
+[pid …] sigaltstack({ss_sp=0x7826f2b9d000, ss_flags=0, ss_size=24576}, NULL) = 0
+[pid …] --- SIGSEGV {si_signo=SIGSEGV, si_code=SEGV_MAPERR, si_addr=0x7ffe09105ff8} ---
+```
+
+24 KiB of borrowed stack, reserved before any of your code ran, is what the walker prints from.
+So the runtime survives the fault by design — and *then* chooses to fail fast, because an
+overflow can strike in the middle of anything, runtime internals included, so the CLR cannot
+establish that the process is in a state where a `catch` or a `finally` could safely run, and it
+judges a torn-down process better than a corrupted one that keeps serving traffic. The proof
+that this is a policy and not a limit is that another runtime makes the opposite choice on the
+same mechanism — the JVM throws `StackOverflowError`, an ordinary catchable throwable.
+
+**"Small methods are free" is true, and it has a boundary.** The JIT inlines aggressively, so
+the property accessors and one-line helpers you write for readability genuinely cost nothing
+once the code is warm. But the inliner works to a budget, and it declines plenty of things: a
+method whose IL is too large, a call whose target it cannot pin down, anything marked
+`[MethodImpl(MethodImplOptions.NoInlining)]`. When a profiler shows an implausible amount of
+self time in a trivial method, the first question is whether something stopped it being
+inlined — and the way to answer that is to look at the generated code rather than to reason
+about the heuristics, which change between releases.
+
+**A Debug build measures the debugger's convenience, not your code.** A Debug build sets
+`DebuggableAttribute.DisableOptimizations`, and the JIT then compiles every method with the
+optimiser off — the .NET equivalent of `gcc -O0`: every local round-trips through a stack slot
+the way `sum_to` does at `-O0` on [the disassembly exercise](/systems/cpu-execution/read-the-disassembly/),
+instead of staying in a register the way the same loop does once optimised. The trap that catches
+people is that `dotnet run file.cs` defaults to Debug, which is why every code sample on these
+pages that needs to be optimised is compiled or run with `-c Release`.
+
+**Register pressure is the reason "just inline everything" is not a strategy.** Sixteen
+registers is the whole budget for a piece of code. A monster method with many live values
+spills the excess to stack slots, and every spilled value starts paying the register-versus-
+memory gap measured at the top of this page. This is one reason the JIT's inliner has a budget
+at all, and why hand-inlining a big method into a hot loop can make the loop's register
+allocation worse rather than better — a question to answer by reading the generated code, not
+by assuming.
+
+## the same idea in other languages
+
+| language | what it's called | the trap |
+| --- | --- | --- |
+| C / C++ | a call under the platform ABI — the same `call`/`ret` you just read | `inline` is a linkage keyword, not a command: it affects the one-definition rule and is only a hint to the optimiser. What actually removes the call is the optimisation level — the same source at `-O0` and `-O2` produces a different program, not a scaled one. |
+| Java | HotSpot JIT, inlining driven by profile, same idea as RyuJIT | HotSpot goes a step further than .NET: when class-hierarchy analysis proves only one implementation of a method is loaded, it inlines a virtual call with **no guard at all**, then **deoptimises and recompiles** if a second class turns up later. Behaviour can therefore change after a plugin, an agent or a mock loads, with no code change. |
+| Go | compiled ahead of time, calls follow Go's own ABI | Goroutine stacks start small and **move** when they grow, so functions carry a stack-limit check in their prologue and the compiler's escape analysis — not the `new` keyword — decides whether a local can live in a frame at all. A pointer to a local that outlives the call forces a heap allocation. |
+| Python (CPython) | a frame object built by the interpreter, not a `call` instruction | There is no inlining to hope for: a Python-level call is interpreter bookkeeping around your bytecode, so the fix is not smaller functions but fewer crossings — vectorise, batch, or push the loop into C. |
+
+## exercises
+
+Both are about reading and reasoning through what the machine actually got.
+
+<ProblemList topic="cpu-execution" />
+
+## interview drills
+
+**Q.** What actually happens when you call a method?
+
+- *weak answer* — "It jumps to the method's code and comes back." True, and it stops exactly
+  where the interesting part starts; the follow-up will be "come back how?"
+- *strong answer* — The arguments go into the registers the calling convention names, `call`
+  pushes the address of the next instruction and jumps, the callee builds a frame for its
+  locals and any callee-saved registers it needs, and `ret` pops that address back into the
+  instruction pointer. The return value comes back in `rax`. The stack is the mechanism that
+  makes recursion and re-entrancy work — each call gets its own frame.
+- *follow-up* — "So why is a stack overflow uncatchable?" Not because there is no room for the
+  handler's frame: the runtime takes the guard-page fault on a separate signal stack it
+  installed up front, which is how it can run a stack walker with the thread's own stack
+  exhausted. Having survived the fault it *chooses* to fail fast, because an overflow can land
+  inside runtime code and the CLR cannot prove a handler would run safely. The proof that it is
+  a choice is that the JVM makes the opposite one on the same mechanism and throws a catchable
+  `StackOverflowError`.
+
+**Q.** You split a 200-line method into fifteen small ones for readability. What did that cost?
+
+- *weak answer* — "Nothing, the JIT inlines everything." Half right, and the interviewer is
+  asking about the other half.
+- *strong answer* — Almost certainly nothing that shows up: small leaf methods get inlined once
+  the code is warm, and a call that survives still has to marshal arguments and build a frame —
+  real instructions, but few of them next to a method doing actual work. The cases to check are
+  methods the inliner refuses — anything too big, anything it cannot devirtualise — and whether
+  inlining everything into one giant body now spills registers that used to fit. The answer is
+  a look at the generated code, not a rule of thumb.
+- *follow-up* — "How would you tell whether it inlined?" Look at the machine code:
+  `DOTNET_JitDisasm` on the method, or an ETW/event-pipe inlining trace.
+
+**Q.** The same code path is dramatically slower in one build than another, with identical
+source. What's the first thing you check?
+
+- *weak answer* — "The second one is warmed up." Plausible and usually wrong when the gap is
+  large and consistent.
+- *strong answer* — That is the shape of an unoptimised build: no register allocation, so every
+  local round-trips to a stack slot, and no inlining. In .NET it is a Debug build or tier-0 code
+  that never got promoted; in C it is `-O0`. Check what the optimiser was allowed to do before
+  looking for anything cleverer.
+- *follow-up* — "How would you prove it rather than assume it?" Disassemble both and count the
+  memory accesses in the inner loop — the register-versus-memory listing at the top of this
+  page is exactly that comparison.
+
+**Q.** Why can an interface call be as cheap as a direct one, and when does that stop being
+true?
+
+- *weak answer* — "Interface calls are always slower, use sealed classes." A rule of thumb with
+  the mechanism missing; the interviewer will ask what `sealed` actually changes.
+- *strong answer* — The JIT profiles the call site. If it keeps seeing one concrete type it
+  emits **guarded devirtualisation**: a cheap check against that type's method-table pointer,
+  and behind that check it inlines the body as if the call had been direct — the same folded
+  arithmetic you'd get from a direct call. The guard is still there when a second type shows up
+  at the same call site; now it fails on every element that isn't the guarded type, and each
+  failure falls through to a real indirect dispatch. The compiled code is identical either way —
+  what differs is only how often, at runtime, execution takes the cheap branch versus the real
+  call.
+- *follow-up* — "What does `sealed` actually buy?" A virtual call on a reference whose static
+  type is sealed has exactly one possible target, so the JIT can devirtualise it with no guard
+  at all. A call through an *interface* reference still needs the guard, because the JIT is
+  betting on a profile rather than proving a fact.
+
+**Q.** What is a register, and why does the number of them matter to code you write in C#?
+
+- *weak answer* — "Fast memory inside the CPU." Fine as far as it goes, but registers are not
+  memory: they have no addresses, and that is the point.
+- *strong answer* — Sixteen named 8-byte slots inside the core that instructions operate on
+  directly. An x86 instruction can name one memory operand, but that value is still hauled in
+  and written back through the cache — the register-versus-memory listing on this page shows
+  exactly which instructions that adds. You do not allocate registers, but you decide how many
+  values a region of code needs live at once, and past that budget the compiler starts spilling
+  to the stack, turning what was a register name into a real load and a real store.
+- *follow-up* — "So should I use fewer locals?" No — the compiler reuses slots freely and
+  short-lived locals are free. The thing that costs is many values live *simultaneously*
+  across a long region.
+
+**Q.** Your service is fine on x64 and slower per core on Graviton. Where do you start?
+
+- *weak answer* — "ARM is slower." It is a different ISA and a different core design, not a
+  slower one.
+- *strong answer* — The JIT compiles for the ISA it finds at startup, so the machine code is
+  genuinely different: different instruction selection, different vector width, a weaker
+  memory model that makes `volatile` and `Interlocked` cost more than they do on x86. Confirm
+  it is CPU time and not I/O, then profile on the ARM box itself — numbers carried over from
+  x64 are not evidence about it.
+- *follow-up* — "Which of those would show up as a *correctness* difference rather than a
+  performance one?" The memory model: code with a missing barrier can work on x86 and fail on
+  ARM64 — see [reordering, visibility and the memory model](/systems/memory-model/).

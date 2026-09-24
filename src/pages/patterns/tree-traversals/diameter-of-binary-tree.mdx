@@ -1,0 +1,147 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: tree-traversals
+problem: diameter-of-binary-tree
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+
+## task
+
+Given the root of a binary tree, return the length (in **edges**) of its diameter: the longest
+path between any two nodes, which may or may not pass through the root.
+
+```text
+          1
+         / \
+        2   3
+       / \
+      4   5
+     /     \
+    6       7
+```
+
+diameter = 4 (the path `6 -> 4 -> 2 -> 5 -> 7`).
+
+## how to think
+
+The trap is assuming the longest path goes through the root. It usually doesn't — in the example
+above, the winning path passes through node `2`, two levels down. So you can't compute this with
+one number that flows up; you need a number that flows up (height, for the parent to use) *and*
+a separate best-so-far that you check at **every** node, not just the root.
+
+That's still postorder — the same shape as
+[Maximum Depth](/patterns/tree-traversals/maximum-depth/), height still has to come from the
+children before a node can act — but now the "visit" step does two things: it updates a running
+best using `leftHeight + rightHeight`
+(the longest path *through this node*), and it still returns `1 + max(leftHeight, rightHeight)`
+up to the parent, because the parent needs that number to compute its own diameter candidate.
+The height and the diameter are two different questions being answered by the same walk.
+
+<Callout kind="note" label="template instance">
+  **Postorder** shape, with an extra side effect. Invariant: after the call at `node` returns,
+  every diameter that passes through `node` or lives entirely inside `node`'s subtree has been
+  considered, and the running best reflects the largest one seen so far anywhere in the tree.
+  What varies from plain postorder: the visit step both updates shared state (the best) *and*
+  returns a value (the height) — the two are computed from the same `left`/`right` pair but
+  serve different callers.
+</Callout>
+
+## solution
+
+```csharp
+public int DiameterOfBinaryTree(TreeNode? root)
+{
+    int diameter = 0;
+
+    int Height(TreeNode? node)
+    {
+        if (node is null) return 0;
+
+        int left = Height(node.Left);
+        int right = Height(node.Right);
+
+        diameter = Math.Max(diameter, left + right);   // best path THROUGH this node
+
+        return 1 + Math.Max(left, right);               // height reported UP to the parent
+    }
+
+    Height(root);
+    return diameter;
+}
+
+// standard interview definition
+public class TreeNode(int val = 0, TreeNode? left = null, TreeNode? right = null)
+{
+    public int Val = val;
+    public TreeNode? Left = left;
+    public TreeNode? Right = right;
+}
+```
+
+## trace
+
+```text
+          1
+         / \
+        2   3
+       / \
+      4   5
+     /     \
+    6       7
+```
+
+Calls finish in postorder; `best` only ever grows:
+
+| finishes | node | left h | right h | through (left+right) | best | height returned |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | 6 | 0 | 0 | 0 | 0 | 1 |
+| 2 | 4 | 1 | 0 | 1 | 1 (was 0) | 2 |
+| 3 | 7 | 0 | 0 | 0 | 1 | 1 |
+| 4 | 5 | 0 | 1 | 1 | 1 | 2 |
+| 5 | 2 | 2 | 2 | 4 | **4 (was 1)** | 3 |
+| 6 | 3 | 0 | 0 | 0 | 4 | 1 |
+| 7 | 1 (root) | 3 | 1 | 4 | 4 | 4 |
+
+The best gets set to `4` at node `2`, four calls before the root even finishes — proof the
+winning path never touches the root. At the root, `left + right = 3 + 1 = 4` ties but doesn't
+beat it: the diameter really does live inside the left subtree.
+
+## why it works
+
+Every path in a tree has a unique highest point — the one node where the path turns from "going
+up" to "going down" (or a path that's entirely one straight line down from that node). Checking
+`left + right` at *every* node, not just the root, guarantees you evaluate every path exactly
+once at its highest point. The height returned to the parent is a separate, smaller question —
+"how far can a path starting *at* this node reach downward" — which the parent needs to compute
+its own `left + right`. Postorder guarantees both children's heights are ready before a node
+computes either number.
+
+<Watch items={[['time', 'O(n)'], ['space', 'O(h) recursion stack — O(n) worst case, O(log n) balanced']]} />
+
+## common bugs
+
+- Returning `left + right` from `Height` instead of `1 + Math.Max(left, right)` — that conflates
+  the diameter-through-this-node with the height-to-report, and corrupts every ancestor's
+  calculation.
+- Computing the diameter only at the root (`leftHeight(root) + rightHeight(root)`) — misses
+  every diameter whose highest point is below the root, which is the whole point of this
+  problem.
+- Off-by-one between edges and nodes: the diameter is a count of **edges** on the path, which is
+  exactly `left + right` (two heights, each already edge-counts to a leaf) — don't add 1 here
+  the way `Height` does.
+- Forgetting `diameter` needs to live outside the recursive helper (a captured local, a field, or
+  a `ref int` parameter) — if it's local to each call, updates in deep calls never reach the
+  caller.
+
+## variants you can now solve
+
+- **Binary Tree Maximum Path Sum** (LC 124) — the hard sibling: same "check at every node, return
+  a smaller number to the parent" shape, but the parent only gets to take *one* direction
+  (`Math.Max(0, left)` or `Math.Max(0, right)`, never both) since a path can't fork twice, and
+  values can be negative so a child's contribution can be worth discarding.
+- **Balanced Binary Tree** (LC 110) — a freebie: reuse `Height`, and instead of tracking a max,
+  return early (e.g. `-1`) the moment `Math.Abs(left - right) > 1` anywhere in the tree.
+- **Same Tree** (LC 100) — another freebie: no height needed at all, just walk two trees together
+  and bail on the first mismatch.

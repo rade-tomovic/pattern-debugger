@@ -1,0 +1,150 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: advanced-graphs
+problem: network-delay-time
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+
+## task
+
+`n` nodes labeled `1` to `n` sit on a network. `times[i] = (ui, vi, wi)` is a directed edge from
+`ui` to `vi` that takes `wi` time to traverse. A signal is sent from node `k`. Return the minimum
+time for **every** node to receive it, or `-1` if some node never does. LeetCode #743.
+
+```text
+times = [[2,1,1],[2,3,1],[3,4,1]], n = 4, k = 2  →  2   (2→1 and 2→3→4 both finish by time 2)
+```
+
+## how to think
+
+BFS finds shortest paths when every edge costs the same — the first time you *visit* a node is
+automatically the *fewest hops* to it. Here edges carry different weights, so that guarantee
+breaks: a node reached in more hops can still arrive sooner in total time than one reached in
+fewer. A plain FIFO queue can pop a node before its truly-shortest path has even been discovered.
+
+Swap the queue for a min-heap ordered by current best-known distance, and the guarantee comes
+back: always expand whichever frontier node is cheapest to reach *so far*. Because every edge
+weight is non-negative, nothing still sitting in the heap could ever produce a cheaper path to
+the node you're about to pop — so the moment you pop it validly, its distance is final. That
+upgrade — queue to min-heap, hop-count to accumulated weight — is Dijkstra's algorithm.
+
+<Callout kind="note" label="template instance">
+  **Dijkstra** skeleton, verbatim except the graph is 1-indexed (LC's node labels start at `1`,
+  so arrays are sized `n + 1` and index `0` sits unused). Invariant: `dist[]` only ever decreases
+  toward the true shortest distance; the `d > dist[node]` check on every pop is lazy deletion,
+  explained below.
+</Callout>
+
+<Callout kind="trap" label="no DecreaseKey">
+  `PriorityQueue<TElement, TPriority>` cannot lower the priority of an entry already inside it —
+  there is no `DecreaseKey`. The fix isn't to search for and fix the old entry; it's to **push a
+  new, cheaper duplicate** every time a shorter path is found, and leave the stale one sitting in
+  the heap. When a node is popped, compare the popped distance against `dist[node]`: if it's
+  worse, a cheaper pop already relaxed this node's neighbors, and the current pop is just a
+  leftover — skip it. That's lazy deletion, and it's the idiom every Dijkstra-in-C# writeup
+  needs and most skip.
+</Callout>
+
+## solution
+
+```csharp
+public int NetworkDelayTime(int[][] times, int n, int k)
+{
+    var graph = new List<(int To, int Weight)>[n + 1];   // 1-indexed nodes
+    for (int i = 1; i <= n; i++) graph[i] = [];
+    foreach (var t in times) graph[t[0]].Add((t[1], t[2]));
+
+    var dist = new int[n + 1];
+    Array.Fill(dist, int.MaxValue);
+    dist[k] = 0;
+
+    var pq = new PriorityQueue<int, int>();
+    pq.Enqueue(k, 0);
+
+    while (pq.TryDequeue(out int node, out int d))
+    {
+        if (d > dist[node]) continue;   // stale duplicate — a cheaper path already won
+
+        foreach (var (to, w) in graph[node])
+        {
+            int nd = d + w;
+            if (nd < dist[to])
+            {
+                dist[to] = nd;
+                pq.Enqueue(to, nd);     // push a fresh, cheaper duplicate instead of decreasing the old one
+            }
+        }
+    }
+
+    int maxDist = 0;
+    for (int i = 1; i <= n; i++)
+    {
+        if (dist[i] == int.MaxValue) return -1;   // some node never reached
+        maxDist = Math.Max(maxDist, dist[i]);
+    }
+    return maxDist;
+}
+```
+
+## trace
+
+`n = 5`, `k = 1`, edges:
+
+```text
+1 --2--> 2 --2--> 3 --1--> 4 --3--> 5
+\--------6--------^
+         \--------9--------^
+```
+
+`dist` starts at `[_, 0, ∞, ∞, ∞, ∞]` (index `0` unused), heap holds `(1, 0)`:
+
+| pop (node, d) | dist[node] | verdict | relaxations |
+| --- | --- | --- | --- |
+| (1, 0) | 0 | valid | `1→2` w2: dist[2] ∞→2, push(2,2); `1→3` w6: dist[3] ∞→6, push(3,6) |
+| (2, 2) | 2 | valid | `2→3` w2: dist[3] 6→4, push(3,4); `2→4` w9: dist[4] ∞→11, push(4,11) |
+| (3, 4) | 4 | valid | `3→4` w1: dist[4] 11→5, push(4,5) |
+| (4, 5) | 5 | valid | `4→5` w3: dist[5] ∞→8, push(5,8) |
+| (3, 6) | 4 | **stale — skip** | — |
+| (5, 8) | 8 | valid | none |
+| (4, 11) | 5 | **stale — skip** | — |
+
+Node `3` and node `4` each get popped twice — once with the distance that wins, once with an
+older, larger one left over from before it was improved. Final `dist = [_, 0, 2, 4, 5, 8]`;
+`max(dist[1..5]) = 8`.
+
+## why it works
+
+Because every weight is non-negative, the node with the smallest tentative distance in the heap
+can never be improved later: any alternate route to it would have to pass through some other
+node currently in (or already popped from) the heap with a distance at least as large, and adding
+a non-negative edge on top of that can only make the total larger still. So popping in increasing
+order of distance and freezing `dist[node]` the first time a *valid* (non-stale) entry for it is
+popped is safe — nothing seen afterward can beat it. The stale entries left over from earlier,
+worse pushes are harmless: by the time they're popped, `dist[node]` already holds the true
+answer, and the `d > dist[node]` check just discards wasted work.
+
+<Watch items={[['time', 'O((V + E) log V)'], ['space', 'O(V + E)']]} />
+
+## common bugs
+
+- Searching the heap to lower an existing entry's priority — there's no API for that; always
+  push a new duplicate instead (see the trap callout above).
+- Skipping the `d > dist[node]` staleness check — a stale, inflated distance then gets used to
+  relax neighbors as if it were current, quietly corrupting downstream distances upward.
+- Sizing arrays to `n` instead of `n + 1` — LC labels nodes `1..n`, not `0..n-1`; a size-`n`
+  array either throws or silently drops the last node.
+- Declaring `-1` the moment any single `dist[i]` looks unreached mid-run instead of checking
+  *after* the heap fully drains — a node can still be waiting in the heap, not yet processed.
+- Forgetting Dijkstra needs non-negative weights — a negative edge can let a node's true shortest
+  path arrive after it's already been popped and frozen, producing a silently wrong answer.
+
+## variants you can now solve
+
+- **Cheapest Flights Within K Stops** (LC 787) — Dijkstra's shape, constrained by hop count, not
+  just distance; the state becomes `(node, stops)` instead of `node` alone.
+- [Number of Provinces](/patterns/advanced-graphs/number-of-provinces/) (LC 547) — the unweighted
+  question one level down: does a path exist at all, no heap required.
+- **Path with Maximum Probability** (LC 1514) — same skeleton with multiplication replacing
+  addition and a max-heap replacing the min-heap.

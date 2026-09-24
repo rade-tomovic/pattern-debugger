@@ -1,0 +1,95 @@
+---
+layout: '@layouts/TopicLayout.astro'
+topic: bit-manipulation
+---
+
+import Callout from '@components/Callout.astro';
+import ProblemList from '@components/ProblemList.astro';
+import Cells from '@components/Cells.astro';
+
+## core idea
+
+Operate on a number's binary representation directly instead of the number's value. A handful of
+identities let `&`, `|`, `^`, `<<`, and `>>` do in one step what a loop, a hash set, or a whole
+extra array would otherwise cost you — usually collapsing an O(n)-space solution down to O(1):
+
+| identity | what it does | shows up in |
+| --- | --- | --- |
+| `x ^ x == 0` and `x ^ 0 == x` | a value cancels itself; XOR is its own inverse | pair-cancellation — "find the loner" |
+| `n & (n - 1)` | clears the lowest set bit | popcount, power-of-two checks |
+| `n & -n` | isolates the lowest set bit (keeps only it) | Fenwick trees, "next set bit" walks |
+| `n << k` / `n >> k` | multiply / divide by `2^k` for a non-negative `n` | fast halving in a bit-DP recurrence |
+| `1 << k` | a mask with only bit `k` set | test, set, or clear one specific bit |
+| `n > 0 && (n & (n - 1)) == 0` | true only when `n` is a power of two | one-line power-of-two check |
+
+<Cells
+  data={['1', '1', '0', '0']}
+  pointers={{ 1: [{ t: 'clear', c: 'red' }] }}
+  cells={{ 1: 'warn' }}
+  caption="n = 12 = 0b1100 — n & (n-1) clears the lowest set bit (weight 4) → 0b1000 = 8"
+/>
+
+## when to reach for it
+
+- The problem demands **no extra space**, and a `HashSet`/`Dictionary` would otherwise be the
+  obvious answer — XOR cancellation deletes it entirely.
+- You're counting or testing individual bits: "how many 1 bits", "is this a power of two",
+  "reverse the bits".
+- The statement forbids the normal arithmetic operators and wants the result built from `&`,
+  `|`, `^`, `<<`, `>>` instead (e.g. "add two integers without `+`").
+- You need an answer for every integer in a range `0..n`, and each answer is one bit-shift away
+  from a smaller integer's answer you've already computed.
+
+## universal templates
+
+XOR cancellation — pairs vanish, the loner (or the gap) survives:
+
+```csharp
+public int XorCancellation(int[] nums)
+{
+    int result = 0;
+    foreach (int x in nums)
+        result ^= x;            // x^x=0 for every pair; XOR is commutative/associative,
+    return result;               // so pairing order never matters
+}
+```
+
+Clear the lowest set bit — count or process bits one at a time, not 32 times:
+
+```csharp
+public int ClearLowestSetBit(uint n)
+{
+    int count = 0;
+    while (n != 0)
+    {
+        n &= n - 1;              // n-1 flips every trailing 0 to 1 and the lowest 1 to 0;
+        count++;                 // ANDing with the original n zeroes out just that one bit
+    }
+    return count;
+}
+```
+
+Bit-DP recurrence — every value's answer is a smaller value's answer plus one bit's worth:
+
+```csharp
+public int[] BitDp(int n)
+{
+    var dp = new int[n + 1];
+    for (int i = 1; i <= n; i++)
+        dp[i] = dp[i >> 1] + (i & 1);   // i>>1 is smaller than i, so it's already filled in
+    return dp;
+}
+```
+
+<Callout kind="insight" label="the space tell">
+  If a `HashSet` would solve it in O(n) space, ask whether the duplicates actually **cancel in
+  pairs**. Two copies of the same value XOR to zero; three or more don't, and you'll need a
+  different trick (per-bit counting mod 3). When pairs do cancel, you just deleted the
+  [hashmap](/patterns/hashmap/) from your solution.
+</Callout>
+
+## problems
+
+Four short problems, each one instance of a skeleton above:
+
+<ProblemList topic="bit-manipulation" />

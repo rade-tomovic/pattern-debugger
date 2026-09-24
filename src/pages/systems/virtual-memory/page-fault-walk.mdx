@@ -1,0 +1,288 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: virtual-memory
+problem: page-fault-walk
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import Solution from '@components/Solution.astro';
+
+## the question
+
+A 256 MiB region is 65,536 pages of 4 KiB. Walk it and touch one byte in each page — 65,536
+single-byte accesses, 4096 bytes apart, the same instruction every time — four ways that differ
+only in what the page tables already say about those pages before the walk starts:
+
+```text
+A  write one byte per page, on a region nobody has ever touched
+B  write one byte per page, on the region A just walked
+C  read  one byte per page, on a region nobody has ever touched
+D  write one byte per page, on the region C just read
+```
+
+Same loop, same instruction count, same bytes, same 256 MiB. The only variable is the state of a
+page-table entry.
+
+<Callout kind="insight" label="predict first">
+  Three commitments before you scroll, and all three are counts, not speeds. **One:** how many
+  minor page faults does each of A, B, C and D produce, for 65,536 pages? Four numbers, and two
+  of them are not what they look like at first glance. **Two:** which one of the four, when it
+  faults, never has to find and zero a real physical frame? **Three:** which one does *more*
+  kernel work than a plain first write — even though every page it touches was, in some sense,
+  already touched? That third one is where most people are wrong, and it is the one that shows up
+  in real code.
+</Callout>
+
+## the code
+
+<Solution>
+
+```csharp
+#:property AllowUnsafeBlocks=true
+// Touch one byte in every 4 KiB page of a 256 MiB region, four ways. The work is
+// identical in all four: 65,536 single-byte accesses, 4096 bytes apart. The only thing
+// that changes is what the page tables already say about those pages before the walk
+// starts. No timing here on purpose — the question this file answers is "how many times
+// does the kernel get involved, and does it do the same thing every time", and both of
+// those are counts, not durations.
+using System.Runtime.InteropServices;
+
+const int Page = 4096;
+const int Pages = 64 * 1024;               // 65,536 pages
+const nuint Bytes = (nuint)Pages * Page;   // 256 MiB
+
+// /proc/self/stat field 10 is minflt, field 12 is majflt. comm (field 2) can hold
+// spaces and brackets, so start parsing after the last ')'.
+static (long min, long maj) Faults()
+{
+    string s = File.ReadAllText("/proc/self/stat");
+    string[] f = s[(s.LastIndexOf(')') + 2)..].Split(' ');
+    return (long.Parse(f[7]), long.Parse(f[9]));
+}
+
+// Resident set: how much of this process is actually in physical RAM right now.
+static long RssKb()
+{
+    foreach (string l in File.ReadLines("/proc/self/status"))
+        if (l.StartsWith("VmRSS:")) return long.Parse(l.Split(':')[1].Trim().Split(' ')[0]);
+    return -1;
+}
+
+long sink = 0;   // consumes the read pass so nothing can be optimized away
+
+unsafe
+{
+    // NativeMemory.Alloc of 256 MiB goes straight to mmap, and NativeMemory.Free
+    // munmaps it — so every walk below starts from page tables that genuinely say
+    // "nothing here", the same guarantee page-fault-walk-recycled.cs shows a plain
+    // new byte[] / drop / GC loop stops giving you after round 2.
+
+    // A — first write touch of a fresh region
+    byte* p = (byte*)NativeMemory.Alloc(Bytes);
+    long minA0 = Faults().min, rssA0 = RssKb();
+    for (int i = 0; i < Pages; i++) p[(nuint)i * Page] = 1;
+    long minA1 = Faults().min, rssA1 = RssKb();
+
+    // B — second write touch of the SAME region, same instructions
+    long minB0 = minA1, rssB0 = rssA1;
+    for (int i = 0; i < Pages; i++) p[(nuint)i * Page] = 2;
+    long minB1 = Faults().min, rssB1 = RssKb();
+    NativeMemory.Free(p);
+
+    // C — first READ touch of a second, fresh region
+    byte* q = (byte*)NativeMemory.Alloc(Bytes);
+    long minC0 = Faults().min, rssC0 = RssKb();
+    long s = 0;
+    for (int i = 0; i < Pages; i++) s += q[(nuint)i * Page];
+    long minC1 = Faults().min, rssC1 = RssKb();
+    sink += s;
+
+    // D — now WRITE to the pages C just read
+    long minD0 = minC1, rssD0 = rssC1;
+    for (int i = 0; i < Pages; i++) q[(nuint)i * Page] = 3;
+    long minD1 = Faults().min, rssD1 = RssKb();
+    NativeMemory.Free(q);
+
+    void Line(string name, long f0, long f1, long rss0, long rss1) =>
+        Console.WriteLine($"{name,-32} minflt +{f1 - f0,7:N0}   VmRSS {rss0,9:N0} -> {rss1,9:N0} kB ({rss1 - rss0,+9:N0})");
+
+    Line("A first touch, write", minA0, minA1, rssA0, rssA1);
+    Line("B second touch, write", minB0, minB1, rssB0, rssB1);
+    Line("C first touch, read", minC0, minC1, rssC0, rssC1);
+    Line("D write after the read pass", minD0, minD1, rssD0, rssD1);
+    Console.WriteLine($"\nmajor faults so far: {Faults().maj}, sink {sink}");
+
+    if (minA1 - minA0 < Pages) throw new Exception($"FAIL: A should fault every page, got {minA1 - minA0}");
+    if (minB1 - minB0 > 10) throw new Exception($"FAIL: B should barely fault, got {minB1 - minB0}");
+    if (minC1 - minC0 < Pages) throw new Exception($"FAIL: C should fault every page, got {minC1 - minC0}");
+    if (minD1 - minD0 < Pages) throw new Exception($"FAIL: D should fault every page again, got {minD1 - minD0}");
+    if (rssD1 - rssD0 < 250_000) throw new Exception("FAIL: D should grow the resident set by roughly a whole region, same as A did");
+    Console.WriteLine("PASS");
+}
+```
+
+</Solution>
+
+## work it out
+
+**What "controls for" means here.** Every walk gets memory the kernel has genuinely never given
+this process, which is the part easiest to get wrong. The obvious way to write this — `new
+byte[N]` per pass, drop it, force a collection — stops testing anything after the second pass,
+because the GC starts handing the next allocation pages it already owns and that are already
+resident. `bench/virtual-memory/page-fault-walk-recycled.cs` is exactly that mistake, run
+deliberately, five rounds of allocate-touch-drop-collect:
+
+```text
+round 0: first touch minor faults  65,792   RSS  284 MiB
+round 1: first touch minor faults  65,535   RSS  542 MiB
+round 2: first touch minor faults       0   RSS  542 MiB
+round 3: first touch minor faults       0   RSS  542 MiB
+round 4: first touch minor faults       0   RSS  542 MiB
+```
+
+From round 2 on, zero faults — the loop still says "first touch" in its own source, and it is not
+one any more. That is why the real harness allocates with `NativeMemory.Alloc` and frees with
+`NativeMemory.Free`: at 256 MiB, glibc serves that straight from `mmap` and returns it with
+`munmap`, so every one of A, B, C and D genuinely starts from `present=0`.
+
+**Follow one byte of walk A into the kernel and back**, because the other three are variations on
+the same trip.
+
+The store executes. The MMU takes the virtual address, checks the TLB, misses, walks the
+four-level page table — and the leaf entry is marked not present. There is nothing to load and
+nothing to store, so the CPU abandons the instruction mid-flight, records the faulting address in
+`CR2`, and raises a **page fault**: a hardware trap into the kernel, at ring 0, on the same
+thread, using the same mechanism as a division by zero — and *not* the `syscall` instruction that
+[processes and threads](/systems/process-and-thread/) describes. Nothing in your code asked for
+this; the hardware took the wheel mid-instruction. The kernel looks the address up in this
+process's list of mappings, confirms the range is genuinely yours and writable, and only then does
+the state-changing part:
+
+```text
+   A: store to an absent entry              C: load from an absent entry
+   ────────────────────────────             ───────────────────────────
+   TLB miss, walk -> not present             TLB miss, walk -> not present
+   #PF: "page not present" trap              #PF: "page not present" trap
+   take a real frame off the free list       point the entry at the ONE shared,
+   zero it (4096 bytes)                      already-zero, read-only frame
+   install a writable, present entry         install a read-only, present entry
+   return to user mode, re-execute           return to user mode, re-execute
+
+   B: store to an entry from A               D: store to an entry from C
+   ─────────────────────────────             ─────────────────────────
+   TLB miss (first time) or hit               TLB (miss or hit) -> present, but
+   walk -> present, writable                  READ-ONLY: this is not "missing",
+   the store just completes                   it is a PROTECTION fault
+                                               #PF: "page present but not writable"
+                                               tear down the shared read-only mapping
+                                               (invalidate the cached translation)
+                                               take a real frame off the free list
+                                               zero it, install a writable entry
+                                               return to user mode, re-execute
+```
+
+Read that table as a ranking, not a story: **B does no kernel work at all. C does the least of the
+three faults — point one entry at a frame that already exists and is already zero. A does more —
+find a fresh frame, zero it, install it. D does the most — everything A does, plus first undoing
+the read-only mapping C left behind**, which on a multi-threaded process can mean interrupting
+other cores that cached the same translation. D is not "a second free lunch after C already paid";
+it is A's bill plus a surcharge for the detour.
+
+## the answer
+
+```text
+A first touch, write            minflt +  65,847   VmRSS    29,036 ->   292,048 kB (  263,012)
+B second touch, write           minflt +       7   VmRSS   292,048 ->   292,128 kB (       80)
+C first touch, read             minflt +  65,541   VmRSS    30,008 ->    30,032 kB (       24)
+D write after the read pass     minflt +  65,552   VmRSS    30,032 ->   292,236 kB (  262,204)
+
+major faults so far: 0, sink 0
+PASS
+```
+
+Three of the four numbers are 65,536 plus a little runtime noise — **A, C and D all fault on
+every single page**, including C (a read of memory that turns out to be all zeros anyway) and D
+(a write to pages that were, a moment ago, "touched" by the read pass). Only B is different: seven
+faults for 65,536 stores, because those pages already have present, writable entries and the loop
+never leaves user mode.
+
+The `VmRSS` column is the other half of the story, and it splits the three faulting walks into two
+groups the fault count alone cannot tell apart. **A and D both grow the resident set by a whole
+region — 263 MiB and 262 MiB.** They both end with real physical frames behind every page. **C
+grows it by 24 kB — next to nothing**, for the identical 65,536-fault count. C's faults installed
+entries, but every one of them points at the same single shared frame of zeros; nothing new became
+resident. The fault counter cannot see that difference. The resident-set counter is the one that
+proves it.
+
+## why it works that way
+
+The general rule: **a fault is one event with several different kernel-side implementations, and
+the minor-fault counter tracks the event, not the implementation.** "Not present" and "present but
+read-only" are two different reasons the MMU can refuse an access, and the kernel branches on
+which one it is — but both increment the same counter by exactly one. A read of never-touched
+anonymous memory faults for the same reason a write does (there is no entry yet), and the kernel's
+shortcut for a read — the shared zero page — is invisible to anything that only counts faults. And
+a write that follows a read is not a discount for having "already touched" the page; a read-only
+shared mapping is closer to *no mapping at all* from a writer's point of view; it costs a
+protection fault on top of everything a first write costs, because the kernel has to walk back
+the optimization it applied for the read before it can give you a private, writable page.
+
+<Watch items={[['pages walked', '65,536'], ['A: minor faults', '≈ 65,536, one per page'], ['B: minor faults', '≈ 0'], ['C: minor faults', '≈ 65,536, one per page'], ['D: minor faults', '≈ 65,536, one per page again'], ['resident after A and D', 'a whole region each'], ['resident after C', 'next to nothing']]} />
+
+## what this looks like in prod
+
+**The first request after a deploy pays this, and it is separate from JIT warmup.** A pod that has
+just started has its heap claimed and untouched. The first requests fault in every page they
+walk — thousands of minor faults — while the JIT is also still tiering. Both effects vanish after
+warmup, which is why a synthetic warmup request pays for real latency that would otherwise land on
+whichever real request happens to walk cold pages first.
+
+**Pooling changes *when* a buffer's pages become resident, not whether the fault ever happens.** A
+*warm* `ArrayPool<byte>` rental hands back a buffer whose pages are already resident and already
+mapped, so walking it never reaches the kernel at all. The first rent from a cold pool is not
+warm: the [topic page's](/systems/virtual-memory/) pooled-vs-fresh comparison shows round 0 of a
+rent-touch-return loop faulting all 16,384 pages of a 64 MiB buffer — no better than a fresh `new
+byte[]` — and the plain allocate-drop-collect loop falling to near-zero faults on its own by round
+2, once the GC is reusing pages it already owns. So do not sell pooling as the thing that stops
+the faults; on this box the collector stops them too. Sell it on the allocations it avoids, and on
+holding one buffer resident instead of letting the heap grow to two.
+
+**A "clear it to be safe" pass over a fresh buffer is C plus A, not free.** Reading a page before
+writing it does not save the write fault — this walk just proved C and D both fault on every page,
+and D costs more than A alone. A defensive zero-fill of a freshly allocated array reads it first
+(C's cost) and then the "real" write touches it again (something closer to D's cost, since the
+read pass leaves those entries read-only), which is why "initialize it to be safe" on memory the
+runtime already guarantees is zero can as much as double the fault bill for that buffer.
+
+## the same idea in other languages
+
+| language | how it shows up | the trap |
+| --- | --- | --- |
+| C | `calloc` for a large block returns fresh `mmap` pages that are already zero, so it never writes them; `malloc` plus `memset` writes every page | `calloc` then `memset` "just to be sure" turns a lazy allocation into a full pass of write faults. `mmap` with `MAP_POPULATE` is the deliberate opposite: pay the faults up front, in one call, and never again. |
+| Java | the JVM commits heap as it grows and touches pages as objects land in them | `-XX:+AlwaysPreTouch` writes every heap page at startup, moving the whole first-touch bill from the first requests to process startup — the same trade as a .NET warmup pass. |
+| Go | a large `make([]byte, n)` is mapped, not populated; the runtime zeroes lazily by relying on fresh kernel pages | reslicing and appending walks new pages one at a time, so the fault cost is spread through the request path instead of appearing at the allocation, which makes it hard to see in a flame graph. |
+| Python | `numpy.zeros` is `calloc` under the hood — near-instant for gigabytes, faults on first use; `numpy.ones` writes every element immediately | benchmarking code built with `zeros` against the same shape built with `ones` is partly comparing who already paid the page faults, not the algorithm. |
+
+## common bugs
+
+- **Measuring "first touch" on memory your allocator recycled.** The control above: from the
+  third round on, the GC returns pages that are already resident, the fault count goes to zero,
+  and nothing in the code says so. If your first-touch benchmark does not print fault counts, you
+  do not know whether it ever faulted at all.
+- **Assuming a read of untouched memory does not fault, because "it's just zeros".** C's fault
+  count is identical to A's. The kernel still has to install an entry for every page; it is only
+  the *physical frame* it points at — one shared frame, forever — that makes the read cheap in
+  residency, not in fault count.
+- **Assuming a write that follows a read is cheap because the page was "already touched".** D
+  faults on every page, same as A, because a read-only entry pointing at the shared zero page is
+  not a green light for a writer. It is closer to `present=0` from that write's point of view, and
+  the kernel has to undo the read's shortcut before it can do the write's own work.
+- **Treating pooling as a fault-count fix rather than a residency fix.** A cold pool's first rental
+  faults exactly like a fresh allocation. What a warm pool actually buys is skipping the fault on
+  every rental *after* the first, by keeping the pages resident between them — which a plain
+  allocate-and-collect loop also achieves on its own after a couple of rounds, once the GC starts
+  reusing its own pages.
+- **Looking for the cost in a syscall trace.** Page faults are not syscalls; `strace` shows none
+  of these 65,536-plus events. `/proc/PID/stat`, `getrusage`, or `ps -o min_flt,maj_flt` are where
+  they are visible.

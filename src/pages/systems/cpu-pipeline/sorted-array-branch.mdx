@@ -1,0 +1,376 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: cpu-pipeline
+problem: sorted-array-branch
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import Solution from '@components/Solution.astro';
+
+## the question
+
+Here is a loop that adds up the bytes in an array that are at least 128:
+
+```csharp
+for (int i = 0; i < data.Length; i++)
+    if (data[i] >= 128)
+        sum += data[i];
+```
+
+Now look at the same 16,384 bytes in four different orders. Every order is a permutation of the
+same multiset, so every order runs the same 16,384 comparisons and the same 8,206 additions —
+sorting or shuffling changes nothing about the *work*.
+
+| order | what it is |
+| --- | --- |
+| shuffled | the bytes as generated, uniformly random |
+| sorted | ascending, so the predicate flips exactly once in the whole array |
+| blocks of 64 | 64 values at or above 128, then 64 below, repeating — not sorted at all |
+| alternating | above, below, above, below — the shortest possible repeating pattern |
+
+The branch predictor's job is to guess, for the *next* element, which way `data[i] >= 128` will
+go, before it knows the value. Real hardware predictors do this with a table: a small counter
+per table entry, indexed by the recent *history* of outcomes, that leans "taken" or "not taken".
+
+<Callout kind="insight" label="predict first">
+  Rank the four orders by how often a realistic history-indexed predictor gets the guess wrong —
+  best to worst. Then answer one more question about each: does giving the predictor *more*
+  history (more bits of memory about what happened recently) help it on that order, hurt it, or
+  make no difference at all? The one people get wrong is "alternating" — the predicate changes
+  on literally every element, so is that the *least* predictable order, or is something else
+  going on?
+</Callout>
+
+## the code
+
+This does not time anything. It builds the same kind of table a real hardware predictor uses —
+a 2-bit saturating counter per history context — and counts, exactly, how many times it would
+guess wrong on each order. `bits` is how many recent outcomes the table remembers; `bits = 0`
+means one counter for the entire run, a predictor with no memory of order at all, only of
+overall bias.
+
+<Solution>
+
+```csharp
+// The same 16,384 bytes, summed with `if (data[i] >= 128) sum += data[i];`, seen in four
+// different orders. Every order performs the same 16,384 comparisons and the same 8,206
+// additions -- only the ORDER of taken/not-taken decisions changes.
+using System.Linq;
+
+const int N = 16384;
+var rng = new Random(12345);
+var shuffled = new byte[N];
+rng.NextBytes(shuffled);
+
+var sorted = (byte[])shuffled.Clone();
+Array.Sort(sorted);
+
+// The same values re-ordered into runs of `run` above the threshold, then `run` below it --
+// not sorted, but a pattern with a short, exact period.
+var high = shuffled.Where(b => b >= 128).ToArray();
+var low = shuffled.Where(b => b < 128).ToArray();
+byte[] Blocks(int run)
+{
+    var a = new byte[N];
+    for (int i = 0, h = 0, l = 0; i < N; i++)
+        a[i] = (i / run) % 2 == 0
+            ? (h < high.Length ? high[h++] : low[l++])
+            : (l < low.Length ? low[l++] : high[h++]);
+    return a;
+}
+
+var orders = new (string Name, byte[] Data)[]
+{
+    ("shuffled",     shuffled),
+    ("sorted",       sorted),
+    ("blocks of 64", Blocks(64)),
+    ("alternating",  Blocks(1)),
+};
+
+// A software model of a real branch predictor: `bits` of recent global history select one of
+// 2^bits two-bit saturating counters (0 = strongly not-taken .. 3 = strongly taken). Each pass
+// replays the SAME sequence, so the table carries state from the previous pass into the next --
+// exactly what happens when a real predictor sees the same loop run many times.
+static int[] Mispredicts(bool[] outcomes, int bits, int passes)
+{
+    int size = 1 << bits;
+    var counters = new byte[size];
+    for (int i = 0; i < size; i++) counters[i] = 1;      // start weakly "not taken"
+    int history = 0, mask = size - 1;
+    var result = new int[passes];
+    for (int p = 0; p < passes; p++)
+    {
+        int mispredicts = 0;
+        foreach (var taken in outcomes)
+        {
+            bool predicted = counters[history] >= 2;
+            if (predicted != taken) mispredicts++;
+            if (taken) { if (counters[history] < 3) counters[history]++; }
+            else       { if (counters[history] > 0) counters[history]--; }
+            history = ((history << 1) | (taken ? 1 : 0)) & mask;
+        }
+        result[p] = mispredicts;
+    }
+    return result;
+}
+
+Console.WriteLine($"{N:N0} elements, {high.Length:N0} at or above 128\n");
+int[] widths = { 0, 1, 7, 14 };
+foreach (var (name, data) in orders)
+{
+    var outcomes = data.Select(b => b >= 128).ToArray();
+    foreach (var bits in widths)
+    {
+        var mp = Mispredicts(outcomes, bits, 3);
+        Console.WriteLine($"{name,-14} history={bits,2} bits   pass 1: {mp[0],5} ({100.0 * mp[0] / N,4:F1}%)   pass 3: {mp[2],5} ({100.0 * mp[2] / N,4:F1}%)");
+    }
+    Console.WriteLine();
+}
+```
+
+</Solution>
+
+## work it out
+
+### the counter, and what it remembers
+
+Each table entry is a 2-bit saturating counter: it moves one step toward "taken" on a taken
+outcome and one step toward "not taken" on the other, and it clamps at both ends instead of
+wrapping.
+
+```text
+2-bit saturating counter — the predictor's memory for ONE history context
+
+  taken           taken           taken
+   ┌──┐            ┌──┐            ┌──┐
+   │  ▼            │  ▼            │  ▼
+  [0]  ───────►  [1]  ───────►  [2]  ───────►  [3]
+strongly         weakly          weakly        strongly
+not-taken        not-taken       taken         taken
+   ▲  │            ▲  │            ▲  │            ▲
+   │  └────────────┘  └────────────┘  └────────────┘
+   └── not taken ──┘
+
+  predict "taken"      when the counter reads 2 or 3
+  predict "not taken"  when the counter reads 0 or 1
+```
+
+The `bits` history is which counter you consult. Recent outcomes are packed into a fixed-width
+register: the newest bit enters on one end, the oldest falls off the other, and that number
+indexes the table.
+
+```text
+history register, 7 bits shown — after each decision the newest outcome shifts in
+
+  before:  1 0 1 1 0 1 0
+  this element: taken (1)
+  after:     0 1 1 0 1 0 1     ← this 7-bit number selects the counter used next
+```
+
+**A pattern with period `P` needs at least `log2(P)` history bits before the table can tell one
+position in the pattern from another.** Below that width, positions that are really different
+collide on the same counter and fight over it.
+
+### sorted — one flip, trivial at any width
+
+The predicate goes "not taken" for the first stretch and "taken" for the rest — one transition
+in 16,384 elements. Even `bits = 0`, a single counter with no history at all, gets this almost
+free: it saturates to "not taken" during the long first run, mispredicts once or twice at the
+transition, then saturates to "taken" for the rest. More history cannot make one flip cheaper
+than that.
+
+### blocks of 64 — the recovery cost is the counter's, not the history's
+
+The predicate flips every 64 elements: 255 flips in the whole array. Walk the counter by hand
+across one real flip — indices 60 to 68 of this exact array, `bits = 0`:
+
+```text
+i    data-driven outcome   counter before   predicted   correct?   counter after
+60   taken                 3                taken       yes        3
+61   taken                 3                taken       yes        3
+62   taken                 3                taken       yes        3
+63   taken                 3                taken       yes        3
+64   not taken             3                taken       NO         2
+65   not taken             2                taken       NO         1
+66   not taken             1                not taken   yes        0
+67   not taken             0                not taken   yes        0
+68   not taken             0                not taken   yes        0
+```
+
+The counter is pinned at 3 through the end of the "taken" run, exactly where a 64-long run of
+the same outcome should leave it. The flip at index 64 costs two wrong guesses — the counter has
+to cross from 3 down through 2 before it reads "not taken" — and then it is correct for the rest
+of that run. **Every flip costs the same two-step crossing**, because that crossing is a
+property of the counter's four states, not of how long each run is. 255 flips at roughly two
+mispredicts each is the whole story, and it does not change much whether the table has 0 bits of
+history or 14: extra history buys separate counters for separate contexts, but every one of
+those counters still has to make the same two-step crossing once per flip it sees.
+
+### alternating — a period-2 signal against a 0-bit counter
+
+The predicate flips on *every* element: taken, not, taken, not. Trace the same counter,
+`bits = 0`, from the very start:
+
+```text
+i   outcome   counter before   predicted   correct?   counter after
+0   taken     1                not taken   NO         2
+1   not       2                taken       NO         1
+2   taken     1                not taken   NO         2
+3   not       2                taken       NO         1
+4   taken     1                not taken   NO         2
+```
+
+Every single guess is wrong, forever, once the counter locks into oscillating between 1 and 2.
+The counter can only move one step per element, but the signal it is chasing reverses on every
+element too — so the counter is always exactly one step behind a target that has already moved
+again. **A single memoryless counter is not merely bad at a period-2 signal, it is
+anti-correlated with it: it ends up predicting almost the opposite of what is about to happen,
+on almost every element.** That is the surprise in this exercise: the order whose predicate
+changes on literally every element is not the hardest one for the hardware — it is one of the
+easiest, *given the right amount of history*. One bit of history (just "what happened last
+time") separates the counter used after a "taken" outcome from the counter used after a
+"not taken" outcome, and a period-2 pattern becomes two counters that each see the *same*
+outcome every single time they are consulted — as easy to learn as the sorted array.
+
+### shuffled — nothing to learn, until the table is the array
+
+A shuffled order has no period at all, so there is no history width between 0 and a few dozen
+bits that helps: every table entry a modest history could select is, itself, seeing a
+close-to-random sequence of outcomes, because randomness does not become less random when you
+slice it into contexts. The only way a finite table stops looking random is if it is large
+enough to give *every position in the specific array being replayed* close to its own counter —
+at `bits = 14`, the table has 16,384 entries, matching the length of the array itself, and by
+the third pass over the *same* fixed array some of those counters have started to memorise
+specific positions rather than generalise a pattern. Real traffic does not replay the same
+16,384-element sequence thousands of times in a row; a benchmark that does is flattering the
+predictor in a way production data never will.
+
+## the answer
+
+Exact counts, not estimates — every number below is the count of wrong guesses this table-based
+predictor made, out of 16,384 decisions, over the array generated by the code above:
+
+```text
+16,384 elements, 8,206 at or above 128
+
+shuffled       history= 0 bits   pass 1:  8127 (49.6%)   pass 3:  8129 (49.6%)
+shuffled       history= 1 bits   pass 1:  8305 (50.7%)   pass 3:  8303 (50.7%)
+shuffled       history= 7 bits   pass 1:  8133 (49.6%)   pass 3:  8126 (49.6%)
+shuffled       history=14 bits   pass 1:  8169 (49.9%)   pass 3:  3488 (21.3%)
+
+sorted         history= 0 bits   pass 1:     2 ( 0.0%)   pass 3:     4 ( 0.0%)
+sorted         history= 1 bits   pass 1:     2 ( 0.0%)   pass 3:     2 ( 0.0%)
+sorted         history= 7 bits   pass 1:     8 ( 0.0%)   pass 3:     2 ( 0.0%)
+sorted         history=14 bits   pass 1:    15 ( 0.1%)   pass 3:     2 ( 0.0%)
+
+blocks of 64   history= 0 bits   pass 1:   513 ( 3.1%)   pass 3:   512 ( 3.1%)
+blocks of 64   history= 1 bits   pass 1:   259 ( 1.6%)   pass 3:   256 ( 1.6%)
+blocks of 64   history= 7 bits   pass 1:   265 ( 1.6%)   pass 3:   256 ( 1.6%)
+blocks of 64   history=14 bits   pass 1:   272 ( 1.7%)   pass 3:   256 ( 1.6%)
+
+alternating    history= 0 bits   pass 1: 16357 (99.8%)   pass 3:  8178 (49.9%)
+alternating    history= 1 bits   pass 1:     3 ( 0.0%)   pass 3:     4 ( 0.0%)
+alternating    history= 7 bits   pass 1:    11 ( 0.1%)   pass 3:     2 ( 0.0%)
+alternating    history=14 bits   pass 1:    22 ( 0.1%)   pass 3:     2 ( 0.0%)
+```
+
+Every hand-worked prediction above is exactly what came out. Sorted costs 2 to 15 mispredicts
+out of 16,384, at any width. Blocks of 64 costs 256 or 512 depending only on whether history
+exists at all, not on how much. Alternating goes from the worst row in the entire table
+(**99.8% wrong** — worse than a coin flip) to one of the best (**0.0%**) by adding a single bit
+of history. Shuffled stays pinned at ≈50% until the table is large enough to start memorising
+the specific array — a 21.3% row that says more about the benchmark than about branch
+prediction in general.
+
+<Callout kind="note" label="the pass 1 / pass 3 gap on alternating, honestly">
+  `bits = 0` on "alternating" drops from 99.8% to 49.9% between pass 1 and pass 3, and the exact
+  reason is a detail of this data, not of prediction in general: `shuffled` has 8,206 bytes at
+  or above 128 and 8,178 below — not an even split — so `Blocks(1)` runs out of "below"
+  elements 28 short of the end and the last 28 elements of pass 1 are all "taken" instead of
+  alternating. That one broken stretch nudges the counter out of the perfectly anti-correlated
+  cycle traced above, and it settles into a different, less catastrophic oscillation for the
+  passes that follow. The 99.8% row is the clean, fully-explained one; the 49.9% row is real
+  output from a real boundary artifact, reported rather than smoothed over.
+</Callout>
+
+## why it works that way
+
+**A branch predictor is a table of small counters indexed by recent history, and what it can
+learn is bounded by two things: how many history bits index the table, and whether the pattern
+actually has a period that fits inside that many bits.** A predicate that changes every element
+is not automatically unpredictable — it is unpredictable only relative to a predictor that
+doesn't have enough history to see the period. Give it one bit for a period-2 pattern, or seven
+bits for a period-128 one, and the "worst" row in a naive table becomes one of the best. What no
+width of a realistic table fixes is a pattern with no period at all — true randomness stays
+wrong roughly half the time regardless, right up until the table is large enough to stop being a
+*pattern* predictor and start being a *memory* of one specific, repeated input.
+
+<Watch items={[['predictor state', 'a 2-bit saturating counter per history context'], ['table index', 'the last K outcomes, packed into a K-bit register'], ['a period-P pattern', 'learnable once history ≥ log2(P) bits'], ['a period-2 pattern at 0 history bits', 'worse than random — anti-correlated, not just unlearned'], ['true randomness', 'no realistic history width fixes it'], ['a small table that fully memorises the input', 'a property of a repeated benchmark, not of production traffic']]} />
+
+## what this looks like in prod
+
+**The shape to recognise is a tight loop with a data-dependent predicate.** Filtering a large
+collection by status, validating records where roughly half fail, a tokenizer branching per
+character, a hot path checking a per-item flag — these are the loops where the *order* elements
+arrive in is a real design decision, not a cosmetic one.
+
+**"It flips constantly" is not the same question as "it is unpredictable."** A status field that
+strictly alternates `Active`, `Inactive`, `Active`, … across a sorted-by-id table is trivially
+predictable once the hardware has seen a handful of rows, exactly like the alternating case
+above. A status field that is genuinely 50/50 with no structure at all is the hard case, and it
+looks identical to the first one if you only ask "does the value change a lot" instead of "is
+there a period here."
+
+**The fix is almost never "make it branchless."** Group the data so the predicate is constant
+for long runs, split one loop into two uniform ones, hoist a condition that does not vary
+per-element out of the loop entirely. All three make the predicate genuinely more learnable,
+which is the actual lever — arithmetic branch elimination, covered in
+[removing the branch](/systems/cpu-pipeline/branchless-rewrite/), is the tool for when none of
+those are available and the predicate really is close to random.
+
+**You cannot always ask hardware performance counters for the answer.** Many hosted and
+containerised environments expose no PMU at all, so a managed profiler cannot report a
+mispredict count directly. The diagnosis that survives that limitation is the one this exercise
+does in software: hold the values fixed, change only their order, and reason about whether the
+new order has a period a predictor could plausibly learn.
+
+## the same idea in other languages
+
+The hardware predictor described here belongs to the CPU, not to any language — every process
+on the same core shares it. What differs by language is whether your source-level `if` is even
+the thing being predicted, and whether the compiler chose to leave a branch there at all.
+
+| language | is your `if` a real machine branch? | the trap |
+| --- | --- | --- |
+| C (gcc, `-O2`) | Depends on the loop bound. Compiled here: with a compile-time-constant trip count the same predicate auto-vectorises into `pcmpgtb`/`pand`/`paddq` — no branch anywhere. Force scalar code with `-fno-tree-vectorize` and it becomes `cmovs` — still no branch. Only `-fno-tree-vectorize -fno-if-conversion` leaves a real conditional jump (`jns`) for this exercise's mechanism to apply to at all. | Reasoning about "the branch predictor" from C source alone tells you nothing until you have checked whether there is a branch in the binary. `objdump -d` is how you find out. |
+| Java (HotSpot) | The JIT can if-convert a small conditional into a `cmov`-equivalent, but whether it does is a per-compilation cost-model decision, not a language guarantee. | Assuming the JIT "already handled it" without checking the compiled output is the same trap as assuming a C# ternary is branchless — covered on [the next exercise](/systems/cpu-pipeline/branchless-rewrite/). |
+| Python (CPython) | No. Your `if` compiles to bytecode, and the interpreter's own dispatch loop is what the hardware predictor actually sees. | The hardware still predicts *something* on every iteration — it just is not predicting your source-level branch, so "optimise the branch" is a category error here; the lever is executing less bytecode. |
+| JavaScript (V8) | Sometimes — TurboFan applies its own if-conversion heuristics, independent of and generally more conservative than a native compiler's. | Same rule as Java: check the generated code (`--print-opt-code`) rather than assume from the source that a conditional survived, or that it did not. |
+
+## common bugs
+
+- **Treating "the value changes a lot" as a proxy for "unpredictable."** The alternating row is
+  the direct counter-example: it changes on every element and is one of the *easiest* rows once
+  the predictor has one bit of history. What matters is whether there is a period at all, not
+  how short it is.
+- **Calling this a cache effect.** It is the reflex explanation and it is wrong here: this
+  exercise never touches memory timing at all, and the loop's 16 KB array is small enough to sit
+  in L1 regardless of order. When you cannot tell prediction from caching in real measurements,
+  reorder the data with the working set fixed to test prediction, and grow the working set with
+  the order fixed to test the cache.
+- **Assuming more history always helps.** It helps a pattern that has a period the extra bits
+  can now distinguish. It does nothing for "blocks of 64" beyond the first bit, because every
+  flip still costs the same two-step counter crossing no matter which counter is doing the
+  crossing, and it does nothing at all for genuine randomness until the table is large enough to
+  memorise the specific input rather than generalise a pattern.
+- **Building a microbenchmark that replays one fixed array many times and trusting the number
+  as "what shuffled data costs."** The 21.3% row above exists only because a 16,384-entry table
+  eventually recognises the *specific* repeated sequence. Production traffic does not repeat a
+  fixed 16 KB pattern thousands of times in a row, so that row is a fact about this benchmark's
+  shape, not a fact you can carry into a design decision.
+- **Reaching for a performance-counter tool that is not there.** `perf stat`'s `branch-misses`
+  answers this directly on hardware that exposes a PMU. Plenty of containers do not, and the
+  technique that still works without one is exactly this exercise: change the data's order,
+  hold everything else fixed, and reason about the mechanism rather than wait for a counter that
+  may never appear.

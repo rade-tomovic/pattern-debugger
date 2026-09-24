@@ -1,0 +1,134 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: intervals
+problem: non-overlapping-intervals
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+
+## task
+
+Given an array of intervals, return the minimum number of intervals you'd have to remove so that
+none of the rest overlap. LeetCode #435.
+
+```text
+intervals = [[1,2],[2,3],[3,4],[1,3]]  →  1
+```
+
+## how to think
+
+This looks like Merge Intervals' sibling, but it's actually the opposite move. You're not
+combining ranges — you're **choosing** the largest subset of intervals that don't conflict, then
+reporting how many got left out (`intervals.Length - kept`). That's the classic interval
+scheduling / activity selection problem, and its greedy rule is: whenever two intervals conflict,
+discard the one that finishes **later**. The one that finishes earlier leaves strictly more room
+for whatever comes next, so keeping it can never be a worse choice than keeping the other one.
+
+To make "finishes earlier" the thing you compare, sort by **end**, not start. Sorting by start
+tempts you into keeping whichever interval you meet first — but "first by start" says nothing
+about how much room it leaves behind, and can pick badly (see "why it works" for exactly that
+failure on this page's own example).
+
+Then one linear sweep: track `lastEnd`, the end of the last interval you decided to keep. Any
+interval whose start is before `lastEnd` conflicts with it — drop it (`removed++`) and leave
+`lastEnd` alone, because the survivor is still the earliest-finishing option on the table.
+Otherwise keep it, and `lastEnd` advances to its end.
+
+<Callout kind="note" label="template instance">
+  **Select** skeleton, verbatim: sort by end, greedily keep whatever doesn't conflict with the
+  last kept interval. Invariant: `lastEnd` always holds the smallest end achievable by any
+  same-size selection made from what's been scanned so far. What varies: the return value —
+  removals instead of the count kept.
+</Callout>
+
+## solution
+
+```csharp
+public int EraseOverlapIntervals(int[][] intervals)
+{
+    if (intervals.Length == 0) return 0;
+
+    Array.Sort(intervals, (a, b) => a[1].CompareTo(b[1]));  // sort by END — greedy needs the earliest finisher
+
+    int removed = 0;
+    int lastEnd = intervals[0][1];
+
+    for (int i = 1; i < intervals.Length; i++)
+    {
+        if (intervals[i][0] < lastEnd)      // overlaps the interval we're keeping
+            removed++;                       // drop this one, keep the earlier-finishing survivor
+        else
+            lastEnd = intervals[i][1];       // no conflict: this becomes the new "last kept"
+    }
+    return removed;
+}
+```
+
+## trace
+
+`intervals = [[1,100],[2,3],[4,5],[6,7],[11,12]]`, sorted by end:
+`[[2,3],[4,5],[6,7],[11,12],[1,100]]`:
+
+| interval | `lastEnd` (before) | check | action | `lastEnd` (after) | `removed` |
+| --- | --- | --- | --- | --- | --- |
+| `[2,3]` | — | — | keep (seed) | `3` | `0` |
+| `[4,5]` | `3` | `4 < 3` → no | keep | `5` | `0` |
+| `[6,7]` | `5` | `6 < 5` → no | keep | `7` | `0` |
+| `[11,12]` | `7` | `11 < 7` → no | keep | `12` | `0` |
+| `[1,100]` | `12` | `1 < 12` → yes | DROP | `12` | `1` |
+
+Final: `removed = 1` — only the giant `[1,100]` has to go.
+
+That last row is the whole point of sorting by end. `[1,100]` has the smallest **start** of any
+interval here, so a sort-by-start greedy would grab it first and regret it immediately:
+
+```text
+same input, sorted by START instead: [1,100],[2,3],[4,5],[6,7],[11,12]
+keep [1,100] first (smallest start) -> lastEnd = 100
+[2,3]:   2 < 100  -> conflicts -> drop
+[4,5]:   4 < 100  -> conflicts -> drop
+[6,7]:   6 < 100  -> conflicts -> drop
+[11,12]: 11 < 100 -> conflicts -> drop
+removed = 4          <- wrong; sort-by-end finds the true minimum, 1
+```
+
+## why it works
+
+Sort by end and greedily keep whatever's compatible — that greedy schedule is provably at least as
+large as any other valid schedule, by induction. The base case: the greedy's very first pick is
+the interval with the smallest end among **all** intervals, so nothing can finish earlier — no
+competing schedule's first pick can beat it. Inductive step: if greedy's `i`-th pick finishes no
+later than any other valid schedule's `i`-th pick, then every interval compatible with that other
+schedule's pick is also compatible with greedy's pick (greedy's end is `<=` theirs), so greedy's
+`(i + 1)`-th pick is at least as good too. That induction never breaks, which is why the greedy
+count is never smaller than any other valid selection's — making `total - kept` the true minimum
+number of removals, not just a plausible one.
+
+<Watch items={[['time', 'O(n log n)'], ['space', 'O(1) extra']]} />
+
+## common bugs
+
+- Sorting by **start** instead of **end** — silently changes the answer; see the trace above,
+  where sort-by-start finds 4 removals and sort-by-end finds the true minimum, 1.
+- Using `<=` instead of `<` at the conflict check (`intervals[i][0] < lastEnd`) — touching
+  intervals like `[1,2]` and `[2,3]` do **not** overlap here, unlike Merge Intervals, where
+  touching counts as overlap. Get this backwards and you'll drop intervals that were fine.
+- Advancing `lastEnd` when you actually dropped an interval — the survivor (the earlier-finishing
+  one) has to stay on the table; overwriting `lastEnd` with the later end you just rejected undoes
+  the entire greedy guarantee.
+- Returning `kept` instead of `intervals.Length - kept` (or, as written here, forgetting the
+  problem asks for removals directly) — the question wants the minimum you'd *remove*, not the
+  maximum you keep.
+
+## variants you can now solve
+
+- **Minimum Number of Arrows to Burst Balloons** (LC 452) — the same sort-by-end greedy, but an
+  arrow through the earliest-ending balloon pops every balloon whose start is at or before that
+  end, so `<=` (not `<`) is the right comparison — touching endpoints DO count as poppable
+  together, the opposite convention from this problem.
+- [Merge Intervals](/patterns/intervals/merge-intervals/) (LC 56) — the sort-by-start sibling:
+  combine ranges instead of selecting among them.
+- [Meeting Rooms II](/patterns/intervals/meeting-rooms-ii/) (LC 253) — a harder version of
+  "how many conflict": instead of one conflict count, you need the *peak* number simultaneously
+  alive.

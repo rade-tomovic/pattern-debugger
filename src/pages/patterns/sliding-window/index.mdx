@@ -1,0 +1,126 @@
+---
+layout: '@layouts/TopicLayout.astro'
+topic: sliding-window
+---
+
+import Callout from '@components/Callout.astro';
+import ProblemList from '@components/ProblemList.astro';
+import Cells from '@components/Cells.astro';
+
+## core idea
+
+A window `[left, right]` slides over contiguous data. `right` only ever moves forward, adding
+one element to the window each step; `left` only ever moves forward too, removing elements when
+some rule says the window should shrink. Because every index enters the window exactly once and
+leaves at most once, the whole scan is O(n) — no re-scanning a subarray from scratch the way a
+brute force does. There are two shapes — fixed and variable — and the variable shape splits by
+shrink discipline:
+
+| shape | window size | shrink rule | typical trigger |
+| --- | --- | --- | --- |
+| fixed | constant `k` | never — slide by one, don't shrink | "subarray of size k" |
+| variable — longest | grows until it can't | shrink while **invalid** | "longest ... such that ..." |
+| variable — shortest | shrinks as soon as it can | shrink while **valid** | "minimum/shortest window containing ..." |
+
+<Cells
+  data={[3, 1, 4, 1, 5, 9, 2, 6]}
+  pointers={{ 2: [{ t: 'L', c: 'amber' }], 5: [{ t: 'R', c: 'cyan' }] }}
+  cells={{ 2: 'win', 3: 'win', 4: 'win', 5: 'win' }}
+  caption="right enters the window once per index, left leaves it at most once per index — that's the whole O(n) argument"
+/>
+
+## when to reach for it
+
+- The question is about a **contiguous** run — subarray or substring, not any subsequence.
+- Keywords: "substring", "subarray", "size k", "at most/exactly k distinct", "minimum/shortest
+  window containing".
+- A brute force would recompute a sum, count, or set **from scratch** for every start index —
+  `O(n·k)` or worse — when the window's state can instead be updated incrementally as one
+  element enters and one leaves.
+- Fixed-size window: every slide adds one element and removes one. Variable-size window: `right`
+  always advances; `left` catches up under a validity rule.
+
+## universal templates
+
+Fixed window — size never changes, so there's no validity check, only bookkeeping:
+
+```csharp
+public int FixedWindow(int[] nums, int k)
+{
+    int windowSum = 0;
+    for (int i = 0; i < k; i++) windowSum += nums[i];   // seed the first window once
+
+    int best = windowSum;
+    for (int right = k; right < nums.Length; right++)
+    {
+        int left = right - k;
+        windowSum += nums[right] - nums[left];          // add entering, remove leaving — O(1) per slide
+        best = Math.Max(best, windowSum);
+    }
+    return best;
+}
+```
+
+Variable window, **longest** — grow greedily, only shrink when forced:
+
+```csharp
+public int VariableWindowLongest(/* input */)
+{
+    // window state lives here: HashSet<char>, Dictionary<char,int>, int[] freq — whatever Valid() needs
+    int left = 0, best = 0;
+
+    for (int right = 0; right < n; right++)
+    {
+        Add(right);                       // window always grows by one element
+
+        while (!IsValid())                // longest → shrink while INVALID
+        {
+            Remove(left);
+            left++;
+        }
+        best = Math.Max(best, right - left + 1);
+    }
+    return best;
+}
+```
+
+Variable window, **shortest** — shrink eagerly, record on the way down:
+
+```csharp
+public int VariableWindowShortest(/* input */)
+{
+    int left = 0, best = int.MaxValue;
+
+    for (int right = 0; right < n; right++)
+    {
+        Add(right);
+
+        while (IsValid())                 // shortest → shrink while VALID, recording as you go
+        {
+            best = Math.Min(best, right - left + 1);
+            Remove(left);
+            left++;
+        }
+    }
+    return best == int.MaxValue ? 0 : best;
+}
+```
+
+`Add`/`Remove`/`IsValid` model whatever the problem needs to track — a `HashSet<char>` for
+membership, a frequency array for a count threshold, a need/have pair of dictionaries for exact
+matching. Every problem below is one of these three skeletons with different `Add`/`Remove`/
+`IsValid`.
+
+<Callout kind="insight" label="the shrink question">
+  Ask: *does a longer window past the invalid point ever help?* If no — growing only breaks
+  things — shrink while **invalid** (you want the longest valid window, so hold the window at
+  its biggest legal size). If a smaller window can still be valid and you want the smallest one,
+  shrink while **valid**, recording the length on every step down before it breaks.
+</Callout>
+
+## problems
+
+Four problems, one fixed-window and three variable-window — the last one combines both shrink
+disciplines' cousin (need/have counting) into the hardest shape in the pattern.
+
+<ProblemList topic="sliding-window" />

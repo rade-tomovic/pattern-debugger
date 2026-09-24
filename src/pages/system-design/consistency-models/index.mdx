@@ -1,0 +1,331 @@
+---
+layout: '@layouts/TopicLayout.astro'
+topic: consistency-models
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+
+## the ground floor
+
+- **replica** — a copy of the same data on a different node. The moment you have more than
+  one, "what does a read return" stops having one obvious answer.
+- **quorum** — the minimum number of replicas that must agree before an operation counts as
+  done. A write quorum and a read quorum that are guaranteed to overlap is how a system reads
+  its own latest write without asking every replica.
+- **linearization point** — the single instant, somewhere between an operation's call and its
+  return, at which it is deemed to have happened. Linearizability is the promise that such a
+  point exists for every operation and that all operations, across all clients, can be lined up
+  on one real-time axis consistent with those points.
+- **causal order** — the order implied by "this write happened because of that read." Weaker
+  than a total order (concurrent, unrelated operations may be seen in different sequences on
+  different replicas), stronger than no order at all.
+
+## core idea
+
+CAP is usually taught as "pick two of three," which falls apart the moment you look at it: a
+system with more than one node cannot opt out of network partitions happening, so partition
+tolerance was never a knob you got to leave off — there is no meaningful "CA" system outside a
+single machine. What CAP actually says is narrower and sharper: **when a partition is
+happening**, you choose between answering at all (availability) and answering with a single,
+up-to-date, real-time-consistent order (linearizable consistency). You cannot have both, and
+the theorem has nothing to say about the case where there is no partition.
+
+PACELC is the fuller model and the one worth keeping in your head, because the **else** branch
+is where you actually live: **P**artition → **A** or **C**; **e**lse (no partition, which is
+almost all the time) → **L**atency or **C**onsistency. Every synchronous-replication decision
+you make — wait for one follower, wait for a quorum, wait for all of them — is you trading
+latency for consistency on a perfectly healthy network, with no partition anywhere near it.
+
+## how it actually works
+
+### the consistency ladder
+
+Four models, from the strongest guarantee to the weakest, and what each one costs to get.
+
+- **Linearizable.** Every operation appears to take effect atomically at some point between its
+  call and its return, and all operations from all clients can be placed on one real-time-
+  consistent order. Costs a round trip that establishes "who is current" before answering — a
+  quorum acknowledgement, or a confirmed-leader check.
+- **Sequential.** All operations appear in one global total order that every process agrees on,
+  but that order does not have to match real time — a process's own operations stay in its own
+  program order, but two different clients' operations can be reordered relative to wall-clock
+  time as long as everyone sees the same reordering. Cheaper to reason about than linearizable
+  in theory, but in practice still needs a single agreed log, so it usually costs the same
+  coordination.
+- **Causal.** Operations that are causally related — a write that was informed by a prior read
+  — are seen in that order everywhere. Concurrent, unrelated operations may be seen in
+  different orders on different replicas, and that is allowed. The mechanism is metadata, not a
+  round trip: a version vector or dependency stamp travels with the write, and a replica holds
+  a write back until the writes it depends on have arrived. No synchronous wait on other nodes.
+- **Eventual.** If writes stop, every replica converges to the same value — eventually, with no
+  bound stated. In between, nothing is promised: reads can go backwards, forwards, or return two
+  different answers from two replicas queried a moment apart. Zero extra round trips: read
+  local, write local, propagate later.
+
+Session guarantees are the pragmatic middle a lot of production systems actually ship:
+**read-your-writes** (you never fail to see your own prior write), **monotonic reads** (once you
+have seen a value, you never see an older one), **monotonic writes** (your writes apply in the
+order you issued them), **writes-follow-reads** (a write you make after a read is ordered after
+whatever that read observed). None of these are global properties — they hold *for one session*
+— which is exactly why they are cheap: the system only has to remember what one client has
+already seen, not agree on a single order for everyone.
+
+### a client watching two nodes disagree
+
+The window every one of the weaker models opens on purpose, made concrete:
+
+```text
+ time →
+
+ LEADER    write(x = 5) ----ack----> CLIENT A     (write is durable: logged, acknowledged)
+    |
+    | async replication — this gap is the eventual-consistency window
+    v
+ FOLLOWER  (has not applied x = 5 yet, still holds x = 4)
+
+ CLIENT B ----read(x)----> FOLLOWER ----returns x = 4     STALE: a committed write, unseen
+
+          ... replication lag closes, FOLLOWER applies x = 5 ...
+
+ CLIENT B ----read(x)----> FOLLOWER ----returns x = 5     converged
+```
+
+Nothing here is a bug. The leader was correct to acknowledge the write the moment it was
+durable on its own log; the follower was correct to answer the read from the data it actually
+had. The staleness is the shape of the guarantee that was chosen, not a failure of it. This is
+the identical shape as [two cores disagreeing about a shared variable](/systems/memory-model/)
+until a memory barrier forces one to see the other's write — same problem, one layer up, paid
+for with a network round trip instead of a fence instruction.
+
+### PACELC as a decision, not a slogan
+
+```text
+                     is a partition happening right now?
+                          /                          \
+                        yes                            no
+                         |                               |
+           choose: AVAILABILITY               (the "else" branch — normal
+              or CONSISTENCY                    operation, almost always)
+              (CAP's "P")                     choose: LATENCY or CONSISTENCY
+             /              \                        /              \
+   answer from any      refuse until the      answer from a       wait for a quorum
+   reachable replica —   partition heals,      nearby replica,     / confirmed leader
+   may be stale (AP)     stay correct (CP)     maybe stale (EL)    before answering (EC)
+```
+
+A system's real position is a pair of letters from this tree, not a single point on a triangle
+— PA/EL (available under partition, latency-favoring otherwise: most caches, DNS, Cassandra's
+usual config), PC/EC (consistent under partition, consistency-favoring otherwise: a
+majority-quorum store like etcd or a linearizable-mode Cosmos DB account), or PA/EC and PC/EL
+for systems that make the two choices independently.
+
+### quorum arithmetic, worked
+
+`N` replicas, a write quorum `W`, a read quorum `R`. If `W + R > N`, every read quorum and every
+write quorum must share at least one replica — pigeonhole, not luck — so a read is guaranteed to
+overlap with the most recent completed write.
+
+```text
+ N = 5 replicas:        [ r1 ] [ r2 ] [ r3 ] [ r4 ] [ r5 ]
+
+ write quorum, W = 3:   [ r1 ] [ r2 ] [ r3 ]
+ read  quorum, R = 3:                 [ r3 ] [ r4 ] [ r5 ]
+                                         ^
+                                         guaranteed overlap: r3 was in both,
+                                         so the read quorum contains at least
+                                         one replica that saw the latest write
+```
+
+The majority size for `N = 5` is `floor(N / 2) + 1 = 3`. Setting `W = R = 3` is the balanced
+choice: `3 + 3 = 6 > 5`, both quorums are majorities, and up to two simultaneous replica
+failures still leave a live majority for both reads and writes. The two extremes trade the same
+total cost in opposite directions: `W = 1, R = N` makes writes cheap (one replica, one round
+trip) but every read must reach all five nodes to guarantee freshness, so one dead replica
+blocks every read; `W = N, R = 1` makes reads cheap but every write waits on the slowest live
+replica and blocks entirely the moment any one replica is unreachable.
+
+None of this is free even when it works. As a published industry reference figure for reasoning
+about relative cost — not something measured on this page — a round trip within one datacenter
+is commonly cited in the sub-millisecond-to-low-single-digit-millisecond range, while a
+cross-region round trip is commonly cited in the tens-of-milliseconds range, roughly an order of
+magnitude larger. A write quorum that spans regions pays that cross-region cost on every write.
+That is PACELC's else-branch in concrete numbers-of-hops terms: spreading a quorum across
+regions is a latency-for-durability trade you make on every single write, partition or not.
+
+## the tradeoff
+
+| model | what it guarantees | what it costs | availability under partition |
+| --- | --- | --- | --- |
+| linearizable | one real-time-consistent order for every operation, everywhere | a quorum or leader-confirmation round trip on every write, often on every read too | must refuse on the minority side — this is CAP's CP |
+| sequential | one agreed total order, not tied to real time | usually still needs a single log or leader in practice, so a similar cost to linearizable | same CP shape in most real implementations |
+| causal | causally related operations stay ordered everywhere; concurrent ones may not | metadata shipped with the write (a version vector), no synchronous cross-replica wait | available — a partitioned replica keeps accepting writes and merges later |
+| eventual | replicas converge if writes stop; no ordering promised meanwhile | none beyond local read/write and async propagation | fully available — this is the model partition tolerance is free under |
+
+The right default for a typical service is causal consistency plus read-your-writes and
+monotonic-reads session guarantees — cheap, available, and it matches what most users actually
+notice ("I don't want to see my own edit disappear," not "I need a global total order"). Reserve
+linearizable for the small set of operations that specifically need it: allocating a unique
+identifier, a check-then-write on a balance, leader election, an idempotency-key lookup. Do not
+build a whole system on linearizable by default — you are paying a consensus round trip on every
+touch to buy a guarantee most of your reads never needed. [Consensus](/system-design/consensus/)
+is where that round trip actually gets paid.
+
+## how it fails
+
+- **Stale reads right after a failover.** Symptom: a support ticket saying "I saved it and it
+  disappeared." Cause: an asynchronous follower was promoted before it had caught up, so the new
+  leader is missing the last few committed writes. Looks on a dashboard like a step change in
+  `replication lag` right before the failover event, then reads that quietly regress.
+- **Split-brain writes.** Symptom: two divergent histories for the same key that need manual
+  reconciliation. Cause: a partition where both sides believe they are primary and both keep
+  accepting writes — this is exactly what a correctly-configured CP system refuses to allow, and
+  exactly what a misconfigured or forced-available one permits. Shows up as duplicate or
+  conflicting rows that a last-write-wins merge silently resolves in an arbitrary direction.
+- **Lost updates from a broken quorum.** Symptom: a write appears to succeed, then a later read
+  does not reflect it. Cause: `W + R <= N`, so no overlap is guaranteed and a read can land
+  entirely on replicas that never received the write. This is a configuration bug, not a network
+  event, and it is invisible under normal load because *most* quorums still happen to overlap by
+  chance.
+- **Causal violation without causal tracking.** Symptom: a reply visible before the comment it
+  replies to, or a deletion that "un-happens." Cause: eventual consistency with no causal
+  metadata, so two writes that a human sees as ordered are propagated independently and can
+  apply out of order on some replica.
+- **Clock-skew corrupting last-write-wins.** Symptom: an update from a second ago loses to an
+  update from an hour ago. Cause: a system using wall-clock timestamps to resolve conflicts
+  (a common default), combined with clock drift between nodes — the "latest" write by timestamp
+  is not the same as the last write that actually happened.
+
+<Callout kind="trap" label="the folklore, corrected">
+  "We chose AP, so we're always available" is only true between partitions. PACELC's else-branch
+  still applies: an AP system that also wants low staleness will pay latency for it in normal
+  operation, and an AP system that wants low latency in normal operation is accepting staleness
+  it did not need a partition to introduce.
+</Callout>
+
+## in practice
+
+- **SQL Server.** Always On availability groups default new replicas to asynchronous-commit;
+  synchronous-commit is opt-in and adds `REQUIRED_SYNCHRONIZED_SECONDARIES_TO_COMMIT` write
+  latency in exchange for a failover target that cannot lose the last commit. A readable
+  secondary is an asynchronous replica by definition — the classic footgun is a load balancer
+  sending a read-after-write request to a secondary that has not replayed the write yet, which
+  is a plain read-your-writes violation, not a bug in SQL Server. `sys.dm_hadr_database_replica_
+  states` reports the redo queue if you need to know how stale a secondary currently is.
+- **PostgreSQL.** Streaming replication is asynchronous by default; getting a synchronous
+  standby needs both `synchronous_standby_names` set and `synchronous_commit` at `on` or
+  stronger. Even then, `on` only waits for the standby to have received and flushed the WAL —
+  not to have replayed it — so a "synchronous" standby's own reads can still lag its own durable
+  log by the replay delay. That gap is easy to miss because the write path looks fully
+  synchronous from the primary's side.
+- **Redis.** Replication to replicas is asynchronous; the primary does not wait for a replica
+  ack before returning from a write. `WAIT numreplicas timeout` exists to block for
+  acknowledgements, at the cost of the round trip, and Redis's own documentation is explicit
+  that this is still best-effort, not a consistency guarantee. Redis Sentinel and Cluster
+  failover can lose the last few writes if the promoted replica had not received them — worth
+  remembering before leaning on Redis (or a Redlock-style distributed lock built on it) for
+  anything that must not silently go backwards.
+- **Cosmos DB** is the one API on this list that names these models directly: Strong, Bounded
+  Staleness, Session (the account default), Consistent Prefix, and Eventual. A request can ask
+  for something weaker than the account default, never something stronger. Session is doing the
+  work described above in "the ground floor" — read-your-writes and monotonic reads, scoped to
+  one session token. That scoping is the footgun: a session token is per-client, so a second
+  browser tab or a different device is a *different* session unless the token is explicitly
+  propagated, and "I edited my profile and my phone still shows the old one" is Session
+  consistency working exactly as documented, not a bug.
+- **Kafka.** Ordering is total within one partition and undefined across partitions — sharding
+  by the wrong key silently breaks whatever order you were relying on. `acks=all` plus
+  `min.insync.replicas` is the write-side durability quorum; `enable.auto.commit` on the
+  consumer is the classic at-most-once trap, because the offset can commit before your handler
+  has actually finished processing the record it points at. Manual commit-after-process gives
+  at-least-once, which then needs an idempotent handler to behave like effectively-once.
+- **RabbitMQ / Azure Service Bus.** Publisher confirms and consumer acks are the at-least-once
+  building blocks; classic mirrored queues have been superseded by quorum queues, which are
+  Raft-replicated and behave like the quorum arithmetic above rather than best-effort mirroring.
+  Service Bus sessions order messages within a session id only — not globally — and duplicate
+  detection has a bounded window, so "no duplicates" is a claim about that window, not forever.
+- **EF Core / `HttpClient` + Polly.** A `DbContext` pointed at a read-replica connection string
+  can return stale data immediately after a write the same request just made through the primary
+  connection — the same read-your-writes gap as the SQL Server case above, just introduced in
+  application code instead of infrastructure. A Polly retry that reissues a non-idempotent
+  `POST` after a timeout — where the original request actually succeeded server-side and only
+  the acknowledgement was lost — is the everyday version of "exactly-once is a claim to read
+  carefully": the fix is an idempotency key the server can deduplicate on, not a stronger retry
+  policy.
+
+## the same idea elsewhere
+
+| elsewhere | the cousin | the trap |
+| --- | --- | --- |
+| a CPU's [memory model](/systems/memory-model/) | sequential consistency there is the identical "one global order" this page calls sequential consistency — two cores disagreeing about a shared variable is two replicas disagreeing about a key, one layer down | a strong guarantee on one machine tells you nothing about your distributed store; a cache-coherence protocol and a consensus protocol enforce the same-sounding order through completely different mechanisms and at wildly different cost |
+| a [mutex](/systems/locks-internals/) | a distributed lock (a Redis-based lock, a Cosmos DB lease) plays the same role — keep two writers off the same thing at once | a mutex holder cannot be paused for an unbounded time by the OS and come back after everyone has moved on; a distributed lock holder can (a GC pause, a frozen VM, a partition), which is exactly why a real distributed lock needs a fencing token and a mutex never does |
+| [cache coherence](/systems/memory-hierarchy/) | MESI is a consistency protocol for cache lines — it enforces a single-writer/many-reader invariant across cores the same way a leader-based replication protocol enforces it across machines | MESI is hardware, sub-microsecond, and invisible to your code; the equivalent invariant between replicas is a design decision you pay for explicitly, every time, over a network |
+| a [Kafka partition's](/system-design/queues-and-streams/) ordering guarantee | total order within one partition is exactly sequential consistency, scoped to one key | ordering across partitions is not guaranteed at all — resharding, or picking the wrong partition key, silently breaks an ordering invariant callers were relying on |
+
+<Watch items={[['R + W > N', 'quorum overlap is guaranteed'], ['linearizable', 'one order, real-time-consistent'], ['sequential', 'one order, not real-time-bound'], ['causal', 'related ops ordered, concurrent ops not'], ['eventual', 'converges only once writes stop'], ['PACELC else-branch', 'latency vs. consistency, no partition needed']]} />
+
+## interview drills
+
+**Q.** Your reads started returning stale data right after a failover — walk me through why.
+- *weak answer* — "the network was probably slow." No mechanism, and it does not explain why it
+  started exactly at the failover.
+- *strong answer* — the promoted replica was an asynchronous follower; it was serving as the new
+  primary before it had replayed the last few writes from the old primary's log, so those writes
+  are simply not there yet. This is the [replication](/system-design/replication/) lag window,
+  made visible by the failover rather than caused by it.
+- *follow-up* — "how would you catch this before a customer does?" Monitor replication lag as a
+  first-class metric, and compare a version/LSN token on the write against what the read replica
+  has applied before trusting a post-failover read.
+
+**Q.** Explain CAP theorem.
+- *weak answer* — "pick two of three; we chose AP." Treats CA as a real option and says nothing
+  about what happens when there is no partition, which is most of the time.
+- *strong answer* — partition tolerance is not optional once you have more than one node, so the
+  real choice is only exposed *when a partition occurs*: answer and risk staleness (available),
+  or refuse and stay correct (consistent). PACELC is the fuller model, because it also names the
+  else-branch: latency versus consistency, on a perfectly healthy network.
+- *follow-up* — "so what do you actually choose day to day, when nothing is partitioned?" The
+  PACELC else-branch: every synchronous-replication decision (wait for one follower, a quorum,
+  or all of them) is trading latency for consistency, partition or not.
+
+**Q.** Your isolation level is serializable and you still saw an anomaly across two services —
+how?
+- *weak answer* — "serializable means no anomalies, so this must be a bug in the database."
+- *strong answer* — serializable holds inside one transaction manager's boundary. The instant a
+  workflow spans two services with two separate databases (or a database and a queue), nothing
+  is left enforcing a single order across that boundary — that gap is exactly what
+  [transactions and isolation](/system-design/transactions/) stops covering and this page's
+  vocabulary starts.
+- *follow-up* — "how would you close that gap?" An explicit pattern for it — an outbox table plus
+  a consumer, or a saga — not a stronger isolation level, because isolation level was never the
+  thing spanning the boundary.
+
+**Q.** `N = 5`, `W = 2`, `R = 2`. What can go wrong?
+- *weak answer* — "that's a majority-ish split, should be fine."
+- *strong answer* — `W + R = 4`, which is not greater than `N = 5`, so overlap between a read
+  quorum and a write quorum is not guaranteed. A read can land entirely on the three replicas
+  that never received the latest write, and the client has no way to tell.
+- *follow-up* — "you need fast reads but can tolerate slower writes — what would you pick
+  instead?" `R = 1`, `W = N` — reads hit any single replica cheaply, writes wait on all of them,
+  and the tradeoff is now explicit rather than accidental.
+
+**Q.** The message queue says "exactly-once delivery." Do you trust that claim?
+- *weak answer* — "sure, the vendor says so."
+- *strong answer* — exactly-once *delivery* over an unreliable network is not achievable in
+  general. What a real system provides is at-least-once delivery plus idempotent processing, or
+  effectively-once semantics inside one system's own transactional boundary (Kafka's idempotent
+  producer plus transactional offsets, for example) — and that boundary usually ends at the
+  handler's own side effects.
+- *follow-up* — "how do you make your handler idempotent?" A deduplication key the handler
+  checks and records atomically with its own side effect, so a redelivered message is a no-op on
+  the second attempt.
+
+**Q.** Cosmos DB is set to Session consistency; a user edits their profile on one device and
+still sees the old value on a second device seconds later — bug?
+- *weak answer* — "yes, Session consistency should make that instant."
+- *strong answer* — no: Session guarantees read-your-writes and monotonic reads *within one
+  session token*, and a second device is a different session unless that token was explicitly
+  propagated to it. This is the documented boundary of the guarantee, not a failure of it.
+- *follow-up* — "how would you make it consistent across devices?" Propagate the session token
+  through a shared store the client can read on any device, or step the account up to Bounded
+  Staleness or Strong for that data if per-device propagation is not practical.

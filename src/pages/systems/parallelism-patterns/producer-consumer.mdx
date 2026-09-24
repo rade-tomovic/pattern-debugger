@@ -1,0 +1,312 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: parallelism-patterns
+problem: producer-consumer
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import Solution from '@components/Solution.astro';
+
+## the code
+
+A two-stage pipeline of the kind that shows up in every ingestion service: one stage produces
+messages, another does the expensive part. They are decoupled by a `Channel<T>` so the fast stage
+never waits on the slow one, both stages are genuinely concurrent, the producer completes the
+writer in a `finally` so a fault cannot hang the consumer, and the whole thing is `async` all the
+way down. This would pass review.
+
+<Solution>
+
+```csharp
+using System.Threading.Channels;
+
+sealed class Msg
+{
+    public int Id;
+    public byte[] Payload;                       // 8 KiB — a deserialized request body
+    public Msg(int id) { Id = id; Payload = new byte[8192]; Payload[0] = (byte)id; }
+}
+
+static class Pipeline
+{
+    const int Items = 100_000;
+    public static long Sink;
+
+    static async Task Produce(ChannelWriter<Msg> w)
+    {
+        try
+        {
+            for (int i = 0; i < Items; i++)
+                await w.WriteAsync(new Msg(i));
+        }
+        finally { w.Complete(); }                // a producer fault must not hang the consumer
+    }
+
+    static async Task Consume(ChannelReader<Msg> r)
+    {
+        await foreach (var m in r.ReadAllAsync())
+        {
+            Thread.SpinWait(1200);               // a fixed amount of CPU work: the slow stage
+            Sink += m.Payload[0];
+        }
+    }
+
+    public static async Task Main()
+    {
+        var ch = Channel.CreateUnbounded<Msg>();
+        var prod = Task.Run(() => Produce(ch.Writer));
+        var cons = Task.Run(() => Consume(ch.Reader));
+        await Task.WhenAll(prod, cons);
+    }
+}
+```
+
+</Solution>
+
+That is the shape under test. The file that actually ran is
+`bench/parallelism-patterns/producer-consumer.cs`, which is this code plus a monitor thread that
+samples the queue depth and heap size on a fixed interval, and two command-line arguments so the
+channel shape can be varied without changing anything else:
+
+```
+DOTNET_GCHeapHardLimit=C000000 dotnet run bench/parallelism-patterns/producer-consumer.cs -c Release -- unbounded 0
+```
+
+`0xC000000` is 192 MiB of managed heap. That environment variable is this container standing in
+for a pod memory limit — it makes visible in a short, controlled run what a production
+container makes visible at three in the morning.
+
+## find it
+
+<Callout kind="insight" label="before you scroll">
+  There is no race here. No lock, no shared mutable state, no `volatile` question, and the code
+  produces the correct answer every time it completes. It also cannot survive.
+
+  Two things to work out. **One:** the consumer does real, fixed work per message and the producer
+  does almost none — an allocation and a channel write. Which one determines how fast the *queue*
+  grows, and which one determines how fast it *drains*?
+
+  **Two:** the pipeline is `async` throughout and nothing blocks, so which line is supposed to
+  make the producer slow down when the consumer cannot keep up? Find the line. It is not there.
+</Callout>
+
+## the failure
+
+Real output, `unbounded`, 192 MiB heap limit. The growth phase, verbatim (the sample column is an
+ordinal — one row per monitor tick — not a timestamp):
+
+```text
+mode: unbounded   heap limit: 192 MiB
+ sample  produced  consumed     depth   heap MB   gen2
+      1      5878       644      5234        42      1
+      2     10460      1180      9280        77      1
+      3     16414      1884     14530       118      2
+      4     22271      2304     19967       164      3
+      5     25957      2866     23091       184      4
+      6     25957      3614     22343       184      4
+     10     25957      6679     19278       184      4
+     20     25957     14457     11500       184      4
+     30     25957     22354      3603       184      4
+     34     25957     25515       442       184      4
+FAILED   produced 25,957   consumed 25,957   peak depth 23,091   peak heap 184 MB   gen2 collections 4
+System.OutOfMemoryException: Exception of type 'System.OutOfMemoryException' was thrown.
+```
+
+The state table, read as a machine rather than as a log — every row is a real sample from the run
+above:
+
+| sample | produced | consumed | queue depth | heap | what changed |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 5,878 written | 644 taken | 5,234 | 42 MB | both stages running; the gap opens immediately |
+| 2 | 10,460 | 1,180 | 9,280 | 77 MB | gen2 collection #1 — the queue is now old enough to survive gen0 and gen1 |
+| 4 | 22,271 | 2,304 | 19,967 | 164 MB | most of the heap budget spent on messages nobody has looked at yet |
+| 5 | 25,957 | 2,866 | 23,091 | 184 MB | peak: the producer has just stopped — `new byte[8192]` cannot be satisfied |
+| 10 | 25,957 (flat) | 6,679 | 19,278 | 184 MB | producer dead; consumer alone is draining the backlog, heap not shrinking |
+| 30 | 25,957 (flat) | 22,354 | 3,603 | 184 MB | still draining; the process is about to exit anyway, from the exception already thrown |
+| 34 | 25,957 (flat) | 25,515 | 442 | 184 MB | last sample before the drain finishes — moot, the process already failed at sample 5 |
+
+The producer's `produced` count stops changing at sample 5 and never moves again; the consumer's
+`consumed` count keeps climbing on its own for the rest of the run, draining a queue that nothing
+is refilling any more. Every one of the 23,091 messages queued at the peak was **fully reachable**
+— sitting in the channel's internal buffer, referenced from a live object — which is why the four
+gen2 collections that ran before the crash (the full-heap kind) freed essentially nothing before
+the process ran out of room to allocate the next `Msg`.
+
+## why it breaks
+
+**A queue between two stages is a rate converter with no gears.** The consumer's rate is set by
+its own fixed per-message work and by whatever else is running on the box at the time. The
+producer's rate is set by `new byte[8192]` and a channel write — cheap, and nothing in the loop
+ever waits for the consumer. Those two rates do not have to agree, and nothing in the program
+makes them agree. Every message the producer gets ahead by is 8 KiB that stays reachable from the
+channel's internal segment list until the consumer gets to it — so a growing gap between
+`produced` and `consumed` is, byte for byte, a growing live heap.
+
+**The GC cannot help, and its failure to help is instructive.** By the time the process dies the
+collector has run several gen2 collections — the full-heap kind — and freed almost nothing,
+because every one of those queued messages is *reachable*: the channel is alive, the message is
+in the channel. [What the GC actually does](/systems/gc-internals/) is reachability, not
+usefulness, and "nobody has got round to this yet" is not a state it can distinguish from "in
+use". The collections are pure cost on top of the problem: each one traces a heap that is mostly
+one enormous live set, and the CPU it burns is CPU the consumer does not get, which makes the gap
+*wider*, not narrower.
+
+**`WriteAsync` on an unbounded channel never yields.** That is the mechanical answer to the second
+question in the callout. `Channel.CreateUnbounded` returns a writer whose `TryWrite` always
+succeeds, so `await w.WriteAsync(...)` completes synchronously, every time, forever. The `await`
+keyword is there in the source and does nothing at runtime — the producer's loop is a tight
+synchronous loop that happens to be spelled with `async`. There is no line that can slow the
+producer down because *the design has no such line*.
+
+Replace the channel with a bounded one and the same `await` becomes real: when the queue is full,
+`WriteAsync` returns an incomplete `ValueTask`, the producer's state machine parks, and it resumes
+only when the consumer has taken something out.
+[The async state machine](/systems/threads-and-scheduling/async-state-machine/) is what that
+parking physically is — no thread is blocked, the continuation is a registered callback. **That is
+backpressure**: the consumer's rate propagating backwards up the pipeline, one queue slot at a
+time.
+
+<Callout kind="trap" label="what unbounded means">
+  An unbounded queue does not mean "this queue has no limit". It means the limit is now the
+  process's memory, it is enforced by the runtime's heap limit or the kernel's OOM killer, and the
+  enforcement action is termination. You did not remove the bound; you moved it somewhere with a worse error message
+  and no ability to push back.
+</Callout>
+
+## the fix
+
+One line. The pipeline code is untouched.
+
+<Solution>
+
+```csharp
+// The only change. Everything else — Produce, Consume, Msg — is identical.
+var ch = Channel.CreateBounded<Msg>(new BoundedChannelOptions(64)
+{
+    FullMode = BoundedChannelFullMode.Wait,      // the producer waits. this IS the backpressure.
+});
+```
+
+</Solution>
+
+Run under the same 192 MiB limit, real output:
+
+```text
+mode: bounded(64)   heap limit: 192 MiB
+ sample  produced  consumed     depth   heap MB   gen2
+      1       760       695        65         6      0
+      2      1536      1471        65         0      0
+     10      7634      7569        65         1      0
+    128     97886     97821        65         2      0
+    129     98658     98593        65         8      0
+    130     99425     99360        65         2      0
+DONE   produced 100,000   consumed 100,000   peak depth 65   peak heap 12 MB   gen2 collections 0   checksum 12742320
+```
+
+The depth column reads 65 in every sample of the whole run: 64 slots in the channel plus one
+message the consumer is actively holding while it works. That is what a pipeline in equilibrium
+looks like — the producer stays exactly one queue's worth ahead of the consumer and not one
+message further. Zero gen2 collections across the whole run, against four before the unbounded
+run had even finished producing: nothing here ever accumulates enough live garbage to trigger
+one, because nothing is ever more than 65 messages ahead.
+
+The exact capacity is not critical, and that is a relief. What matters is that a bound exists at
+all: any capacity from a few dozen to a few thousand keeps the queue's memory footprint bounded
+and gives the producer somewhere to feel the backpressure. Very small capacities such as
+`bounded(1)` are the one shape worth avoiding on their own terms, for a different reason than
+memory — every single message becomes an individual wait-and-wake round trip between producer and
+consumer, which is [the granularity problem](/systems/parallelism-patterns/) applied to a queue
+instead of a loop: a hand-off paid once per item instead of amortized. `SingleWriter` and
+`SingleReader` hints on `BoundedChannelOptions` let the channel skip some interlocked bookkeeping
+when true; whether they are worth setting is a question about the shape of your producers and
+readers, not about this bug.
+
+**The two fixes people reach for first, and why neither is one:**
+
+*"Add more consumers."* More consumers narrow the rate gap between producer and consumer; they do
+not close it by construction, and a gap of any size times unbounded time is unbounded memory.
+Worse, this fix *looks* like it works in a short test — the queue grows more slowly — which is
+exactly how it gets to production. Adding consumers is a fine second step once there is a bound;
+it is not a substitute for one.
+
+*"Raise the memory limit."* A bigger heap converts a fast failure into a slower one — the same
+growth curve, a bigger ceiling to hit before it does. It buys time to notice, not correctness, and
+every byte of the extra headroom is live queue for as long as the run lasts, not spare capacity
+for anything else the process might need. The completion time is set by the *consumer's* rate
+either way — an unbounded queue does not make the consumer faster, it just gives the mismatch
+somewhere bigger to hide before the crash.
+
+The third option, worth knowing because sometimes it is right: `BoundedChannelFullMode.DropOldest`
+or `DropWrite`, which keep the bound and throw messages away instead of making the producer wait.
+For telemetry, metrics and live-view feeds that is the honest choice — data that is stale is
+worthless anyway. For anything you promised to process, it is a silent data-loss bug wearing the
+costume of a fix. `Wait` is the default you should have to argue your way out of.
+
+<Watch items={[['unbounded outcome', 'OutOfMemoryException, every run'], ['peak queue depth, unbounded', '23,091 (this run) — grows with time, not bounded'], ['peak queue depth, bounded(64)', '65 — capacity + 1 in flight, every run'], ['peak heap, bounded(64)', 'flat, low double-digit MB'], ['gen2 collections, unbounded vs bounded(64)', '4 vs 0, this run'], ['what a growing produced-consumed gap means', 'that many × 8 KiB of live, reachable heap']]} />
+
+## what this looks like in prod
+
+The signature is a **memory graph that climbs while every other metric looks healthy**. CPU
+normal, latency normal, error rate zero, throughput exactly as designed — because the producer's
+latency is fantastic; it never waits for anything. Then the pod is OOM-killed, the restart is
+clean, the graphs reset, and the incident review concludes "memory leak, needs investigation". It
+is not a leak. Every byte is reachable, correctly, on purpose. It is a rate mismatch being stored.
+
+The .NET shapes that do this, in rough order of how often they turn up:
+
+- `Channel.CreateUnbounded<T>()` — the one demonstrated here.
+- `new BlockingCollection<T>()` with no bounded capacity, which is the same bug with an older API.
+- A TPL Dataflow `ActionBlock` or `BufferBlock` with default options: `BoundedCapacity` defaults
+  to `DataflowBlockOptions.Unbounded`.
+- `Task.Run` in a loop, or `foreach (var x in items) _ = ProcessAsync(x);` with nothing awaited —
+  the queue here is the thread pool's own work queue plus every captured state machine, and the
+  symptom adds thread-pool starvation to the memory growth. See
+  [thread-pool starvation](/systems/threads-and-scheduling/threadpool-starvation/).
+- An in-memory outbox, retry buffer or batch accumulator that flushes on a timer, where the
+  arrival rate can exceed the flush rate.
+
+What to instrument, in order of value: **queue depth as a gauge**, exported continuously — this is
+the one metric that would have made the run above obvious from its very first samples; **the time
+producers spend waiting on the bound**, which is your early warning that the consumer is falling
+behind; and heap size, which tells you about it last and least usefully, because by the time heap
+alone looks wrong the queue has already been growing for a while.
+
+The design rule that follows: **every queue in the system has a number on it**, and somebody has
+decided what happens when it is full — wait, drop, or reject upstream. A queue whose fullness
+behaviour has never been specified has specified it by default, and the default is "die".
+
+## the same idea in other languages
+
+| language | what it's called | the trap |
+| --- | --- | --- |
+| Go | `make(chan T, n)` for a buffered channel, `make(chan T)` for an unbuffered one | Go has no unbounded channel at all, so this page's bug is unwriteable there — but the default is the *other* extreme: `make(chan T)` blocks the sender until a receiver is ready, which is maximum backpressure and can serialize two stages that were supposed to overlap. Go's version of this incident is an unbounded *slice* that a goroutine appends to |
+| Java | `ArrayBlockingQueue` and `LinkedBlockingQueue` from `java.util.concurrent`, plus Reactive Streams for the async form | `new LinkedBlockingQueue<>()` with no capacity argument defaults to `Integer.MAX_VALUE` — unbounded in practice. Worse, `Executors.newFixedThreadPool(n)` uses exactly that queue internally, so a fixed pool with a bounded thread count has an unbounded backlog. Reactive Streams exists because of precisely this problem: `request(n)` is backpressure expressed as a protocol |
+| Python | `asyncio.Queue(maxsize=...)`, `queue.Queue(maxsize=...)` | both default to `maxsize=0`, which means *unbounded*, not "empty" — the single most misread default in the standard library. `await queue.put(item)` on an unbounded `asyncio.Queue` never yields, exactly as `WriteAsync` never yields here, so the producer coroutine can starve the consumer coroutine as well as the heap |
+| Node.js | streams with `highWaterMark`, and the return value of `writable.write()` | `write()` returns `false` when the buffer is over the watermark and you are expected to stop and wait for the `drain` event — but ignoring the return value is legal and compiles, which makes backpressure opt-in. `pipe()` and `pipeline()` honour it for you, which is why the advice is always to use them rather than writing the loop |
+
+## common bugs
+
+- **Reading "unbounded" as "no limit" instead of "the limit is the heap".** The bound did not go
+  away; it became the container's memory limit, and it is enforced by termination rather than by
+  waiting.
+- **Adding consumers instead of a bound.** More consumers narrow the rate gap; they do not close
+  it by construction, and any positive gap sustained long enough fills any queue. Judging the fix
+  by peak queue depth judges nothing under a heap limit — that number is decided by the limit
+  divided by the message size, not by how good the fix is.
+- **Sizing the bound by "how many messages we expect" rather than by memory.** The number that
+  matters is capacity × message size — 64 × 8 KiB is half a megabyte, and 100,000 × 8 KiB is 800.
+  Pick the bound by multiplying, not by intuition about volume.
+- **Trusting an `await` to yield.** `await w.WriteAsync(x)` on an unbounded channel completes
+  synchronously every time, so the producer's loop never gives up its thread. `async` is not
+  concurrency by itself; it is concurrency only where something in the `async` chain can actually
+  suspend, and an unbounded channel's writer never gives it a reason to.
+- **Forgetting to complete the writer in a `finally`.** If the producer throws before reaching
+  `w.Complete()`, the consumer's `ReadAllAsync` waits for more input forever and `Task.WhenAll`
+  never returns — the process stays alive and idle, with no error logged anywhere. A crash that
+  turns into a silent hang is strictly worse than a crash.
+- **Measuring the queue's depth by subtracting two counters read separately.** The monitor thread
+  in this demonstration does exactly that: it reads `produced`, then `consumed`, and the consumer can
+  advance in between — which is why the bounded run's depth column can read slightly off from the
+  true capacity-plus-one on some samples. Fine for a graph, wrong for an assertion; use
+  `reader.Count` if you need the exact number.

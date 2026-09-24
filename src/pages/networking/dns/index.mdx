@@ -1,0 +1,667 @@
+---
+layout: '@layouts/TopicLayout.astro'
+topic: dns
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import Solution from '@components/Solution.astro';
+
+## the ground floor
+
+- **Packet, header, payload and best-effort delivery** come from
+  [what a network actually is](/networking/network-basics/). Everything below is those, arranged.
+- **An IP address identifies an interface** — 32 bits for IPv4, 128 for IPv6.
+  [IP addresses, subnets and routing](/networking/ip-and-routing/) owns them. This page is only
+  about where the one you connect to came from.
+- **A port is a 16-bit field in a UDP or TCP header**, and the four-tuple is what the kernel
+  demultiplexes on — [ports and sockets](/networking/ports-and-sockets/). DNS lives on port 53 of
+  both protocols.
+- **UDP hands over one datagram, whole or not at all; TCP hands over a byte stream with no
+  message boundaries** — [TCP and UDP](/networking/tcp-and-udp/). DNS uses both, for a reason
+  that is entirely about size.
+- **MTU is the largest payload one link will carry**, and something has to happen when a payload
+  exceeds it — [the link layer](/networking/link-layer/). That constraint shapes the DNS wire
+  format more than anything else does.
+- **A syscall is the door into the kernel** —
+  [processes, threads and the kernel](/systems/process-and-thread/). Resolving a name is a
+  library call in your own address space that usually ends in one.
+
+## core idea
+
+DNS is a distributed database keyed on a name, and the only reason it is interesting is that **no
+single machine holds it**. The tree is cut into zones, each zone is delegated to a set of
+authoritative servers by its parent, and finding an answer means walking down that delegation
+chain until somebody says "I am authoritative for this, here is the record".
+
+Nobody walks the whole chain most of the time, because every answer arrives stamped with a TTL
+and every participant caches it. That single design decision buys the system its scale and hands
+you every operational problem it has: **there is no invalidation.** You cannot tell a resolver
+you do not own that a record changed. You can only wait for its copy to expire. Almost every DNS
+incident a .NET service has is that sentence, plus one .NET-specific twist where the address
+outlives even the cache — a pooled connection that never re-resolves at all.
+
+## how it actually works
+
+### the namespace is a tree, and the dot at the end is real
+
+Read a name right to left. `app.example.com.` is the label `app` inside `example` inside `com`
+inside the root, whose label is empty — which is what the trailing dot is. Every name in the DNS
+is absolute and ends at the root; the trailing dot is normally dropped when humans write it, and
+the stub resolver puts it back. That is not trivia: a name written *with* the dot is absolute and
+skips the search-list machinery below, and one written without it may not be.
+
+A **domain** is a subtree. A **zone** is the part of a subtree one set of authoritative servers
+is actually responsible for. They differ wherever a **delegation** happens: the `com` zone does
+not contain `example.com`'s records, it contains `NS` records naming the servers that do, and a
+query that lands at `com` gets a **referral** instead of an answer.
+
+There is one bootstrapping wrinkle worth knowing, because it explains a whole section of `dig`
+output. If `example.com`'s nameservers are themselves named `ns1.example.com`, then resolving
+them requires already knowing where `example.com` is served — circular. The parent zone breaks
+the loop by publishing their addresses too, as **glue records**, alongside the delegation.
+
+### the walk, once, cold
+
+This is the whole mechanism. Nothing is cached anywhere yet:
+
+```text
+  A COLD LOOKUP — app.example.com, nothing cached at any level
+
+  your process
+      │   Dns.GetHostAddressesAsync("app.example.com")
+      │   an ordinary library call, in your own address space
+      ▼
+  STUB RESOLVER  — libc's getaddrinfo, linked into your process
+      reads /etc/hosts first, then /etc/resolv.conf for a server to ask.
+      It cannot follow a referral. It knows exactly one trick: "go ask".
+      │
+      │  (1)  one UDP datagram to the configured resolver, port 53
+      │       QUESTION  app.example.com.  IN  A
+      │       header bit RD = 1  — "recursion desired: you do the work"
+      ▼
+  RECURSIVE RESOLVER
+      │
+      ├── cached, and TTL not expired?  ── YES ──►  jump straight to (6).
+      │                                            Steps (2)-(5) never
+      │                                            happen. This is THE
+      │                                            SHORT CIRCUIT, and it
+      │                                            is the common case.
+      │
+      ▼   NO — walk the delegation chain, one level at a time
+      │
+      │  (2)  → a ROOT server                                   RD = 0
+      │        Q: app.example.com. A
+      │        A: no ANSWER.  AUTHORITY: NS records for com.
+      │                       ADDITIONAL: glue addresses for them
+      │
+      │  (3)  → a .COM TLD server                               RD = 0
+      │        Q: app.example.com. A
+      │        A: no ANSWER.  AUTHORITY: NS for example.com.
+      │                       ADDITIONAL: glue addresses for them
+      │
+      │  (4)  → example.com's AUTHORITATIVE server              RD = 0
+      │        Q: app.example.com. A
+      │        A: ANSWER, aa = 1:  app.example.com. TTL IN A 203.0.113.10
+      │
+      │  (5)  the resolver caches every record it was handed, the
+      │       delegations included, each under its own TTL — which is why
+      │       the next lookup anywhere in .com skips (2), and the next one
+      │       inside example.com skips (2) and (3)
+      ▼
+  (6)  resolver → stub: one UDP datagram back. ANSWER: A 203.0.113.10
+  (7)  stub → your process: an IPAddress, or a small array of them
+  (8)  ONLY NOW does anything connect. The TCP handshake to
+       203.0.113.10:443 is a separate protocol and separate round trips,
+       and it is not this page
+```
+
+
+Say the two words precisely, because interviews turn on them and most people have them backwards:
+
+- **The stub asks recursively.** It sets `RD = 1` and expects a final answer. It is incapable of
+  following a referral. That is the entire contract.
+- **The recursive resolver iterates.** It sets `RD = 0` and asks servers that will answer or
+  refer, one hop down the tree at a time, until it is holding an authoritative answer. Root and
+  TLD servers do not recurse for anybody; refusing to is what keeps them cheap enough to exist.
+
+So "recursive" describes the *request* the stub makes, and "iterative" describes the *work* the
+resolver does on its behalf. Both words are about the same lookup.
+
+### where the stub gets its server
+
+Here is `/etc/resolv.conf` on the Linux box these pages were written on:
+
+```text
+nameserver 8.8.8.8
+nameserver 8.8.4.4
+options timeout:2 attempts:3
+```
+
+Two servers, tried in order, with a fallback to the second when the first does not answer.
+`attempts` is a *count*: with two nameservers listed and three attempts, glibc's resolver will
+put an unanswered query on the wire up to six times — three rounds over the two servers —
+before the caller sees a failure. That is worth internalising because of what it implies — **a
+DNS query that goes unanswered has already been retried underneath you**, and by the time
+`Dns.GetHostAddressesAsync` gives up on a timeout, the stub has spent a retry budget you did not
+configure and cannot see. An answer is different: a `SERVFAIL` sends the stub to the next
+nameserver, and an `NXDOMAIN` comes straight back on the first response without touching the
+budget at all — which is one more reason `NXDOMAIN`, `SERVFAIL` and a timeout are three different
+diagnoses.
+
+Two things are absent from this file and both are informative. There is no `search` line, so no
+name gets suffixed with anything — the simple case. And the servers are real remote addresses
+rather than `127.0.0.53`, which means there is no `systemd-resolved` on this box and therefore
+**no OS-level cache in the path at all**: every miss in the process goes straight out to the
+network. A desktop Linux box, a Windows machine, or a Kubernetes pod all have something in that
+slot, and the difference is exactly the difference between three cache levels and four.
+
+<Callout kind="trap" label="ndots, and the pod that asks several questions to get one answer">
+  A Kubernetes pod's `resolv.conf` carries the opposite of the file above: a `search` list of
+  cluster domains and `options ndots:5`. `ndots` is a threshold — a name containing *fewer* dots
+  than that is treated as relative and tried against each search domain in turn before it is ever
+  tried as written. So `api.internal`, with one dot, gets appended to each search suffix first,
+  and each of those attempts is a separate query that comes back `NXDOMAIN`. glibc asks for `A`
+  and `AAAA` both, so the count doubles again. The fix costs one character: write the name with a
+  trailing dot, `api.internal.`, and it is absolute, the search list is skipped, and there is one
+  question instead of several. This is also why `svc-a.default.svc.cluster.local` — four dots,
+  still under five — costs a cluster extra queries compared with the same name written with the
+  dot on the end.
+</Callout>
+
+### the records, and what each is for
+
+A record is a `(name, class, type, TTL, data)` tuple. Class is always `IN` in practice. These are
+the types worth knowing cold:
+
+| type | what it is for |
+| --- | --- |
+| `A` | the name's IPv4 address — 32 bits of data, and what most lookups are actually for |
+| `AAAA` | the name's IPv6 address — 128 bits. A dual-stack client asks for both and picks |
+| `CNAME` | "this name is an alias for that name" — the resolver restarts the lookup at the target |
+| `NS` | which servers are authoritative for a zone. This is what a delegation physically is |
+| `MX` | where to deliver mail for this domain, with a preference number to order the candidates |
+| `TXT` | arbitrary text. In practice: SPF, DKIM, DMARC, and domain-ownership proofs for every SaaS you have ever onboarded |
+| `SRV` | service location — protocol, port and target host for a named service, so the port is discovered rather than assumed |
+| `PTR` | the reverse map, address back to name, published under `in-addr.arpa` and `ip6.arpa` |
+| `SOA` | the zone's start-of-authority record: the primary server, the contact, the serial, the secondary-sync timers, and the `MINIMUM` field that governs negative caching |
+
+Two rules about `CNAME` cause real outages, and they are the same rule twice:
+
+1. **A `CNAME` cannot coexist with any other record at the same name.** If `www.example.com` is a
+   `CNAME`, it cannot also carry a `TXT`, an `MX`, or an `A`. The alias replaces the name's
+   entire existence, it does not decorate it. (DNSSEC signature records are the narrow exception,
+   and they are not something you author by hand.)
+2. **Therefore a `CNAME` cannot sit at a zone apex.** The apex — `example.com` itself, with no
+   label in front — is required to carry the zone's `SOA` and its `NS` records. Rule 1 says a
+   `CNAME` there would exclude them. So it is forbidden, and no amount of arguing with the
+   provider's UI changes it.
+
+That is the mechanism behind a very common ticket: `www.example.com` can be pointed at a CDN with
+a single `CNAME`, and `example.com` cannot be pointed anywhere the same way. The answers
+are provider-side inventions with names like `ALIAS`, `ANAME`, or "CNAME flattening" — the
+provider resolves the target itself and publishes the resulting addresses as ordinary apex `A`
+and `AAAA` records, re-resolving on its own schedule. It looks like a `CNAME` in the control
+panel and it is not one on the wire.
+
+### TTL, and the four places your answer might come from
+
+Every record carries a TTL: a count of seconds, in a 32-bit field that RFC 2181 pins to its
+bottom 31 bits. It means "you may keep this for this long", and each cache that receives a record
+starts *its own* countdown and hands the *remaining* time to whoever asks it next.
+
+```text
+  ONE RECORD, FOUR INDEPENDENT COUNTDOWNS
+  (the bars are relative — this page does not deal in durations)
+
+  AUTHORITATIVE ZONE     app.example.com.  A  203.0.113.10   TTL = T
+        │
+        │  nobody below is ever notified of anything. Each cache starts
+        │  its own clock when IT received the record, and serves only the
+        │  remainder to whoever asks it next.
+        ▼
+  recursive resolver     [##############################]  filled first
+     (the one that walks;
+      8.8.8.8 for the box above)
+        ▼
+  intermediate forwarder [########################]        filled later
+     (a pod's CoreDNS, a corporate
+      resolver, a home router)
+        ▼
+  OS-level cache         [##################]              later still
+     (systemd-resolved, nscd, the
+      Windows DNS Client service —
+      absent on the container above)
+        ▼
+  your process           (no countdown of any kind)
+     (an open pooled connection that
+      already resolved; a dictionary
+      of addresses you wrote yourself)
+
+  change the record now and every level keeps serving the old answer until
+  its own bar empties — at four different moments. The process has no bar
+  at all: an open connection re-resolves when it is closed and replaced,
+  and not one moment sooner.
+```
+
+
+Three consequences fall straight out of that picture.
+
+**A change lands at different times for different people, and that is not "propagation".** The
+word suggests something spreading outward from the zone. Nothing spreads. Each cache independently
+stops lying at its own moment, determined by when *it* last asked, so two users on the same office
+network can see different answers for as long as the longest TTL in the chain.
+
+**You lower a TTL before a migration, not during one.** The TTL that governs how long the old
+answer survives is the one that was *already cached* when you made the change — the new, lower
+value cannot reach a cache that is not asking yet. So the sequence is: lower the TTL, wait out
+the old TTL so every cache has re-fetched and is now holding the short one, then make the change,
+then raise it again once the dust settles. Doing it in the other order buys you nothing at all,
+and is the single most common self-inflicted DNS outage in a cutover.
+
+**A low TTL is a request, not a guarantee.** Resolvers are permitted to clamp: some floor very
+short TTLs upward to protect themselves, some cap very long ones. Plan the cutover around what
+you can prove, which is the direction of the mechanism, not around the exact number you published.
+
+Negative answers are cached too, which surprises people the first time a record they just created
+stays invisible. When a server answers `NXDOMAIN` (or `NOERROR` with an empty answer section), it
+includes the zone's `SOA` in the authority section, and the caching lifetime for that *absence* is
+the `SOA` record's `MINIMUM` field, capped by the TTL of the `SOA` record itself. So the
+turnaround on "I created it and it still says it doesn't exist" is governed by a number in a
+record you never look at — which is exactly the same trap as
+[negative caching](/system-design/caching/) anywhere else, with the difference that here you
+cannot flush it.
+
+### transport: why a name lookup cares about MTU
+
+A DNS query goes out as **one UDP datagram to port 53**, and the answer comes back as one. That
+is the right default — a lookup is a single small request/response with no state worth a
+handshake, and re-asking costs exactly one more datagram, where recovering it over TCP would
+cost a three-way handshake before the question could even be posed.
+
+The historic constraint is that a DNS message carried over UDP was capped at 512 bytes, which
+keeps the whole datagram — 512 plus 8 bytes of UDP header plus 20 of IPv4 — inside the 576-byte
+datagram every IPv4 host is required to accept, so it never depends on reassembly. Over TCP there
+is no such cap: the message is length-prefixed and may run to 65,535 bytes. When a UDP answer does
+not fit, the server sends back what it can with the **`TC` (truncated) flag set**, and that flag
+means exactly one thing to the client: *ask again over TCP*. So the fallback is not a failure
+path, it is the protocol working — **DNS is both, always has been**, and a firewall rule that permits UDP 53 while blocking TCP 53
+produces the memorable failure where small answers work and large ones do not.
+
+**EDNS0** is the extension that made the 512-byte UDP limit negotiable. The client attaches an
+`OPT` pseudo-record to the additional section advertising a larger UDP payload size it is willing to
+receive, along with room for extended response codes and flags (the `DO` bit, which asks for
+DNSSEC records). Advertise too large a size and the reply exceeds the path MTU, gets fragmented
+by IP, and fragments are dropped by a great many middleboxes — which is why operational practice
+moved from advertising very large sizes toward conservative ones that fit a typical path. This is
+the same MTU story as everywhere else, arriving at the application layer; the mechanism lives on
+[the link layer](/networking/link-layer/) and
+[IP and routing](/networking/ip-and-routing/).
+
+Two more transports exist and both are about privacy rather than size, because plain DNS is
+cleartext and every hop can read and rewrite it: **DoT** (DNS over TLS) on **port 853**, and
+**DoH** (DNS over HTTPS) on **port 443**, indistinguishable from ordinary web traffic, which is
+simultaneously its selling point and the reason network operators dislike it. Zone transfers
+between a primary and its secondaries (`AXFR`, `IXFR`) use TCP, because they are bulk.
+
+### the four answers you can get, and what each one rules out
+
+This is the most useful table on the page, because the distinction is diagnostic rather than
+cosmetic — each row deletes a different part of the search space:
+
+| what you get back | what it means | what it eliminates |
+| --- | --- | --- |
+| `NXDOMAIN` (RCODE 3) | a server authoritative for the zone stated that this name does not exist | the network, your resolver, and the zone's servers are all fine. It is a typo, a missing record, or a search-suffix mangling the name. Nothing to fix on the transport |
+| `NOERROR` with an empty answer | the name exists, but not with the type you asked for — "NODATA" | also not a transport problem. The classic case is a name with an `A` and no `AAAA`, hit by a client that asked `AAAA` first |
+| `SERVFAIL` (RCODE 2) | your resolver could not produce an answer: an upstream refused or failed, the zone's servers are unreachable *from the resolver*, or DNSSEC validation failed | not a typo. Ask a *different* resolver and ask the authoritative server directly — if the direct query answers, the problem is your resolver's path, not the zone |
+| nothing at all, to the timeout | no datagram came back. Your query died on the way out or the answer died on the way back | this eliminates almost nothing, which is the point — it is the same "silence teaches you least" lesson as a dropped `SYN` in [ports and sockets](/networking/ports-and-sockets/). Suspect the resolver address, a firewall rule on 53, or a network policy |
+
+The pairing to carry: **an answer means something is alive and told you something. Silence means
+your packet is gone and you have learned nothing.** [Seeing the network](/networking/network-troubleshooting/)
+builds the whole checklist on that shape.
+
+### reading `dig`, without pretending to have run it
+
+`dig` sends one DNS query and prints the response section by section. Below is an **annotated
+schematic** — not a captured session. The names are placeholders, the addresses come from the
+documentation ranges, and every value is illustrative:
+
+```text
+  ANNOTATED SCHEMATIC — illustrative, not a transcript
+
+  $ dig @198.51.100.53 app.example.com A
+
+  ;; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 41234
+  ;; flags: qr rd ra; QUERY: 1, ANSWER: 2, AUTHORITY: 0, ADDITIONAL: 1
+     └─ qr = this is a response      rd = recursion was desired (you asked)
+        ra = recursion available     aa = ABSENT, so this answer is not
+                                          authoritative: it came from the
+                                          resolver's cache or its own walk
+
+  ;; OPT PSEUDOSECTION:
+  ; EDNS: version: 0, flags: do; udp: 1232
+     └─ the EDNS0 OPT record: the largest UDP answer this side will accept,
+        and the DO bit asking for DNSSEC records
+
+  ;; QUESTION SECTION:
+  ;app.example.com.               IN   A
+     └─ echoed back verbatim. If this does not read the way you expected,
+        a search suffix rewrote your name and that IS the bug
+
+  ;; ANSWER SECTION:
+  app.example.com.        300     IN   CNAME  edge.cdn.example.net.
+  edge.cdn.example.net.   60      IN   A      203.0.113.10
+     └─ the chain, in the order the resolver followed it. The middle column
+        is the REMAINING TTL, not the published one — ask twice and if the
+        number has gone DOWN you were served from cache; if it is back at
+        its full value, this answer was just fetched
+
+  ;; AUTHORITY SECTION  and  ;; ADDITIONAL SECTION:
+     └─ neither is printed here, which the counts above already said. On a
+        REFERRAL, or when you query the authoritative server directly, these
+        two sections appear and are the whole point — a cached answer from a
+        resolver usually carries neither. A referral's authority section is
+        the list of servers to ask next,
+
+           example.net.        172800  IN   NS   ns1.example.net.
+           example.net.        172800  IN   NS   ns2.example.net.
+
+        and its additional section is the glue: the addresses of exactly
+        those nameservers, volunteered so you do not have to ask for them
+
+           ns1.example.net.    172800  IN   A    198.51.100.10
+           ns2.example.net.    172800  IN   A    198.51.100.11
+```
+
+The four questions each variant answers:
+
+- `dig name A` — "what does my configured resolver currently believe", cache included.
+- `dig @server name A` — "what does *that specific server* say", which is how you separate a
+  broken resolver from a broken zone. Point it at one of the zone's own nameservers — the `NS`
+  records a referral hands you — and you have bypassed every cache in the chain.
+- `dig +trace name` — "do the iterative walk yourself, from the root, printing each referral".
+  This is the diagram at the top of this page, executed and shown one step at a time, and it is
+  how you find which delegation is wrong.
+- `dig -x 203.0.113.10` — the reverse lookup, which is just a `PTR` query against the
+  `in-addr.arpa` name built from the address.
+
+`nslookup` asks the same questions with a friendlier and much less precise output; when the two
+disagree about what happened, believe `dig`.
+
+### the .NET surface
+
+Resolving a name from C# is one call, and it goes through the OS stub resolver — so `/etc/hosts`,
+`/etc/resolv.conf`, the search list and the OS cache all apply, exactly as they would to any other
+program on the box:
+
+<Solution>
+
+```csharp
+using System.Net;
+using System.Net.Sockets;
+
+// getaddrinfo underneath. One name legitimately answers with several
+// addresses, of both families — this is not an error case, it is the
+// normal shape, and whoever connects has to choose.
+IPAddress[] addresses = await Dns.GetHostAddressesAsync("app.example.com");
+
+foreach (IPAddress address in addresses)
+{
+    // InterNetwork = IPv4, from an A record.
+    // InterNetworkV6 = IPv6, from an AAAA record.
+    Console.WriteLine($"{address}  {address.AddressFamily}");
+}
+```
+
+</Solution>
+
+What that would print, for a dual-stack name, is one line per address — say
+`203.0.113.10  InterNetwork` followed by an `InterNetworkV6` line — and those are examples, not a
+capture. Two things about that surface are worth knowing before you build on it. It returns
+**addresses, not records**: there is no TTL anywhere in the result, because you did not query DNS,
+you asked the OS to resolve a name. And a failure surfaces as a `SocketException` with
+`SocketError.HostNotFound` — the same exception type as a connect failure, which is why
+distinguishing "the name did not resolve" from "the address did not answer" in a log means
+reading the `SocketError`, not the message.
+
+<Callout kind="trap" label="the two ways to get HttpClient wrong, and they are opposites">
+  **A `new HttpClient()` per request** opens a fresh connection per call and drops it. Every one of
+  those spends a client ephemeral port and holds it through `TIME_WAIT` after close, so under load
+  `connect` eventually has nothing to hand out — on Linux a `SocketException` carrying
+  `SocketError.AddressNotAvailable`, which is a message about addresses caused by a shortage of
+  ports. That
+  mechanism belongs to [ports and sockets](/networking/ports-and-sockets/).
+
+  **A single `HttpClient` held for the life of the process** fixes that and creates the opposite
+  problem. Its handler owns a connection pool, and a pooled connection is bound to the address it
+  originally resolved. While that connection stays healthy and in use, nothing in the stack has any
+  reason to ask DNS anything ever again. The record's TTL is irrelevant — it governs caches, and
+  this is not a cache, it is an open socket. Publish a new address, retire the old backend, and
+  this process keeps talking to it until the connection breaks on its own.
+
+  So "always use a singleton `HttpClient`" is half of the advice, and the half that gets stated
+  without its condition.
+</Callout>
+
+The knob that closes the second jaw is on the handler, not on the client:
+
+<Solution>
+
+```csharp
+using System.Net.Http;
+
+static HttpClient CreateClient(Uri baseAddress, TimeSpan pooledConnectionLifetime)
+{
+    var handler = new SocketsHttpHandler
+    {
+        // The ONLY bound on how stale a pinned address can get. Past this age
+        // a connection is not handed to another request: it is closed as soon
+        // as it stops being in use, and the next request through the pool has
+        // to resolve the name again. The default is Timeout.InfiniteTimeSpan
+        // — that is, never.
+        PooledConnectionLifetime = pooledConnectionLifetime,
+    };
+
+    // Idle connections are already reclaimed by PooledConnectionIdleTimeout,
+    // which has a finite default. That is why the failure only shows up on
+    // BUSY connections: the idle ones do rotate, the working ones do not.
+    return new HttpClient(handler) { BaseAddress = baseAddress };
+}
+```
+
+</Solution>
+
+`IHttpClientFactory` is the answer that closes both jaws by default, and it is what you should
+reach for in an ASP.NET Core service: it hands out clients over a pooled, shared handler — so you
+get connection reuse and no port exhaustion — and it rotates the underlying handler on a lifetime,
+so the addresses get re-resolved periodically without you thinking about it. Setting
+`PooledConnectionLifetime` by hand on a long-lived handler, as above, is the same fix built
+yourself, and is what you do for a client that lives outside the DI container. Either is correct.
+Neither of them is "make it static and stop thinking about it".
+
+Choose the lifetime with one more thing in mind: an intermediate NAT device, load balancer or
+firewall keeps its own idle state for your connection and will drop it silently when its own
+timeout expires, and the next request on that "still open" pooled connection gets an `RST`. The
+handling of *that* — pooling policy, keep-alive, the round-trip accounting — belongs to
+[the network path](/system-design/networking/), which is where this page hands off.
+
+## the mental model
+
+```text
+  the shape of one lookup
+
+    your code ──► stub resolver ──► recursive resolver ──► root ──► TLD ──► authoritative
+                  (asks RECURSIVELY,     (does the ITERATING,   (answer or refer; these
+                   RD = 1, cannot         RD = 0, caches         never recurse for anyone)
+                   follow a referral)     everything)
+
+    and the short circuit that makes it work at all:
+    any cache along the way with unexpired data ends the walk right there
+
+  the four caches, nearest to your code first — each with its OWN countdown
+
+    your process        an open pooled connection: NO countdown at all
+    the OS              systemd-resolved / nscd / Windows DNS Client
+    a forwarder         CoreDNS, a corporate resolver, a home router
+    the resolver        the one that actually walks the delegation chain
+
+  the rule with no exceptions
+
+    DNS HAS NO INVALIDATION. You cannot revoke an answer you already gave.
+    You can only publish a shorter TTL and wait out the longer one that is
+    already out there. Which is why the TTL comes down BEFORE the change.
+
+  the diagnostic pair
+
+    an answer (NXDOMAIN / NODATA / SERVFAIL)  something is alive and told you
+    silence to the timeout                     your packet is gone; learn nothing
+```
+
+<Watch items={[['transport', 'UDP 53 first, TCP 53 on the `TC` flag or on request'], ['DoT / DoH', 'port 853 / port 443'], ['plain DNS over UDP', 'capped at 512 bytes without `EDNS0`'], ['name limits', '63 bytes per label, 255 bytes per name'], ['`A` / `AAAA` data width', '32 bits / 128 bits'], ['who iterates', 'the recursive resolver — the stub only sets `RD`'], ['RCODEs worth knowing', '`NOERROR` 0 · `SERVFAIL` 2 · `NXDOMAIN` 3'], ['root nameservers', '13 names, `a` through `m`, each one address served by many machines'], ['negative caching lifetime', 'the `SOA` `MINIMUM` field, capped by the `SOA` record TTL'], ['`PooledConnectionLifetime` default', '`Timeout.InfiniteTimeSpan` — a busy connection never re-resolves']]} />
+
+## why you should care
+
+**The cutover that half worked.** You move a service to a new address, drop the TTL well
+beforehand, watch the old backend drain — and a stubborn slice of traffic keeps arriving at it.
+The graph is the tell: the new backend's request count rises and then plateaus below where it
+should be, while the old one holds a flat, non-decaying floor of traffic. A DNS cache produces a
+*decaying* tail, because each cache expires at its own moment and stops. A flat floor is not a
+cache at all — it is a set of processes holding open connections that will never re-resolve,
+which is the `HttpClient` trap above wearing a dashboard. The fix is a bounded
+`PooledConnectionLifetime` (or `IHttpClientFactory`) deployed *before* the next cutover; there is
+nothing you can do from the DNS side to reach a socket that is already open.
+
+**Why "restart the pod" appears to fix it.** Restarting destroys the process, and with it every
+pooled connection, every pinned address and any in-process cache. The replacement resolves from
+scratch, gets the new answer, and the incident ends — which is why the runbook says to do it and
+why the runbook is never revisited. Two things are worth being clear-eyed about. First, nothing
+was fixed: the new process pins the new address exactly as hard, and the next cutover reproduces
+the incident identically. Second, the restart only works if the *resolver's* copy has expired
+too — if the stale record is still cached at the forwarder or the recursive resolver, your fresh
+process gets the same stale answer immediately, and you now have a "the restart didn't work"
+ticket on top of the original one. That failure is diagnosed by asking the authoritative server
+directly and comparing.
+
+**A resolution failure that arrives as a connection error.** `Dns.GetHostAddressesAsync` and the
+socket path both throw `SocketException`, so a name that failed to resolve and an address that
+refused a connection look alike in an unstructured log line. Log the `SocketError` value:
+`HostNotFound` means you never got as far as the network, and no amount of staring at security
+groups will help; `ConnectionRefused` means the name resolved fine and something answered and
+said no; `TimedOut` means it resolved fine and your packet vanished. Those three route to three
+completely different investigations, and they are one property apart in code.
+
+**The code review you can now do.** A `new HttpClient()` inside a method. A `static readonly
+HttpClient` with no `PooledConnectionLifetime` and a comment saying this is best practice. A
+hostname resolved once at startup and stored in a field "to avoid the DNS lookup" — that is a
+cache with an infinite TTL and no invalidation, hand-written. A `CNAME` proposed for a zone apex.
+A cutover runbook whose first step is "change the record" rather than "lower the TTL and wait".
+A retry policy on a call that fails with `HostNotFound`, which will retry a typo several times
+before failing. And any config that hardcodes an IP address for a dependency that publishes a
+name, which converts a DNS problem you would have noticed into an outage six months later when
+somebody re-addresses the thing.
+
+Where this goes next: [the protocols on top](/networking/application-protocols/) is what was
+waiting on the answer — the request that could not be sent until a name became an address.
+[Seeing the network](/networking/network-troubleshooting/) makes "does the name resolve" the first
+rung of a ladder, because a failure there eliminates every rung above it.
+[Caching strategies](/system-design/caching/) is the same TTL bargain in a system you actually
+control, and reading the two together is the fastest way to see what DNS gave up to get its scale.
+
+## the same idea elsewhere
+
+| the idea here | where else it shows up | what carries over, and what does not |
+| --- | --- | --- |
+| a TTL on a record | a TTL on a cache entry — [caching strategies](/system-design/caching/) | the bargain is identical: bounded staleness in exchange for not asking. The difference is decisive — you can delete a key from your own Redis, and you cannot delete anything from a resolver you do not run. Expiry is the *only* invalidation DNS has, which is the whole reason the TTL must come down before the change |
+| four cache levels, any hit ending the walk | the CPU cache hierarchy — [memory hierarchy](/systems/memory-hierarchy/) | the structure is the same and the guarantee is not: hardware caches are kept consistent by a coherence protocol, so a stale line cannot be read. DNS caches have no coherence mechanism whatsoever — they diverge by design, and only expiry reconciles them |
+| a resolver's cached mapping from name to address | the ARP cache one layer down — [the link layer](/networking/link-layer/) | same shape, a learned mapping held under a timer, and the same failure, a mapping that outlives the thing it mapped. The difference is reach: an ARP entry is corrected by traffic on the same broadcast domain, while nothing on your network can correct a resolver's cache from outside |
+| several `A` records for one name, handed out in rotation | an L4 load balancer picking a backend — [the network path](/system-design/networking/) | it looks like load balancing and it is not failover. DNS has no health signal and no way to withdraw an answer a client already holds, so a dead address stays in that client's rotation until its TTL expires — which is why real failover happens at a layer that can observe health |
+| `NXDOMAIN` versus a timeout | `RST` versus silence on a TCP connect — [ports and sockets](/networking/ports-and-sockets/) | the same diagnostic logic at two layers, and worth internalising once: a response means something is alive and answered you, silence means your packet died somewhere and you have learned nothing about the far end |
+| the stub retrying underneath you | a retry policy you configured — [timeouts, retries and circuit breakers](/system-design/reliability/) | same mechanism, but this one is invisible: `attempts` in `resolv.conf` multiplied by the nameserver count is a retry budget nobody in your codebase wrote, and it is spent *inside* the call your own timeout is wrapping. Budget for it or your outer timeout is smaller than the thing it is timing |
+
+## interview drills
+
+**Q.** We changed an A record and some users are still hitting the old server. What is happening?
+
+- *weak answer* — "DNS propagation, it always takes a while to spread." There is no propagation and
+  nothing is spreading. The follow-up asks what is physically holding the old value, and there is
+  nothing under this answer to hold it up.
+- *strong answer* — Nothing propagates; caches expire. The old record was already cached at
+  several independent levels — a forwarder, the recursive resolver, the OS, each having started
+  its own countdown when it fetched — so each stops lying at its own moment, and users diverge
+  until the longest of those runs out. What matters is the TTL that was in force *before* the
+  change, not the one I published with it. And if some clients never recover, it is not a cache at
+  all: it is a process holding open connections that were pinned to the old address at connect
+  time.
+- *follow-up* — "So how should the cutover have been done?" Lower the TTL, wait out the *old* TTL
+  so every cache is holding the short one, then change the record, then restore the TTL.
+
+**Q.** Why can't I point `example.com` itself at my CDN with a CNAME?
+
+- *weak answer* — "The registrar doesn't allow it." True and incidental; the follow-up is "why
+  not", and it is not a policy.
+- *strong answer* — A `CNAME` cannot coexist with any other record at the same name — the alias
+  replaces the name rather than decorating it. A zone apex is required to carry the zone's `SOA`
+  and its `NS` records, so a `CNAME` there would exclude the two records that make the zone a
+  zone. That is why `www` is trivial to point at a CDN and the apex is not, and why providers
+  invented `ALIAS`/`ANAME`/flattening: they resolve the target themselves and publish the result
+  as ordinary apex `A` and `AAAA` records.
+- *follow-up* — "What do you give up with flattening?" The provider re-resolves on its own
+  schedule rather than the client following the alias, so the CDN's own short-TTL steering is
+  filtered through somebody else's refresh loop.
+
+**Q.** Is DNS UDP or TCP?
+
+- *weak answer* — "UDP." Half right, and the half missing is the one that causes incidents.
+- *strong answer* — Both, on port 53. A query goes out as one UDP datagram because that is the
+  right shape for a small stateless request/response. When the answer will not fit, the server
+  replies with the `TC` flag set and the client re-asks over TCP; `EDNS0` raises the UDP size
+  ceiling to make that less common. Zone transfers are TCP always, and DoT and DoH are separate
+  transports on 853 and 443.
+- *follow-up* — "What breaks if a firewall allows UDP 53 but not TCP 53?" Small answers resolve
+  and large ones fail — a name with many records, or a DNSSEC-signed zone, stops working while
+  everything else looks fine.
+
+**Q.** Your pod can't reach a service by name. Walk me through it.
+
+- *weak answer* — "Restart the pod and see." That sometimes works, which is the problem, and it
+  teaches you nothing about why.
+- *strong answer* — First I want to know which failure it is, because they eliminate different
+  things. `NXDOMAIN` means a server authoritative for the zone said the name does not exist —
+  transport is fine, so I am looking at a typo or a search-suffix rewrite, and I would check
+  whether the name has fewer dots than `ndots` and is being suffixed. `SERVFAIL` means my resolver
+  could not produce an answer, so I ask a different resolver and ask the authoritative server
+  directly to separate a resolver problem from a zone problem. A timeout means nothing came back
+  at all, which points at the resolver address in `resolv.conf`, cluster DNS being down, or a
+  network policy on port 53. Only after that do I care about the address.
+- *follow-up* — "It resolves from your laptop but not from the pod." Then it is almost certainly
+  a cluster-internal name or a split-horizon zone — one where the same name deliberately answers
+  differently depending on who asks — and the two resolvers are simply being asked different
+  questions.
+
+**Q.** How does `HttpClient` interact with DNS?
+
+- *weak answer* — "Use a singleton, it's a known issue." That is the advice that causes the other
+  half of the bug.
+- *strong answer* — There are two opposite mistakes. A client per request spends an ephemeral port
+  per call and holds it through `TIME_WAIT`, so you exhaust the range under load. A client held
+  forever pools connections, and a pooled connection stays bound to the address it resolved at
+  connect time — no TTL can touch it, because it is a socket, not a cache. The bound on that is
+  `SocketsHttpHandler.PooledConnectionLifetime`, whose default is infinite;
+  `IHttpClientFactory` sets a finite one for you and gives you pooling at the same time, which is
+  why it is the default answer rather than a singleton.
+- *follow-up* — "How would you spot the pinning in production?" A flat, non-decaying floor of
+  traffic to a retired backend after a cutover. A cache produces a tail that decays as TTLs
+  expire; an open connection produces a level line until something restarts.
+
+**Q.** What does a resolver do with a negative answer?
+
+- *weak answer* — "Nothing, it just returns the error." Then a newly created record would be
+  visible immediately, and it frequently is not.
+- *strong answer* — It caches it. An `NXDOMAIN` comes back carrying the zone's `SOA` in the
+  authority section, and the lifetime for caching that absence is the `SOA`'s `MINIMUM` field,
+  capped by the `SOA` record's own TTL. So "I created the record and it still says it does not
+  exist" is governed by a field in a record nobody looks at, and the fix is to wait it out — or,
+  better, not to query a name before you create it.
+- *follow-up* — "How is that different from `NOERROR` with no answers?" That is NODATA: the name
+  exists but has no record of the type you asked for. It is cached the same way, and it is what a
+  dual-stack client hits when it asks for `AAAA` on a name that only has an `A`.

@@ -1,0 +1,263 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: process-and-thread
+problem: syscall-cost
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import Solution from '@components/Solution.astro';
+
+## the question
+
+Write the same 1,000,000 bytes to `/dev/null` four ways — same bytes, same destination, almost
+the same loop. All that changes between the four is how the writes get batched before they leave
+your process:
+
+```text
+A  unbuffered stream, one byte per Write call
+B  64 KiB buffered stream, one byte per Write call
+C  unbuffered stream, but hand-batched into 4096-byte Write calls
+D  no stream at all — one byte into a plain byte[], so the loop never leaves your process
+```
+
+`/dev/null` is deliberate: the device discards whatever it's given without copying it anywhere, so
+there is nothing left in the picture except the crossing itself.
+
+<Callout kind="insight" label="predict first">
+  Before you scroll: how many times does each of A, B, C, D actually cross into the kernel to move
+  those million bytes? You already know a `FileStream` buffers by default, and that a buffer
+  flushes when it's full or when you call `Flush()` — work the count out from that alone for each
+  mode. Then decide the harder question: does a 4096-byte crossing cost the kernel roughly the
+  same as a 1-byte crossing, or roughly 4096 times as much? Write both answers down before you
+  scroll.
+</Callout>
+
+## the code
+
+<Solution>
+
+```csharp
+// Write the same 1,000,000 bytes to /dev/null four ways. The bytes are identical; only how
+// they're batched before crossing into the kernel changes. This program does the writing and
+// checks it completed correctly — the syscall counts that answer the question above come from
+// running the compiled version under strace, not from anything this program measures itself.
+
+const int Bytes = 1_000_000;
+byte[] one = new byte[1] { 1 };
+byte[] block = new byte[4096];
+Array.Fill(block, (byte)1);
+
+static FileStream Open(int bufferSize) =>
+    new("/dev/null", FileMode.Open, FileAccess.Write, FileShare.ReadWrite, bufferSize);
+
+// A. unbuffered, one byte per Write call — every call crosses into the kernel
+void PerByteUnbuffered()
+{
+    using var fs = Open(0);
+    for (int i = 0; i < Bytes; i++) fs.Write(one, 0, 1);
+}
+
+// B. same one-byte calls, but a 64 KiB user-space buffer absorbs 65,536 of them per crossing
+void PerByteBuffered()
+{
+    using var fs = Open(65536);
+    for (int i = 0; i < Bytes; i++) fs.Write(one, 0, 1);
+    fs.Flush();
+}
+
+// C. unbuffered again, batched by hand into 4 KiB calls
+void PerBlockUnbuffered()
+{
+    int whole = Bytes / block.Length;                  // 244 full blocks, then the remainder
+    using var fs = Open(0);
+    for (int i = 0; i < whole; i++) fs.Write(block, 0, block.Length);
+    fs.Write(block, 0, Bytes - whole * block.Length);   // exactly 1,000,000 bytes, like the others
+}
+
+// D. control: the same byte-at-a-time loop, but into a plain array — no stream, no syscall at all
+long PerByteMemoryOnly()
+{
+    var userBuffer = new byte[65536];
+    int pos = 0;
+    long sum = 0;
+    for (int i = 0; i < Bytes; i++)
+    {
+        userBuffer[pos++] = one[0];
+        sum += userBuffer[pos - 1];                     // touch every byte so the loop can't be dropped
+        if (pos == userBuffer.Length) pos = 0;
+    }
+    return sum;
+}
+
+PerByteUnbuffered();
+PerByteBuffered();
+PerBlockUnbuffered();
+var sum = PerByteMemoryOnly();
+
+if (sum != Bytes) throw new Exception($"FAIL: expected checksum {Bytes}, got {sum}");
+Console.WriteLine("PASS");
+```
+
+</Solution>
+
+## work it out
+
+Trace what each mode's `Write` call actually does, one at a time.
+
+**Mode D never opens a stream, so it never crosses at all** — 0 crossings, whatever the loop trip
+count is. This is the control: it prices the loop and the memory store on their own, with nothing
+else in the picture.
+
+**Mode A asks for `bufferSize: 0`.** Zero really does mean zero — there is no user-space buffer to
+absorb anything, so every single `Write(one, 0, 1)` call has nowhere to sit and goes straight to a
+syscall. 1,000,000 calls, predict 1,000,000 crossings.
+
+**Mode C writes 4096 bytes per call, still unbuffered.** Same reasoning, far fewer calls:
+`1,000,000 / 4096 ≈ 244.14`, so 244 full-size calls plus one short remainder call, predict 245
+crossings.
+
+**Mode B is the one that takes a second to work out.** A 65,536-byte user-space buffer absorbs
+one-byte writes until it's full, then flushes — and flushing is itself the crossing.
+`1,000,000 / 65,536 ≈ 15.26`, so the buffer fills and flushes 15 times during the loop
+(15 × 65,536 = 983,040 bytes), leaving a 16,960-byte remainder that the explicit `Flush()` at the
+end pushes out as one more call: predict 16 crossings.
+
+Before checking any of that against a real trace, look at what the *default* buffer does — this
+is the detail that trips people up, because "unbuffered" is not the default. A plain `FileStream`
+constructor with no `bufferSize` argument gets .NET's 4 KiB buffer. Push 4,097 bytes one at a time
+through it, and here is the real trace, filtered to the write family:
+
+```text
+--- one more (the 4096th) ---
+--- and one more (the 4097th) ---
+--- dispose/flush ---
+pwrite64(22, "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"..., 4096, 0) = 4096
+pwrite64(22, "\0", 1, 4096)             = 1
+```
+
+Two crossings for 4,097 one-byte calls: the buffer holds the first 4,096 silently, and it's the
+4,097th call — the one that finds no room — that triggers the flush, not the call that filled the
+buffer. It empties on the write that has nowhere to go, not the moment it becomes full. Dispose
+then flushes the trailing byte. So "unbuffered `FileStream`" is something you have to ask for;
+`bufferSize: 0` or `1` is the actual review trigger, not a missing argument.
+
+And the control comparison that isolates the crossing from everything else — three unbuffered
+calls against three buffered ones, same bytes, same device:
+
+```text
+--- three unbuffered writes ---
+pwrite64(32, "x", 1, 0)                 = 1
+pwrite64(32, "x", 1, 1)                 = 1
+pwrite64(32, "x", 1, 2)                 = 1
+--- three buffered writes ---
+--- flush ---
+pwrite64(32, "xxx", 3, 0)               = 3
+```
+
+Three calls into the unbuffered stream, three syscalls. Three calls into the buffered stream, zero
+syscalls, until the explicit flush produces exactly one. Same three bytes, same three `Write`
+calls at the C# level — the only thing that changed is how many times the *kernel* saw them.
+
+## the answer
+
+Running all four full-scale modes under `strace -c`, filtered to the syscall that actually moves
+the bytes (`pwrite64` — .NET issues the positional write rather than plain `write` for a seekable
+handle, so a `FileStream` can track its own position without a separate `lseek`):
+
+```text
+mode A — unbuffered, 1 byte per Write     :  1,000,000 pwrite64 calls
+mode B — buffered 64 KiB, 1 byte per Write:         16 pwrite64 calls
+mode C — unbuffered, 4096 bytes per Write :        245 pwrite64 calls
+mode D — no stream, no syscall            :          0 pwrite64 calls
+```
+
+Every prediction lands exactly: A and C follow straight from "no buffer, no absorption," and B's
+16 matches the 15 automatic flushes of the full 64 KiB buffer plus the one final explicit
+`Flush()` for the 16,960-byte remainder.
+
+Now the harder half of the prediction. **A 4096-byte crossing and a 1-byte crossing are close in
+cost, not 4096 times apart.** The reasoning: the fixed part of a syscall — the privilege-level
+switch, saving your registers so the kernel can use its own, whatever entry/exit mitigation work
+this CPU's kernel does — happens once per crossing and does not care how many bytes you handed it.
+The only part of the cost that scales with payload is copying those bytes somewhere, and
+`/dev/null` discards its input without meaningfully copying it anywhere at all, so on this device
+that variable part is close to nothing for either call. Mode C isn't cheap *per byte* because it
+moves bytes efficiently; it's cheap in total because it crossed the boundary 245 times instead of
+a million. **The lever is calls, not bytes.**
+
+## why it works that way
+
+[Processes, threads and the kernel](/systems/process-and-thread/) shows the actual instruction and
+what it does: a privilege-level switch to ring 0, a jump to a fixed kernel entry point, your thread
+now running kernel code on a separate kernel stack. None of that work depends on the syscall's
+arguments — the CPU doesn't know or care whether you asked to write one byte or four thousand until
+the kernel-side code actually reads which syscall it was and what its arguments are. What *does*
+scale with the arguments is whatever the specific syscall does with them: a `write` to a real file
+has to copy your bytes into the kernel's page cache, and a bigger buffer means more copying.
+`/dev/null` is the one target where that variable part is close to zero, which is exactly why it
+isolates the fixed part so cleanly here — on a real file or socket, expect the variable part to
+matter more as payloads grow, without changing the basic shape: fewer, bigger calls still beat
+more, smaller ones, because the fixed part you avoid paying scales with the *call count* either
+way.
+
+This generalizes past I/O: **whenever a fixed per-operation cost dominates, the only lever that
+moves the total is the number of operations.** Batching database round trips, coalescing log
+writes, sending one network message instead of ten — same arithmetic, different constant.
+
+<Watch items={[['bytes moved, every mode', '1,000,000'], ['crossings, mode A (1 byte/call, no buffer)', '1,000,000'], ['crossings, mode B (64 KiB buffer)', '16'], ['crossings, mode C (4096 bytes/call, no buffer)', '245'], ['crossings, mode D (no stream)', '0'], ['default FileStream buffer', '4 KiB'], ['syscall for a positional write on this box', 'pwrite64, not write']]} />
+
+## what this looks like in prod
+
+The symptom is *system* CPU time, not user CPU time. A service burning a large share of its cores
+inside the kernel is not running your C# for that share; `sy` in `top`, or `stime` in
+`/proc/PID/stat`, is the number to look at, and no amount of optimizing the code *between* the
+calls will move it.
+
+The usual sources, in the order they show up in real services: a logger that flushes every line; a
+socket write per message instead of per batch; a `FileStream` opened with `bufferSize: 0` or `1`,
+or with a buffer far smaller than the writes going through it, or wrapped in code that calls
+`Flush()` inside the loop; `Console.Out` in a hot path (it is autoflushing, so every line is a
+crossing); reading a stream a few bytes at a time; and a database or cache client used one row at a
+time inside a `foreach`. To confirm rather than guess, `strace -c -f -p PID` for a few seconds
+gives you a syscall histogram — the *counts* are what you want out of it.
+
+Two traps worth knowing before you start "fixing" this. Async does not remove the crossing:
+`WriteAsync` changes which thread waits for the completion, not whether the program enters the
+kernel — [threads and scheduling](/systems/threads-and-scheduling/) is where that distinction
+actually pays off. And a sandboxed environment makes each crossing do more work, because a seccomp
+filter runs on every syscall entry — the same code takes a harder path in a hardened container than
+it does on a laptop.
+
+The fixes are the same three moves every time: buffer (a `BufferedStream`, a `PipeWriter`, a
+logger's batching sink), batch (build N messages, send once), or move the boundary outward (send
+bigger units and let the far end split them). All three trade crossings for a memory copy, which
+this page just showed you is the cheap side of that trade.
+
+## the same idea in other languages
+
+| language | what it's called | the trap |
+| --- | --- | --- |
+| C | `FILE*` from `fopen` is buffered; a raw descriptor from `open` plus `write(2)` is not | `setvbuf` only works before the first read or write on the stream, and `stderr` is unbuffered by definition — a debug loop writing to stderr is one syscall per message |
+| Go | `os.File.Write` is a direct syscall; `bufio.Writer` is the buffer you have to add yourself | nothing flushes a `bufio.Writer` for you, so a missing `defer w.Flush()` silently truncates the tail of the output rather than failing |
+| Java | `FileOutputStream.write` goes straight out; `BufferedOutputStream` and `BufferedWriter` are the wrappers | `System.out` is a `PrintStream` with autoflush enabled, so a `println` per iteration is a syscall per iteration no matter how fast the rest of the loop is |
+| Python | `open()` returns a buffered object by default; `buffering=0` is legal only in binary mode | the same script has different syscall counts interactively and piped, because stdout is line-buffered on a terminal and block-buffered otherwise — which is why output "disappears" until the process exits |
+
+## common bugs
+
+- **Assuming a buffered stream does less work, rather than fewer crossings.** The buffer doesn't
+  make the write itself cheaper; it turns many syscalls into a memory copy plus one syscall. And if
+  you stop looking before `Flush()` or dispose runs, the crossing you meant to account for hasn't
+  happened yet.
+- **Benchmarking against a real file instead of `/dev/null`.** Then you are also measuring the page
+  cache and eventual writeback, which happen on their own schedule, outside your loop entirely.
+  [Virtual memory](/systems/virtual-memory/) is where that cache lives.
+- **Tracing with `strace` and treating it as free.** Every syscall becomes at least two extra stops
+  for the tracer — entry and exit — so a program run under `strace -c` is a fine way to *count*
+  crossings and a bad way to reason about anything else about the run.
+- **Assuming `async` removes the boundary.** `WriteAsync` on a `FileStream` still ends in the same
+  `pwrite64`; what changes is which thread is parked while it completes, not whether the kernel
+  gets crossed into.
+- **Reasoning per byte when the cost is per call.** A benchmark that varies payload size while
+  holding the call count fixed will show you almost nothing, because the fixed part of the cost —
+  the part this whole page is about — doesn't move with payload. Vary the call count instead.

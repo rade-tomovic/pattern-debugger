@@ -1,0 +1,307 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: gc-internals
+problem: generations-in-action
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import Solution from '@components/Solution.astro';
+
+## the question
+
+Three loops. Each runs 2,000,000 times, does the same arithmetic, and produces the same total.
+The only thing that differs is what happens to the object each iteration touches.
+
+```text
+churn    every iteration allocates an Entry and drops it immediately
+retain   every iteration allocates an Entry and stores it in an array that outlives the loop
+reuse    one Entry is allocated before the loop and mutated 2,000,000 times
+```
+
+`churn` and `retain` allocate exactly the same number of objects and exactly the same number of
+bytes. `reuse` allocates nothing at all. This is the difference between a request handler that
+builds a DTO and throws it away, one that adds it to a cache, and one that writes into a pooled
+buffer.
+
+<Callout kind="insight" label="predict first">
+  Commit to three things before scrolling.
+
+  **One:** for each pattern, how many gen0, gen1 and gen2 collections will the 2,000,000
+  iterations cause? Write down nine numbers.
+
+  **Two:** `reuse` allocates nothing. Does it cause zero collections, or a small number? Reason
+  it out from what actually triggers a collection.
+
+  **Three:** which of the three ends the run with the most objects sitting in gen2, and why —
+  reason it from what survival does to an object's generation, not from a guess.
+</Callout>
+
+## the experiment
+
+The exact file that produced every number below —
+`dotnet run bench/gc-internals/generations-in-action.cs`:
+
+<Solution>
+
+```csharp
+// The exercise for /systems/gc-internals/generations-in-action/.
+//   dotnet run bench/gc-internals/generations-in-action.cs
+using System;
+using System.Runtime.CompilerServices;
+
+const int N = 2_000_000;                     // allocations (or loop turns) per pattern
+
+Console.WriteLine($"runtime={System.Runtime.InteropServices.RuntimeInformation.FrameworkDescription}  " +
+                  $"cores={Environment.ProcessorCount}  serverGC={System.Runtime.GCSettings.IsServerGC}");
+
+// ── the three patterns ───────────────────────────────────────────────────────
+
+// A. churn — every object is dead before the next one is born
+[MethodImpl(MethodImplOptions.NoInlining)]
+static long Churn(int n)
+{
+    long sum = 0;
+    for (int i = 0; i < n; i++)
+    {
+        var e = new Entry(i, i * 2);
+        sum += e.Value;                      // used, then unreachable
+    }
+    return sum;
+}
+
+// B. retain — every object is kept forever (a cache with no eviction)
+[MethodImpl(MethodImplOptions.NoInlining)]
+static long Retain(int n, Entry[] keep)
+{
+    long sum = 0;
+    for (int i = 0; i < n; i++)
+    {
+        var e = new Entry(i, i * 2);
+        keep[i] = e;                         // still reachable when the loop ends
+        sum += e.Value;
+    }
+    return sum;
+}
+
+// C. reuse — one mutable object, no allocation at all
+[MethodImpl(MethodImplOptions.NoInlining)]
+static long Reuse(int n, Entry scratch)
+{
+    long sum = 0;
+    for (int i = 0; i < n; i++)
+    {
+        scratch.Key = i;
+        scratch.Value = i * 2;
+        sum += scratch.Value;
+    }
+    return sum;
+}
+
+// ── harness ──────────────────────────────────────────────────────────────────
+var keep = new Entry[N];                     // allocated once, before any pattern runs
+var scratch = new Entry(0, 0);
+
+Console.WriteLine("\n  pattern | allocated MB | gen0 | gen1 | gen2 | heap after MB");
+foreach (string pattern in new[] { "churn", "retain", "reuse" })
+{
+    Array.Clear(keep);
+    GC.Collect(2, GCCollectionMode.Forced, blocking: true);
+    GC.WaitForPendingFinalizers();
+    GC.Collect(2, GCCollectionMode.Forced, blocking: true);
+
+    long a0 = GC.GetAllocatedBytesForCurrentThread();
+    int c0 = GC.CollectionCount(0), c1 = GC.CollectionCount(1), c2 = GC.CollectionCount(2);
+
+    double sink = pattern switch
+    {
+        "churn" => Churn(N),
+        "retain" => Retain(N, keep),
+        _ => Reuse(N, scratch),
+    };
+
+    long alloc = GC.GetAllocatedBytesForCurrentThread() - a0;
+    int g0 = GC.CollectionCount(0) - c0, g1 = GC.CollectionCount(1) - c1, g2 = GC.CollectionCount(2) - c2;
+    Console.WriteLine($"  {pattern,-7} | {alloc / 1048576.0,12:F1} | {g0,4} | {g1,4} | {g2,4} | " +
+                      $"{GC.GetTotalMemory(false) / 1048576.0,13:F1}");
+    GC.KeepAlive(sink);
+}
+
+class Entry(int key, long value)
+{
+    public int Key = key;
+    public long Value = value;
+}
+```
+
+</Solution>
+
+## what it controls for
+
+**The three loops do identical work apart from the lifetime.** Same iteration count, same
+arithmetic, same `Entry` type, same field writes. `churn` and `retain` even allocate the same
+number of objects — the `Retain` loop's only extra instruction is the array store, and the array
+it stores into is allocated once, before any pattern runs, so its own allocation is never charged
+to a pattern.
+
+**The result is consumed.** Each loop returns a running `sum` that is accumulated into `sink` and
+passed to `GC.KeepAlive`. Without that, the JIT is entitled to notice that `Reuse` produces
+nothing anybody reads and delete the loop, and a benchmark that measures a deleted loop reports
+whatever number you were hoping for. [Source to machine code](/systems/il-jit-codegen/) is where
+that class of lie lives.
+
+**Every pattern starts from a clean heap.** Before each pattern runs, the keeper array is cleared
+and two full blocking collections run with a `WaitForPendingFinalizers` between them. Otherwise
+`retain`'s 61 MB of live objects would still be reachable when `reuse` starts, and would show up
+in `reuse`'s numbers even though `reuse` never touched them.
+
+**What is counted is collections and bytes, not wall time.** `GC.CollectionCount` per generation
+and `GC.GetAllocatedBytesForCurrentThread` are exact counters with no scheduler noise in them —
+they report the same numbers on every run, on any machine, which is not true of a stopwatch.
+
+## the numbers
+
+| pattern | allocated MB | gen0 | gen1 | gen2 | heap after MB |
+| --- | --- | --- | --- | --- | --- |
+| `churn` | 61.0 | 3 | 0 | 0 | 28.5 |
+| `retain` | 61.0 | 4 | 3 | 1 | 76.4 |
+| `reuse` | 0.0 | 0 | 0 | 0 | 15.3 |
+
+`churn` and `retain` allocate the identical 61.0 MB — the difference is entirely in what happens
+after. `reuse` allocates nothing and its heap-after figure is just whatever the runtime had
+resident from starting up.
+
+## why
+
+The mechanism is one sentence: **a collection's cost is proportional to what survives it, and
+survival is what promotion is made of.**
+
+### what the collector actually did in each case
+
+In `churn`, every `Entry` is unreachable before the next one is born. When gen0's budget runs
+out, the collector suspends the threads, walks the roots, finds essentially nothing alive in
+gen0, and declares the whole region free — the dead objects are **never visited**. Marking is a
+walk over live objects; garbage costs nothing to collect because the collector never learns it
+existed. 61 MB of allocation cost exactly 3 gen0 collections and nothing else — gen1 and gen2
+were never touched, because nothing was ever promoted into them.
+
+In `retain`, the keeper array is a root, so every object the loop has produced so far is
+reachable. Now a gen0 collection finds *everything* in gen0 alive: it must mark all of it and
+promote the lot into gen1. Which means the next collection has a full gen1 to deal with, and
+eventually a gen2 collection walks the whole heap — the 4/3/1 ladder above is that promotion
+cascade happening in real time, on the identical 61 MB `churn` walked away from for free.
+
+In `reuse`, there is one object. The allocation pointer never moves, so the gen0 budget is never
+exhausted, so no collection is ever triggered — not "a small number," zero, because a collection
+is triggered only by an allocation and this loop performs none. The prediction that trips people
+up here is expecting some background housekeeping to run anyway; there is none. If nothing
+allocates, nothing collects.
+
+### the promotion ladder, watched directly
+
+The same source file also tracks one deliberately-retained object across forced collections:
+
+```text
+=== one object that is never dropped, after each forced collection ===
+  freshly allocated                      gen=0
+  after gen0 collection #1               gen=1
+  after gen0 collection #2               gen=1
+  after gen0 collection #3               gen=1
+  after gen0 collection #4               gen=1
+  after a gen1 collection                gen=2
+  after a gen2 collection                gen=2
+```
+
+Surviving a collection promotes an object exactly one generation. Collections 2, 3 and 4 are
+gen0 collections, and a gen0 collection does not look at gen1 — so the object sits in gen1,
+untouched and uncounted, until something forces a gen1 collection. **That is the generational
+bet paying off**: the vast majority of collections never even glance at the data you kept.
+
+The flip side is the census of where `retain`'s 2,000,000 objects ended up:
+
+```text
+=== generation census of the 2,000,000 retained objects ===
+  gen0 431,992   gen1 522,755   gen2 1,045,253
+  heap now 76.4 MB
+```
+
+Over half of them made it all the way to gen2 inside a single loop. Everything in that column is
+now invisible to gen0 and gen1 collections, and will only be looked at again by a full
+collection. That is the third prediction, answered: `retain` is the one with the most in gen2,
+because it is the only pattern where anything survives at all, and survival is the only thing
+promotion runs on. The other two patterns' gen2 count is zero for two different reasons — nothing
+lived long enough (`churn`), or nothing was ever allocated (`reuse`) — which is worth holding
+onto, because a profiler showing "gen2: 0" does not by itself tell you which of those two stories
+you are in.
+
+### why `churn` still costs something against `reuse`
+
+61 MB of allocation is not free even when none of it survives. Every `new Entry` bumps a pointer,
+writes a 16-byte header, and zeroes the fields; that is real work and it is why `churn` still
+triggers 3 gen0 collections while `reuse` triggers none. It is also why 2,000,000 objects at
+32 bytes each streaming through the CPU's caches is a
+[memory hierarchy](/systems/memory-hierarchy/) cost sitting on top of the GC one — `reuse` keeps
+touching the same 32 bytes and they stay resident in the fastest cache the whole time; `churn`
+writes 61 MB of memory that was never in cache to begin with.
+
+That is the honest accounting of the escape hatch: pooling wins on two separate mechanisms, GC
+work and cache behaviour, and the second one is the one people forget to claim.
+
+<Watch items={[['churn', '3 gen0, nothing promoted'], ['retain', '4/3/1, half promoted to gen2'], ['reuse', '0 collections — nothing allocates'], ['bytes allocated, churn = retain', '61.0 MB'], ['gen0 budget, this box', '≈16 MB']]} />
+
+## what this looks like in prod
+
+`churn` is what a healthy service looks like: a high allocation rate, a flat heap, frequent cheap
+gen0 collections, and gen1/gen2 counts that barely move. If someone shows you a dashboard with
+tens of thousands of gen0 collections and no gen2s, nothing is wrong. Allocation rate on its own
+is not a problem.
+
+`retain` is the shape of every cache-related incident. Rising gen2 count with a rising heap means
+objects are being promoted faster than they are dying, and the usual causes are a dictionary with
+no eviction, a list that accumulates per-request state, or an object graph that outlives the
+request that made it. The metric that tells you which is `gen-2-gc-count` in
+`dotnet-counters monitor System.Runtime`; the metric that tells you it *hurts* is request latency,
+because each of those gen2 collections does mark work proportional to everything you have kept.
+When the heap stops rising but the collections keep happening, you no longer have a growth
+problem — you have a permanent tax, and the fix is to make the cache smaller, not to make the GC
+faster.
+
+`reuse` is what you are aiming for in a hot path, and it is not always achievable — the moment an
+object must outlive the call that made it, you are back in `churn` at best. But the whole family
+of .NET performance work (`ArrayPool`, `Span`, `ObjectPool`, `RecyclableMemoryStream`, struct
+enumerators, `ValueTask`) is the same move: turn allocations into reuse, and the collector has
+nothing to do.
+
+One trap worth naming: the difference between `churn` and `retain` is invisible in a code review
+that only looks at the allocating line. `var e = new Entry(...)` is identical in both. What
+differs is the line that stores it, which may be in another file, another layer, or an event
+subscription you cannot see from here — which is what
+[the leak that was not a leak](/systems/gc-internals/the-leak-hunt/) is about.
+
+## the same idea in other languages
+
+| language | what it's called | the trap |
+| --- | --- | --- |
+| Java | the same generational split (young/old, with G1's regions), the same "most objects die young" bet | the arithmetic transfers, but there is no LOH: G1 calls an object larger than half a region "humongous" and puts it straight into old-generation regions. Sizing a per-request buffer against .NET's 85,000-byte line and assuming it applies to a JVM is a mistake in both directions |
+| Go | not generational at all — one concurrent mark-sweep over the whole heap | the `retain` penalty still exists (marking cost is proportional to live objects) but the `churn` pattern is cheaper than it looks, because escape analysis keeps many short-lived allocations on the goroutine stack entirely. `go build -gcflags=-m` prints which ones escaped; C# gives you no such report for a class |
+| Python (CPython) | reference counting for the common case, plus a generational collector with three generations for cycles only | the `reuse` win is far bigger and the `churn` cost far higher, because every object carries a refcount that is incremented and decremented on every assignment. There is also no equivalent of `reuse` for integers or tuples — they are immutable, so "mutate in place" is not available |
+| C++ | no collector, so `churn` is `new`/`delete` (or a pool allocator) and `retain` is just a container that grows | the cost profile inverts: allocation is the expensive part (a real allocator search) and keeping objects alive is free, which is the exact opposite of the table above. Engineers carrying C++ intuition optimise the wrong half of a .NET hot path — they fight `new`, when the thing to fight is survival |
+
+## common bugs
+
+- **Timing an allocation loop whose result nothing reads.** The JIT can delete a loop that
+  produces no observable effect, and you will measure a benchmark of nothing. Every loop here
+  returns a sum that is accumulated and passed to `GC.KeepAlive`.
+- **Not resetting the heap between patterns**, so the second pattern pays the collection bill for
+  garbage the first one left behind. The symptom is a benchmark where the first pattern run looks
+  fine and later ones get steadily worse for no reason visible in their own code.
+- **Reading gen0 collection count on its own as a health metric.** `churn` provoked three gen0
+  collections and promoted nothing; `retain` provoked four and promoted over a million objects.
+  The count says how often; the gen1/gen2 columns say what actually got kept.
+- **Concluding "allocation is slow" from the `churn`-versus-`reuse` gap.** Most of that gap is
+  writing 61 MB of memory that was never in cache, not the allocator. The allocator itself is a
+  pointer bump.
+- **Forgetting that the keeper array is itself a survivor.** An `Entry[2_000_000]` is 16 MB, well
+  over the 85,000-byte line, so it lives on the large object heap from birth and is only ever
+  collected by a gen2. Any benchmark that allocates its own bookkeeping arrays inside the
+  measured region is measuring that too.

@@ -1,0 +1,95 @@
+---
+layout: '@layouts/TopicLayout.astro'
+topic: binary-search
+---
+
+import Callout from '@components/Callout.astro';
+import ProblemList from '@components/ProblemList.astro';
+import Cells from '@components/Cells.astro';
+
+## core idea
+
+Binary search isn't really "find a value in an array" — it's "find the point where a monotonic
+condition flips." Every problem below turns an O(n) scan into O(log n) by discarding half the
+remaining search space with a single comparison. What changes between problems is *what* you're
+searching over and *what counts as a hit*:
+
+| shape | loop | what you're finding |
+| --- | --- | --- |
+| exact match | `while (left <= right)` | one specific value's index — return the moment you hit it |
+| boundary | `while (left < right)` | the first/last index where a condition flips false → true |
+| search the answer | `while (left < right)` over a value range | the smallest/largest value for which a monotonic check passes |
+
+<Cells
+  data={[-1, 0, 3, 5, 9, 12, 20]}
+  pointers={{ 0: [{ t: 'L', c: 'amber' }], 6: [{ t: 'R', c: 'cyan' }], 3: [{ t: 'M', c: 'purple' }] }}
+  caption="one comparison at mid decides which half is provably irrelevant"
+/>
+
+## when to reach for it
+
+- The input is **sorted**, or you can define a **monotonic** predicate over it — false, false,
+  ..., false, true, true, ..., true, never flipping back.
+- You want exactly **one** occurrence of a value → exact match.
+- You want the **first or last** index satisfying some condition — an insertion point, a rotated
+  array's pivot → boundary.
+- The problem says "minimum/maximum X such that ..." and checking a single candidate X is cheap
+  → binary search the *answer*, not the array.
+- A linear scan works but every comparison feels like it should discard half the remaining
+  candidates, not just one.
+
+## universal templates
+
+Exact match — the classic form, and the one you'll instinctively reach for first:
+
+```csharp
+public int ExactMatch(int[] nums, int target)
+{
+    int left = 0, right = nums.Length - 1;
+
+    while (left <= right)                     // stop once the range is empty
+    {
+        int mid = left + (right - left) / 2;  // overflow-safe midpoint
+        if (nums[mid] == target) return mid;  // found it — stop immediately
+
+        if (nums[mid] < target) left = mid + 1;   // nums[mid] and everything left of it is too small
+        else right = mid - 1;                     // nums[mid] and everything right of it is too big
+    }
+    return -1;                                // target isn't in nums
+}
+```
+
+Boundary — never return early; narrow until exactly one candidate survives:
+
+```csharp
+public int Boundary(int[] nums, int target)
+{
+    int left = 0, right = nums.Length;        // right is one PAST the last index — exclusive
+
+    while (left < right)                      // stop when left == right: one candidate left
+    {
+        int mid = left + (right - left) / 2;
+        if (Condition(nums[mid], target))
+            right = mid;                      // mid satisfies it — it MIGHT be the boundary, keep it
+        else
+            left = mid + 1;                   // mid doesn't — the boundary is strictly after it
+    }
+    return left;                              // first index where Condition holds
+}
+```
+
+**Search the answer** reuses the *boundary* skeleton verbatim — `left`/`right` just span
+*candidate answers* instead of array indices, and `Condition` becomes a monotonic feasibility
+check like `CanFinish(mid)`. Koko Eating Bananas, below, is the template instance.
+
+<Callout kind="trap" label="the classic infinite loop">
+  In the boundary form, `mid` is **left-biased** — when `right - left == 1`, `mid == left`. Write
+  `left = mid` on the branch that discards the low half (instead of `left = mid + 1`) and `left`
+  never moves: infinite loop. The rule that keeps you safe: the branch that *keeps* `mid` in play
+  uses `right = mid` (always fine, since `mid < right`); the branch that *drops* `mid` must use
+  `left = mid + 1`, never `left = mid`.
+</Callout>
+
+## problems
+
+<ProblemList topic="binary-search" />

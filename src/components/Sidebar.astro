@@ -1,0 +1,93 @@
+---
+import { sections, topicsInSection, topicPath } from '@data/curriculum';
+import LangPicker from '@components/LangPicker.astro';
+
+const current = Astro.url.pathname;
+
+const groups = sections.map((s) => ({
+  section: s,
+  items: topicsInSection(s.id).map((t) => ({
+    tab: t.tab,
+    title: t.title,
+    path: topicPath(t),
+    active: current.startsWith(topicPath(t)),
+  })),
+}));
+---
+
+<aside
+  class="border-line sticky top-0 hidden h-dvh w-56 shrink-0 overflow-y-auto border-r px-4 py-6 lg:block"
+>
+  <a href="/" class="font-mono text-sm font-semibold tracking-tight text-ink hover:text-amber">
+    <span class="text-muted">//</span> pattern debugger
+  </a>
+  <nav class="mt-6 space-y-5" aria-label="Site">
+    {
+      groups.map((g) => (
+        <div>
+          <p class="font-mono text-[0.65rem] tracking-[0.12em] text-muted uppercase">
+            {g.section.title}
+          </p>
+          <ul class="mt-1.5 space-y-0.5">
+            {g.items.map((i) => (
+              <li>
+                <a
+                  href={i.path}
+                  title={i.title}
+                  aria-current={i.active ? 'page' : undefined}
+                  class:list={[
+                    'block rounded-md px-2 py-1 font-mono text-[0.78rem] transition-colors',
+                    i.active
+                      ? 'bg-panel2 text-amber'
+                      : 'text-muted hover:bg-panel hover:text-ink',
+                  ]}
+                >
+                  {i.tab}
+                </a>
+              </li>
+            ))}
+          </ul>
+        </div>
+      ))
+    }
+  </nav>
+  <LangPicker />
+</aside>
+
+<!-- mobile nav -->
+<details class="border-line bg-panel group fixed inset-x-0 top-0 z-40 border-b lg:hidden">
+  <summary
+    class="flex cursor-pointer items-center justify-between px-4 py-3 font-mono text-sm text-ink select-none"
+  >
+    <span><span class="text-muted">//</span> pattern debugger</span>
+    <span class="text-muted group-open:hidden">≡ menu</span>
+    <span class="hidden text-muted group-open:inline">× close</span>
+  </summary>
+  <nav class="max-h-[70dvh] space-y-4 overflow-y-auto px-4 pb-6" aria-label="Site">
+    {
+      groups.map((g) => (
+        <div>
+          <p class="font-mono text-[0.65rem] tracking-[0.12em] text-muted uppercase">
+            {g.section.title}
+          </p>
+          <ul class="mt-1 space-y-0.5">
+            {g.items.map((i) => (
+              <li>
+                <a
+                  href={i.path}
+                  class:list={[
+                    'block rounded-md px-2 py-1 font-mono text-[0.82rem]',
+                    i.active ? 'bg-panel2 text-amber' : 'text-muted',
+                  ]}
+                >
+                  {i.tab}
+                </a>
+              </li>
+            ))}
+          </ul>
+        </div>
+      ))
+    }
+    <LangPicker />
+  </nav>
+</details>

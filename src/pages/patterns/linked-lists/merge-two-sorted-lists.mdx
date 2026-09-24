@@ -1,0 +1,117 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: linked-lists
+problem: merge-two-sorted-lists
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+
+## task
+
+Given the heads of two sorted linked lists, merge them into one sorted list by splicing the
+existing nodes together (no new nodes for the data itself), and return the head.
+
+```text
+list1 = [1, 2, 4], list2 = [1, 3, 4]  →  [1, 1, 2, 3, 4, 4]
+```
+
+## how to think
+
+Each list is already sorted, so merging is O(n + m): repeatedly take whichever head is smaller
+and advance that list. The annoying part is the *first* node — you don't know whether the answer
+starts with `list1`'s head or `list2`'s head until you've compared them, so hard-coding either
+one is wrong. A dummy node in front erases that decision entirely: you always write the winner
+through `tail.Next`, and `dummy.Next` is the real head once you're done, whichever list it
+happened to come from.
+
+<Callout kind="note" label="template instance">
+  **Dummy head** skeleton. Invariant: everything from `dummy.Next` through `tail` is the
+  fully-merged, sorted-so-far result; `list1` and `list2` point at whatever's left to merge, and
+  every value left in either one is `>= tail.Val`.
+</Callout>
+
+## solution
+
+```csharp
+public ListNode? MergeTwoLists(ListNode? list1, ListNode? list2)
+{
+    var dummy = new ListNode();
+    var tail = dummy;
+
+    while (list1 != null && list2 != null)
+    {
+        if (list1.Val <= list2.Val)
+        {
+            tail.Next = list1;
+            list1 = list1.Next;
+        }
+        else
+        {
+            tail.Next = list2;
+            list2 = list2.Next;
+        }
+        tail = tail.Next;
+    }
+    tail.Next = list1 ?? list2;   // splice whatever's left — it's already sorted
+    return dummy.Next;
+}
+
+// standard interview definition
+public class ListNode(int val = 0, ListNode? next = null)
+{
+    public int Val = val;
+    public ListNode? Next = next;
+}
+```
+
+## trace
+
+`list1 = [1, 2, 4]`, `list2 = [1, 3, 4]`:
+
+| step | `list1` head | `list2` head | picked | reason |
+| --- | --- | --- | --- | --- |
+| 1 | 1 | 1 | `1` from `list1` | tie — `<=` favors `list1` |
+| 2 | 2 | 1 | `1` from `list2` | `2 > 1` |
+| 3 | 2 | 3 | `2` from `list1` | `2 <= 3` |
+| 4 | 4 | 3 | `3` from `list2` | `4 > 3` |
+| 5 | 4 | 4 | `4` from `list1` | tie — `<=` favors `list1` |
+| — | `null` | 4 | splice remainder | `list1` exhausted → `tail.Next = list2` |
+
+```text
+dummy -> 1 -> 1 -> 2 -> 3 -> 4 -> [tail]        (list1 exhausted)
+list2 remaining:                       4
+
+after splice: dummy -> 1 -> 1 -> 2 -> 3 -> 4 -> 4 -> null
+```
+
+## why it works
+
+At the top of every iteration, everything already appended (`dummy.Next .. tail`) is sorted and
+consists of exactly the smallest values consumed from either list so far — call this the loop
+invariant. Each iteration extends that prefix by one node: the smaller of the two current heads,
+which must be the next-smallest value not yet used *overall*, because both `list1` and `list2`
+are individually sorted (nothing smaller remains hiding further down either list). When one list
+runs dry, the other is still fully sorted and every value in it is `>= tail.Val` — so splicing it
+on wholesale, unread, preserves the sort.
+
+<Watch items={[['time', 'O(n + m)'], ['space', 'O(1)'], ['new nodes allocated', '0 — only the dummy']]} />
+
+## common bugs
+
+- Skipping the dummy and hand-picking whichever head is smaller to seed `tail` — works, but
+  reintroduces the exact special case the dummy exists to remove.
+- Forgetting the final splice (`tail.Next = list1 ?? list2`) entirely — the merged result silently
+  stops short, missing every remaining node in whichever list wasn't exhausted.
+- Allocating brand-new nodes with `new ListNode(...)` instead of re-linking the existing ones —
+  correct, but wastes O(n + m) allocations the problem doesn't ask for.
+- Using `<` instead of `<=` on ties — not wrong, just flips which list wins a tie; pick one and
+  say so out loud if asked.
+
+## variants you can now solve
+
+- [Merge K Sorted Lists](/patterns/heap-top-k/merge-k-sorted-lists/) (LC 23) — this exact merge,
+  generalized: a min-heap picks the smallest of K heads instead of comparing 2 by hand.
+- **Sort List** (LC 148) — merge sort on a linked list; the merge step *is* this function.
+- [Add Two Numbers](/patterns/linked-lists/add-two-numbers/) (LC 2) — another dummy-head
+  problem, but one that builds brand-new sum nodes instead of splicing existing ones.

@@ -1,0 +1,323 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: concurrency-hazards
+problem: deadlock-repro
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import Solution from '@components/Solution.astro';
+
+## the code
+
+A ledger. Money moves between accounts, and both accounts have to be locked for the duration —
+otherwise a reader could see the money after it left the source and before it arrived at the
+destination, which is a balance sheet that does not balance. Two locks, both held, nothing clever.
+
+<Solution>
+
+```csharp
+class Account(int id, long balance)
+{
+    public readonly int Id = id;
+    public long Balance = balance;
+}
+
+static void Transfer(Account from, Account to, long amount)
+{
+    lock (from)
+    {
+        lock (to)
+        {
+            from.Balance -= amount;
+            to.Balance += amount;
+        }
+    }
+}
+```
+
+</Solution>
+
+This passes review, it passes its unit tests, and — as the odds table below shows — it will
+comfortably pass your load test too. The evidence for everything below is
+`bench/concurrency-hazards/deadlock-repro.cs`, which holds every variant side by side — so this
+method is called `TransferNaive` there, and the fixed one `TransferOrdered`. Two modes:
+
+```text
+dotnet run bench/concurrency-hazards/deadlock-repro.cs log
+dotnet run bench/concurrency-hazards/deadlock-repro.cs odds
+```
+
+## find it
+
+<Callout kind="insight" label="before you scroll">
+  There is no missing lock here, no unsynchronised field, and no shared state outside the two
+  accounts. Both mutations happen with both locks held.
+
+  Name the two calls that must be in flight at the same time for this to hang, and write down the
+  four-step interleaving. Then commit to a number: **how many transfers does this code complete
+  before it deadlocks, with four threads and 1,000 accounts?** Order of magnitude is enough — tens,
+  thousands, millions. That number is why the code is in production.
+</Callout>
+
+## the failure
+
+First, forced. A `Barrier` between the two acquisitions holds both threads at the exact moment
+each holds one lock, which turns a probabilistic bug into a deterministic one. Real output, real
+managed thread ids, logged with a monotonic step counter — not a clock — so what you're reading is
+the actual order events happened in, across two threads:
+
+```text
+  [  1] tid   1  main: account 1 and account 2 created, both threads about to start
+  [  2] tid   4  thread A: Transfer(1 -> 2), taking lock on account 1
+  [  3] tid   4  thread A: HOLDS 1
+  [  4] tid   5  thread B: Transfer(2 -> 1), taking lock on account 2
+  [  5] tid   5  thread B: HOLDS 2
+  [  6] tid   5  thread B: now wants lock on account 1 (held by A)
+  [  7] tid   4  thread A: now wants lock on account 2 (held by B)
+  [  8] tid   1  main: both threads returned before the watchdog fired? False
+  [  9] tid   1  main: thread A state = Background, WaitSleepJoin   alive = True
+  [ 10] tid   1  main: thread B state = Background, WaitSleepJoin   alive = True
+  [ 11] tid   1  main: balances unchanged: account 1 = 1000, account 2 = 1000
+  [ 12] tid   1  WATCHDOG: neither thread will ever run again. killing the process.
+```
+
+Both threads are `WaitSleepJoin` — parked, off the run queue, consuming nothing. Both are alive.
+The process is healthy. A health check that does not touch these two accounts answers instantly.
+The watchdog — a plain `Thread.Join` with a timeout, used only to end the demo — had to kill it.
+
+| step | thread A — `Transfer(1, 2)` | thread B — `Transfer(2, 1)` | account 1 lock | account 2 lock |
+| --- | --- | --- | --- | --- |
+| 1 | `lock (from)` where `from` is 1 — acquired | — | held by A | free |
+| 2 | — | `lock (from)` where `from` is 2 — acquired | held by A | held by B |
+| 3 | `lock (to)` where `to` is 2 — **blocks**, waiting on B | — | held by A | held by B |
+| 4 | — | `lock (to)` where `to` is 1 — **blocks**, waiting on A | held by A | held by B |
+| 5 | parked in `Monitor.Enter`, holding 1 | parked in `Monitor.Enter`, holding 2 | held by A, forever | held by B, forever |
+
+Neither thread can release what it holds, because releasing happens at the end of a block neither
+will ever reach. Now the number you predicted. Same code, no barrier, no injected delays — four
+threads picking random distinct account pairs as fast as they can, with a detector that watches
+for two consecutive polls with zero forward progress and calls that a deadlock. What is reported
+below is a COUNT — how many transfers landed before the cycle closed — never a rate:
+
+```text
+=== the SAME buggy code, by how many accounts it has to collide over ===
+    4 threads, random distinct pairs, one trial per size
+  accounts     2: DEADLOCKED — transfers completed before the stall:          141
+  accounts     8: DEADLOCKED — transfers completed before the stall:        1,738
+  accounts    64: DEADLOCKED — transfers completed before the stall:       12,690
+  accounts  1000: DEADLOCKED — transfers completed before the stall:      782,036
+
+=== the ordered version, same pressure, same detector, same account count ===
+  accounts  1000, ordered locks: no stall — detector hit its cap — transfers completed:  857,456,984
+```
+
+| accounts to collide over | deadlocked | transfers completed before the stall |
+| --- | --- | --- |
+| 2 | yes | 141 |
+| 8 | yes | 1,738 |
+| 64 | yes | 12,690 |
+| 1,000 | yes | 782,036 |
+| 1,000, ordered locks | no | 857,456,984 (detector's cap reached, never stalled) |
+
+Read the count column as an ordering, not a value: every step up in account count raised the
+number of transfers survived before the stall. That is exactly what the mechanism predicts — two
+threads have to pick *the same pair*, in *opposite order*, inside the tiny window between the two
+`lock` statements, and with `n` accounts the number of distinct unordered pairs is
+`n * (n - 1) / 2`. With 2 accounts there is exactly *one* possible pair, so every single transfer
+collides on it — only the opposite-order timing has to line up, which is why the stall came
+fastest there. With 1,000 accounts there are nearly half a million distinct pairs to spread the
+threads' random picks across, so two threads landing on the *same* pair at all is already rare
+before the timing even has to align — which is why that trial survived far longer. The exact
+counts will differ run to run, because real scheduler timing decided them, not a formula; the
+direction — more accounts, more distinct pairs, fewer collisions, longer survival — will not. The
+ordered version ran nearly a billion transfers over the same 1,000 accounts under the same
+pressure and never stalled at all, because it has no cycle to close, at any account count.
+
+That is the entire reason this bug reaches production: the probability of the cycle closing falls
+as the number of things there are to collide over rises, so making the system *more realistic*
+makes the bug *less reproducible*. The deadlock does not get rarer as you scale up; it gets rarer
+as you test — and the exact transfer count above will differ if you run the file again, because it
+depends on exactly when the scheduler interleaves two threads. What will not differ: the buggy
+version always deadlocks, eventually, and the ordered version never does, because it has no cycle
+in its wait-for graph to close.
+
+## why it breaks
+
+The four conditions from [the topic page](/systems/concurrency-hazards/) all hold, and the fourth
+is the one this code creates:
+
+- **mutual exclusion** — `Monitor` is exclusive by definition.
+- **hold and wait** — `Transfer` holds `from` while asking for `to`. That is the nesting.
+- **no preemption** — nothing can take a `Monitor` away from its owner. `Monitor.Exit` is the only
+  way out, and it is unreachable.
+- **circular wait** — and here it is. The acquisition order is `(from, to)`, which means the order
+  is chosen by *the caller's arguments*. `Transfer(a, b)` walks 1 → 2, `Transfer(b, a)` walks
+  2 → 1. Two threads walking a shared resource graph in opposite directions is a cycle waiting
+  for the two of them to be in flight simultaneously.
+
+The window is tiny: it is the handful of CPU instructions between acquiring the first lock and
+acquiring the second — the branch, the field write, the call. With 1,000 accounts, two threads must
+pick the *same pair* in *opposite orders* and both land inside that window — which is why it took
+hundreds of thousands of transfers before it happened even once. The window does not shrink when
+you add accounts. Only the chance of two threads being in it on the same pair does, and that chance
+falls as roughly the inverse square of the account count, because the number of distinct pairs to
+collide over grows as `n * (n - 1) / 2`.
+
+```text
+   thread A: lock(1) ─────╢ window ╟───── lock(2)
+   thread B:                lock(2) ─────╢ window ╟───── lock(1)
+                                    ▲
+                          both threads must be INSIDE
+                          their own window at the same
+                          instant, on the SAME pair,
+                          walking it in OPPOSITE order —
+                          that's the only way the cycle closes
+```
+
+<Callout kind="trap" label="the thing that makes it worse in a real service">
+  In the code above the critical section is two additions — the window is as small as this code can
+  make it. In a service the critical section usually contains a database call, a serialisation, a
+  log write, or a call into code somebody else owns, and the window stretches to cover however long
+  that call takes. A longer window means more opportunities for two threads to be inside their
+  windows on the same pair at once, which is exactly the event the cycle needs. "Do not do I/O
+  under a lock" is usually sold as a performance rule; it is also the mechanism that turns a
+  deadlock nobody has ever seen into one that shows up in the first week of load.
+</Callout>
+
+## the fix
+
+Break circular wait. Not by adding a lock, not by removing one: by making the acquisition order a
+property of the *accounts* rather than of the *arguments*.
+
+<Solution>
+
+```csharp
+static void Transfer(Account from, Account to, long amount)
+{
+    // The two locks are the same two locks either way. Only the ORDER changes,
+    // and now the order is a total order over accounts that every thread agrees on.
+    Account first  = from.Id < to.Id ? from : to;
+    Account second = from.Id < to.Id ? to : from;
+
+    lock (first)
+    {
+        lock (second)
+        {
+            from.Balance -= amount;      // the mutation still uses from/to, not first/second
+            to.Balance += amount;
+        }
+    }
+}
+```
+
+</Solution>
+
+A cycle in the wait-for graph needs at least one thread going "up" the order and one going "down".
+If every thread walks smallest-id first, there is no direction to disagree about, and the graph is
+acyclic by construction. Three lines, no extra lock — the ordered version ran hundreds of millions
+of transfers over the same 1,000 accounts under the same pressure with no stall, against a broken
+version that deadlocked at every account count tried.
+
+Two more details that are easy to get wrong. `Id` must be **stable and unique** — if two accounts
+share an id the comparison is not a total order and the cycle comes back. And `Transfer(a, a)`
+must be handled: with `from.Id == to.Id`, `first` and `second` are the same object, and the inner
+`lock` re-enters harmlessly because `Monitor` is reentrant — but the arithmetic then subtracts and
+adds on the same balance, which is a business bug, not a concurrency one. Reject it above the
+locks.
+
+When there is no natural key, `RuntimeHelpers.GetHashCode(obj)` gives you a stable per-object
+number. It is not guaranteed unique, so the standard pattern adds a third "tie-break" lock taken
+first when the two hashes collide.
+
+Two other fixes get proposed first, and both are worse.
+
+**One global lock over the whole ledger.** It is correct, it is one line, and it is the fix that
+gets merged at 2 a.m. It also serialises every transfer in the system, including the 999 other
+accounts that had nothing to do with any one transfer. The mechanism is structural, not something
+you need a stopwatch to see: a single `lock (GlobalGate)` gives the ledger exactly one critical
+section, so every transfer — no matter which two accounts it touches — queues behind every other
+transfer in flight anywhere in the system. The ordered version's critical sections are per pair of
+accounts: two threads only contend if they happen to pick overlapping accounts, and with 1,000
+accounts to choose two from, most random pairs of concurrent transfers touch disjoint accounts
+entirely and never wait on each other at all. That is the whole argument for per-resource locking
+over one coarse lock — it turns contention into a function of what actually overlaps, instead of a
+function of how many threads exist.
+
+**`Monitor.TryEnter` with a timeout, retry on failure.** The reason not to use it is not speed. It
+is that abort-and-retry replaces a hang with a retry storm under exactly the load that caused the
+problem in the first place — every failed attempt did real work acquiring and releasing the first
+lock, then threw that work away, which is precisely the mechanism the topic page's livelock section
+quantifies: [close to half of every attempt wasted](/systems/concurrency-hazards/), at every
+backoff length tried, when two threads settle into lockstep. `TryEnter` also needs a policy for
+what to do when retries run out — fail the request? and then what? — and it leaves the design bug
+in place: you still have two locks with no agreed order, and the next person to write a three-lock
+operation gets no warning from it.
+
+<Watch items={[['locks held at once', '2'], ['coffman conditions', '4'], ['break just', '1'], ['deadlocks, 2 accounts', 'yes, within a few hundred transfers'], ['deadlocks, 1,000 accounts', 'yes, eventually'], ['ordered, 1,000 accounts', 'never, at any account count'], ['global lock contention', 'every transfer, regardless of which accounts it touches']]} />
+
+## what this looks like in prod
+
+The signature is unmistakable once you have seen it: **latency for one group of endpoints goes
+vertical, CPU goes to near zero, thread count climbs**, and the process keeps answering health
+checks. Zero CPU is the discriminator. A lock convoy, a livelock or a retry storm all look similar
+in the latency graph and all burn CPU; a deadlock burns none, because every thread involved is
+parked in the kernel.
+
+The thread count climbs because the thread pool sees queued work and no completions, and
+injects new threads at its own throttled pace — how that injection works is covered on
+[the scheduling page](/systems/threads-and-scheduling/) — each of which eventually blocks on
+the same cycle. That is why the two symptoms co-occur, and why "we scaled out and it got
+worse" is a normal part of this incident.
+
+To confirm it, take a dump of the live process **before** restarting, because the restart destroys
+the only evidence:
+
+```text
+dotnet-dump collect -p <pid>
+dotnet-dump analyze core_XXXX
+> clrstack -all          # every managed stack; look for Monitor.Enter / SemaphoreSlim.Wait
+> syncblk                # which threads own which sync blocks — the wait-for edges
+```
+
+`syncblk` gives you the ownership side and `clrstack` gives you the waiting side; between them the
+cycle is usually readable in a minute. Then the review question is always the same: which two
+locks, and what order was each acquisition path using.
+
+The prevention that scales better than vigilance is architectural. Hold one lock, never two — most
+two-lock operations exist because state that belongs together was split across two objects. Or
+stop sharing: give each account a queue and let one worker own it, which is
+[partitioning](/systems/parallelism-patterns/) and removes the lock rather than ordering it.
+
+## the same idea in other languages
+
+| language | what it's called | the trap |
+| --- | --- | --- |
+| Java | the identical bug with `synchronized`; the JVM will *tell* you — a thread dump (`jstack`, or Ctrl-Break) runs a deadlock detector and prints "Found one Java-level deadlock" with both stacks | .NET has no equivalent built in. You get the same information from a dump plus `syncblk`, but nothing prints it for you, so people go looking for a slow query instead |
+| C++ | `std::lock(m1, m2)` takes several mutexes with a deadlock-avoidance algorithm, and `std::scoped_lock(m1, m2)` is the RAII wrapper for it | there is no such API in .NET — the ordering discipline here is manual and unenforced. C++ also gives you `std::recursive_mutex` explicitly, whereas .NET's `Monitor` is reentrant whether you wanted that or not |
+| Go | the runtime detects the *total* case: when every goroutine is asleep it panics with "all goroutines are asleep - deadlock!" | that check only fires when *nothing* can run. A two-goroutine cycle inside a live server is invisible to it, exactly as here. `sync.Mutex` is also not reentrant, so the self-deadlock version is a real risk that C# does not have |
+| Python | `threading.Lock` is not reentrant and `threading.RLock` is; the two-lock cycle behaves exactly as above | the GIL does not help at all — it serialises bytecode, not lock acquisition, so a lock-ordering deadlock in Python is the same bug with the same fix. `faulthandler.dump_traceback_later()` is the closest thing to an automatic dump |
+
+## common bugs
+
+- **Fixing the interleaving instead of the order.** Adding a `Thread.Sleep`, a retry, or a jitter
+  delay makes the forced repro stop reproducing and leaves the cycle in the code. The forced
+  version on this page uses a `Barrier` precisely so it cannot be papered over: the test either
+  passes because the order is fixed, or it hangs.
+- **Ordering by something unstable.** Sorting by `ToString()`, by a mutable name, by array
+  position, or by a hash that can collide is not a total order. Two paths that disagree about
+  which lock is "first" restore the cycle, and the resulting bug is rarer and therefore worse.
+- **Ordering only the paths you found.** Lock order is a global property: one method that takes
+  the pair the other way — a maintenance job, an admin endpoint, a `Dispose` — re-arms it.
+  Ordering must be enforced at a single choke point that every caller goes through, not repeated
+  at each call site.
+- **Calling out from inside a lock.** A callback, an event handler, an `IEnumerable` the caller
+  supplied, or a virtual method can take locks you have never heard of, in an order you cannot
+  see. Every "call into unknown code under a lock" is an unbounded extension of your lock order.
+- **Assuming a load test proves anything about this.** The odds table is the whole argument: the
+  same code deadlocked within a few hundred transfers with 2 accounts, and took hundreds of
+  thousands with 1,000. A clean test run means your test had too few collisions, not that the code
+  is correct.
+- **Treating `TryEnter` with a timeout as the fix.** It converts a hang into intermittent failures
+  and hides the missing order. Use it as a *detector* if you like — log loudly when it times out,
+  because that log line is the deadlock you have not fixed yet.

@@ -1,0 +1,405 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: gc-internals
+problem: the-leak-hunt
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import Solution from '@components/Solution.astro';
+
+## the code
+
+A pricing service, registered in the DI container with a scoped lifetime — one instance per HTTP
+request, created when the request starts and dropped when it ends. It subscribes to a
+process-wide event so that a config reload takes effect immediately instead of at the next
+deploy. This shipped, and it passed review, and the reviewer was not being careless.
+
+<Solution>
+
+```csharp
+// Raises an event whenever configuration is reloaded. One instance per process.
+static class ConfigWatcher
+{
+    public static event Action<string>? Changed;
+
+    public static void Publish(string key) => Changed?.Invoke(key);
+
+    // diagnostics only — a multicast delegate's invocation list IS its subscriber list
+    public static Delegate[] Subscribers => Changed?.GetInvocationList() ?? [];
+}
+
+// Registered as a scoped service: the DI container builds one per request.
+sealed class PricingService
+{
+    private readonly byte[] _priceTable = new byte[8 * 1024];   // per-request working set
+    private decimal _margin = 0.15m;
+
+    public PricingService()
+    {
+        ConfigWatcher.Changed += OnConfigChanged;               // stay in sync with live config
+    }
+
+    private void OnConfigChanged(string key)
+    {
+        if (key == "pricing.margin") _margin = 0.20m;
+    }
+
+    public decimal Quote(int units)
+    {
+        _priceTable[units & 8191] = 1;
+        return units * _margin;
+    }
+}
+```
+
+</Solution>
+
+The symptom in production: memory climbs steadily from the moment the pod starts, never falls,
+and is eventually OOM-killed by the orchestrator. Restarting fixes it for a few hours. There is
+no `OutOfMemoryException` in the logs and no unmanaged memory anywhere in the process.
+
+## find it
+
+<Callout kind="insight" label="before you scroll">
+  There is nothing here that fails to free memory — this is .NET, nothing frees memory. So the
+  question is not "what leaked". It is: **after a request ends, what root can still reach that
+  request's `PricingService`?**
+
+  Walk it backwards. The 8 KB `_priceTable` is reachable from the `PricingService` that owns it.
+  What is reachable from? Find the chain that ends at something the collector treats as a root —
+  a static field, a live stack slot, or a GC handle — and you have the bug.
+</Callout>
+
+## the failure
+
+Twenty thousand requests, each creating a `PricingService`, calling `Quote`, and dropping it.
+Every 5,000 requests the harness forces **two full blocking gen2 collections** with a
+`WaitForPendingFinalizers` between them, then reports `GC.GetTotalMemory(true)` — so every number
+below is the heap *after* the collector has done everything it can.
+
+`dotnet run bench/gc-internals/the-leak-hunt.cs -- broken`:
+
+```text
+runtime=.NET 10.0.11  mode=broken
+
+  requests | subscribers | live heap MB | request #1 still alive
+         0 |           0 |          0.1 | n/a
+     5,000 |       5,000 |         39.8 | True
+    10,000 |      10,000 |         79.5 | True
+    15,000 |      15,000 |        119.2 | True
+    20,000 |      20,000 |        159.0 | True
+
+  20,000 requests served, quote total 30,001,500
+  live heap grew 158.9 MB (8.1 KB per request)
+  subscribers still attached: 20,000
+  who they are: PricingService × 20,000
+  request #1's service still alive: True
+
+  a 100-request test would have grown the heap by 814 KB — inside the noise of any assertion you would write
+Unhandled exception. System.Exception: FAIL: live heap grew 158.9 MB across 20,000 request-scoped services that were all supposed to be garbage
+   at Harness.Run(String[] args)
+   at Program.<Main>$(String[] args)
+```
+
+The state table, one row per checkpoint of that real run:
+
+| requests served | subscribers on `ConfigWatcher.Changed` | live heap after a full GC | request #1's service still reachable |
+| --- | --- | --- | --- |
+| 0 | 0 | 0.1 MB | — |
+| 5,000 | 5,000 | 39.8 MB | yes |
+| 10,000 | 10,000 | 79.5 MB | yes |
+| 15,000 | 15,000 | 119.2 MB | yes |
+| 20,000 | 20,000 | 159.0 MB | yes |
+
+Three columns, three facts. The subscriber count equals the request count exactly: not one
+service has ever detached. The heap grows by 8.1 KB per request — the 8 KB `_priceTable` plus the
+service, the delegate, and the invocation list's share. And the very first request's service,
+whose HTTP response was sent 19,999 requests ago, is still reachable.
+
+<Callout kind="trap" label="why nobody caught this in test">
+  The last line of the run is the whole reason this reaches production: **100 requests grow the
+  heap by 814 KB.** Every integration test, every load test that runs for thirty seconds, every
+  local debugging session — all of them are inside the noise of any memory assertion a sane
+  person would write. The bug is not intermittent and not timing-dependent. It is perfectly
+  deterministic and perfectly invisible at test scale, because it is measured in kilobytes per
+  request and only kills you at millions of requests.
+</Callout>
+
+## why it breaks
+
+`ConfigWatcher.Changed` is a **static field**. A static field is a GC root — the collector starts
+its walk from it without being told, because a static lives as long as its type, which lives as
+long as the process.
+
+An event is a multicast delegate, and `+=` appends. So the root path is:
+
+```text
+   [static field]                                       ← a GC root
+   ConfigWatcher.Changed  (Action<string>)
+        │
+        └── invocation list  (Delegate[20,000])
+                 │
+                 ├── Action<string> #1
+                 │        └── Target ──→ PricingService #1
+                 │                            └── _priceTable ──→ byte[8192]
+                 ├── Action<string> #2
+                 │        └── Target ──→ PricingService #2 ──→ byte[8192]
+                 ⋮
+                 └── Action<string> #20,000 ──→ PricingService #20,000 ──→ byte[8192]
+```
+
+`ConfigWatcher.Changed += OnConfigChanged` does not register "a method". `OnConfigChanged` is an
+instance method, so the compiler builds a delegate object — on the heap, like every other
+delegate and closure ([the stack and the heap](/systems/stack-and-heap/) prices them) — holding
+**a reference to `this`**, and adds it to the list. The event now owns a strong reference to
+every `PricingService` ever constructed, and every one of those owns 8 KB.
+
+This is what makes it invisible to the usual reflexes:
+
+- **The collector is working perfectly.** It walked the graph, reached all 20,000 services from a
+  root, and correctly concluded that they are live. Every one of those numbers above was taken
+  *after* two forced full collections.
+- **There is no missing `free`.** Nothing was supposed to free anything.
+- **The allocating line is innocent.** `new byte[8 * 1024]` per request is normal. The line that
+  causes the leak is `ConfigWatcher.Changed += OnConfigChanged`, which allocates 64 bytes and
+  looks like plumbing.
+
+The subscriber census in the output — `PricingService × 20,000` — is the in-process version of
+what a heap dump would tell you. Enumerating `GetInvocationList()` and grouping by
+`d.Target?.GetType()` names the culprit type directly, which is worth remembering: an event is
+the one root you can interrogate from inside your own process.
+
+<Callout kind="note" label="the direction of the arrow">
+  The reflex is "the service subscribed to the event, so the service depends on the event". The
+  reference points the other way. **The publisher holds the subscriber.** A long-lived publisher
+  and a short-lived subscriber is a leak by construction, and it does not matter how careful the
+  subscriber is about its own lifetime.
+</Callout>
+
+## the fix
+
+Unsubscribe when the scope ends. The delegate that was added is stored in a field so the exact
+same delegate can be removed, and the type becomes `IDisposable` so the DI container's scope
+disposal does it for you.
+
+<Solution>
+
+```csharp
+sealed class PricingServiceFixed : IDisposable
+{
+    private readonly byte[] _priceTable = new byte[8 * 1024];
+    private readonly Action<string> _onConfigChanged;           // the exact delegate we subscribed
+    private decimal _margin = 0.15m;
+
+    public PricingServiceFixed()
+    {
+        _onConfigChanged = OnConfigChanged;
+        ConfigWatcher.Changed += _onConfigChanged;
+    }
+
+    public void Dispose() => ConfigWatcher.Changed -= _onConfigChanged;
+
+    private void OnConfigChanged(string key)
+    {
+        if (key == "pricing.margin") _margin = 0.20m;
+    }
+
+    public decimal Quote(int units)
+    {
+        _priceTable[units & 8191] = 1;
+        return units * _margin;
+    }
+}
+```
+
+</Solution>
+
+`dotnet run bench/gc-internals/the-leak-hunt.cs -- fixed`, same
+20,000 requests:
+
+```text
+  requests | subscribers | live heap MB | request #1 still alive
+         0 |           0 |          0.1 | n/a
+     5,000 |           0 |          0.1 | False
+    10,000 |           0 |          0.1 | False
+    15,000 |           0 |          0.1 | False
+    20,000 |           0 |          0.1 | False
+
+  20,000 requests served, quote total 30,001,500
+  live heap grew 0.0 MB (0.0 KB per request)
+  subscribers still attached: 0
+  who they are: (nobody)
+  request #1's service still alive: False
+
+PASS: live heap is flat across the whole run
+```
+
+158.9 MB of growth becomes 0.0 MB, and request #1's service is gone by the 5,000-request
+checkpoint. Same allocations, same work, same event — the only difference is that the root
+stops pointing at them.
+
+### the two fixes people reach for first
+
+**"Call `GC.Collect()`."** It is already being called — twice, blocking, at every checkpoint in
+the broken run, and the heap grew anyway. This is worth sitting with, because it is the single
+most common wrong instinct about managed leaks. The collector's job is to keep everything
+reachable from a root, and every one of those 20,000 services *is* reachable. Forcing a
+collection makes the collector do more work and reach exactly the same conclusion. If forcing a
+collection would have fixed it, it was never a leak.
+
+**"Unsubscribe with a lambda."** This compiles, reads correctly, and does nothing:
+
+<Solution>
+
+```csharp
+sealed class PricingServiceLambdaFix : IDisposable
+{
+    private readonly byte[] _priceTable = new byte[8 * 1024];
+    private decimal _margin = 0.15m;
+
+    public PricingServiceLambdaFix()
+    {
+        ConfigWatcher.Changed += key => OnConfigChanged(key);
+    }
+
+    public void Dispose() => ConfigWatcher.Changed -= key => OnConfigChanged(key);
+
+    private void OnConfigChanged(string key)
+    {
+        if (key == "pricing.margin") _margin = 0.20m;
+    }
+
+    public decimal Quote(int units)
+    {
+        _priceTable[units & 8191] = 1;
+        return units * _margin;
+    }
+}
+```
+
+</Solution>
+
+Run with `-- lambda`, and the output is byte-for-byte the same disaster as the broken version:
+20,000 subscribers still attached, 158.9 MB of growth, `PricingServiceLambdaFix × 20,000`. The
+reason is delegate identity. `-=` removes an entry whose delegate is **equal** to the one you
+pass, and delegate equality is `(target, method)`. Two lambdas written in two different places
+are two different compiler-generated methods, so they are never equal, and `-=` silently removes
+nothing. Verified on this machine, with
+`dotnet run bench/gc-internals/the-leak-hunt.cs -- delegates`:
+
+```text
+  baseline: 0 subscriber(s)
+  two delegates from one method group: ReferenceEquals=False, Equals=True
+  method group  += then -=  leaves 0 subscriber(s)
+  lambda        += then -=  leaves 1 subscriber(s)
+  still attached: target=<>c__DisplayClass3_0, method=<Delegates>b__0
+```
+
+Two delegates built from the same method group are two different objects (`ReferenceEquals` is
+false) that compare **equal**, so `-=` finds and removes one. Two lambdas written in two places
+are two different compiler-generated methods, so they never compare equal and the subscriber
+stays. Where those methods live depends on what the lambda captured: capture only `this` and the
+compiler puts the method on your own class — which is why the leaking run's census named
+`PricingServiceLambdaFix` as the target — while capturing a local produces a separate closure
+class, the `<>c__DisplayClass3_0` above.
+
+A method group is safe — `Changed -= OnConfigChanged` builds a *new* delegate object that is not
+reference-equal to the subscribed one but *is* `Equals` to it, so `-=` finds it. Storing the
+delegate in a field, as the fix does, makes that guarantee explicit instead of subtle, and it
+survives someone later refactoring the handler into a lambda.
+
+<Watch items={[['leak', '8.1 KB / request'], ['after 20k requests', '159.0 MB'], ['forced full GCs', 'no effect'], ['subscribers', '20,000'], ['fixed', '0.0 MB growth'], ['visible at 100 requests', '814 KB']]} />
+
+## what this looks like in prod
+
+The metric is resident memory climbing on a straight line from pod start, with a **flat** or
+gently rising GC heap *rate* — allocation looks normal, because it is normal. Gen2 collection
+count rises steadily too, and this is the tell people miss: it is not that collections stopped
+happening, it is that they stopped helping. Each one promotes another few thousand services into
+gen2 and reclaims almost nothing.
+
+Getting the mechanism right here is the difference between a diagnosis and a guess. **Marking
+visits objects, not bytes**: the collector's cost tracks the *number* of live objects it has to
+walk, not the number of megabytes they occupy. This leak's heap is almost entirely 8 KB `byte[]`
+buffers — 20,000 of them account for nearly all of the 159 MB, so the live-object count is
+roughly `20,000 services + 20,000 buffers + 20,000 delegates ≈ 60,000` objects for 159 MB. Change
+what leaks and that ratio changes with it: the identical 159 MB built out of small 32-byte objects
+instead — the `retain` pattern from
+[watching the generations](/systems/gc-internals/generations-in-action/) — is millions of objects
+for the same megabytes, and mark work scales with that object count, not the byte count. A
+service that "only" leaks small DTOs or log-scope objects is walking far more live objects per MB
+than one leaking a few large buffers, and pays for it in mark work accordingly, even though both
+dashboards would show the same growing-heap-in-MB graph.
+
+Two more things follow from the mechanism, both already established on the
+[topic page](/systems/gc-internals/): the collection this leak eventually forces is a **gen2**,
+because those 20,000 services have long since promoted out of gen0 and gen1, and gen2 is the only
+generation that ever revisits them; and whether that gen2 blocks the world or runs in the
+background depends on whether the live set has crossed the size where background GC is worth
+starting at all — a small leak can sit below that floor for a long time, taking the full blocking
+hit every time, before it ever grows large enough to qualify for the background path.
+
+The background path does not make the leak free even once it qualifies: the mark work did not
+disappear, it moved onto the cores that are also serving requests, and a rising allocation rate
+can still force a blocking collection at the worst possible moment. The service gets slower at the
+tail long before it dies, and the graph that shows it is request latency, not memory.
+
+One more reason the memory graph misleads: the number your orchestrator kills you on is
+*resident set*, which is not the GC heap and does not fall the moment a collection frees
+something — [virtual memory](/systems/virtual-memory/) is where those numbers come apart. A pod
+can be killed while `GC.GetTotalMemory` looks entirely reasonable.
+
+Finding it in a real process, in the order you should actually try:
+
+1. **Two heap dumps, twenty minutes apart, and diff the object counts.** `dotnet-gcdump collect`
+   is enough; the type whose count grew by exactly the number of requests served is your answer.
+2. **`gcroot` on one instance of that type** in `dotnet-dump analyze`. It prints the path from a
+   root, which is the picture drawn above, with real addresses.
+3. **Look for the long-lived publisher.** Every managed leak reduces to "a long-lived thing holds
+   a short-lived thing". The usual publishers are `static event`, a `static` dictionary used as a
+   cache, a `System.Threading.Timer` (whose callback keeps its target alive for as long as the
+   `Timer` itself is alive — which in a service is almost always a field on a singleton or an
+   `IHostedService`; drop every reference to the `Timer` and it stops firing instead, which is the
+   opposite-shaped bug people actually expect from it), and anything registered as a singleton in
+   DI that captures a scoped service.
+
+The DI-lifetime version of this bug deserves its own line, because it is the one that bites
+teams hardest: **a singleton that captures a scoped service pins that scope forever.** ASP.NET
+Core's `ValidateScopes` catches the direct case at startup; it does not catch the case where the
+singleton subscribes to something the scoped service raises, or holds a callback that closes over
+it.
+
+The review rule that would have caught this: **every `+=` on something that outlives the
+subscriber needs a matching `-=` on a path that always runs.** If you cannot point at that path,
+either the subscriber must be a singleton too, or the subscription must be weak.
+
+## the same idea in other languages
+
+| language | what it's called | the trap |
+| --- | --- | --- |
+| Java | the listener leak; the canonical example is a static collection or a listener registry holding objects that should have died | identical mechanism and identical fix, plus a tool .NET lacks an exact match for: `WeakHashMap`, and `WeakReference`-based listener lists that are common in Java frameworks. Java's `finalize()` will not save you either — deprecated in 9, deprecated *for removal* in 18 by JEP 421, which also added `--finalization=disabled` to switch it off |
+| JavaScript | `addEventListener` without `removeEventListener` | the same shape and the most-hit version of it in the world: a listener holds its closure, the closure holds whatever it captured, and a detached DOM node stays alive because something is still listening on it. `WeakMap` and `WeakRef` are the escapes, mirroring `ConditionalWeakTable` and `WeakReference` |
+| Python | a reference cycle plus `__del__`, or a module-level list that accumulates | refcounting frees the acyclic case the instant the last name goes away, which trains the habit that "when it goes out of scope it is gone" — and that habit is exactly wrong for a subscriber, because the publisher's list still holds a reference. Same bug, less warning |
+| C++ | a `shared_ptr` cycle, or a raw observer list of pointers | the observer pattern's failure mode is the mirror image: the danger is the *dangling* pointer when the subscriber dies without deregistering, not the leak. C++ makes you crash where .NET makes you grow, and `weak_ptr` is the fix for both directions |
+
+## common bugs
+
+- **Assuming a garbage collector means you cannot leak.** It means you cannot leak *unreachable*
+  memory. Reachable-but-useless is the only kind of leak a tracing collector has, and it is the
+  only kind you will ever debug in .NET.
+- **Unsubscribing with a lambda** (`x -= s => Handle(s)`), which silently removes nothing because
+  delegate equality is `(target, method)` and two lambdas are two methods. Measured above: same
+  159 MB.
+- **Reaching for `GC.Collect` when memory grows.** It was already running. If the objects are
+  reachable it will keep every one of them, and you have paid a full stop-the-world pause to
+  learn nothing.
+- **Unsubscribing only on the happy path.** If the `-=` is at the end of a method rather than in
+  a `finally` or a `Dispose`, one thrown exception leaks the subscriber permanently — and the
+  requests that throw are the ones that repeat.
+- **Making the handler `static` to "avoid capturing `this`", and closing over a field anyway.**
+  A static method with no captures does not leak; the moment the lambda touches an instance
+  member, the compiler captures `this` and you are back where you started. Check what the
+  delegate's `Target` actually is.
+- **Treating `IDisposable` as being about unmanaged resources only.** Here nothing unmanaged is
+  involved. `Dispose` is the hook for *detaching from roots*, which is a managed-memory concern.

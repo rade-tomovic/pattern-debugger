@@ -1,0 +1,179 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: dynamic-programming
+problem: longest-increasing-subsequence
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import Cells from '@components/Cells.astro';
+
+## task
+
+Given an integer array `nums`, return the length of the longest strictly increasing subsequence.
+Elements don't need to be contiguous, but must keep their original relative order.
+
+```text
+nums = [10, 9, 2, 5, 3, 7, 101, 18]  →  4   ([2, 3, 7, 18] or [2, 3, 7, 101])
+```
+
+## how to think
+
+For each index `i`, ask: what's the longest increasing subsequence that *ends exactly at* `i`?
+It's built by taking the best increasing subsequence ending at some earlier index `j` where
+`nums[j] < nums[i]`, and appending `nums[i]` to it — so
+`dp[i] = 1 + max(dp[j])` over every `j < i` with `nums[j] < nums[i]` (or just `1`, if `nums[i]`
+starts fresh). The answer to the whole problem is the best `dp[i]` over *all* `i`, not
+`dp[n-1]` — the longest subsequence can end anywhere.
+
+This differs from Word Break and Coin Change in one detail: there, every predecessor `j` was
+tried, filtered only by reachability (`dp[j]`); here the filter is on *value*
+(`nums[j] < nums[i]`) — every single element is always "reachable" as a subsequence of length 1
+on its own. Checking every `j < i` for every `i` is O(n²): good enough for most interviews, and
+the version to derive first.
+
+<Callout kind="note" label="template instance">
+  **Bottom-up tabulation.** State: `dp[i]` = length of the longest increasing subsequence ending
+  exactly at index `i`. Recurrence: `dp[i] = 1 + max(dp[j])` over `j < i` with
+  `nums[j] < nums[i]` (or `1` alone). Base case: every `dp[i]` starts at `1`. Answer: `max(dp)`,
+  not `dp[n-1]`.
+</Callout>
+
+## solution
+
+```csharp
+public int LengthOfLIS(int[] nums)
+{
+    if (nums.Length == 0) return 0;     // no elements, no subsequence
+
+    var dp = new int[nums.Length];
+    Array.Fill(dp, 1);                  // every element is an LIS of length 1 by itself
+    int best = 1;
+
+    for (int i = 1; i < nums.Length; i++)
+    {
+        for (int j = 0; j < i; j++)
+        {
+            if (nums[j] < nums[i])
+                dp[i] = Math.Max(dp[i], dp[j] + 1);   // extend the LIS ending at j
+        }
+        best = Math.Max(best, dp[i]);
+    }
+    return best;
+}
+```
+
+## trace
+
+`nums = [10, 9, 2, 5, 3, 7, 101, 18]`, `dp` starts all `1`s:
+
+| i | nums[i] | j's where `nums[j] < nums[i]` | dp[i] = 1 + max(dp[j]) | dp array | best |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 9 | none (10 ≥ 9) | 1 | `[1,1,1,1,1,1,1,1]` | 1 |
+| 2 | 2 | none | 1 | `[1,1,1,1,1,1,1,1]` | 1 |
+| 3 | 5 | j=2 (`2 < 5`) | 1+1=2 | `[1,1,1,2,1,1,1,1]` | 2 |
+| 4 | 3 | j=2 (`2 < 3`) | 1+1=2 | `[1,1,1,2,2,1,1,1]` | 2 |
+| 5 | 7 | j=2,3,4 (`2,5,3 < 7`) | 1+max(1,2,2)=3 | `[1,1,1,2,2,3,1,1]` | 3 |
+| 6 | 101 | j=0..5 (all `< 101`) | 1+max(1,1,1,2,2,3)=4 | `[1,1,1,2,2,3,4,1]` | 4 |
+| 7 | 18 | j=0..5 (all `< 18`) | 1+max(1,1,1,2,2,3)=4 | `[1,1,1,2,2,3,4,4]` | 4 |
+
+Final answer: `best = 4` — e.g. `[2, 5, 7, 101]` or `[2, 3, 7, 18]`. Notice the winning length
+lands at index 6, not the last index — the table only tracks length, not which subsequence;
+recovering the actual elements needs a parent-pointer array alongside `dp`.
+
+`dp[6] = 4` is realized by chaining indices 2 → 4 → 5 → 6 — values `2, 3, 7, 101`, each one
+picking up its predecessor's best length:
+
+<Cells
+  data={[10, 9, 2, 5, 3, 7, 101, 18]}
+  pointers={{ 6: [{ t: 'i', c: 'amber' }] }}
+  cells={{ 2: 'ok', 4: 'ok', 5: 'ok', 6: 'ok' }}
+  caption="dp[6] = 4, built from indices 2, 4, 5, 6 → 2, 3, 7, 101"
+/>
+
+## why it works
+
+`dp[i]` is exactly the longest increasing subsequence ending at `i`, by induction: any increasing
+subsequence ending at `i` either has length `1` (just `nums[i]`), or its second-to-last element is
+some `nums[j] < nums[i]` at an earlier index — and everything before that element is, by
+definition, an increasing subsequence ending at `j`, whose best length is `dp[j]`. Trying every
+`j < i` and taking the max means no candidate predecessor is missed. Taking `max(dp)` at the end,
+rather than `dp[n-1]`, accounts for the subsequence not needing to reach the last index.
+
+<Watch items={[['time', 'O(n^2)'], ['space', 'O(n)']]} />
+
+## common bugs
+
+- Returning `dp[n-1]` instead of `max(dp)` — the LIS frequently doesn't end at the last element
+  (it doesn't in the trace above: index 6 holds the winning value, index 7 only ties it).
+- Using `<=` instead of `<` when comparing `nums[j]` and `nums[i]` — that would let equal elements
+  into a *strictly* increasing subsequence.
+- Confusing "subsequence" with "subarray" — a subsequence skips freely (`nums[j]` and `nums[i]`
+  need not be adjacent); reaching for a sliding window here solves the wrong problem entirely.
+- Initializing `dp` to `0`s instead of `1`s — every element is trivially a length-1 subsequence on
+  its own, and starting at `0` undercounts everywhere.
+
+## variants you can now solve
+
+- **Russian Doll Envelopes** (LC 354) — sort envelopes by width, then run LIS on heights (with a
+  tie-break on equal widths) — this exact problem wearing a 2D costume.
+- **Number of Longest Increasing Subsequence** (LC 673) — the same `dp[i]` table, plus a parallel
+  `count[i]` array tracking how many subsequences achieve that length.
+- **Longest Chain of Pairs** (LC 646) — sort by first element, then it's this recurrence with
+  "chains" instead of "increasing."
+
+## optional coda: O(n log n) with patience sorting
+
+The O(n²) table works by asking "what's the best subsequence ending here" for every index.
+There's a faster equivalent that flips the question: maintain `tails`, where `tails[k]` is the
+*smallest possible tail value* of any increasing subsequence of length `k+1` seen so far. For
+each new number `x`, binary-search `tails` for the first entry `>= x` and overwrite it (or append,
+if `x` is bigger than everything seen so far). `tails.Count` at the end is the LIS length.
+
+```csharp
+public int LengthOfLISFast(int[] nums)
+{
+    var tails = new List<int>();        // tails[k] = smallest tail of any LIS of length k+1 so far
+
+    foreach (int x in nums)
+    {
+        int lo = 0, hi = tails.Count;
+        while (lo < hi)                           // boundary search: first index with tails[mid] >= x
+        {
+            int mid = (lo + hi) / 2;
+            if (tails[mid] < x) lo = mid + 1;
+            else hi = mid;
+        }
+        if (lo == tails.Count) tails.Add(x);       // x extends every subsequence found so far
+        else tails[lo] = x;                        // x is a smaller, equally-good tail for length lo+1
+    }
+    return tails.Count;
+}
+```
+
+<Callout kind="tip" label="why tails.Count is correct, not the array's contents">
+  `tails` is **not** an actual subsequence — after processing `10, 9, 2` it holds `[2]`, not
+  `[10]`, even though 10 came first. What's invariant is that `tails` stays sorted and
+  `tails.Count` always equals the true LIS length so far: every overwrite replaces a tail with a
+  strictly smaller-or-equal one, which can only make *future* numbers more likely to extend or
+  replace something, never less. This is the
+  [binary-search boundary template](/patterns/binary-search/) at work — `tails[mid] < x` decides
+  which half survives, exactly like Find First and Last Position.
+</Callout>
+
+Trace on the same input, `nums = [10, 9, 2, 5, 3, 7, 101, 18]`:
+
+| x | tails before | lands at | tails after |
+| --- | --- | --- | --- |
+| 10 | `[]` | 0 (append) | `[10]` |
+| 9 | `[10]` | 0 | `[9]` |
+| 2 | `[9]` | 0 | `[2]` |
+| 5 | `[2]` | 1 (append) | `[2, 5]` |
+| 3 | `[2, 5]` | 1 | `[2, 3]` |
+| 7 | `[2, 3]` | 2 (append) | `[2, 3, 7]` |
+| 101 | `[2, 3, 7]` | 3 (append) | `[2, 3, 7, 101]` |
+| 18 | `[2, 3, 7, 101]` | 3 | `[2, 3, 7, 18]` |
+
+`tails.Count = 4` — same answer, in O(n log n) instead of O(n²). Worth knowing exists and being
+able to sketch, but the O(n²) table above is what most interviewers actually want to watch you
+derive first.

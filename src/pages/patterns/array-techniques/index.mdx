@@ -1,0 +1,154 @@
+---
+layout: '@layouts/TopicLayout.astro'
+topic: array-techniques
+---
+
+import Callout from '@components/Callout.astro';
+import ProblemList from '@components/ProblemList.astro';
+import Cells from '@components/Cells.astro';
+
+## core idea
+
+This topic is the drawer of tools that don't fit the other patterns cleanly. Each tool trades a
+little precompute or bookkeeping for collapsing an O(n²) or O(n) repeated-work problem into a
+single pass — or a single O(1) lookup. There's no one skeleton here; there are five, and
+recognizing *which one* a problem wants is the actual skill:
+
+| shape | idea | typical trigger |
+| --- | --- | --- |
+| prefix sum | precompute cumulative totals once | many range-sum queries on a fixed array |
+| in-place read/write | compact or partition without a second array | "in-place", "O(1) extra space" |
+| single-pass accumulator | carry one running value forward, decide extend-vs-reset each step | "max subarray", "majority element" |
+| prefix × suffix | two directional passes folded into one output | "every element except itself", no division |
+| matrix walk | direction-aware traversal that shrinks or mirrors | rotate, transpose, spiral through a grid |
+
+<Cells
+  data={[0, 0, 2, 1, 1, 2]}
+  pointers={{ 0: [{ t: 'L', c: 'amber' }, { t: 'M', c: 'purple' }], 4: [{ t: 'H', c: 'cyan' }] }}
+  caption="three pointers, three regions: [0,L) settled 0s, [L,M) settled 1s, (H,end] settled 2s"
+/>
+
+## when to reach for it
+
+- The same array is queried for range sums **many times** and never mutates → precompute
+  prefix sums once, answer each query in O(1).
+- The problem says "in-place" or "O(1) extra space" and asks you to compact, remove, or sort a
+  small fixed alphabet of values → read/write pointers, or a multi-region partition.
+- You want the **best contiguous run** (max sum) or the element that **dominates** a pass
+  (majority) → one running value, updated with a local decision at every index.
+- The formula for position `i` needs "everything except `nums[i]`" and division is off the
+  table (a zero would break it) → run the pass twice, once forward, once backward.
+- The input is a 2D grid and the question is about rotating, transposing, or walking it in a
+  spiral, layer by layer → direction-aware boundary tracking.
+
+## universal templates
+
+Prefix sum — precompute once, answer any range in O(1):
+
+```csharp
+public int[] BuildPrefix(int[] nums)
+{
+    int[] prefix = new int[nums.Length + 1];   // prefix[i] = sum of nums[0..i), sentinel prefix[0] = 0
+    for (int i = 0; i < nums.Length; i++)
+        prefix[i + 1] = prefix[i] + nums[i];
+    return prefix;
+}
+```
+
+The same idea run **twice** — once left-to-right, once right-to-left, folding both into the same
+output array — is how you answer "everything except position `i`" without division.
+
+In-place read/write — the two-region compaction you already met in
+[two pointers](/patterns/two-pointers/):
+
+```csharp
+public int Partition(int[] nums)
+{
+    int write = 0;                              // [0, write) is the finished region so far
+    for (int read = 0; read < nums.Length; read++)
+    {
+        if (Keep(nums[read]))
+        {
+            (nums[write], nums[read]) = (nums[read], nums[write]);
+            write++;
+        }
+    }
+    return write;
+}
+```
+
+Dutch National Flag — the same idea upgraded to **three** regions and three pointers:
+
+```csharp
+public void ThreeWayPartition(int[] nums)
+{
+    int low = 0, mid = 0, high = nums.Length - 1;
+
+    while (mid <= high)
+    {
+        int region = Classify(nums[mid]);           // -1 / 0 / +1 → which region it belongs in
+        if (region < 0)
+        {
+            (nums[low], nums[mid]) = (nums[mid], nums[low]);
+            low++; mid++;                            // swapped-in value is a known "1" — safe to advance
+        }
+        else if (region == 0)
+        {
+            mid++;
+        }
+        else
+        {
+            (nums[mid], nums[high]) = (nums[high], nums[mid]);
+            high--;                                  // mid stays: the swapped-in value is unexamined
+        }
+    }
+}
+```
+
+Single-pass running accumulator — one value carried forward, folded with a local decision:
+
+```csharp
+public int SinglePassBest(int[] nums)
+{
+    int running = nums[0];
+    int best = nums[0];
+
+    for (int i = 1; i < nums.Length; i++)
+    {
+        running = Fold(running, nums[i]);            // extend the run, or reset using nums[i] alone
+        best = Math.Max(best, running);
+    }
+    return best;
+}
+```
+
+Matrix boundary walk — shrink a frame of four edges layer by layer:
+
+```csharp
+public void WalkBoundary(int[][] matrix)
+{
+    int top = 0, bottom = matrix.Length - 1;
+    int left = 0, right = matrix[0].Length - 1;
+
+    while (top <= bottom && left <= right)
+    {
+        Visit(top, bottom, left, right, matrix);      // walk this layer's four edges in order
+        top++; bottom--; left++; right--;             // shrink to the next layer in
+    }
+}
+```
+
+Rotating a matrix in place uses a different two-step trick — transpose (`matrix[i][j] ↔
+matrix[j][i]`), then reverse every row — rather than a shrinking walk. Both problems below show
+their own instance.
+
+<Callout kind="insight" label="the one question to ask">
+  Before reaching for one of these, ask: *"does this array/matrix get read once, or many
+  times?"* Read once → a single pass usually wins. Queried repeatedly → precompute pays for
+  itself. If the answer needs information from *both* directions at once (prefix and suffix,
+  or clockwise and counter-clockwise), that's your signal for two passes instead of one.
+</Callout>
+
+## problems
+
+<ProblemList topic="array-techniques" />

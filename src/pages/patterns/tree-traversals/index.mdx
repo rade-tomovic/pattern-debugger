@@ -1,0 +1,91 @@
+---
+layout: '@layouts/TopicLayout.astro'
+topic: tree-traversals
+---
+
+import Callout from '@components/Callout.astro';
+import ProblemList from '@components/ProblemList.astro';
+
+## core idea
+
+A tree problem is a traversal wearing a costume. The recursion always looks the same — visit
+left, visit right, do something with the current node — and the *only* thing that changes
+between problems is **when** "do something" happens relative to the two recursive calls. Get
+that placement right and half the tree section of an interview is just this template with a
+different line inside it.
+
+| traversal | visit order | when you want it |
+| --- | --- | --- |
+| preorder | node, then left, then right | do work *before* descending — copy, serialize, print top-down |
+| inorder | left, then node, then right | walk a **BST** in sorted order |
+| postorder | left, then right, then node | combine children's answers into the parent's — height, sum, diameter |
+
+## when to reach for it
+
+- The problem hands you a `TreeNode` explicitly — this is recursion-first territory, not the
+  queue-and-grid world of [BFS/DFS](/patterns/bfs-dfs/).
+- You need every value **in sorted order** and you're told (or can assume) the tree is a BST →
+  inorder.
+- A node's answer depends on what its **children** compute first — height, sum, "is this
+  balanced" → postorder, children report up, parent combines.
+- You're transforming, copying, or printing the tree root-first, doing work at a node before
+  touching its subtrees → preorder.
+- The problem explicitly asks for an **iterative** solution, or you're worried about recursion
+  depth on a skewed tree → the same traversal, with an explicit `Stack<TreeNode>` standing in
+  for the call stack.
+
+## universal template
+
+One function, three traversals — only the position of the "visit" line moves:
+
+```csharp
+public void Preorder(TreeNode? node, List<int> output)
+{
+    if (node is null) return;              // base case: nothing here, stop recursing
+
+    output.Add(node.Val);                  // VISIT HERE -> preorder (node, left, right)
+    Preorder(node.Left, output);
+    Preorder(node.Right, output);
+}
+
+public void Inorder(TreeNode? node, List<int> output)
+{
+    if (node is null) return;
+
+    Inorder(node.Left, output);
+    output.Add(node.Val);                  // VISIT HERE -> inorder (left, node, right)
+    Inorder(node.Right, output);
+}
+
+public void Postorder(TreeNode? node, List<int> output)
+{
+    if (node is null) return;
+
+    Postorder(node.Left, output);
+    Postorder(node.Right, output);
+    output.Add(node.Val);                  // VISIT HERE -> postorder (left, right, node)
+}
+
+// standard interview definition
+public class TreeNode(int val = 0, TreeNode? left = null, TreeNode? right = null)
+{
+    public int Val = val;
+    public TreeNode? Left = left;
+    public TreeNode? Right = right;
+}
+```
+
+Every problem below is one of these three shapes, sometimes returning a value instead of
+appending to a list, sometimes carrying extra state (a running best, a pair of bounds) down or
+up alongside the recursion. The shape of the function never changes.
+
+<Callout kind="insight" label="the one question to ask">
+  Does this node's answer need something its **children** computed first? If yes, you want
+  postorder — recurse into both children, then combine. That single question is behind
+  maximum depth, diameter, balanced-tree checks, and most of the "hard" tree problems you'll
+  meet later. If the answer is no and you're just walking top-down, preorder is simpler.
+</Callout>
+
+## problems
+
+<ProblemList topic="tree-traversals" />

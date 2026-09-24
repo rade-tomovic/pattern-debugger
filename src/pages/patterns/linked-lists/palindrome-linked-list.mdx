@@ -1,0 +1,149 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: linked-lists
+problem: palindrome-linked-list
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+
+## task
+
+Given the `head` of a singly linked list, return `true` if it reads the same forward and
+backward.
+
+```text
+head = [1, 2, 2, 1]  →  true
+head = [1, 2]        →  false
+```
+
+## how to think
+
+Copying every value into an array and comparing front-to-back solves it in O(n) space, but a
+singly linked list can't walk backward on its own — so O(1) space means finding a way to compare
+the list against itself without a second copy. The fix: physically reverse the second half in
+place, then walk the first half and the now-reversed second half forward together, comparing as
+you go — both walks move the same direction, so no backward traversal is ever needed. This is
+three pieces of the topic chained back to back: find the middle (fast/slow), reverse from there
+(the four-line loop), then a plain comparison walk.
+
+<Callout kind="note" label="template instance">
+  Chains two skeletons: **fast/slow** to find the middle, then **iterative reversal** starting
+  from `slow.Next` instead of `head`. What varies from the standalone reversal page: the result
+  feeds a comparison walk instead of being returned directly, and the middle node (on an
+  odd-length list) is deliberately left out of both halves.
+</Callout>
+
+## solution
+
+```csharp
+public bool IsPalindrome(ListNode? head)
+{
+    if (head?.Next == null) return true;
+
+    // 1. find the middle — slow lands on the last node of the first half
+    ListNode slow = head, fast = head;
+    while (fast.Next != null && fast.Next.Next != null)
+    {
+        slow = slow.Next!;
+        fast = fast.Next.Next;
+    }
+
+    // 2. reverse the second half in place
+    ListNode? prev = null, curr = slow.Next;
+    while (curr != null)
+    {
+        var next = curr.Next;
+        curr.Next = prev;
+        prev = curr;
+        curr = next;
+    }
+
+    // 3. walk both halves forward, comparing
+    ListNode left = head, right = prev!;
+    while (right != null)
+    {
+        if (left.Val != right.Val) return false;
+        left = left.Next!;
+        right = right.Next!;
+    }
+    return true;
+}
+
+// standard interview definition
+public class ListNode(int val = 0, ListNode? next = null)
+{
+    public int Val = val;
+    public ListNode? Next = next;
+}
+```
+
+## trace
+
+**Even length**, `head = [1, 2, 2, 1]`:
+
+```text
+before:  1 -> 2 -> 2 -> 1 -> null
+              ^slow (middle, second half starts at slow.Next)
+
+after reversing the second half:
+first half:               1 -> 2
+reversed second half:     1 -> 2 -> null      (was 2 -> 1 -> null)
+```
+
+Node `2`'s (the one `slow` sits on) `.Next` was never touched by the reversal, so it still points
+at the reversed half's last node — walking from `head` actually gives `1 -> 2 -> 2 -> null`. That's
+harmless: the compare loop below is driven by `right`, which starts at `prev`, and it stops the
+moment `right` hits `null`, well before it would ever reach back into the first half.
+
+| step | `left` | `right` | match? |
+| --- | --- | --- | --- |
+| find middle | slow lands on index 1 (`2`) | — | — |
+| reverse | second half `[2, 1]` becomes `[1, 2]` | — | — |
+| compare 1 | `1` | `1` | yes |
+| compare 2 | `2` | `2` | yes |
+| result | — | — | **true** |
+
+**Odd length**, `head = [1, 2, 3, 2, 1]` — the middle-skip aha moment:
+
+| step | `left` | `right` | match? |
+| --- | --- | --- | --- |
+| find middle | slow lands on index 2 (`3`, the true middle) | — | — |
+| reverse | second half `[2, 1]` becomes `[1, 2]` | — | — |
+| compare 1 | `1` | `1` | yes |
+| compare 2 | `2` | `2` | yes |
+| result | — | — | **true** (`3` is never compared — correct, the middle needs no partner) |
+
+## why it works
+
+For an odd-length list, the fast/slow loop guard (`fast.Next != null && fast.Next.Next != null`)
+stops with `slow` sitting exactly on the true middle node, so reversing from `slow.Next` leaves
+that middle node out of *both* halves — which is exactly right, since a palindrome's middle
+element never needs a mirror partner. For an even-length list, `slow` stops on the last node of
+the first half, so `slow.Next` starts the second half cleanly with nothing left over. Either way,
+the comparison loop runs only as long as `right != null`, so it naturally stops after
+`floor(n / 2)` comparisons without ever needing to know `n` up front.
+
+<Watch items={[['time', 'O(n)'], ['space', 'O(1)'], ['passes', '1 (plus the reversal — still one linear scan total)']]} />
+
+## common bugs
+
+- Comparing against the second half *before* reversing it — walking both halves forward just
+  checks whether the list equals itself, which is always true.
+- Getting the middle-finding guard wrong: using plain `fast != null` (the [Middle of the Linked
+  List](/patterns/linked-lists/middle-of-linked-list/) version) shifts `slow` by one node on
+  even-length input and reverses starting from the wrong place.
+- Forgetting to restore the list afterward if the interviewer asks for it preserved — re-reversing
+  the second half restores the original structure in the same O(1) extra space.
+- Not short-circuiting empty and single-node lists — `head?.Next == null` catches both in one
+  check; without it, `slow.Next` on a single node is `null` and the reversal loop degenerates
+  correctly anyway, but it's worth stating out loud that you considered it.
+
+## variants you can now solve
+
+- **Reorder List** (LC 143) — the same find-middle-then-reverse-second-half combo, but it
+  interleaves the two halves instead of comparing them.
+- [Reverse Linked List](/patterns/linked-lists/reverse-linked-list/) (LC 206) — the reversal half
+  of this combo, isolated.
+- [Middle of the Linked List](/patterns/linked-lists/middle-of-linked-list/) (LC 876) — the
+  middle-finding half of this combo, isolated.

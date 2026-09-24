@@ -1,0 +1,333 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: bits-and-memory
+problem: sizeof-and-layout
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import Solution from '@components/Solution.astro';
+
+## the question
+
+Four structs. Nothing clever in any of them — this is the shape of a row in an in-memory cache,
+a tick in a market-data buffer, a point in a mesh.
+
+```csharp
+struct Naive   { public byte Flag; public long Ticks; public byte Kind; }
+struct Packed  { public long Ticks; public byte Flag; public byte Kind; }
+struct Point3  { public float X, Y, Z; }
+struct WithRef { public byte Flag; public string Name; }
+```
+
+The field sizes are not in dispute: `byte` is 1, `long` is 8, `float` is 4, and a reference is
+8 on this 64-bit machine. So `Naive` holds 10 bytes of your data, `Packed` holds the same 10,
+`Point3` holds 12, and `WithRef` holds 9.
+
+<Callout kind="insight" label="predict first">
+  Commit to these before you scroll.
+
+  **(1)** `Unsafe.SizeOf` for each of the four structs above. **(2)** Which of the four keeps
+  its fields at the offsets you declared them in, and which does not. **(3)** A fifth struct,
+  `Squeezed`, is `Naive`'s three fields under `[StructLayout(LayoutKind.Sequential, Pack = 1)]`
+  — the attribute that tells the compiler not to insert padding. Predict its size, and how many
+  `Squeezed` elements fit in one 64-byte cache line compared to one `Packed` element.
+
+  If your instinct is "the sizes are 10, 10, 12 and 9", write that down. Three of those four are
+  wrong, and one struct does not keep the field order you wrote it in.
+</Callout>
+
+## the code
+
+One file, four questions put to the runtime directly: the size and field offsets of each
+struct, what an array of 100 elements actually costs the GC, what the interop marshaller would
+lay out instead for the one struct that has both a managed and a marshalled answer, and how many
+elements of each shape share one 64-byte cache line. No stopwatch anywhere in it — every number
+below is a size, an offset, or a byte count the runtime states outright.
+
+<Solution>
+
+```csharp
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
+
+// Four struct shapes, one question each: what does the runtime actually do
+// with this field order?
+struct Naive   { public byte Flag; public long Ticks; public byte Kind; }
+struct Packed  { public long Ticks; public byte Flag; public byte Kind; }
+struct Point3  { public float X, Y, Z; }
+struct WithRef { public byte Flag; public string Name; }
+
+// Same fields as WithRef, but explicitly asking for declaration order.
+[StructLayout(LayoutKind.Sequential)]
+struct SeqRef { public byte Flag; public string Name; }
+
+[StructLayout(LayoutKind.Sequential, Pack = 1)]
+struct Squeezed { public byte Flag; public long Ticks; public byte Kind; }
+
+static class Layout
+{
+    // byte distance from the start of a struct to one of its fields
+    static nint Off<T>(ref T origin, ref byte field)
+        => Unsafe.ByteOffset(ref Unsafe.As<T, byte>(ref origin), ref field);
+
+    static long Allocated(Action f)
+    {
+        long before = GC.GetTotalAllocatedBytes(precise: true);
+        f();
+        return GC.GetTotalAllocatedBytes(precise: true) - before;
+    }
+
+    public static void Main()
+    {
+        // ---- part 1: sizes and field offsets, asked of the runtime itself ----
+        Naive n = default; Packed p = default; Point3 t = default; WithRef w = default; SeqRef q = default;
+        Console.WriteLine($"Naive    size={Unsafe.SizeOf<Naive>(),2}  Flag@{Off(ref n, ref n.Flag)} Ticks@{Off(ref n, ref Unsafe.As<long, byte>(ref n.Ticks))} Kind@{Off(ref n, ref n.Kind)}");
+        Console.WriteLine($"Packed   size={Unsafe.SizeOf<Packed>(),2}  Ticks@{Off(ref p, ref Unsafe.As<long, byte>(ref p.Ticks))} Flag@{Off(ref p, ref p.Flag)} Kind@{Off(ref p, ref p.Kind)}");
+        Console.WriteLine($"Point3   size={Unsafe.SizeOf<Point3>(),2}  X@{Off(ref t, ref Unsafe.As<float, byte>(ref t.X))} Y@{Off(ref t, ref Unsafe.As<float, byte>(ref t.Y))} Z@{Off(ref t, ref Unsafe.As<float, byte>(ref t.Z))}");
+        Console.WriteLine($"WithRef  size={Unsafe.SizeOf<WithRef>(),2}  Flag@{Off(ref w, ref w.Flag)} Name@{Off(ref w, ref Unsafe.As<string, byte>(ref w.Name))}");
+        Console.WriteLine($"SeqRef   size={Unsafe.SizeOf<SeqRef>(),2}  Flag@{Off(ref q, ref q.Flag)} Name@{Off(ref q, ref Unsafe.As<string, byte>(ref q.Name))}   (LayoutKind.Sequential requested)");
+        Squeezed z = default;
+        Console.WriteLine($"Squeezed size={Unsafe.SizeOf<Squeezed>(),2}  Flag@{Off(ref z, ref z.Flag)} Ticks@{Off(ref z, ref Unsafe.As<long, byte>(ref z.Ticks))} Kind@{Off(ref z, ref z.Kind)}   (Pack = 1)");
+
+        // ---- part 2: the marshalled layout is a second, different answer ----
+        Console.WriteLine($"\nSeqRef managed layout:    Flag@{Off(ref q, ref q.Flag)} Name@{Off(ref q, ref Unsafe.As<string, byte>(ref q.Name))}");
+        Console.WriteLine($"SeqRef marshalled layout: Flag@{Marshal.OffsetOf<SeqRef>("Flag")} Name@{Marshal.OffsetOf<SeqRef>("Name")}   (Marshal.OffsetOf)");
+
+        // ---- part 3: what an array of them actually costs, to the byte ----
+        object keep = null!;
+        Console.WriteLine($"\nnew Naive[100]    allocated {Allocated(() => keep = new Naive[100]),6:N0} bytes");
+        Console.WriteLine($"new Packed[100]   allocated {Allocated(() => keep = new Packed[100]),6:N0} bytes");
+        Console.WriteLine($"new Squeezed[100] allocated {Allocated(() => keep = new Squeezed[100]),6:N0} bytes");
+        GC.KeepAlive(keep);
+
+        // ---- part 4: how many elements of each share one 64-byte cache line ----
+        const int line = 64;
+        Console.WriteLine($"\nelements per {line}-byte cache line (line size / element size):");
+        Console.WriteLine($"  Naive[]    {(double)line / Unsafe.SizeOf<Naive>(),5:F2}");
+        Console.WriteLine($"  Packed[]   {(double)line / Unsafe.SizeOf<Packed>(),5:F2}");
+        Console.WriteLine($"  Squeezed[] {(double)line / Unsafe.SizeOf<Squeezed>(),5:F2}");
+    }
+}
+```
+
+</Solution>
+
+`Naive` and `Packed` are the *same three fields of the same three types*. Not similar — the
+same. The only difference anywhere in this file is the order the field declarations appear in,
+so anything the sizes below show is attributable to layout and nothing else.
+
+## work it out
+
+**The rule is one sentence: a value of size S wants to live at an address that is a multiple of
+S.** A `long` at a multiple of 8, an `int` at a multiple of 4, a `byte` anywhere. A struct's
+alignment is the strictest alignment among its fields, and its size is rounded *up* to a
+multiple of that alignment so the next element of an array starts legally too.
+
+Apply it to `Naive` in declaration order:
+
+```text
+ Flag at 0     ok — a byte goes anywhere
+ Ticks at 1    bad — 1 is not a multiple of 8  ->  insert 7 bytes of padding, put Ticks at 8
+ Kind at 16    ok — a byte goes anywhere
+ total 17      bad — round up to a multiple of 8  ->  7 more bytes of tail padding
+
+ offset  0     1                  8                  16   17           24
+         ┌──┬───────────────────┬──────────────────┬──┬──────────────┐
+         │F │  7 bytes padding  │      Ticks       │K │  7 bytes pad │
+         └──┴───────────────────┴──────────────────┴──┴──────────────┘
+                                                    size = 24, of which 14 hold nothing
+```
+
+Now `Packed`, the same fields sorted widest-first:
+
+```text
+ offset  0                      8  9              16
+         ┌──────────────────┬──┬──┬──────────────┐
+         │      Ticks       │F │K │  6 byte pad  │
+         └──────────────────┴──┴──┴──────────────┘
+                                    size = 16, of which 6 hold nothing
+```
+
+That generalises to a rule you can apply while reading a diff: **declare fields in decreasing
+size order.** Widest first, `byte` and `bool` last. `Point3` needed no help — three `float`
+values are each 4 bytes with alignment 4, they tile perfectly, and 12 is already a multiple of
+4, so there is not one wasted byte.
+
+**The padding exists because a field access has to be a constant offset.** Here is `Naive` in C,
+compiled on this box with `gcc -O2` and disassembled — x86-64, AT&T syntax:
+
+```text
+struct naive { unsigned char flag; long ticks; unsigned char kind; };
+long read_ticks(struct naive *s) { return s->ticks; }
+int  read_kind (struct naive *s) { return s->kind;  }
+
+0000000000000000 <read_ticks>:
+   0:   endbr64                      ; branch-target hardening, not part of the logic
+   4:   mov    0x8(%rdi),%rax        ; load 8 bytes from (struct pointer + 8) — one instruction
+   8:   ret
+   9:   nopl   0x0(%rax)             ; do-nothing filler so the next function starts at 0x10
+
+0000000000000010 <read_kind>:
+  10:   endbr64
+  14:   movzbl 0x10(%rdi),%eax       ; load 1 byte from (struct pointer + 16), zero-extend
+  18:   ret
+```
+
+The comments are mine; everything left of them is verbatim `objdump` output. `0x8` and `0x10` —
+the offsets from the diagram above — are baked into the instruction as constants. The C
+compiler, on completely different rules from the CLR, chose the same 24-byte layout with the
+same offsets, because both are obeying the same hardware: reaching a field is an addition the
+CPU does for free inside the addressing mode, and padding is the price of keeping every one of
+those loads a *single* access instead of one that spans two cache lines and has to be stitched
+together.
+
+**Then the surprise the diagram cannot predict: the CLR reorders the moment there is a reference
+in the struct.** `WithRef` is declared `Flag` then `Name`; run the code above and `Name` comes
+back at offset 0 and `Flag` at offset 8 — the reverse. `SeqRef`, which asks for
+`LayoutKind.Sequential` explicitly, does exactly the same thing.
+
+C# emits sequential layout for structs by default, and the CLR honours it for
+`Naive`/`Packed`/`Point3` — every field here is a value type, so the padding arithmetic above is
+the whole story. But a struct containing an object reference is laid out *automatically* in
+managed memory regardless of what you asked for, because the garbage collector has to walk every
+reference field in every object it scans, and it wants them at offsets it controls rather than
+offsets a declaration chose. There is no padding rule to derive this from — it is a policy
+choice inside the CLR, and the only way to know the answer is to ask the runtime, which is what
+`Unsafe.SizeOf` and `Unsafe.ByteOffset` are for.
+
+That override is only over the *managed* layout, though. `LayoutKind.Sequential` still describes
+the struct the interop marshaller builds when you P/Invoke with it, so `SeqRef` has two different
+correct answers depending which question you ask — `Unsafe.ByteOffset` reports the managed one,
+`Marshal.OffsetOf` reports the marshalled one — and the code above asks both.
+
+**Elements per cache line is the arithmetic that follows directly from the sizes.** A cache line
+is 64 bytes — the unit memory actually moves in, covered in full on
+[memory hierarchy](/systems/memory-hierarchy/) — so `64 / sizeOf` is how many whole elements of
+an array share one line: `2.67` for `Naive` (24 bytes), `4.00` for `Packed` (16 bytes), `6.40`
+for `Squeezed` (10 bytes, `Pack = 1`). More elements per line means fewer lines a sequential walk
+has to touch for the same element count — that direction is certain, because it is the same
+division that produced the size in the first place. `Squeezed` pays for that density in a
+narrower way than the padded structs do: with no padding, `Ticks` sits at offset 1 inside a
+10-byte element, so its address relative to the start of a line advances by 10 bytes each time.
+`10` and `64` share a factor of 2, so that pattern repeats every 32 elements — and within each
+cycle of 32, exactly 4 of the 8-byte `Ticks` loads land in the last 7 bytes of a line and
+straddle into the next one, the other 28 do not. x86-64 handles a misaligned load in hardware, so
+every one of them still returns the right value — the trade is a portability and correctness
+one, covered below, not a correctness bug on this architecture.
+
+## the answer
+
+The real output of the file above, on this machine:
+
+```text
+Naive    size=24  Flag@0 Ticks@8 Kind@16
+Packed   size=16  Ticks@0 Flag@8 Kind@9
+Point3   size=12  X@0 Y@4 Z@8
+WithRef  size=16  Flag@8 Name@0
+SeqRef   size=16  Flag@8 Name@0   (LayoutKind.Sequential requested)
+Squeezed size=10  Flag@0 Ticks@1 Kind@9   (Pack = 1)
+
+SeqRef managed layout:    Flag@8 Name@0
+SeqRef marshalled layout: Flag@0 Name@8   (Marshal.OffsetOf)
+
+new Naive[100]    allocated  2,424 bytes
+new Packed[100]   allocated  1,624 bytes
+new Squeezed[100] allocated  1,024 bytes
+
+elements per 64-byte cache line (line size / element size):
+  Naive[]     2.67
+  Packed[]    4.00
+  Squeezed[]  6.40
+```
+
+| struct | your data | you predicted | actual size | field offsets |
+| --- | --- | --- | --- | --- |
+| `Naive` | 10 bytes | 10 | **24** | `Flag@0` `Ticks@8` `Kind@16` |
+| `Packed` | 10 bytes | 10 | **16** | `Ticks@0` `Flag@8` `Kind@9` |
+| `Point3` | 12 bytes | 12 | **12** | `X@0` `Y@4` `Z@8` |
+| `WithRef` | 9 bytes | 9 | **16** | `Name@0` `Flag@8` — **reordered** |
+| `SeqRef` (explicitly `LayoutKind.Sequential`) | 9 bytes | 9 | **16** | `Name@0` `Flag@8` — reordered anyway |
+| `Squeezed` (`Pack = 1`) | 10 bytes | 10 | **10** | `Flag@0` `Ticks@1` `Kind@9` |
+
+Three of the four sizes anyone declares by adding up field widths are wrong, and both structs
+that hold a reference reorder regardless of what `LayoutKind.Sequential` asked for.
+
+`100 × 24 + 24 = 2,424` and `100 × 16 + 24 = 1,624` — the trailing 24 bytes in both, and in
+`Squeezed`'s `100 × 10 + 24 = 1,024`, are the array object's own header: an object header word, a
+method-table pointer, and the length. Everything past that is your elements, and 1,400 of
+`Naive[100]`'s 2,400 element bytes hold nothing at all.
+
+<Watch items={[['rule', 'size S wants an address divisible by S'], ['struct align', 'max of its fields'], ['size', 'rounded up to that'], ['Naive', '24 B — Flag@0 Ticks@8 Kind@16'], ['Packed', '16 B — Ticks@0 Flag@8 Kind@9'], ['cache line', '64 B'], ['fix', 'declare widest field first']]} />
+
+## why it works that way
+
+Every field access the CLR or the C compiler emits is a base address plus a compile-time-known
+offset, and hardware only guarantees a single memory access for a load whose address is a
+multiple of its own size. Padding is the compiler paying bytes to keep that guarantee, and it
+pays them per struct — which is why the cost is invisible on one instance and a line item on
+twenty million. That single sentence explains every row of the table above except the two that
+hold a reference, which follow a second, narrower rule: the CLR lays out any struct containing
+a reference field itself, so it can find that field at a fixed offset when the garbage collector
+walks the object, and it does this whether or not you asked for sequential layout. **Measure the
+size, do not compute it** — `Unsafe.SizeOf` is one call, and unlike arithmetic on the field list
+it is right about all six rows above, including the two the padding rule alone cannot predict.
+
+## what this looks like in prod
+
+You do not notice padding one struct at a time. You notice it at the point where a count of rows
+turns into a number on a memory graph.
+
+A service holding a 20-million-row in-memory index of `Naive` is carrying 480 MB of array; the
+same three fields as `Packed` is 320 MB. The 160 MB difference is not slack — it is bytes the
+container must be sized for, and bytes the GC must walk on a gen2 collection. The symptom is
+never "padding": it is a pod that OOM-kills at a row count someone else's identical service
+survives, or a memory graph with a slope nobody can account for.
+
+The reviewable version of this is short. When a diff adds a field to a struct that lives in an
+array or a `List<T>` with a large count, look at where it went. A `bool` appended to the end of a
+16-byte struct is free if there is tail padding to absorb it and costs 8 bytes per row if there
+is not, and nothing in the diff tells you which. `Unsafe.SizeOf` in a test is the cheap way to
+find out, and it makes the size a thing the team notices when it changes.
+
+The same reasoning is the reason `List<T>` of a big struct behaves differently from `List<T>` of
+a class: the list of structs is one contiguous run of elements, so padding multiplies directly
+into the array's footprint, while a list of class references is 8 bytes per element plus a
+separate object each — which trades padding for pointer chasing. Which of those a workload wants
+is a [memory hierarchy](/systems/memory-hierarchy/) question, not a Big-O one; the counting side
+of it is [Big-O](/foundations/big-o/).
+
+## the same idea in other languages
+
+The C, Go and Rust rows were compiled and run on this box today, on the same three fields.
+
+| language | what it does with `byte, long, byte` | the trap |
+| --- | --- | --- |
+| C | 24 bytes, fields at 0 / 8 / 16 — identical to the CLR's sequential layout | `sizeof` is a compile-time constant, so the padding is invisible unless you print `offsetof`. Add `__attribute__((packed))` and you get 10 bytes, at the cost of the same misaligned-load trade `Pack = 1` makes. |
+| Go | 24 bytes, fields at 0 / 8 / 16 | Go lays fields out in declaration order and *never* reorders, so field order is entirely on you — there is no automatic reordering to fall back on for a reference-containing struct, unlike C#. `unsafe.Sizeof` and `unsafe.Offsetof` tell you, and are worth a test. |
+| Rust | 16 bytes with the default `repr(Rust)`; 24 with `#[repr(C)]` | The opposite default from C#: Rust reorders freely unless you ask for C layout, so the naive declaration is already optimal — and any code that assumes a byte layout must say `#[repr(C)]` or it is reading garbage. |
+| Java | no user-defined value types, so there is no array-of-struct at all | An array of objects is an array of *references*: each element is a separate heap object with its own header, so you get pointer chasing exactly where C# gets one contiguous run. Object field layout is entirely the JVM's business — no declaration-order guarantee, and no `sizeof` to check it with. |
+
+## common bugs
+
+- **Adding up the field sizes and trusting the total.** The four obvious predictions on this
+  page are 10, 10, 12 and 9; the actual answers are 24, 16, 12 and 16. Call `Unsafe.SizeOf` —
+  it is one line and it cannot be wrong.
+- **Assuming declaration order is honoured.** It is, right up until the struct contains an object
+  reference, at which point the CLR lays it out automatically and ignores an explicit
+  `LayoutKind.Sequential` for the managed layout. Any code that reinterprets that struct's actual
+  bytes — `MemoryMarshal.AsBytes`, a hash over the raw memory — is silently wrong on it. P/Invoke
+  is the exception, not another victim: the marshaller still builds the sequential layout you
+  asked for, which is exactly why `Marshal.OffsetOf` and `Unsafe.ByteOffset` disagree on `SeqRef`.
+- **Reaching for `Pack = 1` to shrink a hot struct.** It does shrink it — `Squeezed` is a real 10
+  bytes, no padding — but it gives up the guarantee that a load of a naturally aligned primitive
+  is a single, atomic access, which the [memory model](/systems/memory-model/) builds on. Not
+  every architecture absorbs a misaligned load the way x86-64 does, and some fault outright. A
+  layout attribute is a portability and correctness decision, not a free shrink.
+- **Forgetting the array header when estimating memory.** `new T[100]` costs `100 * sizeof(T)`
+  plus 24 bytes of header, not just the element bytes — small on a 100-element array, and exactly
+  as large a fraction on a 20-million-element one, where it adds up to 480 MB versus 320 MB
+  depending on field order alone.
+- **Optimising a struct nobody has a million of.** Padding is a per-element cost. On a struct you
+  allocate a few thousand of, 8 wasted bytes is 8 kilobytes, and the field order that reads best
+  wins.

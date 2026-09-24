@@ -1,0 +1,125 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: binary-search
+problem: find-minimum-rotated
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import Cells from '@components/Cells.astro';
+
+## task
+
+A sorted array of distinct integers was rotated at some unknown pivot. Find the minimum element,
+in O(log n).
+
+```text
+nums = [4, 5, 6, 7, 0, 1, 2]  →  0
+```
+
+## how to think
+
+The array as a whole isn't sorted, so you can't compare `nums[mid]` to a fixed target the way
+classic binary search does. But a single rotation only breaks order at exactly one point, and that
+gives you a comparison to lean on: look at `nums[mid]` against `nums[right]`.
+
+If `nums[mid] > nums[right]`, the break — and therefore the minimum — must be strictly between
+`mid` and `right`, because a value larger than the rightmost element can only happen on the "high"
+side of a rotation. The entire left half, `mid` included, can be discarded. If instead
+`nums[mid] <= nums[right]`, the segment from `mid` to `right` is itself already sorted (no break
+inside it), which means `mid` could very well *be* the minimum — so it has to stay in the range,
+not get discarded.
+
+That's the whole algorithm: one comparison per step, shrinking from whichever side the comparison
+rules out, always keeping a candidate minimum in range.
+
+<Callout kind="note" label="template instance">
+  **Boundary** skeleton (`while (left < right)`) — with `right` starting at the last index (not
+  one past it), because the condition reads `nums[right]`. Invariant: the minimum always lies
+  within `[left, right]`. Condition: `nums[mid] <= nums[right]` → keep `mid` (`right = mid`);
+  otherwise discard it (`left = mid + 1`).
+</Callout>
+
+## solution
+
+```csharp
+public int FindMin(int[] nums)
+{
+    int left = 0, right = nums.Length - 1;
+
+    while (left < right)
+    {
+        int mid = left + (right - left) / 2;
+
+        if (nums[mid] > nums[right])
+            left = mid + 1;      // the break is between mid and right — min is past mid
+        else
+            right = mid;         // [mid, right] is already sorted — mid could BE the min
+    }
+
+    return nums[left];           // left == right: the minimum
+}
+```
+
+## trace
+
+`nums = [4, 5, 6, 7, 0, 1, 2]`:
+
+| step | L | R | mid | nums[mid] | nums[R] | verdict | move |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | 0 | 6 | 3 | 7 | 2 | `7 > 2` — break is right of mid | `left = 4` |
+| 2 | 4 | 6 | 5 | 1 | 2 | `1 <= 2` — `[mid, R]` sorted, mid could be min | `right = 5` |
+| 3 | 4 | 5 | 4 | 0 | 1 | `0 <= 1` — `[mid, R]` sorted, mid could be min | `right = 4` → loop ends (`left == right`) |
+
+`nums[4] = 0`.
+
+<Cells
+  data={[4, 5, 6, 7, 0, 1, 2]}
+  pointers={{ 0: [{ t: 'L', c: 'amber' }], 3: [{ t: 'M', c: 'purple' }], 6: [{ t: 'R', c: 'cyan' }] }}
+  cells={{ 0: 'warn', 1: 'warn', 2: 'warn', 3: 'warn' }}
+  caption="nums[mid] = 7 > nums[R] = 2 → the break is to the right; indices 0-3 can't hold the minimum"
+/>
+
+<Cells
+  data={[4, 5, 6, 7, 0, 1, 2]}
+  pointers={{ 4: [{ t: 'min', c: 'green' }] }}
+  cells={{ 0: 'dim', 1: 'dim', 2: 'dim', 3: 'dim', 4: 'ok', 5: 'dim', 6: 'dim' }}
+  caption="left = right = 4 → nums[4] = 0 is the minimum, found in three comparisons"
+/>
+
+## why it works
+
+Comparing `nums[mid]` to `nums[right]` unambiguously tells you which side of the single rotation
+break `mid` is on: greater means you're still in the pre-break "high" segment, so the minimum is
+strictly later and `mid` is safe to drop; less-or-equal means you're already inside (or exactly
+at) the sorted "low" segment that starts with the minimum, so `mid` is a live candidate and must
+stay in range. The invariant "the minimum lies within `[left, right]`" therefore holds at every
+step, the range still halves each iteration, and it converges to the single index that must be the
+minimum.
+
+<Watch items={[['time', 'O(log n)'], ['space', 'O(1)']]} />
+
+## common bugs
+
+- Comparing `nums[mid]` to `nums[left]` instead of `nums[right]` — with a small range this
+  comparison can't reliably distinguish "not rotated here" from "rotated here," and misroutes the
+  search.
+- Writing `right = mid - 1` on the "mid could be the min" branch instead of `right = mid` — that
+  excludes `mid` from ever being returned, even when `mid` genuinely is the answer.
+- On the branch that discards `mid`, writing `left = mid` instead of `left = mid + 1`: since `mid`
+  floors toward `left`, that stalls the moment `right - left == 1` — infinite loop. Only the
+  branch that *keeps* `mid` in range gets to leave `left`/`right` at `mid`; the branch that drops
+  it must move by `mid + 1`.
+- Assuming duplicates are allowed — LC 153 guarantees distinct values. With duplicates,
+  `nums[mid] == nums[right]` is ambiguous about which half is sorted and needs a linear fallback
+  (LC 154).
+
+## variants you can now solve
+
+- **[Search in Rotated Sorted Array](/patterns/binary-search/search-rotated-array/)** (LC 33) —
+  same rotated array, a different question: find a target, not the pivot.
+- **Find Minimum in Rotated Sorted Array II** (LC 154) — duplicates allowed; the comparison
+  degrades to O(n) worst case and needs a `right--` fallback when `nums[mid] == nums[right]`.
+- **[Koko Eating Bananas](/patterns/binary-search/koko-eating-bananas/)** — the exact same "keep
+  mid, shrink from one side" boundary shape, applied to a range of candidate speeds instead of
+  array indices.

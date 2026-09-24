@@ -1,0 +1,124 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: two-pointers
+problem: remove-duplicates
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import Cells from '@components/Cells.astro';
+
+## task
+
+Given an array `nums` sorted in non-decreasing order, remove duplicates **in place** so each
+unique value appears once, keeping relative order. Return `k`, the number of unique values —
+the first `k` slots of `nums` must hold the answer; what's beyond index `k` doesn't matter.
+
+```text
+nums = [1,1,2,2,2,3,4,4,5]  →  k = 5, nums[0..5) = [1,2,3,4,5]
+```
+
+## how to think
+
+"In place" plus "sorted" is the array-techniques giveaway for same-direction read/write
+pointers. `read` scans every element exactly once; `write` marks the boundary of the answer
+built so far — everything at index `< write` is final and deduplicated. The only question each
+step answers is: *does `nums[read]` belong in the answer, or have I already kept it?*
+
+Because the array is sorted, duplicates of any value are always contiguous, so "already kept"
+reduces to one comparison: is `nums[read]` equal to the last value I actually wrote? If yes,
+skip it — `write` doesn't move and the duplicate is silently dropped. If no, it's a new value:
+claim the next slot and advance the boundary.
+
+<Callout kind="note" label="template instance">
+  **Same direction (read/write)** skeleton. `Keep(x)` becomes "`x != nums[write - 1]`" — compare
+  against the *last kept* value, not the previous array slot. Invariant: `nums[0..write)` is
+  always the deduplicated prefix of everything `read` has seen so far.
+</Callout>
+
+## solution
+
+```csharp
+public int RemoveDuplicates(int[] nums)
+{
+    if (nums.Length == 0) return 0;
+
+    int write = 1;                              // nums[0] is always kept
+    for (int read = 1; read < nums.Length; read++)
+    {
+        if (nums[read] != nums[write - 1])      // new value relative to what we've kept
+            nums[write++] = nums[read];
+    }
+    return write;
+}
+```
+
+## trace
+
+`nums = [1,1,2,2,2,3,4,4,5]`, starting `write = 1` (index 0 is kept unconditionally):
+
+| read | nums[read] | nums[write-1] | verdict | action |
+| --- | --- | --- | --- | --- |
+| 1 | 1 | 1 | duplicate | skip |
+| 2 | 2 | 1 | new | `nums[1] = 2`, `write → 2` |
+| 3 | 2 | 2 | duplicate | skip |
+| 4 | 2 | 2 | duplicate | skip |
+| 5 | 3 | 2 | new | `nums[2] = 3`, `write → 3` |
+| 6 | 4 | 3 | new | `nums[3] = 4`, `write → 4` |
+| 7 | 4 | 4 | duplicate | skip |
+| 8 | 5 | 4 | new | `nums[4] = 5`, `write → 5` |
+
+At `read = 2`, before the write happens — `write` trails `read` by one slot, the two `1`s
+already collapsed to one:
+
+<Cells
+  data={[1, 1, 2, 2, 2, 3, 4, 4, 5]}
+  pointers={{ 1: [{ t: 'W', c: 'amber' }], 2: [{ t: 'R', c: 'cyan' }] }}
+  cells={{ 0: 'ok' }}
+  caption="W holds the write boundary; R has already skipped the duplicate 1 at index 1"
+/>
+
+After the loop, `nums = [1,2,3,4,5,3,4,4,5]` — the first 5 slots are the answer, everything past
+`write` is leftover scratch, never meant to be read:
+
+<Cells
+  data={[1, 2, 3, 4, 5, 3, 4, 4, 5]}
+  pointers={{ 5: [{ t: 'k=5', c: 'amber' }] }}
+  cells={{ 0: 'ok', 1: 'ok', 2: 'ok', 3: 'ok', 4: 'ok', 5: 'dim', 6: 'dim', 7: 'dim', 8: 'dim' }}
+  caption="nums[0..5) is the deduplicated answer; the tail is garbage the caller must ignore"
+/>
+
+## why it works
+
+`write` never advances past a value it hasn't verified is new, so `nums[0..write)` is an
+invariant that holds after every iteration: it is exactly the unique values seen so far, in
+order. `read` visits every index once, so the whole array is classified in a single O(n) pass,
+and because `write <= read` always, the write never overtakes — and therefore never
+overwrites — an element `read` still needs to inspect.
+
+<Watch items={[['time', 'O(n)'], ['space', 'O(1)'], ['passes', '1']]} />
+
+## common bugs
+
+- Comparing `nums[read]` against `nums[read - 1]` instead of `nums[write - 1]`. For this exact
+  problem the two happen to coincide, but the moment you generalize (allow up to two
+  duplicates, drop into a different write rule) only the write-relative comparison stays
+  correct.
+- Starting `write` at `0` instead of `1` — `nums[0]` is kept unconditionally; the loop only
+  needs to *decide* about everything after it.
+- Skipping the `nums.Length == 0` guard — the loop simply never runs (`1 < 0` is false), so the
+  function silently returns `1` instead of `0` for an empty array. No crash, just a wrong answer,
+  which is the sneaky kind to miss.
+- Returning the mutated array instead of the integer `write` — the grader only looks at the
+  first `k` slots the function reports, not the whole array.
+- Assuming the tail past index `k` is untouched or zeroed — it's genuine leftover data from the
+  overwrite, and code that reads it afterward is reading garbage.
+
+## variants you can now solve
+
+- **[Move Zeroes](/patterns/array-techniques/move-zeroes/)** (LC 283) — the same read/write
+  compaction template, recalled: `Keep(x)` flips to "`x != 0`", and instead of discarding the
+  rejects you shove them to the back.
+- **Remove Duplicates from Sorted Array II** (LC 80) — allow up to two copies of each value;
+  compare against `nums[write - 2]` instead of `nums[write - 1]`.
+- **Remove Element** (LC 27) — same skeleton again, `Keep(x)` becomes "`x != val`".

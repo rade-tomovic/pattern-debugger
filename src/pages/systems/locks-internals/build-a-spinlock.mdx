@@ -1,0 +1,403 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: locks-internals
+problem: build-a-spinlock
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import Solution from '@components/Solution.astro';
+
+## the question
+
+A lock is an atomic word, a wait queue, and a way to park a thread. Delete the last two and you
+still have a lock — a bad one, but a real one. This is all of it:
+
+```csharp
+sealed class NaiveSpinLock
+{
+    int _state;
+
+    public void Enter()
+    {
+        while (Interlocked.CompareExchange(ref _state, 1, 0) != 0)
+        { }                                          // burn a core until it frees up
+    }
+
+    public void Exit() => Volatile.Write(ref _state, 0);   // release-store: 1 -> 0
+}
+```
+
+Twelve lines. It provides mutual exclusion, and it provides the visibility guarantee that goes
+with it. It provides nothing else: no reentrancy, no timeout, no fairness, no `Wait`/`Pulse`, no
+way to give up, and — the point of this exercise — no backoff.
+
+<Callout kind="insight" label="predict first">
+  Nothing here is timed. Four things to reason out before you scroll.
+
+  **One:** the twelve lines above provide mutual exclusion by construction — the CAS makes it
+  impossible for two threads to both see `_state == 0` and both proceed. What happens if you
+  delete the lock entirely and just do `_count++` from sixteen threads at once? Will the final
+  count come out exactly right, close, or noticeably short?
+
+  **Two:** `NaiveSpinLock`, `PoliteSpinLock` (the same code plus `SpinWait.SpinOnce()` in the
+  loop), and `lock` (Monitor) are compared on one axis: out of two million acquisitions split
+  across as many threads as the machine has cores, how many times does the lock change hands to
+  a *different* thread ("acquisitions per turn" — high means one thread keeps winning; low means
+  it rotates almost every time)? Rank the three from most rotation to least, and say what each
+  one does the instant it loses a CAS that predicts your ranking.
+
+  **Three:** run all three locks with *twice* as many threads as the machine has cores. Do you
+  expect correctness to hold for all three anyway? Why would oversubscription threaten
+  correctness at all, given that each `Enter()` only returns once the CAS actually succeeds?
+
+  **Four, qualitative:** with more spinning threads than cores, some threads are, at any given
+  instant, not running. What does the OS scheduler have to do that it would not have to do if
+  there were one thread per core — and which of the three locks gives the scheduler any
+  information about which threads are just waiting?
+</Callout>
+
+## the code
+
+Four ways to add one to a shared `long` — no lock, the naive spin, the same spin with a
+backoff, and `Monitor` — checked for correctness at the machine's own core count and at twice
+that many threads, then compared on exactly one axis: who gets the lock next. No `Stopwatch`,
+no CPU-time sampling, anywhere in this file.
+
+<Solution>
+
+```csharp
+// Evidence for /systems/locks-internals/build-a-spinlock/ — run with:
+//   dotnet run bench/locks-internals/build-a-spinlock.cs -c Release
+// Twelve lines of spinlock, checked for correctness against `lock` (Monitor)
+// at 1x and 2x the machine's core count, then compared on ONE axis that
+// needs no stopwatch: who actually gets the lock next. No Stopwatch and no
+// CPU-time sampling anywhere in this file — the fairness question is
+// answered entirely by counting owner changes, which is exact and needs no
+// timing to be meaningful.
+using System.Runtime.CompilerServices;
+
+// ── the whole thing ─────────────────────────────────────────────────────────
+// _state is 0 when free and 1 when held. CompareExchange writes 1 only if it
+// reads 0, and reports what it saw. That single instruction IS the lock.
+sealed class NaiveSpinLock
+{
+    int _state;
+
+    public void Enter()
+    {
+        while (Interlocked.CompareExchange(ref _state, 1, 0) != 0)
+        { }                                          // burn a core until it frees up
+    }
+
+    public void Exit() => Volatile.Write(ref _state, 0);   // release-store: 1 -> 0
+}
+
+// The same lock, with the one change that matters: tell the CPU and then the
+// OS scheduler that we are spinning. SpinWait escalates pause -> Thread.Yield
+// -> Sleep(0) -> Sleep(1) as the wait gets longer.
+sealed class PoliteSpinLock
+{
+    int _state;
+
+    public void Enter()
+    {
+        var spin = new SpinWait();
+        while (Interlocked.CompareExchange(ref _state, 1, 0) != 0) spin.SpinOnce();
+    }
+
+    public void Exit() => Volatile.Write(ref _state, 0);
+}
+
+static class Bench
+{
+    static long _count;
+    static readonly NaiveSpinLock Naive = new();
+    static readonly PoliteSpinLock Polite = new();
+    static readonly object Gate = new();
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    static void WithNaive(int n) { for (int i = 0; i < n; i++) { Naive.Enter(); try { _count++; } finally { Naive.Exit(); } } }
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    static void WithPolite(int n) { for (int i = 0; i < n; i++) { Polite.Enter(); try { _count++; } finally { Polite.Exit(); } } }
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    static void WithMonitor(int n) { for (int i = 0; i < n; i++) lock (Gate) _count++; }
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    static void WithNothing(int n) { for (int i = 0; i < n; i++) _count++; }
+
+    // ── who gets the lock next? ─────────────────────────────────────────────
+    // Every acquisition records the owner. If the owner changed since last
+    // time, that is a handoff to a different thread; if it did not, the same
+    // thread got the lock again and the lock word never had to leave its core.
+    static int _lastOwner; static long _handoffs;
+    static void Note() { int me = Environment.CurrentManagedThreadId; if (me != _lastOwner) { _handoffs++; _lastOwner = me; } _count++; }
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    static void NaiveNoted(int n) { for (int i = 0; i < n; i++) { Naive.Enter(); try { Note(); } finally { Naive.Exit(); } } }
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    static void PoliteNoted(int n) { for (int i = 0; i < n; i++) { Polite.Enter(); try { Note(); } finally { Polite.Exit(); } } }
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    static void MonitorNoted(int n) { for (int i = 0; i < n; i++) lock (Gate) Note(); }
+
+    static void RunToCompletion(Action<int> body, int threads, int totalOps)
+    {
+        int per = totalOps / threads;
+        var ts = new Thread[threads];
+        var start = new ManualResetEventSlim(false);
+        for (int t = 0; t < threads; t++) { ts[t] = new Thread(() => { start.Wait(); body(per); }) { IsBackground = true }; ts[t].Start(); }
+        Thread.Sleep(20);                       // let every thread reach the gate
+        start.Set();
+        foreach (var th in ts) th.Join();
+    }
+
+    public static void Main()
+    {
+        int cores = Environment.ProcessorCount;
+
+        // ── 1. is it actually a lock, at the machine's own core count? ──────
+        const int Ops = 2_000_000;
+        foreach (var (name, body) in new (string, Action<int>)[] { ("no lock", WithNothing), ("NaiveSpinLock", WithNaive), ("PoliteSpinLock", WithPolite), ("lock (Monitor)", WithMonitor) })
+        {
+            _count = 0;
+            RunToCompletion(body, cores, Ops);
+            Console.WriteLine($"  {name,-16} {cores} threads x {Ops / cores:N0} increments -> {_count,10:N0}   {(_count == Ops ? "correct" : $"LOST {Ops - _count:N0}")}");
+        }
+        if (_count != Ops) throw new Exception("FAIL: Monitor lost an update");
+
+        // ── 2. does it stay correct oversubscribed — more threads than cores? ─
+        int over = cores * 2;
+        Console.WriteLine($"\n  oversubscribed: {over} threads on {cores} cores");
+        foreach (var (name, body) in new (string, Action<int>)[] { ("NaiveSpinLock", WithNaive), ("PoliteSpinLock", WithPolite), ("lock (Monitor)", WithMonitor) })
+        {
+            _count = 0;
+            RunToCompletion(body, over, Ops);
+            Console.WriteLine($"  {name,-16} {over} threads x {Ops / over:N0} increments -> {_count,10:N0}   {(_count == Ops ? "correct" : $"LOST {Ops - _count:N0}")}");
+        }
+        if (_count != Ops) throw new Exception("FAIL: a lock lost an update oversubscribed");
+
+        // ── 3. fairness: how often does the lock change hands? ──────────────
+        // Exact and needs no timing: count acquisitions and owner changes,
+        // both incremented under the very lock being measured, so counting
+        // costs no extra synchronization of its own.
+        Console.WriteLine($"\n  handoffs, {cores} threads x {Ops / cores:N0} acquisitions each lock");
+        Console.WriteLine($"  {"lock",-16} {"acquisitions",13} {"owner changes",14} {"acq per turn",13}");
+        foreach (var (name, body) in new (string, Action<int>)[] { ("NaiveSpinLock", NaiveNoted), ("PoliteSpinLock", PoliteNoted), ("lock (Monitor)", MonitorNoted) })
+        {
+            _handoffs = 0; _lastOwner = 0; _count = 0;
+            RunToCompletion(body, cores, Ops);
+            Console.WriteLine($"  {name,-16} {_count,13:N0} {_handoffs,14:N0} {(double)_count / _handoffs,13:F1}");
+        }
+
+        Console.WriteLine($"\nchecksum {_count}");
+        Console.WriteLine("PASS");
+    }
+}
+```
+
+</Solution>
+
+## work it out
+
+**No lock at all is the control, and it is worth confirming it actually fails** before trusting
+that any of the three real locks succeeds for the right reason. `_count++` from many threads at
+once is the exact same read-modify-write race [the fast path and the slow
+path](/systems/locks-internals/lock-cost-ladder/) walks through step by step: load, add, store,
+three separate operations with no guarantee the interleaving respects them. The final checksum
+below lands nowhere near correct, every time, which is the baseline everything else has to beat.
+
+**Here is what the JIT actually emits for those twelve lines** — `NaiveSpinLock:Enter`/`Exit`,
+dumped through the JIT's own diagnostic disassembly, forced past the tier-0 quick-JIT path so
+it shows the fully-optimized body rather than an unoptimized first pass, with both methods
+temporarily marked `[MethodImpl(MethodImplOptions.NoInlining)]` for the dump only (without that
+attribute the JIT inlines both into the caller and the method never exists as a standalone
+compiled body to dump):
+
+```text
+; NaiveSpinLock:Enter()
+       push     rbp
+       mov      rbp, rsp
+G_M000_IG03:
+       lea      rcx, bword ptr [rdi+0x08]   ; &_state — past the object header and MethodTable ptr
+       mov      edx, 1                      ; the value we want to write
+       xor      eax, eax                    ; the value we expect to find: 0
+       lock
+       cmpxchg  dword ptr [rcx], edx        ; ← the entire lock
+       test     eax, eax                    ; did we see 0?
+       jne      SHORT G_M000_IG03           ; no — spin
+       pop      rbp
+       ret
+
+; NaiveSpinLock:Exit()
+       xor      eax, eax
+       mov      dword ptr [rdi+0x08], eax   ; ← the entire unlock. a plain store
+       ret
+```
+
+That is the same `lock cmpxchg` the C spinlock on
+[what a lock is made of](/systems/locks-internals/) compiles to, from the same source shape, on
+the same instruction set. `Interlocked.CompareExchange` is not a library call at all — the JIT
+knows it as an intrinsic and emits the instruction directly. `Volatile.Write` is a plain `mov`
+here **because x86 stores already have release semantics**; the topic page's ARM discussion is
+where that stops being free.
+
+**Now the fairness question, and why the three locks should behave differently.** The instant a
+thread loses a CAS, each of the three does something different:
+
+- `NaiveSpinLock` immediately retries the exact same instruction. Every losing thread is a
+  tight loop hammering the same cache line as fast as the core can issue `lock cmpxchg`.
+- `PoliteSpinLock` calls `SpinWait.SpinOnce()`, which escalates: a short CPU-level spin first,
+  then `Thread.Yield()`, then `Thread.Sleep(0)`, then `Thread.Sleep(1)` — each step taking the
+  losing thread further out of active competition for a while.
+- `lock` (`Monitor`) spins briefly too, then parks the thread through the kernel once the spin
+  budget is exhausted — and a woken thread races for the lock again rather than being handed it,
+  the same diagram as [the topic page](/systems/locks-internals/).
+
+The prediction that follows: `PoliteSpinLock` should show the most same-owner streaks, because
+its losers spend real time not even trying — the field of active contenders thins out, and
+whichever thread is currently running (often the one that just released, since it heads straight
+back into its own next attempt) faces less competition. `NaiveSpinLock`, with every thread
+hammering continuously and none of them backing off, has no equivalent quiet period — with as
+many threads as cores, the CAS a released line resolves to is effectively up for grabs by
+whichever core's retry lands first, which is close to arbitrary.
+
+**Oversubscription is a scheduling question, not a locking question.** `Enter()` only returns
+once the CAS truly succeeds, for all three locks, so correctness cannot depend on how many
+threads exist — a thread that is not currently scheduled simply has not attempted its next CAS
+yet. What oversubscription changes is *how the CPU's time is split*: with more runnable threads
+than cores, the OS has to time-slice, and it has no way to tell that a `NaiveSpinLock` spinner is
+"just waiting" rather than doing real work — a busy CAS loop looks identical to useful
+computation from the scheduler's point of view. `PoliteSpinLock` and `Monitor` both make real
+yield/sleep syscalls once their spin budget is up, which is a real signal to the scheduler that
+this thread has nothing to do right now; `NaiveSpinLock` never emits that signal, so a spinning
+thread and the actual lock holder compete for cores on equal footing.
+
+## the answer
+
+One core count, one clean run, real output:
+
+```text
+  no lock          16 threads x 125,000 increments ->    171,929   LOST 1,828,071
+  NaiveSpinLock    16 threads x 125,000 increments ->  2,000,000   correct
+  PoliteSpinLock   16 threads x 125,000 increments ->  2,000,000   correct
+  lock (Monitor)   16 threads x 125,000 increments ->  2,000,000   correct
+
+  oversubscribed: 32 threads on 16 cores
+  NaiveSpinLock    32 threads x 62,500 increments ->  2,000,000   correct
+  PoliteSpinLock   32 threads x 62,500 increments ->  2,000,000   correct
+  lock (Monitor)   32 threads x 62,500 increments ->  2,000,000   correct
+
+  handoffs, 16 threads x 125,000 acquisitions each lock
+  lock              acquisitions  owner changes  acq per turn
+  NaiveSpinLock        2,000,000        392,094           5.1
+  PoliteSpinLock       2,000,000         14,239         140.5
+  lock (Monitor)       2,000,000        437,166           4.6
+
+checksum 2000000
+PASS
+```
+
+**Prediction one confirmed hard.** With no lock, sixteen threads racing on `_count++` lost the
+large majority of their increments — not close, not "a little off". The three real locks all
+land exactly on 2,000,000, every time, at both thread counts.
+
+**Prediction two: `PoliteSpinLock` batches far more turns per handoff than the other two —
+roughly 30× more here — and `NaiveSpinLock` and `lock` come out close to each other, both in
+the single digits.** That confirms the mechanism reasoning above: a backoff that actually takes
+losers out of contention for a while concentrates wins on whoever is currently active, by an
+order of magnitude. What did *not* separate cleanly is `NaiveSpinLock` against `Monitor` — with
+as many threads as cores, both rotate ownership almost every acquisition, because in both cases
+a losing thread is back in the race (spinning, or freshly woken and barging) essentially
+immediately. That is itself worth sitting with: the naive lock's total absence of a backoff and
+`Monitor`'s deliberately brief spin-before-park produce similar turn-taking here, even though
+their cost structures are nothing alike.
+
+**Prediction three confirmed: correctness held at both thread counts, for all three real
+locks**, exactly as the reasoning predicted — `Enter()` cannot return early regardless of how
+much time-slicing the OS has to do underneath it.
+
+<Callout kind="trap" label="the case oversubscription hints at but does not force">
+  Doubling the thread count past the core count is enough to make the scheduling pressure real,
+  but not enough to force the worst case. The genuinely pathological scenario — many more
+  spinning threads than cores, where the actual lock holder can go a long stretch without being
+  scheduled at all while every spinner keeps burning a full time slice checking a word that
+  cannot change until the holder runs again — is reasoning from the mechanism above, not
+  something this run demonstrates directly. What is demonstrated is the ingredient: `NaiveSpinLock`
+  gives the scheduler no signal that a spinning thread is idle, and `PoliteSpinLock`/`Monitor`
+  both do.
+</Callout>
+
+## why it works that way
+
+**A backoff is not a performance tweak — it is the thing that tells the OS scheduler "I am
+waiting, not working".** `NaiveSpinLock`'s CAS loop is, from the scheduler's point of view,
+indistinguishable from useful computation: it never calls anything that says otherwise. Every
+real lock — `SpinLock`, `Monitor`'s own spin phase, `PoliteSpinLock` here — eventually makes a
+real yield or sleep call, and that call is what lets the scheduler prioritize a thread that is
+actually about to release a lock over one that is only checking whether it can.
+
+**Fewer active contenders is what produces long ownership streaks, not "the lock getting
+faster".** `PoliteSpinLock`'s huge acquisitions-per-turn number is not about `PoliteSpinLock`
+being better tuned — it is a direct count-level consequence of most other threads being
+temporarily out of the race. The same reasoning explains why `Monitor`'s barging design (a
+woken thread races rather than being handed the lock) does not automatically produce more
+fairness than a raw CAS loop: barging is barging, whichever mechanism backs it.
+
+**Correctness and fairness are different guarantees, and this exercise deliberately measures
+both separately.** The naive lock provides one (mutual exclusion) and not the other (no
+scheduling awareness, no bound on how unevenly turns get distributed). `Monitor` provides more
+of both, at a real cost this exercise does not price — [the fast path and the slow
+path](/systems/locks-internals/lock-cost-ladder/) is where that cost gets counted.
+
+<Watch items={[['no lock, many threads', 'loses updates, every run — not close'], ['PoliteSpinLock, acquisitions per turn', 'tens to hundreds — a real backoff concentrates wins'], ['NaiveSpinLock / Monitor, acquisitions per turn', 'single digits at thread count ≈ core count — rotates almost every time'], ['correctness, 2x oversubscribed', 'holds for every real lock — Enter() cannot return early'], ['lines of code, the whole lock', '12']]} />
+
+## what this looks like in prod
+
+You will not write `while (Interlocked.CompareExchange(...) != 0) { }` in a service. You will
+inherit it, or something with its shape: a "lightweight" custom lock in a utility library, a
+`SpinLock` field somebody added after reading that it was faster, a retry loop around
+`ConcurrentDictionary.TryUpdate` with no backoff, a `while (!_ready) { }` poll on a flag.
+
+The signature in production is a **core pinned near 100% while throughput is flat and no
+useful work is being done.** In a container that is worse than it sounds: CPU quota is enforced
+by throttling, so threads that spin eat the quota that the thread holding the lock needs in
+order to release it, and the whole process can stall at the cgroup level. A CPU profile shows
+one method at the top with a huge sample count, which reads like a hot loop rather than like
+waiting, and that is how this gets misdiagnosed as "optimise the hot method".
+
+The rule that keeps you out of it: **never spin on a thread you do not control the scheduling
+of.** A thread-pool thread can be preempted at any point, including while holding your lock. If
+you have a critical section genuinely short enough that a spin is worth it, use `SpinLock`,
+which at least has a proper backoff and a documented contract. Otherwise use `lock`, which
+spins for you, briefly, and then does the smart thing.
+
+## the same idea in other languages
+
+| language | what it's called | the trap |
+| --- | --- | --- |
+| C / C++ | `atomic_compare_exchange` / `std::atomic::compare_exchange_weak`, with `_mm_pause()` in the retry loop | there is no runtime to save you: a spin loop over a plain `int` without atomics or `volatile` can be hoisted out of the loop entirely by the optimiser, so the thread spins on a value in a register and never sees the release. In C# `Interlocked` and `Volatile` make that specific miscompile impossible |
+| Java | `AtomicInteger.compareAndSet`, plus `Thread.onSpinWait()` for the `pause` hint | the same twelve lines work, and `synchronized` on the JVM does its own adaptive spinning that also reduces to a CAS on the mark word — so a hand-rolled version is not automatically the win it looks like, and it loses the JVM's ability to report the lock in a thread dump |
+| Go | `sync/atomic.CompareAndSwapInt32`, with `sync.Mutex` for the real thing — its own spin phase is bounded to a handful of iterations before it parks the goroutine | the folklore that a call-free `for { x++ }` can never be preempted, and therefore starves the goroutine holding a lock, has been false since Go 1.14 added signal-based asynchronous preemption — a documented runtime change, not something this page benchmarks. What is still true, and does transfer: a spin loop with no backoff burns a whole processor's worth of CPU doing nothing, in Go exactly as in .NET |
+| Rust | `AtomicBool::compare_exchange` with explicit `Ordering::Acquire` / `Ordering::Release` | Rust makes you name the two orderings this C# code gets from `Interlocked` and `Volatile.Write`, and picking `Ordering::Relaxed` compiles, passes on x86 where stores are already ordered, and breaks on ARM. The bug this page's `Volatile.Write` prevents is a `Relaxed` away in every language that exposes the choice |
+
+## common bugs
+
+- **Releasing with a plain assignment.** `_state = 0` instead of `Volatile.Write(ref _state, 0)`
+  compiles to the same instruction on x86 and is still wrong: nothing stops the JIT from moving
+  writes from inside the critical section to after the release. It will work in every test you
+  run on an x86 laptop and fail on ARM, which is now most of the servers you can rent.
+- **Spinning on a non-volatile read.** A loop like `while (_state != 0) { }` over an ordinary
+  field can be hoisted so the read happens once, and the loop spins forever on a stale register
+  value. `Interlocked.CompareExchange` in the loop condition is what makes the re-read
+  mandatory.
+- **Forgetting that this lock is not reentrant.** `lock` lets the same thread enter twice; this
+  class hangs. Any recursion, any callback into your own code, any `ToString` on a locked object
+  that re-enters, and the thread deadlocks against itself with no diagnostic at all.
+- **Releasing in a `finally` — or not.** The harness wraps every acquisition in `try`/`finally`,
+  exactly as the `lock` keyword does for you. Without it, one exception inside the critical
+  section leaves `_state` at 1 forever and every other thread spins until the process is killed.
+- **Assuming a fairness result generalizes across machines.** Acquisitions-per-turn is a
+  function of core count as much as of the lock's design — the same three locks on a machine
+  with a different core count can show a different ordering. Rerun the measurement rather than
+  quoting a number from elsewhere.
+- **Treating "it stayed correct oversubscribed" as "it is fine oversubscribed".** Correctness
+  and cost are different guarantees. A spin lock with no backoff can be correct at any thread
+  count and still be the reason a container is CPU-throttled into the ground.

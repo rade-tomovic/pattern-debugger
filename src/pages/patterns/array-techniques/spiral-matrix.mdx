@@ -1,0 +1,136 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: array-techniques
+problem: spiral-matrix
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+
+## task
+
+Given an `m x n` matrix, return all its elements in spiral order — clockwise, starting from the
+top-left, spiraling inward.
+
+```text
+[[1, 2, 3],
+ [4, 5, 6],       →  [1, 2, 3, 6, 9, 12, 11, 10, 7, 4, 5, 8]
+ [7, 8, 9],
+ [10, 11, 12]]
+```
+
+## how to think
+
+Walking row-by-row or column-by-column doesn't produce a spiral — the direction has to change
+every time you'd walk off the shape you've already visited, and the shape shrinks after every
+side. Track four boundaries — `top`, `bottom`, `left`, `right` — and walk the current layer's
+four edges in order: top row left-to-right, right column top-to-bottom, bottom row
+right-to-left, left column bottom-to-top. After each edge, shrink the boundary that edge just
+finished (`top++` after the top row, `right--` after the right column, and so on), and repeat
+until the boundaries cross.
+
+The two "inner" edges — the bottom row and the left column — need a guard the first two edges
+don't: on a matrix that's down to a single row or single column, walking all four edges would
+revisit cells already emitted by the top row or right column. Checking `top <= bottom` before
+the bottom row, and `left <= right` before the left column, skips the edges that no longer
+exist.
+
+<Callout kind="note" label="template instance">
+  **Matrix walk** skeleton, boundary-shrink form. Invariant: everything strictly outside
+  `[top, bottom] x [left, right]` has already been visited, in order, exactly once. Each
+  iteration walks the current frame's four edges and shrinks all four boundaries by one.
+</Callout>
+
+## solution
+
+```csharp
+public IList<int> SpiralOrder(int[][] matrix)
+{
+    var result = new List<int>();
+    int top = 0, bottom = matrix.Length - 1;
+    int left = 0, right = matrix[0].Length - 1;
+
+    while (top <= bottom && left <= right)
+    {
+        for (int col = left; col <= right; col++) result.Add(matrix[top][col]);
+        top++;
+
+        for (int row = top; row <= bottom; row++) result.Add(matrix[row][right]);
+        right--;
+
+        if (top <= bottom)                                          // guard: a row might be gone
+        {
+            for (int col = right; col >= left; col--) result.Add(matrix[bottom][col]);
+            bottom--;
+        }
+
+        if (left <= right)                                          // guard: a column might be gone
+        {
+            for (int row = bottom; row >= top; row--) result.Add(matrix[row][left]);
+            left++;
+        }
+    }
+    return result;
+}
+```
+
+## trace
+
+`matrix = [[1,2,3],[4,5,6],[7,8,9],[10,11,12]]` (4 rows x 3 cols). Every row below is one edge
+walk from the verified run — including the one that adds nothing:
+
+| edge walked | guard | top | bottom | left | right | result (after) |
+| --- | --- | --- | --- | --- | --- | --- |
+| top row | — | 1 | 3 | 0 | 2 | `[1, 2, 3]` |
+| right col | — | 1 | 3 | 0 | 1 | `[1, 2, 3, 6, 9, 12]` |
+| bottom row | `top(1) <= bottom(3)` ✓ | 1 | 2 | 0 | 1 | `[1, 2, 3, 6, 9, 12, 11, 10]` |
+| left col | `left(0) <= right(1)` ✓ | 1 | 2 | 1 | 1 | `[..., 11, 10, 7, 4]` |
+| top row | — | 2 | 2 | 1 | 1 | `[..., 7, 4, 5]` |
+| right col | — | 2 | 2 | 1 | 0 | `[..., 5, 8]` |
+| bottom row | `top(2) <= bottom(2)` ✓, but `right(0) < left(1)` so the inner loop adds nothing | 2 | 1 | 1 | 0 | `[..., 5, 8]` (unchanged) |
+
+After that last row, the left-column guard fails (`left(1) <= right(0)` is false), and the outer
+`while` check then sees `top(2) > bottom(1)` and stops. Full result:
+`[1, 2, 3, 6, 9, 12, 11, 10, 7, 4, 5, 8]`.
+
+The visitation order, laid over the original grid, makes the spiral visible at a glance:
+
+```text
+ 1   2   3
+10  11   4
+ 9  12   5
+ 8   7   6
+```
+
+## why it works
+
+Every cell belongs to exactly one layer, and each layer's four edges are walked in a fixed
+clockwise order, so cells are emitted in spiral order by construction. The boundary shrinks by
+exactly one on each side after that side is fully walked, so no cell is ever revisited — and
+the two guards (`top <= bottom`, `left <= right`) exist precisely because a layer that's been
+reduced to one row or one column has already had all of its cells emitted by the first two
+edges; walking the remaining two would double-count them.
+
+<Watch items={[['time', 'O(m * n)'], ['space', 'O(1) extra'], ['passes', '1 (per layer)']]} />
+
+## common bugs
+
+- Skipping the `top <= bottom` / `left <= right` guards on the bottom-row and left-column walks
+  — on a matrix with only one remaining row or column, this double-counts cells the first two
+  edges already emitted.
+- Using `matrix[0].Length` for `right` when the matrix isn't guaranteed rectangular — LeetCode's
+  input is rectangular, but a jagged `int[][]` in general C# might not be; guard if the source
+  isn't trusted.
+- Off-by-one on the boundary updates — forgetting `top++` / `right--` / `bottom--` / `left++`
+  after each edge walks the same layer forever (infinite loop) or re-emits its corners.
+- Confusing this with **generating** a spiral (filling a matrix in spiral order) — this problem
+  *reads* an existing matrix; Spiral Matrix II reverses the direction of the whole exercise.
+
+## variants you can now solve
+
+- **[Rotate Image](/patterns/array-techniques/rotate-image/)** (LC 48) — the other matrix walk
+  in this family: two fixed passes (transpose, reverse) instead of a shrinking boundary.
+- **Set Matrix Zeroes** (LC 73) — a different in-place matrix trick: use the first row and
+  column themselves as the "zero this out" markers, avoiding a second matrix.
+- **Spiral Matrix II** (LC 59) — the same boundary-shrink walk, but *filling* `1..n²` into the
+  matrix in spiral order instead of reading values out.

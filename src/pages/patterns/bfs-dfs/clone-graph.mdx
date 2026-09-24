@@ -1,0 +1,135 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: bfs-dfs
+problem: clone-graph
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+
+## task
+
+You're given a reference to a node in a connected undirected graph. Each node has an integer `val`
+and a list of `neighbors`. Return a deep copy of the whole graph — new node objects, same values,
+same connections, reachable starting from the returned node. LeetCode #133.
+
+```text
+adjacency: 1-2, 2-3, 3-4, 4-1   (a 4-cycle)
+CloneGraph(node 1) -> a new node with val 1, whose neighbor graph mirrors the original exactly
+```
+
+## how to think
+
+The graph has a cycle, so a plain "visit each node, recurse into neighbors" DFS would loop forever —
+node 1 leads to node 2, which leads back to node 1, forever. What breaks the cycle is the same idea
+behind any cycle-safe graph traversal: remember every node you've already started cloning, and when
+you reach one again, hand back the clone you already made instead of recursing into it again.
+
+The dictionary does two jobs at once, which is the actual insight: it's the visited set (so no
+original node is ever processed twice) *and* the answer (so when a neighbor points back to a node
+you've already cloned, you have the clone on hand to wire up the connection). One
+`Dictionary<Node, Node>`, keyed by the original node, replaces what would otherwise be a separate
+`visited` set plus a lookup table.
+
+<Callout kind="note" label="template instance">
+  **DFS** skeleton, on a graph. Invariant: every original node has at most one clone, created the
+  first time `Dfs` sees it and registered in the dictionary *before* any of its neighbors are
+  visited. What varies: a `Dictionary<Node, Node>` stands in for a `bool[] visited` — checking
+  membership answers "have I visited this?" and, unlike a plain visited set, also hands back the
+  value you need to attach as a neighbor.
+</Callout>
+
+## solution
+
+```csharp
+public Node? CloneGraph(Node? node)
+{
+    if (node is null) return null;
+    return Dfs(node, new Dictionary<Node, Node>());
+}
+
+private Node Dfs(Node original, Dictionary<Node, Node> cloned)
+{
+    if (cloned.TryGetValue(original, out Node? existing))
+        return existing;                          // already cloned — hand back the same instance, don't recurse again
+
+    var clone = new Node(original.Val);
+    cloned[original] = clone;                      // register BEFORE recursing — this is what breaks the cycle
+
+    foreach (Node neighbor in original.Neighbors)
+        clone.Neighbors.Add(Dfs(neighbor, cloned));
+
+    return clone;
+}
+
+public class Node(int val = 0, List<Node>? neighbors = null)   // LC 133's graph node
+{
+    public int Val = val;
+    public List<Node> Neighbors = neighbors ?? [];
+}
+```
+
+## trace
+
+`node1.Neighbors = [2, 4]`, `node2.Neighbors = [1, 3]`, `node3.Neighbors = [2, 4]`,
+`node4.Neighbors = [1, 3]` — a 4-cycle:
+
+```text
+1 -- 2
+|    |
+4 -- 3
+```
+
+`Dfs(1, {})` kicks it off. Every call, in order, including the cache hits:
+
+| # | call | reached from | result | `cloned` keys after |
+| --- | --- | --- | --- | --- |
+| 1 | `Dfs(1)` | root | create clone₁ | `{1}` |
+| 2 | `Dfs(2)` | 1's 1st neighbor | create clone₂ | `{1, 2}` |
+| 3 | `Dfs(1)` | 2's 1st neighbor | cache hit → clone₁ | `{1, 2}` |
+| 4 | `Dfs(3)` | 2's 2nd neighbor | create clone₃ | `{1, 2, 3}` |
+| 5 | `Dfs(2)` | 3's 1st neighbor | cache hit → clone₂ | `{1, 2, 3}` |
+| 6 | `Dfs(4)` | 3's 2nd neighbor | create clone₄ | `{1, 2, 3, 4}` |
+| 7 | `Dfs(1)` | 4's 1st neighbor | cache hit → clone₁ | `{1, 2, 3, 4}` |
+| 8 | `Dfs(3)` | 4's 2nd neighbor | cache hit → clone₃ | `{1, 2, 3, 4}` |
+| 9 | `Dfs(4)` | 1's 2nd neighbor | cache hit → clone₄ | `{1, 2, 3, 4}` |
+
+4 nodes, each visited once (4 creates) and reached again exactly once more per remaining edge
+(5 cache hits) — 9 calls total, zero infinite recursion. Final wiring:
+`clone₁.Neighbors = [clone₂, clone₄]`, `clone₂.Neighbors = [clone₁, clone₃]`,
+`clone₃.Neighbors = [clone₂, clone₄]`, `clone₄.Neighbors = [clone₁, clone₃]` — the same 4-cycle,
+rebuilt from entirely new node instances.
+
+## why it works
+
+The invariant holds because registration happens *before* recursion, not after: by the time `Dfs`
+starts looping over `original.Neighbors`, `clone` is already in the dictionary. So if any neighbor's
+own neighbor-walk leads back to `original` — which it always eventually does in an undirected graph,
+since every edge is a two-way street — that walk finds `original` already registered and returns the
+existing clone instead of recursing into it again. Swap the order (recurse first, register after)
+and the exact same cycle recurses forever, because nothing stops `Dfs(1)` calling `Dfs(2)` calling
+`Dfs(1)` calling `Dfs(2)`, without end.
+
+<Watch items={[['time', 'O(V + E)'], ['space', 'O(V) — the dictionary, plus the recursion stack']]} />
+
+## common bugs
+
+- Registering the clone in the dictionary *after* the `foreach` loop instead of before it — the
+  cycle-breaking guarantee disappears, and any cyclic graph (which is essentially all of them)
+  recurses forever.
+- Using a `bool[] visited` array by node index instead of the dictionary — you lose the ability to
+  hand back the actual clone on a revisit, so you'd need a second lookup array anyway; the
+  dictionary is strictly simpler here.
+- Forgetting to guard `node is null` — the empty-graph input throws instead of returning `null`.
+- Relying on `Node`'s default `Equals`/`GetHashCode` without checking they stay reference-based — if
+  `Node` ever gets custom value equality added later, using it as a dictionary key silently breaks
+  the whole cache.
+
+## variants you can now solve
+
+- [Course Schedule](/patterns/advanced-graphs/course-schedule/) (LC 207) — same graph-DFS engine,
+  but the question is cycle detection instead of copying.
+- [Number of Provinces](/patterns/advanced-graphs/number-of-provinces/) (LC 547) — connected
+  components on a graph, without needing to build anything.
+- **Copy List with Random Pointer** (LC 138) — the exact same original-to-clone dictionary trick, on
+  a linked list with an extra pointer instead of a graph.

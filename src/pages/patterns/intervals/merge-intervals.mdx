@@ -1,0 +1,125 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: intervals
+problem: merge-intervals
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+
+## task
+
+Given an array of intervals where `intervals[i] = [start, end]`, merge every pair of overlapping
+intervals and return the resulting array of non-overlapping intervals, sorted by start. LeetCode #56.
+
+```text
+intervals = [[1,3],[2,6],[8,10],[15,18]]  →  [[1,6],[8,10],[15,18]]
+```
+
+## how to think
+
+The brute-force instinct is to compare every pair of intervals and union the ones that overlap —
+`O(n^2)`, and worse, "keep re-scanning until nothing changes" if a merge creates a new overlap
+with something you already passed.
+
+Sorting first removes that re-scanning entirely. Once intervals are ordered by **start**, the
+only interval that can possibly overlap with the run you're currently building is the *next* one
+in line — anything overlapping a run has to start before that run's end, and starts only increase
+from here on, so nothing further back or further forward needs a second look. That turns the
+whole problem into one pass: keep a "currently open" merged interval, and for each next interval
+either it overlaps (extend the open interval's end) or it doesn't (the open interval is done —
+close it and open a new one with the current interval).
+
+`Array.Sort(intervals, (a, b) => a[0].CompareTo(b[0]))` mutates in place with no extra allocation;
+`intervals.OrderBy(iv => iv[0]).ToArray()` reads a hair cleaner if you'd rather not touch the
+input, at the cost of a new array. Either is fine to say out loud in an interview.
+
+<Callout kind="note" label="template instance">
+  **Merge** skeleton, verbatim: sort by start, extend-or-start-new sweep. Invariant: `merged`
+  always holds fully-merged, mutually non-overlapping intervals for everything scanned so far.
+  What varies: nothing — this problem *is* the base case of the merge shape.
+</Callout>
+
+## solution
+
+```csharp
+public int[][] Merge(int[][] intervals)
+{
+    if (intervals.Length == 0) return [];
+
+    Array.Sort(intervals, (a, b) => a[0].CompareTo(b[0]));  // sort by START
+
+    var merged = new List<int[]> { intervals[0] };
+
+    for (int i = 1; i < intervals.Length; i++)
+    {
+        var last = merged[^1];
+        var current = intervals[i];
+
+        if (current[0] <= last[1])                    // overlaps (or touches) the open run
+            last[1] = Math.Max(last[1], current[1]);   // widen the run to cover both
+        else
+            merged.Add(current);                       // no overlap: close the run, start a new one
+    }
+
+    return [.. merged];
+}
+```
+
+## trace
+
+`intervals = [[1,3],[2,6],[8,10],[15,18],[17,20]]` — already sorted by start:
+
+| i | current | last (before) | check | action | `merged` after |
+| --- | --- | --- | --- | --- | --- |
+| — | — | — | — | seed | `[[1,3]]` |
+| 1 | `[2,6]` | `[1,3]` | `2 <= 3` → yes | extend end to `max(3,6)=6` | `[[1,6]]` |
+| 2 | `[8,10]` | `[1,6]` | `8 <= 6` → no | new run | `[[1,6],[8,10]]` |
+| 3 | `[15,18]` | `[8,10]` | `15 <= 10` → no | new run | `[[1,6],[8,10],[15,18]]` |
+| 4 | `[17,20]` | `[15,18]` | `17 <= 18` → yes | extend end to `max(18,20)=20` | `[[1,6],[8,10],[15,20]]` |
+
+Final: `[[1,6],[8,10],[15,20]]`.
+
+Step 4 is the "aha": the last run had already absorbed nothing since step 2, but a fresh overlap
+reopens it and widens it again — merging isn't a one-shot check, it can happen to any run at any
+later step, as long as the next interval's start still reaches back into it:
+
+```text
+before i=4:  merged = [1,6], [8,10], [15,18]
+i=4: current = [17,20]
+  17 <= 18 (last.End)  -> overlaps -> extend last.End to max(18, 20) = 20
+after:       merged = [1,6], [8,10], [15,20]
+```
+
+## why it works
+
+After sorting by start, `merged[^1]`'s end is always the **maximum** end among every interval
+folded in so far — merging only ever widens via `Math.Max`, never narrows. So checking the current
+interval against just `merged[^1]` is equivalent to checking it against *every* interval merged so
+far: if the current interval overlapped some earlier interval but not the open run, that earlier
+interval's end would have to exceed the open run's end — impossible, since the open run's end is
+already the max of everything merged into it. That's why one comparison per step is enough; you
+never have to look further back than the run you're currently extending.
+
+<Watch items={[['time', 'O(n log n)'], ['space', 'O(n)']]} />
+
+## common bugs
+
+- Forgetting to sort by start first (or sorting by end by mistake) — the "only check the last
+  merged run" argument depends entirely on start order.
+- Using `<` instead of `<=` at the overlap check — touching intervals like `[1,4]` and `[4,5]`
+  should merge into `[1,5]` under LC 56's definition; `<` would leave them separate.
+- Widening `merged[^1]` in place without realizing it's often a live reference back into the
+  caller's own `intervals` array — the merge mutates the input, not just a private copy.
+- Comparing `current` against `intervals[i - 1]` instead of `merged[^1]` — those two diverge the
+  moment any merge has already happened.
+
+## variants you can now solve
+
+- [Insert Interval](/patterns/intervals/insert-interval/) (LC 57) — merge again, but a single new
+  interval is spliced into an already-sorted, already-merged list, so no full re-sort is needed.
+- **Meeting Rooms I** (LC 252) — a yes/no version: after sorting by start, the moment any
+  `intervals[i][0] < intervals[i - 1][1]` you already know the answer is "no."
+- [Non-overlapping Intervals](/patterns/intervals/non-overlapping-intervals/) (LC 435) — same
+  family, opposite sort key: counting removals with sort-by-end greedy instead of combining with
+  sort-by-start.

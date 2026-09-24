@@ -1,0 +1,150 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: bfs-dfs
+problem: rotting-oranges
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+
+## task
+
+A grid holds `0` (empty), `1` (fresh orange), or `2` (rotten orange). Every minute, every rotten
+orange rots each of its 4-directional fresh neighbors simultaneously. Return the number of minutes
+until no cell has a fresh orange left, or `-1` if some fresh orange can never be reached. LeetCode
+#994.
+
+```text
+grid = [[2,1,1],
+        [1,1,0],
+        [0,1,1]]
+→ 4
+```
+
+## how to think
+
+"Simultaneously" is the whole signal. Every rotten orange spreads at the same time, every minute —
+that's not one BFS per rotten orange, it's *one* BFS whose queue starts with all of them already in
+it. Seed the queue with every initial rotten cell before the first round runs, and the round-by-round
+level structure you already know from plain BFS falls out for free: everything in the queue when a
+round starts rotted in an earlier minute (or was rotten from the start); everything enqueued during
+the round rots at the *next* minute.
+
+Track `fresh` as a running count instead of re-scanning the grid: decrement it every time a cell
+rots, and the moment it hits `0` you're done — every minute after that would be wasted work. If the
+queue drains with `fresh` still above zero, some fresh orange was unreachable, and the answer is
+`-1`.
+
+<Callout kind="note" label="template instance">
+  **Multi-source BFS.** Invariant: after processing round *m*, every fresh orange within
+  BFS-distance *m* of some initially-rotten orange has rotted, and `minutes == m`. What varies from
+  single-source BFS: the queue is seeded with *every* rotten cell up front, not just one, and instead
+  of returning the round count directly, a `fresh > 0` check after the loop decides between the
+  round count and `-1`.
+</Callout>
+
+## solution
+
+```csharp
+public int OrangesRotting(int[][] grid)
+{
+    int rows = grid.Length, cols = grid[0].Length;
+    Queue<(int R, int C)> queue = new();
+    int fresh = 0;
+
+    for (int r = 0; r < rows; r++)
+        for (int c = 0; c < cols; c++)
+        {
+            if (grid[r][c] == 2) queue.Enqueue((r, c));    // seed with EVERY rotten orange up front
+            else if (grid[r][c] == 1) fresh++;
+        }
+
+    int[] dRow = [-1, 1, 0, 0];
+    int[] dCol = [0, 0, -1, 1];
+    int minutes = 0;
+
+    while (queue.Count > 0 && fresh > 0)
+    {
+        int size = queue.Count;                // this round's rotten oranges
+        for (int i = 0; i < size; i++)
+        {
+            var (r, c) = queue.Dequeue();
+            for (int d = 0; d < 4; d++)
+            {
+                int nr = r + dRow[d], nc = c + dCol[d];
+                if (nr < 0 || nr >= rows || nc < 0 || nc >= cols || grid[nr][nc] != 1) continue;
+
+                grid[nr][nc] = 2;               // mark rotten WHEN ENQUEUEING — the grid IS the visited array
+                fresh--;
+                queue.Enqueue((nr, nc));
+            }
+        }
+        minutes++;
+    }
+
+    return fresh == 0 ? minutes : -1;
+}
+```
+
+## trace
+
+```text
+2 1 1
+1 1 0
+0 1 1
+```
+
+Seed: `queue = [(0,0)]`, `fresh = 6`.
+
+| minute | queue at start of round | rots this round | fresh after |
+| --- | --- | --- | --- |
+| 1 | `[(0,0)]` | `(0,0)→(1,0)`, `(0,0)→(0,1)` | 4 |
+| 2 | `[(1,0), (0,1)]` | `(1,0)→(1,1)`, `(0,1)→(0,2)` | 2 |
+| 3 | `[(1,1), (0,2)]` | `(1,1)→(2,1)` | 1 |
+| 4 | `[(2,1)]` | `(2,1)→(2,2)` | 0 |
+
+`fresh == 0` after minute 4, so the loop condition (`fresh > 0`) stops it there — `minutes = 4`.
+
+The spread, minute by minute (the "aha": every rotten cell pushes outward on the same clock):
+
+```text
+minute 0     minute 1     minute 2     minute 3     minute 4
+2 1 1        2 2 1        2 2 2        2 2 2        2 2 2
+1 1 0   ->   2 1 0   ->   2 2 0   ->   2 2 0   ->   2 2 0
+0 1 1        0 1 1        0 1 1        0 2 1        0 2 2
+```
+
+## why it works
+
+Every rotten orange that starts a round rotted in an earlier round, or was rotten at minute 0, and
+the queue snapshot (`size = queue.Count`) processes exactly this round's oranges before any of their
+newly-rotted neighbors get touched. That means `minutes` after round *m* finishes is exactly the
+BFS distance from the nearest initially-rotten orange to every cell rotted so far — which is exactly
+"how many minutes did it take." The `fresh` counter turns "is every orange rotten" from an
+O(rows × cols) re-scan into an O(1) check, and its value once the loop ends tells you whether the
+BFS reached everything or stalled with unreachable fresh oranges left over.
+
+<Watch items={[['time', 'O(rows × cols)'], ['space', 'O(rows × cols) — the queue, worst case every cell starts rotten']]} />
+
+## common bugs
+
+- Seeding the queue with only the first rotten orange found, or running a separate BFS per rotten
+  orange — both break the "simultaneous" requirement and produce a `minutes` that's too high.
+- Returning `minutes` unconditionally instead of checking `fresh == 0` first — a grid with an
+  unreachable fresh orange needs `-1`, not whatever `minutes` happened to reach when the queue
+  drained.
+- Incrementing `minutes` even on a round that rotted zero new cells — the `while (queue.Count > 0 &&
+  fresh > 0)` guard here prevents entering an empty round, but a hand-rolled version that tracks
+  minutes differently can easily count a wasted round.
+- Forgetting the "no fresh oranges at all" starting case — `fresh` is `0` before the loop even runs,
+  and `minutes` correctly stays `0`; make sure a refactor doesn't special-case this wrong.
+
+## variants you can now solve
+
+- [Number of Islands](/patterns/bfs-dfs/number-of-islands/) (LC 200) — the same "grid IS the visited
+  array" trick (mutate in place instead of a separate `visited[,]`), single-source instead of
+  multi-source.
+- **Walls and Gates** (LC 286) — multi-source BFS from every gate simultaneously, filling in
+  distances instead of counting minutes.
+- **01 Matrix** (LC 542) — multi-source BFS from every `0` cell, the same shape as this problem with
+  distances as the output.

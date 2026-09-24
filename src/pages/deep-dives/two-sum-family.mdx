@@ -1,0 +1,259 @@
+---
+layout: '@layouts/TopicLayout.astro'
+topic: two-sum-family
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import Cells from '@components/Cells.astro';
+
+## one problem, two tools
+
+Two Sum is the rare interview question that is really a *tool choice* in disguise. Both
+[two pointers](/patterns/two-pointers/) and the [hashmap](/patterns/hashmap/) solve it in
+linear time once their precondition is met — the whole game is knowing which precondition you
+have and what each tool silently costs you.
+
+| | opposite-end pointers | dictionary lookup |
+| --- | --- | --- |
+| precondition | input is **sorted** | none |
+| time | O(n) — O(n log n) if you must sort first | O(n) |
+| extra space | O(1) | O(n) |
+| what you get back | positions in *sorted* order | **original indices**, intact |
+| duplicates | adjacency skip — natural after sorting | ask-before-store handles pairs for free |
+| streaming input | no — needs the whole array up front | yes — one pass, never looks back |
+
+The rest of this page: the same input pushed through both tools, what sorting quietly
+destroys, the framing that generalizes the dictionary far beyond Two Sum, and the follow-up
+question interviewers love to ask.
+
+## the two solutions, side by side
+
+Sorted input → pointers. This is [Two Sum II](/patterns/two-pointers/two-sum-ii/) (LC 167),
+returning 0-based positions:
+
+```csharp
+public int[] TwoSumSorted(int[] sorted, int target)
+{
+    int left = 0, right = sorted.Length - 1;
+
+    while (left < right)
+    {
+        int sum = sorted[left] + sorted[right];
+        if (sum == target)
+            return [left, right];           // positions in the SORTED order
+
+        if (sum < target) left++;           // sorted[left] too small for everyone
+        else right--;                       // sorted[right] too big for everyone
+    }
+    return [];
+}
+```
+
+Unsorted input → dictionary. This is [Two Sum](/patterns/hashmap/two-sum/) (LC 1):
+
+```csharp
+public int[] TwoSum(int[] nums, int target)
+{
+    Dictionary<int, int> seen = new();      // value → index where it sits
+
+    for (int i = 0; i < nums.Length; i++)
+    {
+        int need = target - nums[i];        // what would complete me right now
+        if (seen.TryGetValue(need, out int j))
+            return [j, i];                  // original indices, intact
+
+        seen[nums[i]] = i;                  // now nums[i] is the one waiting
+    }
+    return [];                              // no pair exists
+}
+```
+
+From ten thousand feet they are the same algorithm: one pass, and each element either resolves
+the search or narrows it. The difference is *where the knowledge lives*. The pointer version
+stores it in the sorted order itself — which is why it costs nothing. The dictionary version
+has to buy a memory, because in unsorted data the order carries no information.
+
+## the same input through both
+
+`nums = [5, 2, 7, 4, 3]`, `target = 6` — the answer LC 1 wants is `[1, 3]` (2 + 4).
+
+The dictionary, one pass — ask *before* you store:
+
+| i | `nums[i]` | need | `seen` before the ask | verdict |
+| --- | --- | --- | --- | --- |
+| 0 | 5 | 1 | `{}` | miss — store `5→0` |
+| 1 | 2 | 4 | `{5→0}` | miss — store `2→1` |
+| 2 | 7 | −1 | `{5→0, 2→1}` | miss — store `7→2` |
+| 3 | 4 | 2 | `{5→0, 2→1, 7→2}` | **hit** — `seen[2]` is 1, return `[1, 3]` |
+
+The pointers, on a sorted copy `[2, 3, 4, 5, 7]`:
+
+| step | L | R | sum | verdict | move |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 0 | 4 | 2 + 7 = 9 | `9 > 6` — too big | `right--` |
+| 2 | 0 | 3 | 2 + 5 = 7 | `7 > 6` — too big | `right--` |
+| 3 | 0 | 2 | 2 + 4 = 6 | hit | return `[0, 2]` |
+
+<Cells
+  data={[2, 3, 4, 5, 7]}
+  pointers={{ 0: [{ t: 'L', c: 'amber' }], 2: [{ t: 'R', c: 'cyan' }] }}
+  cells={{ 0: 'ok', 2: 'ok', 3: 'dim', 4: 'dim' }}
+  caption="the pointers find the right values — at positions 0 and 2 of the sorted copy"
+/>
+
+<Cells
+  data={[5, 2, 7, 4, 3]}
+  cells={{ 1: 'ok', 3: 'ok' }}
+  caption="but LC 1 asks where those values live in the ORIGINAL array: [1, 3]"
+/>
+
+Both tools found 2 + 4. Only one of them can still tell you where those values were.
+
+## when sorting destroys information
+
+Sorting is lossy: it throws away *position*. Two Sum II never notices, because its answer is
+phrased in sorted positions to begin with. LC 1's answer **is** original positions — so a
+plain sort discards exactly the thing you were asked to return. You can patch it by decorating
+every value with its index before sorting:
+
+```csharp
+public int[] TwoSumSortFirst(int[] nums, int target)
+{
+    // carry each value's original index — the O(1)-space claim just died
+    var pairs = new (int Val, int Idx)[nums.Length];
+    for (int i = 0; i < nums.Length; i++) pairs[i] = (nums[i], i);
+    Array.Sort(pairs);                      // tuples compare by Val, then Idx
+
+    int left = 0, right = pairs.Length - 1;
+    while (left < right)
+    {
+        int sum = pairs[left].Val + pairs[right].Val;
+        if (sum == target)
+            return [Math.Min(pairs[left].Idx, pairs[right].Idx),
+                    Math.Max(pairs[left].Idx, pairs[right].Idx)];
+
+        if (sum < target) left++;
+        else right--;
+    }
+    return [];
+}
+```
+
+It works — on the trace input the pairs sort to `(2,1) (3,4) (4,3) (5,0) (7,2)`, the same
+three steps as above land on `(2,1)` and `(4,3)`, and out comes `[1, 3]`. Now look at the
+bill: an O(n) pairs array *plus* an O(n log n) sort — strictly worse than the dictionary on
+both axes. The patch exists only to prove it isn't worth applying.
+
+<Callout kind="insight" label="the cost is conserved">
+  On unsorted input, every fast approach pays O(n) space somewhere — the dictionary pays it in
+  lookups, sort-first pays it in decorated copies. The only O(1)-space solution that keeps
+  original indices is the O(n²) brute force. The interview question is really: *which resource
+  does the problem let you spend?*
+</Callout>
+
+## "key = what I need"
+
+The dictionary line worth memorizing isn't code, it's the question behind it: standing at
+element `i`, **what would I need to see to be done right now?** Make *that* the lookup key.
+Then store yourself under the name a *future* element will ask for. The key is never "what I
+have" — it's "what someone is waiting for":
+
+```csharp
+// the one-pass lookup shape behind the whole Two Sum family
+Dictionary<int, int> seen = new();
+for (int i = 0; i < items.Length; i++)
+{
+    int need = WhatWouldFinishMeNow(items[i], target);  // complement / prefixSum − k / …
+    if (seen.TryGetValue(need, out int found))
+        return Answer(found, i);            // ask BEFORE you store — no self-matching
+    seen[KeyOf(items[i])] = InfoOf(i);      // register: someone later may need me
+}
+return [];
+```
+
+The ask-before-store order matters twice: it stops an element from matching itself (`target`
+6, element 3 must not pair with its own entry), and it means every hit pairs the current
+element with a strictly *earlier* one — no pair is ever counted twice. The framing scales
+across the whole [hashmap topic](/patterns/hashmap/):
+
+| problem | standing at… | "what I need" — the lookup key | what gets stored |
+| --- | --- | --- | --- |
+| [Two Sum](/patterns/hashmap/two-sum/) (LC 1) | element `i` | `target - nums[i]` | value → index |
+| [Longest Consecutive Sequence](/patterns/hashmap/longest-consecutive-sequence/) (LC 128) | candidate start `n` | is `n - 1` absent? | every value, in a `HashSet` |
+| [Subarray Sum Equals K](/patterns/hashmap/subarray-sum-equals-k/) (LC 560) | running total `p` | `p - k` seen before, how often? | prefix sum → count |
+| [Two Sum II](/patterns/two-pointers/two-sum-ii/) (LC 167) | the pair `(L, R)` | nothing — sorted order answers "where would my complement be?" for free | nothing |
+
+That last row is the entire tradeoff restated: a sorted array *is* a dictionary whose lookup
+is "move a pointer".
+
+## the decision table
+
+| your situation | reach for | why |
+| --- | --- | --- |
+| sorted input, values or sorted positions wanted | [two pointers](/patterns/two-pointers/two-sum-ii/) | O(1) space — the sort already did the thinking |
+| unsorted, **original indices** required (LC 1 as stated) | [hashmap](/patterns/hashmap/two-sum/) | sorting destroys indices; the dictionary keeps them |
+| unsorted, only values / yes-no wanted, memory is tight | sort in place, then pointers | spend O(n log n) time to avoid the O(n) dictionary |
+| all pairs or triples, deduplicated | sort + pointers ([3Sum](/patterns/two-pointers/three-sum/)) | duplicate-skipping is an adjacency check after sorting |
+| counting subarrays by sum | hashmap ([LC 560](/patterns/hashmap/subarray-sum-equals-k/)) | order must be preserved — prefix sums die if you sort |
+| data arrives as a stream | hashmap | you can't sort what hasn't arrived; ask-then-store never revisits |
+
+## the family tree: 167 → 1 → 15 → 560
+
+```text
+167  Two Sum II (sorted)      converging pointers — O(1) space, the root
+ │
+ │   drop the "sorted" guarantee: order now carries no information
+ ▼
+  1  Two Sum (unsorted)       the dictionary takes over — key = target − x
+ │
+ │   add a third addend: fix one element, the rest is 167 again
+ ▼
+ 15  3Sum                     sort + outer loop + converging pointers
+ │
+ │   pairs of elements become pairs of PREFIX SUMS — count, don't locate
+ ▼
+560  Subarray Sum Equals K    the dictionary returns — key = prefixSum − k
+```
+
+- [Two Sum II](/patterns/two-pointers/two-sum-ii/) (LC 167) — where the discard argument is
+  proven. Everything below inherits it.
+- [Two Sum](/patterns/hashmap/two-sum/) (LC 1) — same question, minus the sorted guarantee.
+  The tool flips because the answer wants indices and sorting would destroy them.
+- [3Sum](/patterns/two-pointers/three-sum/) (LC 15) — the tool flips *back*: 3Sum's answer
+  wants values, not indices, so sorting is safe again — and it's what makes duplicate-skipping
+  and the inner pointer walk possible.
+- [Subarray Sum Equals K](/patterns/hashmap/subarray-sum-equals-k/) (LC 560) — the deep cut:
+  `prefix[j] - prefix[i] = k` is Two Sum over running totals. Here the hashmap isn't chosen,
+  it's *forced* — sorting prefix sums would destroy the subarray structure entirely.
+
+<Callout kind="tip" label="the pattern in the pattern">
+  The family alternates tools — 167 pointers, 1 hashmap, 15 pointers, 560 hashmap — and every
+  flip is driven by one question: **does order carry information I can use, or destroy
+  information I must keep?** Answer that and the tool picks itself.
+</Callout>
+
+## when the interviewer asks "what if it's sorted?"
+
+The follow-up comes in both directions, and it's a gift — it's checking whether you chose your
+tool or just memorized it. Have the answers ready:
+
+**You solved LC 1 with a dictionary. "What if the input were sorted?"** — "Then I'd switch to
+opposite-end two pointers: same O(n) time, O(1) space instead of O(n), because sorted order
+lets each comparison discard every pair involving one end. The dictionary only earns its space
+cost when order carries no information."
+
+**You used pointers. "And if it's not sorted?"** — "Sorting first costs O(n log n) and loses
+the original indices. A value→index dictionary does one O(n) pass and keeps them — I'd trade
+O(n) space for that."
+
+**"Can you keep O(1) space *and* return original indices?"** — "Not below O(n²). Every fast
+approach pays either the sort — which loses indices unless I decorate values with them, and
+that's O(n) space again — or the dictionary. I'd name that tradeoff and ask which resource
+matters more here."
+
+<Watch items={[['sorted', 'pointers — O(1) space'], ['unsorted + indices', 'hashmap — O(n) space'], ['both constraints', 'O(n²) brute force only']]} />
+
+Saying the third answer out loud — *naming* the impossibility instead of flailing at it — is
+worth more than either solution. It's the same recognition skill the
+[master table](/deep-dives/pattern-recognition/) trains across all seventeen patterns.

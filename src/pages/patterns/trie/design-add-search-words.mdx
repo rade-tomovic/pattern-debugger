@@ -1,0 +1,168 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: trie
+problem: design-add-search-words
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+
+## task
+
+Design a `WordDictionary` with `AddWord(word)` and `Search(word)`, where a search pattern may
+contain `.`, meaning "any single letter matches here."
+
+```text
+AddWord("bad"); AddWord("dad"); AddWord("mad")
+Search("pad")  → false   ("pad" was never added)
+Search("bad")  → true    (exact match)
+Search(".ad")  → true    ("." matches 'b', 'd', or 'm')
+Search("b..")  → true    ("bad" matches: b, then any, any)
+```
+
+## how to think
+
+This is the same trie as [Implement Trie](/patterns/trie/implement-trie/) — the only thing
+that changes is how `Search` walks it. A plain character walks straight down one child. A `.`
+doesn't tell you which child to take, so you don't get to know — you try **all of them**. If any
+branch leads to a full match, the pattern matches; if none do, it doesn't.
+
+"Try every child" is exactly what recursion gives you for free: at a `.`, loop over
+`node.Children.Values` and recurse into each one, short-circuiting the moment one returns `true`.
+At a literal character, there's exactly one branch to try, so the loop-over-children logic
+degenerates to the same single lookup `Search` used before. One function handles both cases.
+
+<Callout kind="note" label="template instance">
+  The **dictionary-based node** skeleton from the topic page — unchanged structure, upgraded
+  walk. `AddWord` is `Insert`, verbatim. `Search` moves from an iterative straight-line walk to a
+  recursive one: at index `i`, a literal character still requires exactly one matching child;
+  `.` requires trying every child at that node. Base case: `i == word.Length` — return whether
+  the node reached is `IsWord`.
+</Callout>
+
+## solution
+
+```csharp
+public class TrieNode
+{
+    public Dictionary<char, TrieNode> Children { get; } = [];
+    public bool IsWord;
+}
+
+public class WordDictionary
+{
+    private readonly TrieNode _root = new();
+
+    public void AddWord(string word)
+    {
+        var node = _root;
+        foreach (char c in word)
+        {
+            if (!node.Children.TryGetValue(c, out var next))
+            {
+                next = new TrieNode();
+                node.Children[c] = next;
+            }
+            node = next;
+        }
+        node.IsWord = true;
+    }
+
+    public bool Search(string word) => Search(word, 0, _root);
+
+    private bool Search(string word, int i, TrieNode node)
+    {
+        if (i == word.Length) return node.IsWord;    // consumed the whole pattern — is this a word?
+
+        char c = word[i];
+        if (c != '.')
+        {
+            return node.Children.TryGetValue(c, out var next) && Search(word, i + 1, next);
+        }
+
+        // wildcard: we don't know which child is right, so try every one
+        foreach (var child in node.Children.Values)
+        {
+            if (Search(word, i + 1, child)) return true;   // short-circuit on the first match
+        }
+        return false;
+    }
+}
+```
+
+## trace
+
+Dictionary after `AddWord("bad")`, `AddWord("dad")`, `AddWord("mad")` — three words, one shared
+suffix `"ad"`, no shared prefix:
+
+```text
+root ─┬─ b ─ a ─ d ●   ("bad")
+      ├─ d ─ a ─ d ●   ("dad")
+      └─ m ─ a ─ d ●   ("mad")
+```
+
+`Search("pad")` — the very first character has no matching child, so recursion never even starts:
+
+| call | i | char | branches tried | result |
+| --- | --- | --- | --- | --- |
+| `Search("pad")` | 0 | `p` | none — `root` has no `'p'` child | `false` |
+
+`Search(".ad")` — the wildcard at `i=0` fans out over all three of the root's children:
+
+```text
+Search(".ad")
+i=0 '.' at root: try children [b, d, m]
+  i=1 'a' at root->b: child exists → descend
+    i=2 'd' at root->b->a: child exists → descend
+      i=3 end of pattern at root->b->a->d, IsWord=true
+  branch 'b' succeeds → return true immediately, 'd' and 'm' never tried
+```
+
+`Search("b..")` — one real branch, then two wildcards each with exactly one live child, so the
+walk stays linear even though both remaining characters are wildcards:
+
+```text
+Search("b..")
+i=0 'b' at root: child exists → descend
+  i=1 '.' at root->b: try children [a]
+    i=2 '.' at root->b->a: try children [d]
+      i=3 end of pattern at root->b->a->d, IsWord=true
+    branch 'a' succeeds → true
+  branch (only option) succeeds → true
+```
+
+The `.ad` trace is the one that matters: it stops at the **first** successful branch (`b`) and
+never visits `d` or `m` — short-circuiting is what keeps this fast when a match exists early.
+
+## why it works
+
+A pattern matches if and only if *some* way of replacing each `.` with a concrete letter spells a
+stored word. Trying every child at a `.` position is exactly the same thing as trying every
+possible letter there — except you only try letters that actually lead somewhere, because you're
+walking real trie edges instead of guessing blindly over the alphabet. The recursion's `||`
+(via the `foreach` + early `return true`) is a logical OR over "does some completion of this
+branch match" — which is precisely the definition of a wildcard match.
+
+<Watch items={[['search, no wildcards', 'O(L)'], ['search, worst case', 'O(26^d) — d = wildcard count, bounded by real children'], ['space', 'O(L) recursion depth']]} />
+
+## common bugs
+
+- Calling `TryGetValue('.', ...)` as if `.` were a literal key — `.` is never actually stored in
+  the trie, it means "branch over every key that is."
+- Checking `node.IsWord` before confirming `i == word.Length` — a node can be a stored word
+  *and* have children; you must consume the whole pattern first.
+- Not short-circuiting the wildcard loop: looping over every child but ignoring the return value
+  instead of returning `true` the moment one branch succeeds.
+- Advancing `i` inconsistently between the literal-character branch and the wildcard branch — both
+  must recurse with `i + 1`, or the pattern position and trie depth drift apart.
+- Forgetting `AddWord("")` is legal: `Search("")` should check `_root.IsWord` directly, with zero
+  characters walked.
+
+## variants you can now solve
+
+- [Implement Trie](/patterns/trie/implement-trie/) (LC 208) — the plain version of this
+  structure, no wildcards. Start there if the recursion above felt like a jump.
+- [Word Search II](/patterns/trie/word-search-ii/) (LC 212) — the same "branch over candidates
+  and recurse" instinct, now walking a grid instead of a pattern string.
+- **Concatenated Words** (LC 472) — trie search combined with DP over string splits; a good next
+  step once wildcard search feels natural.

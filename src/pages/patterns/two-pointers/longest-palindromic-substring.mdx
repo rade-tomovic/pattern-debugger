@@ -1,0 +1,142 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: two-pointers
+problem: longest-palindromic-substring
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import Cells from '@components/Cells.astro';
+
+## task
+
+Given a string `s`, return the longest substring that is a palindrome. If more than one has the
+maximal length, any one of them is accepted.
+
+```text
+s = "abccbaby"  →  "abccba"   (length 6; "bab" also occurs, but shorter)
+```
+
+## how to think
+
+Checking every substring for palindrome-ness is O(n³) — O(n²) substrings, O(n) each to verify.
+A DP table over `(i, j)` pairs (see [dynamic programming](/patterns/dynamic-programming/)) gets
+you to O(n²) time but pays O(n²) *space* for the table. There's a cheaper route: every
+palindrome has exactly one center — either a single character (odd length, like `"aba"`) or the
+gap between two characters (even length, like `"abba"`). A string of length `n` has `2n - 1`
+such centers. Try every one, expand outward while the two sides still mirror each other, and
+track the widest expansion you find. That's O(n²) time, O(1) extra space, no table.
+
+The expansion step is exactly the third two-pointer shape — start together (or one apart) and
+walk outward — just called once per center instead of once for the whole problem.
+
+<Callout kind="note" label="template instance">
+  **Expand from middle** skeleton, called *twice per index*: once treating the index itself as
+  the center (odd length), once treating the gap right after it as the center (even length).
+  Invariant: `ExpandAroundCenter` returns the length of the longest palindrome centered exactly
+  there — the first mismatch it hits is a hard boundary, since widening past a mismatch can
+  never repair it.
+</Callout>
+
+## solution
+
+```csharp
+public string LongestPalindrome(string s)
+{
+    if (s.Length < 1) return "";
+    int start = 0, maxLen = 1;
+
+    for (int center = 0; center < s.Length; center++)
+    {
+        int len1 = ExpandAroundCenter(s, center, center);       // odd length, single center
+        int len2 = ExpandAroundCenter(s, center, center + 1);   // even length, gap center
+        int len = Math.Max(len1, len2);
+        if (len > maxLen)
+        {
+            maxLen = len;
+            start = center - (len - 1) / 2;
+        }
+    }
+    return s.Substring(start, maxLen);
+}
+
+private int ExpandAroundCenter(string s, int left, int right)
+{
+    while (left >= 0 && right < s.Length && s[left] == s[right])
+    {
+        left--;
+        right++;
+    }
+    return right - left - 1;
+}
+```
+
+## trace
+
+`s = "abccbaby"` (index: `a0 b1 c2 c3 b4 a5 b6 y7`), starting `maxLen = 1`:
+
+| center | char | odd len | even len | best | action |
+| --- | --- | --- | --- | --- | --- |
+| 0 | a | 1 | 0 | 1 | no update |
+| 1 | b | 1 | 0 | 1 | no update |
+| 2 | c | 1 | 6 | 6 | **update** — `start=0, maxLen=6` |
+| 3 | c | 1 | 0 | 1 | no update |
+| 4 | b | 1 | 0 | 1 | no update |
+| 5 | a | 3 | 0 | 3 | no update — 3 is less than 6 |
+| 6 | b | 1 | 0 | 1 | no update |
+| 7 | y | 1 | 0 | 1 | no update |
+
+Center 2 — the gap between the two `c`s expands the whole way out to the ends:
+
+<Cells
+  data={['a', 'b', 'c', 'c', 'b', 'a', 'b', 'y']}
+  pointers={{ 2: [{ t: 'C', c: 'purple' }], 3: [{ t: 'C', c: 'purple' }] }}
+  caption="even center between index 2 and 3 — c==c, then b==b, then a==a, then index -1 stops it"
+/>
+
+Final answer — six characters win, the trailing `"by"` never gets folded in:
+
+<Cells
+  data={['a', 'b', 'c', 'c', 'b', 'a', 'b', 'y']}
+  cells={{ 0: 'ok', 1: 'ok', 2: 'ok', 3: 'ok', 4: 'ok', 5: 'ok', 6: 'dim', 7: 'dim' }}
+  caption='"abccba" — length 6, start = 2 - (6-1)/2 = 0'
+/>
+
+At center 5 (`'a'`), the odd expansion separately finds `"bab"` (length 3) — a real palindrome,
+just not the longest one, so it never overwrites the length-6 answer already on record.
+
+## why it works
+
+Every palindrome, of any length, has exactly one center: a single index for odd lengths, a gap
+for even ones. So the longest palindrome in `s` must be found by *some* center in the `2n - 1`
+we try — there's nowhere else it could be centered. For a fixed center, expanding outward is
+monotonic: once `s[left] != s[right]`, no larger radius from that same center can ever become
+valid again, because the mismatched pair is still inside any wider window. That's what makes
+"expand until the first mismatch, then stop" correct rather than just convenient.
+
+<Watch items={[['time', 'O(n^2)'], ['space', 'O(1)'], ['centers tried', '2n - 1']]} />
+
+## common bugs
+
+- Checking only odd-length centers — misses even-length answers entirely, like `"bb"` in
+  `"cbbd"`.
+- Reconstructing the start index as `center - len / 2` instead of `center - (len - 1) / 2` —
+  the off-by-one only shows up on even-length matches. For odd lengths integer division makes
+  the two expressions coincide, so a test suite skewed toward odd palindromes won't catch it.
+- Forgetting `s.Substring`'s second argument is a **length**, not an end index — a habit
+  carried over from languages that slice by `[start, end)`.
+- Skipping the `s.Length < 1` guard — an empty string with `maxLen` defaulted to `1` would
+  throw on `s.Substring(0, 1)`.
+- Assuming there's a single "correct" answer to test against — inputs like `"babad"` have
+  multiple valid longest palindromes (`"bab"` and `"aba"` are both length 3); hardcode the
+  length, not the exact string, when writing your own test cases.
+
+## variants you can now solve
+
+- **[Valid Palindrome](/patterns/two-pointers/valid-palindrome/)** (LC 125) — mirror-compare one
+  fixed string instead of searching every possible center for the best one.
+- **Palindromic Substrings** (LC 647) — same expand-from-center engine; instead of tracking the
+  longest, increment a counter on every successful expansion (every radius, not just the final
+  one, is itself a valid palindrome).
+- **Longest Palindromic Subsequence** (LC 516) — sounds similar, but subsequence (not substring)
+  breaks the "one center, expand outward" argument entirely; that one needs real DP.

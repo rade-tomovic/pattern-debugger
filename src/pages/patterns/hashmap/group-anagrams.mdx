@@ -1,0 +1,104 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: hashmap
+problem: group-anagrams
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+
+## task
+
+Given an array of strings, group the anagrams together. Return the groups in any order.
+
+```text
+strs = ["eat", "tea", "tan", "ate", "nat", "bat"]
+  →  [["eat", "tea", "ate"], ["tan", "nat"], ["bat"]]
+```
+
+## how to think
+
+[Valid Anagram](/patterns/hashmap/valid-anagram/) checks whether *two* strings are anagrams.
+This is the same fact — "same letters ⇒ same group" — applied to a whole array: every string
+needs to land in a bucket with every other string that shares its letters, and nowhere else.
+
+A dictionary buckets things by key. The question is what key two anagrams share that no
+non-anagram shares. Sorting a string's characters gives exactly that: `"eat"` and `"tea"` both
+sort to `"aet"`; `"tan"` sorts to `"ant"`. That sorted string is a **canonical form** — every
+anagram of a word maps to the identical canonical form, and no non-anagram does. Group by it.
+
+<Callout kind="note" label="template instance">
+  **value → count**'s sibling: instead of counting occurrences, the dictionary value is a
+  *list* — value → group. Key: the canonical form (sorted characters) of the string. Invariant:
+  after processing index `i`, every string seen so far sits in the list keyed by its own
+  canonical form.
+</Callout>
+
+## solution
+
+```csharp
+public IList<IList<string>> GroupAnagrams(string[] strs)
+{
+    var groups = new Dictionary<string, List<string>>();
+
+    foreach (string s in strs)
+    {
+        char[] chars = s.ToCharArray();
+        Array.Sort(chars);
+        string key = new string(chars);              // canonical form: same letters -> same key
+
+        if (!groups.TryGetValue(key, out var list))
+            groups[key] = list = [];
+        list.Add(s);
+    }
+
+    var result = new List<IList<string>>();          // explicit loop -- keeps the copy visible
+    foreach (var group in groups.Values) result.Add(group);
+    return result;
+}
+```
+
+## trace
+
+`strs = ["eat", "tea", "tan", "ate", "nat", "bat"]`:
+
+| s | sorted chars | key | groups after this step |
+| --- | --- | --- | --- |
+| `eat` | e,a,t | `aet` | `aet:[eat]` |
+| `tea` | t,e,a | `aet` | `aet:[eat, tea]` |
+| `tan` | t,a,n | `ant` | `aet:[eat, tea]`, `ant:[tan]` |
+| `ate` | a,t,e | `aet` | `aet:[eat, tea, ate]`, `ant:[tan]` |
+| `nat` | n,a,t | `ant` | `aet:[eat, tea, ate]`, `ant:[tan, nat]` |
+| `bat` | b,a,t | `abt` | `aet:[eat, tea, ate]`, `ant:[tan, nat]`, `abt:[bat]` |
+
+Final groups (dictionary value order): `[eat, tea, ate]`, `[tan, nat]`, `[bat]`.
+
+## why it works
+
+Two strings are anagrams if and only if sorting their characters produces the same sequence —
+that's just the definition of "same letters, same multiplicities" restated as "same sorted
+form". So the canonical-form key is exactly the equivalence relation the problem asks you to
+partition by: identical key ⇔ anagrams of each other. Each string is sorted once (`O(k log k)`
+for a string of length `k`) and inserted once, so for `n` strings of max length `k` the total
+work is `O(n · k log k)`.
+
+<Watch items={[['time', 'O(n · k log k)'], ['space', 'O(n · k)']]} />
+
+## common bugs
+
+- Using the **unsorted** string as the key — that only groups exact duplicates, not anagrams.
+- Forgetting `strs` can contain the empty string — `""` sorts to `""` and groups correctly with
+  other empty strings, but it's an easy case to trip over if you assume `s.Length >= 1`.
+- Building the canonical key with a frequency array instead of sorting when the alphabet is
+  large or case-sensitive — a 26-slot signature silently drops information outside `a`-`z`.
+- Mutating `s.ToCharArray()` and forgetting the original `s` (unsorted) is what you `Add` to the
+  group, not the sorted `chars` array.
+
+## variants you can now solve
+
+- **Group Shifted Strings** (LC 249) — same grouping shape, different canonical form: normalize
+  each string to its "distance from the first letter" pattern instead of sorting.
+- **[Valid Anagram](/patterns/hashmap/valid-anagram/)** (LC 242) — the two-string special case
+  this problem generalizes; worth reviewing the `int[26]` alternative to sorting there.
+- **Find All Anagrams in a String** (LC 438) — grouping's cousin: a sliding window whose
+  frequency signature must *match* one fixed target, rather than bucketing many strings.

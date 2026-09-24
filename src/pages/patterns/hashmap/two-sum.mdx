@@ -1,0 +1,114 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: hashmap
+problem: two-sum
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import Cells from '@components/Cells.astro';
+
+## task
+
+Given an **unsorted** array of integers and a `target`, return the indices of the two numbers
+that add up to `target`. Exactly one solution exists, and you may not use the same element
+twice.
+
+```text
+nums = [2, 1, 5, 3, 4], target = 9  →  [2, 4]   (5 + 4 = 9)
+```
+
+## how to think
+
+This is the same question as [Two Sum II](/patterns/two-pointers/two-sum-ii/), minus the one
+fact that made pointers work: the array isn't sorted, and sorting it would throw away the
+original indices the problem asks for. So the opposite-ends argument is dead — you need a
+different way to avoid the O(n²) brute force.
+
+The move: instead of *looking ahead* for a partner, remember everyone you've already *looked
+behind* at. For each `nums[i]`, ask "have I already seen the number that completes this pair?"
+That question — "have I seen `target - nums[i]` before, and where?" — is exactly what a
+dictionary answers in O(1). One pass, one lookup per element, done.
+
+<Callout kind="note" label="template instance">
+  **value → index** skeleton, verbatim. What varies: nothing — this *is* the template.
+  Invariant: by the time you check index `i`, the dictionary holds every index before it.
+  Key: the *value itself*. Check `target - nums[i]` before inserting `nums[i]`, so an element
+  never pairs with itself.
+</Callout>
+
+For the full tradeoff between this and the sorted-array approach — when each tool wins, and
+why — see [the Two Sum family](/deep-dives/two-sum-family/).
+
+## solution
+
+```csharp
+public int[] TwoSum(int[] nums, int target)
+{
+    var seen = new Dictionary<int, int>();      // value -> index
+
+    for (int i = 0; i < nums.Length; i++)
+    {
+        int complement = target - nums[i];
+        if (seen.TryGetValue(complement, out int j))
+            return [j, i];
+
+        seen[nums[i]] = i;                        // record AFTER the check
+    }
+
+    return [];                                    // unreachable — a solution is guaranteed
+}
+```
+
+## trace
+
+`nums = [2, 1, 5, 3, 4]`, `target = 9`:
+
+| i | nums[i] | complement | seen before this step | verdict | seen after |
+| --- | --- | --- | --- | --- | --- |
+| 0 | 2 | 7 | `{}` | miss | `{2→0}` |
+| 1 | 1 | 8 | `{2→0}` | miss | `{2→0, 1→1}` |
+| 2 | 5 | 4 | `{2→0, 1→1}` | miss | `{2→0, 1→1, 5→2}` |
+| 3 | 3 | 6 | `{2→0, 1→1, 5→2}` | miss | `{2→0, 1→1, 5→2, 3→3}` |
+| 4 | 4 | 5 | `{2→0, 1→1, 5→2, 3→3}` | **hit** (5 → index 2) | return `[2, 4]` |
+
+Step 4 — `4`'s complement, `5`, is already in the map at index 2:
+
+<Cells
+  data={[2, 1, 5, 3, 4]}
+  pointers={{ 4: [{ t: 'i', c: 'amber' }] }}
+  cells={{ 2: 'ok', 4: 'ok' }}
+  caption="complement 5 was recorded at index 2 back in step 2 -- one lookup closes the pair"
+/>
+
+## why it works
+
+The invariant is simple: right before processing index `i`, `seen` contains exactly the values
+and indices from `0..i-1`. So `seen.TryGetValue(complement, ...)` is really asking "does a
+*valid earlier partner* exist?" — and because we insert `nums[i]` only *after* that check, index
+`i` can never pair with itself. Every index is inserted once and looked up once, so the whole
+pass is O(n) time for O(n) extra space — you're paying memory to avoid the sort that pointers
+would have needed.
+
+<Watch items={[['time', 'O(n)'], ['space', 'O(n)']]} />
+
+## common bugs
+
+- Inserting `nums[i]` into the map **before** checking for the complement — lets an element
+  pair with itself when `target == 2 * nums[i]`.
+- Returning the **values** instead of the **indices** — the problem asks for indices
+  specifically because the array isn't sorted, so values alone don't pin down a position.
+- Sorting the array "to make it easier" — that's [Two Sum II](/patterns/two-pointers/two-sum-ii/)'s
+  problem, and sorting here destroys the original indices you must return.
+- Using `Dictionary.Add` instead of the indexer assignment — `Add` throws on a duplicate key,
+  and duplicate *values* (different indices) are legal input.
+
+## variants you can now solve
+
+- **[Two Sum II (sorted input)](/patterns/two-pointers/two-sum-ii/)** (LC 167) — when the array
+  is already sorted, opposite-end pointers win on space; see
+  [the Two Sum family](/deep-dives/two-sum-family/) for the full decision.
+- **[3Sum](/patterns/two-pointers/three-sum/)** (LC 15) — fix one element, then it's Two Sum on
+  the rest (usually solved with pointers once you've sorted for duplicate-skipping).
+- **Two Sum III — Data Structure Design** (LC 170) — same dictionary, now behind `Add`/`Find`
+  calls instead of a single function.

@@ -1,0 +1,310 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: threads-and-scheduling
+problem: threadpool-starvation
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import Solution from '@components/Solution.astro';
+
+## the code
+
+A service endpoint. The client library is async all the way down, as every modern one is. The
+handler is synchronous because it was written before the library was, and somebody bridged the
+two with a one-line facade. It has been in production for a year.
+
+<Solution>
+
+```csharp
+// The I/O. Async all the way down, as every modern client library is.
+static async Task<int> QueryAsync(int id)
+{
+    await Task.Delay(20);                       // stands in for the database round trip
+    return id * 2;
+}
+
+// The synchronous facade somebody added so that callers did not have to change.
+static int Query(int id) => QueryAsync(id).GetAwaiter().GetResult();
+
+// The request handler. Runs on a thread-pool thread, exactly as in ASP.NET Core.
+static int Handle(int id) => Query(id) + 1;
+
+// The same handler, written the other way.
+static async Task<int> HandleAsync(int id) => await QueryAsync(id) + 1;
+```
+
+</Solution>
+
+Three hundred requests arrive at once. Each needs 20 ms of I/O and nothing else. The full file —
+this code plus the driver and a sampler on their own OS thread — is
+`bench/threads-and-scheduling/threadpool-starvation.cs`, run as
+`dotnet run bench/threads-and-scheduling/threadpool-starvation.cs blocking`.
+
+## find it
+
+<Callout kind="insight" label="before you scroll">
+  There is no lock here, no shared mutable state, and no bug in `QueryAsync`. Work out the
+  mechanism before you read on.
+
+  `GetAwaiter().GetResult()` blocks *one* thread per request while it waits. But `QueryAsync`
+  itself returns almost immediately — at its `await Task.Delay(20)` — so the blocked thread is not
+  waiting for `QueryAsync` to finish computing anything. It is waiting for something else to
+  *run*. What, and on which threads? If 300 requests arrive at once and the pool starts with only
+  a handful of workers, what has to happen before request number 250 can even begin?
+</Callout>
+
+## the failure
+
+Same file, both modes, sampled at a fixed number of evenly spaced checks — never a clock reading,
+only counts:
+
+```text
+mode=blocking   requests=300   cores=16
+  check  1   pool threads   1   queued    1   done   0/300
+  check  2   pool threads  27   queued  216   done  72/300
+  check  3   pool threads  35   queued  118   done 169/300
+  check  4   pool threads  39   queued   81   done 219/300
+  pool threads at end 42   (4 checks to drain the queue)
+
+mode=async   requests=300   cores=16
+  check  1   pool threads   1   queued    1   done   0/300
+  pool threads at end 16   (1 checks to drain the queue)
+```
+
+| 300 requests, 20 ms of I/O each | `.GetAwaiter().GetResult()` | `await` |
+| --- | --- | --- |
+| checks needed to fully drain the queue | 4 | 1 |
+| pool threads at the end | 42 | 16 |
+| pool threads created beyond the starting minimum | 38 | 0 |
+
+The async run finishes before the pool has grown past its starting size at all — it never needed
+to. The blocking run is still climbing at the last check, having already created many times more
+workers than there are cores, and the queue is still not empty. Nothing in this service is broken;
+almost nothing in it can run, either.
+
+Now shrink it until every step fits in a table. `bench/threads-and-scheduling/starvation-interleaving.cs`
+clamps the pool to two workers and sends three requests, so that injection cannot paper over what
+is happening. A watchdog has to end the run, because this bug does not resolve on its own:
+
+```text
+  step  1  tid   1  [pool threads 2, queued 1]  all 3 requests queued
+  step  2  tid   5  [pool threads 2, queued 1]  request 0: handler starts
+  step  3  tid   7  [pool threads 2, queued 1]  request 1: handler starts
+  step  4  tid   5  [pool threads 2, queued 1]  request 0: blocking this pool thread in .GetAwaiter().GetResult()
+  step  5  tid   7  [pool threads 2, queued 1]  request 1: blocking this pool thread in .GetAwaiter().GetResult()
+  step  6  tid   5  [pool threads 2, queued 1]  request 0: QueryAsync starts, awaiting the I/O
+  step  7  tid   7  [pool threads 2, queued 1]  request 1: QueryAsync starts, awaiting the I/O
+  step  8  tid   4  [pool threads 2, queued 3]  WATCHDOG: no progress — printing the log and exiting
+  never finished: 3 requests, pool threads 2, queued 3
+```
+
+That is the whole bug, in seven steps. As a table — every row is a step of that run:
+
+| step | worker tid 5 | worker tid 7 | the pool's queue |
+| --- | --- | --- | --- |
+| 1 | idle | idle | `[r0, r1, r2]` — three handlers queued |
+| 2–3 | takes r0, handler starts | takes r1, handler starts | `[r2]` |
+| 4–5 | enters `GetResult()` | enters `GetResult()` | `[r2]` |
+| 6–7 | **parked** — awaiting the I/O | **parked** — awaiting the I/O | `[r2]`, and no thread to run it |
+| (not logged — both `Task.Delay`s eventually elapse) | still parked | still parked | each timer posts a continuation, behind `r2` |
+| 8, watchdog | still parked | still parked | queue length **3** — `r2` plus the two continuations — and it never moves |
+
+The last row is observed, not reasoned: the queue held one item while the workers were parking and
+three items by the time the watchdog gave up, and it never shrank in between. Neither timer, nor
+the kernel, nor the runtime is stuck: the queue is full, every item in it is runnable, and there is
+no thread left to run one. **A circular wait with no lock in it:**
+
+```text
+   worker tid 5                        worker tid 7
+   ┌──────────────────────┐            ┌──────────────────────┐
+   │ handling request 0    │            │ handling request 1    │
+   │ parked in GetResult() │            │ parked in GetResult() │
+   └───────────┬───────────┘            └───────────┬───────────┘
+               │ needs                               │ needs
+               ▼                                     ▼
+         continuation 0                        continuation 1
+               │                                     │
+               └───────────────────┬─────────────────┘
+                                    ▼
+                 pool's queue: [request 2, continuation 0, continuation 1]
+                                    │
+                                    ▼
+                 needs a free worker to run any of these — but
+                 the only two workers that exist are tid 5 and
+                 tid 7, and both are parked waiting for exactly
+                 the items sitting in this queue.
+```
+
+No lock is held anywhere in this picture. It is a cycle made entirely of "I am waiting for a work
+item that only a worker like me can run" — every worker that would run the next step *is* the
+thing that's blocked.
+
+And the OS's view of the same shape, from `bench/threads-and-scheduling/blocked-threads.cs` —
+twenty blocking work items, then a census of every thread in the process with the kernel function
+it is parked in, straight out of `/proc/self/task`:
+
+```text
+pool threads 21, work items still queued 0
+   21 x  .NET TP Worker     state S   parked in futex_do_wait
+    2 x  blocked-thr-ust    state S   parked in futex_do_wait
+    1 x  blocked-threads    state R   parked in 0
+    1 x  .NET SynchManag    state S   parked in poll_schedule_timeout.constprop.0
+    1 x  .NET EventPipe     state S   parked in poll_schedule_timeout.constprop.0
+    1 x  .NET DebugPipe     state S   parked in wait_for_partner
+    1 x  .NET Debugger      state S   parked in futex_do_wait
+    1 x  .NET Finalizer     state S   parked in futex_do_wait
+    1 x  .NET Tiered Com    state S   parked in futex_do_wait
+    1 x  .NET TP Gate       state S   parked in futex_do_wait
+    1 x  .NET Timer         state S   parked in futex_do_wait
+    1 x  .NET SigHandler    state S   parked in anon_pipe_read
+```
+
+Twenty-one workers, all in state `S`, all sitting in `futex_do_wait` — the kernel primitive
+underneath every managed wait, and the subject of [how a lock is built](/systems/locks-internals/).
+`state S` is why the CPU graph is flat during an outage: a blocked thread burns nothing at all.
+
+## why it breaks
+
+**`.GetAwaiter().GetResult()` does not wait for a thread to finish. It waits for a work item to be
+scheduled.** That is the step everybody skips. `QueryAsync` returns at its first `await`; there is
+no thread inside it. What completes its Task is a *continuation*, and a continuation is a work item
+queued to the very pool whose thread you are currently occupying. So each blocked request holds one
+worker hostage and simultaneously joins the queue for another one.
+
+Every one of the 300 handlers that gets a worker immediately blocks that worker inside
+`GetResult()`, waiting for a continuation. The blocked handlers are, as a group, occupying workers
+and creating demand for workers at the same time. The 20 ms timers eventually fire and post their
+continuations into the same global queue the still-unstarted handlers are sitting in — *behind*
+them. Nothing can drain until the pool decides to add a thread, one round of injection at a time.
+
+The only thing that breaks the cycle is the pool deciding to add a thread — and how it decides that
+is on [the topic page](/systems/threads-and-scheduling/): cautiously, and more so the less the pool
+can tell about *why* a worker is idle. The blocking run above needed four separate rounds of
+injection and dozens of extra workers to finish what the `await` version finished with none.
+**The service does not deadlock at this scale; it recovers, slowly, against a load its starting
+pool size was never going to satisfy on its own.** Clamp the pool hard enough — as the interleaving
+demo above does — and there is no injection left to rescue it at all, and the graded collapse
+becomes a permanent hang.
+
+Two details are worth keeping separate, because both get called "the async deadlock":
+
+| | this page | the [sync-context](/systems/threads-and-scheduling/) deadlock |
+| --- | --- | --- |
+| where | ASP.NET Core, console apps, any pool thread | WinForms, WPF, ASP.NET on .NET Framework |
+| what the continuation needs | *any* free pool thread | *one specific* thread |
+| does it recover | yes, a little at a time | never |
+| does `ConfigureAwait(false)` fix it | **no** | yes |
+
+Real services hit the graded version far more often, which is worse in one specific way — it looks
+like a performance problem, so people go looking for a slow query.
+
+## the fix
+
+Delete the facade. That is the whole fix, and every other option is a way of paying for keeping it.
+
+<Solution>
+
+```csharp
+// The I/O. Unchanged — it was never the problem.
+static async Task<int> QueryAsync(int id)
+{
+    await Task.Delay(20);                       // stands in for the database round trip
+    return id * 2;
+}
+
+// The handler, all the way async. No thread is held while the I/O is in flight:
+// the method returns at the await, and its state lives in a small heap object
+// until a continuation resumes it.
+static async Task<int> HandleAsync(int id) => await QueryAsync(id) + 1;
+```
+
+</Solution>
+
+Same 300 requests: the pool never grows past its starting size, because at no point does any
+request hold a worker hostage waiting on another worker.
+
+Two fixes people reach for first, and what is wrong with each:
+
+**"Raise `ThreadPool.SetMinThreads`."** This works, in the sense that a tourniquet works. It
+removes the injection delay for the first N threads, so the collapse becomes a fast, expensive
+service instead of a stalled one. You are still paying a full OS thread — reserved address space
+and resident memory per thread, both far larger than a pending await's (the exact figures are on
+[the topic page](/systems/threads-and-scheduling/)) — per *concurrent request*, and you have chosen
+a concurrency ceiling by hand that the pool was supposed to discover. It is the right emergency
+action at 3 a.m. and the wrong permanent state.
+
+**"Add `ConfigureAwait(false)` everywhere."** This fixes a different bug. `ConfigureAwait(false)`
+stops the continuation being posted back to a captured `SynchronizationContext` — and ASP.NET Core
+does not install one, so under ASP.NET Core it changes nothing here at all. The continuation was
+already going to the pool. The pool is what has no threads. (In a WinForms or legacy-ASP.NET app
+it *does* fix the hang, which is exactly why the advice travels to places it does not belong.)
+
+The third one, `Task.Run(() => Query(id)).Result`, is worse than the bug: it consumes a pool thread
+for the blocking call *and* a pool thread for the caller waiting on it, so it doubles the pool
+threads consumed per request. Moving blocking code onto the pool does not remove the blocking; it
+just makes it somebody else's thread.
+
+<Watch items={[['pool threads used, blocking', '42 (this run)'], ['pool threads used, await', '16 (== cores)'], ['injection rounds, blocking', '4'], ['injection rounds, await', '1'], ['extra workers await needed', '0']]} />
+
+## what this looks like in prod
+
+The pager says the service is up and the requests are timing out. CPU is 15%, memory is flat, GC
+is quiet, and the logs contain nothing but the timeouts themselves. Restarting fixes it for as long
+as it takes the traffic to come back.
+
+What to look at, in order:
+
+1. **`threadpool-queue-length` in `dotnet-counters`.** A queue climbing while CPU is low is
+   starvation, and there is no other thing it can be. `threadpool-thread-count` climbing a little
+   at a time next to it is the confirmation.
+2. **A dump.** `dotnet-dump analyze`, then `clrstack -all`. Dozens of pool threads whose stacks
+   bottom out in a wait, and directly above each wait, one of your own frames calling `.Result`,
+   `.Wait()`, or `.GetAwaiter().GetResult()`. That frame is the fix.
+3. **On Linux, without any managed tooling at all**, `cat /proc/PID/task/*/wchan` and count the
+   threads sitting in `futex_do_wait` while `top` shows the process near idle.
+
+The usual sources, in the order they turn up: a sync facade over an async client like the one
+above; `HttpClient` or a database call reached through a legacy interface; `async void` handlers
+that a caller "awaits" by blocking; a `SemaphoreSlim.Wait()` (the synchronous one) instead of
+`await WaitAsync()`; constructors and property getters, which cannot be async and so become the
+place people hide a `.Result`; and logging or telemetry that flushes synchronously.
+
+The prevention that actually holds: an analyzer rule banning `.Result`, `.Wait()` and
+`GetAwaiter().GetResult()` outside `Main`, and a load test with concurrency well above your core
+count — because at low concurrency this bug is invisible. At a handful of concurrent requests, the
+code above is fine.
+
+## the same idea in other languages
+
+| language | what it's called | the trap |
+| --- | --- | --- |
+| Java | the same shape with a fixed `ExecutorService`: a task submitted to a pool that blocks on a `Future` from the same pool | Java's classic escape is a `ForkJoinPool`, whose `ManagedBlocker` lets a blocking task tell the pool to compensate by adding a thread — .NET's pool does something similar automatically for `Task` waits, which is why blocking on a `Task` here (a shape the runtime can recognise) triggers a far more aggressive injection response than blocking on a plain event (a shape it cannot) |
+| Java 21+ | virtual threads | this bug largely disappears: a blocked virtual thread parks its stack on the heap and releases its carrier, so "just block" becomes correct advice again. It is the strongest argument that .NET's colour-the-method design is a trade, not a free win — and .NET has no equivalent, so the advice does not transfer |
+| Python | `asyncio` — calling `loop.run_until_complete` from inside a running loop | it raises instead of hanging, because the loop is single-threaded and the runtime can detect the nesting. .NET cannot detect it, because there is a real pool and the call is merely *unwise*, not impossible |
+| Go | blocking a goroutine on a channel that another goroutine must fill | the runtime detaches OS threads that block in syscalls and creates new ones, so the equivalent of this bug needs *all* goroutines blocked — at which point Go's deadlock detector prints "all goroutines are asleep" and exits, which is more than .NET will do for you |
+| Node.js | two different failures: a synchronous call (`fs.readFileSync`, a busy loop) on the event loop, and saturating libuv's worker pool | the first is total rather than gradual — one blocking call stops every request in the process at once, and there is no `.Result` to write, which is why the ecosystem never developed the sync-over-async habit. The gradual shape exists too: libuv keeps a small worker pool (`UV_THREADPOOL_SIZE`, default 4) behind `fs`, `dns.lookup`, `crypto` and `zlib`. Measured here (`bench/threads-and-scheduling/libuv-pool.cjs`, node 24): saturate the pool's 4 slots with `crypto.pbkdf2` jobs and a queued `fs.readFile` does not complete until one of them frees a slot — while a timer set at the same moment fires on schedule regardless, because timers never touch that pool |
+
+## common bugs
+
+- **Testing at a concurrency below your core count.** A handful of concurrent requests through the
+  broken handler above look perfect — a worker per request, no queue. The bug only exists when
+  demand exceeds the pool, so a functional test, a local debug session and a light smoke test all
+  pass. Load-test above `Environment.ProcessorCount` or you have tested nothing.
+- **Reading the flat CPU graph as "not our code".** A blocked thread is in state `S` and burns zero
+  CPU, so the more starved the service is, the *healthier* the CPU graph looks. The utilization
+  number is measuring the wrong thing; the queue length is measuring the right one.
+- **Blaming the dependency.** Every request's latency includes the queue wait, so the traces show a
+  slow database call when the database itself did the trivial 20 ms round trip it was asked to do.
+  Compare the client-side span with the server-side one: if the gap is on your side of the wire,
+  you are queuing, not waiting.
+- **Fixing it with `ConfigureAwait(false)`.** It addresses a different mechanism — context capture,
+  not thread supply — and ASP.NET Core has no context to capture. It is not harmful; it is just not
+  related, and shipping it lets everyone believe the bug is fixed.
+- **Fixing it by raising min threads and stopping there.** The incident goes away and the design
+  problem stays: one OS thread per concurrent request — reserved address space and resident memory
+  far larger than a pending await's, per [the topic page](/systems/threads-and-scheduling/) — and a
+  hand-picked ceiling that is now load-bearing.
+- **Assuming an `async` method is safe to block on because *it* is async.** The asyncness is what
+  makes it unsafe: an async method's completion is a work item on the pool, so blocking a pool
+  thread on it is a request for a resource you are holding.

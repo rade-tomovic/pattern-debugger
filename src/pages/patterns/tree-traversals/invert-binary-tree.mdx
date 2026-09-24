@@ -1,0 +1,138 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: tree-traversals
+problem: invert-binary-tree
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+
+## task
+
+Given the root of a binary tree, invert it: every node's left and right subtree swap places,
+recursively, all the way down. Return the new root.
+
+```text
+    4                4
+   / \              / \
+  2   7    ->      7   2
+ / \ / \          / \ / \
+1  3 6  9        9  6 3  1
+```
+
+## how to think
+
+There's no clever insight to find here — that's the point of the problem. You need one fact per
+node: *"my left subtree and my right subtree trade places."* If you can say that sentence, you
+can write the recursion: swap the two child references, then make sure the same thing happens
+everywhere below by recursing into both children.
+
+The only real decision is *when* to swap relative to the two recursive calls, and — unlike most
+tree problems — it genuinely doesn't matter here. Swap-then-recurse (preorder shape) swaps a
+node's children before either subtree has been touched. Recurse-then-swap (postorder shape)
+fully inverts both subtrees first, then swaps them into place. Both reach the same final tree,
+because inverting subtree A never depends on what happens to subtree B — they're independent
+work. That independence is what makes this the gentlest possible "traversal in a costume."
+
+<Callout kind="note" label="template instance">
+  **Preorder** shape: do the work (swap) first, then recurse left, then recurse right. Invariant:
+  every node not yet visited still holds its original children; every node already visited has
+  swapped ones. What varies from the plain template: the "visit" step mutates the tree instead
+  of collecting a value — and for this one problem specifically, the postorder version (recurse
+  first, swap after) is equally correct, since the two subtrees never interact.
+</Callout>
+
+## solution
+
+```csharp
+public TreeNode? InvertTree(TreeNode? root)
+{
+    if (root is null) return null;
+
+    (root.Left, root.Right) = (root.Right, root.Left);   // swap first - order doesn't matter here
+
+    InvertTree(root.Left);
+    InvertTree(root.Right);
+
+    return root;
+}
+
+// standard interview definition
+public class TreeNode(int val = 0, TreeNode? left = null, TreeNode? right = null)
+{
+    public int Val = val;
+    public TreeNode? Left = left;
+    public TreeNode? Right = right;
+}
+```
+
+## trace
+
+```text
+        4
+       / \
+      2   7
+     / \ / \
+    1  3 6  9
+```
+
+| call | node | children before | children after swap | recurses into |
+| --- | --- | --- | --- | --- |
+| 1 | 4 (root) | L=2, R=7 | L=7, R=2 | 7, then 2 |
+| 2 | 7 | L=6, R=9 | L=9, R=6 | 9, then 6 |
+| 3 | 9 | leaf | leaf | — |
+| 4 | 6 | leaf | leaf | — |
+| 5 | 2 | L=1, R=3 | L=3, R=1 | 3, then 1 |
+| 6 | 3 | leaf | leaf | — |
+| 7 | 1 | leaf | leaf | — |
+
+Because the root's children got swapped in call 1, call 2 visits what *used to be* the root's
+right subtree (rooted at 7) — that's why 7 is processed, and finishes, before we ever get back
+to node 2. The resulting tree:
+
+```text
+        4
+       / \
+      7   2
+     / \ / \
+    9  6 3  1
+```
+
+Preorder of the result is `4,7,9,6,2,3,1` — exactly the call order in the table above, because
+this solution swaps in preorder shape.
+
+## why it works
+
+Induction on subtree size. A leaf inverts itself trivially (no children to swap). For an
+internal node, assume both recursive calls correctly invert their (smaller) subtrees — wherever
+they get called, they leave a correctly-inverted tree at that reference. The swap then attaches
+the correctly-inverted right subtree where the left one used to be, and vice versa. Since the
+swap and the two recursive calls touch disjoint reference slots, their relative order is free —
+every node gets visited and mutated exactly once, so the whole tree ends up inverted.
+
+<Watch items={[['time', 'O(n)'], ['space', 'O(h) recursion stack — O(n) worst case, O(log n) balanced']]} />
+
+## common bugs
+
+- Swapping with two plain assignments instead of a tuple or temp: `root.Left = root.Right;
+  root.Right = root.Left;` — the second line reads the `Left` you just overwrote, so both
+  children end up holding the same subtree. Use `(root.Left, root.Right) = (root.Right,
+  root.Left)` or a temp variable.
+- Swapping only the root's direct children and forgetting to recurse — the top two subtrees
+  trade places but everything below stays un-mirrored.
+- Not null-checking before recursing — `InvertTree(root.Left)` is safe here because the method
+  itself checks `root is null` on entry, but a hand-rolled loop version needs that guard
+  explicitly.
+- Forgetting the `return root;` at the end and returning `void`, which breaks callers that chain
+  the result (and breaks the recursive calls themselves, which ignore the return value here but
+  wouldn't in a version that reassigns instead of mutating in place).
+
+## variants you can now solve
+
+- **[Maximum Depth of Binary Tree](/patterns/tree-traversals/maximum-depth/)** (LC 104) — same
+  recursive shape, but now the children have to answer *before* the parent can combine, so order
+  stops being optional.
+- **Symmetric Tree** (LC 101) — ask "is this tree its own mirror?" instead of building the
+  mirror; same left/right comparison, no mutation.
+- **Same Tree** (LC 100) — the comparison version of this recursion with no swap at all: walk
+  two trees together, node by node.

@@ -1,0 +1,126 @@
+---
+layout: '@layouts/TopicLayout.astro'
+topic: heap-top-k
+---
+
+import Callout from '@components/Callout.astro';
+import ProblemList from '@components/ProblemList.astro';
+import Cells from '@components/Cells.astro';
+
+## core idea
+
+`PriorityQueue<TElement, TPriority>` buys you one cheap operation — always know the smallest
+live element in `O(1)`, maintained at `O(log n)` per insert/remove — and the entire top-K family
+is built on top of that one operation.
+Instead of fully sorting `O(n log n)` worth of data, you keep a heap capped at exactly the size
+you need, so every push and pop only pays for what you're tracking, never for everything you've
+seen. Three shapes cover the family:
+
+| shape | heap | typical trigger |
+| --- | --- | --- |
+| bounded heap (size K) | one heap, capped at K | "Kth largest", "top K frequent", "K closest" |
+| K-way merge | one heap holding the current frontier of each source | "merge K sorted…", multi-list problems |
+| two heaps | max-heap (lower half) + min-heap (upper half), balanced | running/streaming median |
+
+<Cells
+  data={[3, 2, 1, 5, 6, 4]}
+  cells={{ 0: 'warn', 1: 'warn', 2: 'warn', 3: 'win', 4: 'win', 5: 'warn' }}
+  caption="bounded min-heap of size 2 over these six values: only 5 and 6 survive as the top-2 club"
+/>
+
+## when to reach for it
+
+- "Kth largest/smallest", "top K", "K closest" in the prompt — you never need full order, just
+  the boundary.
+- Several already-sorted sources need combining — a heap always knows which source's next value
+  is smallest, in `O(log k)` instead of a linear scan.
+- The data keeps arriving (a stream) and you need a running statistic — the Kth largest so far,
+  or the median so far — after every insertion.
+- A comparison-based structure is genuinely needed. If values have a small bounded range, bucket
+  or counting sort (see [Sorting for Interviews](/foundations/sorting/)) beats a heap outright.
+
+## universal templates
+
+Bounded min-heap of size K — the shape you'll write most often:
+
+```csharp
+public int[] TopK(int[] nums, int k)
+{
+    var heap = new PriorityQueue<int, int>();     // min-heap: root is the smallest kept
+
+    foreach (var n in nums)
+    {
+        heap.Enqueue(n, n);
+        if (heap.Count > k) heap.Dequeue();        // evict the smallest — it can't be in the top K
+    }
+    return [.. heap.UnorderedItems.Select(x => x.Element)];
+}
+```
+
+K-way merge — one heap slot per source, refilled the instant it's consumed:
+
+```csharp
+public int[] KWayMerge(int[][] sortedSources)
+{
+    // (value, which source, index within that source)
+    var heap = new PriorityQueue<(int Value, int Src, int Idx), int>();
+    for (int s = 0; s < sortedSources.Length; s++)
+        if (sortedSources[s].Length > 0)
+            heap.Enqueue((sortedSources[s][0], s, 0), sortedSources[s][0]);
+
+    var result = new List<int>();
+    while (heap.TryDequeue(out var top, out _))
+    {
+        result.Add(top.Value);                     // top is the smallest live candidate — safe to emit
+        int nextIdx = top.Idx + 1;
+        if (nextIdx < sortedSources[top.Src].Length)
+            heap.Enqueue((sortedSources[top.Src][nextIdx], top.Src, nextIdx), sortedSources[top.Src][nextIdx]);
+    }
+    return [.. result];
+}
+```
+
+Two heaps, balanced around the middle:
+
+```csharp
+public class TwoHeapMedian
+{
+    private readonly PriorityQueue<int, int> _lo = new(Comparer<int>.Create((a, b) => b.CompareTo(a))); // max-heap: lower half
+    private readonly PriorityQueue<int, int> _hi = new();                                                // min-heap: upper half
+
+    public void Add(int num)
+    {
+        _lo.Enqueue(num, num);
+        _hi.Enqueue(_lo.Peek(), _lo.Peek());       // shuttle lo's current max into hi unconditionally...
+        _lo.Dequeue();
+        if (_hi.Count > _lo.Count)                 // ...then undo it if that left hi too big
+        {
+            _lo.Enqueue(_hi.Peek(), _hi.Peek());
+            _hi.Dequeue();
+        }
+    }
+
+    public double Median() =>
+        _lo.Count > _hi.Count ? _lo.Peek() : (_lo.Peek() + _hi.Peek()) / 2.0;
+}
+```
+
+Every problem below is one of these three skeletons with a different priority key or comparer.
+
+<Callout kind="note" label="PriorityQueue API notes">
+  `PriorityQueue<TElement, TPriority>` is a **min-heap** by construction. For a max-heap, pass a
+  comparer that flips the order: `new PriorityQueue<int, int>(Comparer<int>.Create((a, b) => b.CompareTo(a)))`
+  — that's what `_lo` above is. There is no `DecreaseKey` — you cannot cheaply lower a priority
+  already sitting in the heap. A `Remove(element, …)` overload exists, but it's an `O(n)`
+  scan-and-fix, not a real decrease-key. The idiom that actually survives an interview is **lazy
+  deletion**: push a duplicate with the fresher priority, and when you pop, check whether the
+  entry is still valid before trusting it. [Network Delay Time](/patterns/advanced-graphs/network-delay-time/)
+  needs exactly this.
+</Callout>
+
+## problems
+
+Five problems across the three shapes above — the first three are all the bounded heap (stream,
+batch, and derived-key), then one K-way merge and one two-heap problem:
+
+<ProblemList topic="heap-top-k" />

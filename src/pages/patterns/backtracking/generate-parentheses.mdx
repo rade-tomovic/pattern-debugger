@@ -1,0 +1,157 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: backtracking
+problem: generate-parentheses
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+
+## task
+
+Given `n` pairs of parentheses, return every string of length `2n` made of well-formed
+combinations — every `(` has a matching `)`, and no prefix ever has more `)` than `(`.
+
+```text
+n = 3  →  ["((()))","(()())","(())()","()(())","()()()"]
+```
+
+## how to think
+
+The brute-force move is to generate all `2^(2n)` strings of `(` and `)` and filter for validity
+after the fact — wasteful, because most of those strings go invalid within the first few
+characters and there's no reason to keep building them. Backtracking's whole value here is
+catching that invalidity **the instant it happens**, so an entire dead subtree never gets
+visited.
+
+Track two counters instead of the string's validity directly: `open` (how many `(` placed so
+far) and `close` (how many `)` placed so far). A candidate stays legal exactly when two rules
+hold at every step: you can still place `(` only if `open < n` (you haven't used your budget),
+and you can place `)` only if `close < open` (there's an unmatched `(` for it to close). Those
+two `if`s *are* the pruning — instead of generating a string and checking "is this valid," the
+recursion only ever takes moves that keep it valid, so every leaf it reaches (`path.Length == 2n`)
+is automatically well-formed.
+
+<Callout kind="note" label="template instance">
+  **Constrained** shape: unlike every other page in this topic, the branches aren't "loop over a
+  choice list" — they're two `if`-guarded calls, `(` when `open < n`, `)` when `close < open`.
+  Invariant: at every node, `close <= open <= n`, which is exactly the well-formed-prefix
+  condition; `IsComplete` is `path.Length == 2 * n`.
+</Callout>
+
+## solution
+
+```csharp
+public IList<string> GenerateParenthesis(int n)
+{
+    var result = new List<string>();
+    var path = new StringBuilder();
+
+    void Backtrack(int open, int close)
+    {
+        if (path.Length == 2 * n)
+        {
+            result.Add(path.ToString());
+            return;
+        }
+
+        if (open < n)                    // budget left for an opener
+        {
+            path.Append('(');
+            Backtrack(open + 1, close);
+            path.Length--;
+        }
+        if (close < open)                // an unmatched opener exists to close
+        {
+            path.Append(')');
+            Backtrack(open, close + 1);
+            path.Length--;
+        }
+    }
+
+    Backtrack(0, 0);
+    return result;
+}
+```
+
+## trace
+
+`n = 3` — 21 real calls produce exactly the 5 Catalan-number results:
+
+```text
+first two levels — every deeper node repeats the same two if-guards:
+
+              ""
+         open<3? yes
+              "("
+      open<3? yes    close<open? yes (0<1)
+        "(("              "()"
+```
+
+Every append, in call order:
+
+| call | append | path | (open,close) | note |
+| --- | --- | --- | --- | --- |
+| 1 | `(` | `"("` | (1,0) | recurse |
+| 2 | `(` | `"(("` | (2,0) | recurse |
+| 3 | `(` | `"((("` | (3,0) | `open==n`, only `)` legal from here |
+| 4 | `)` | `"((()"` | (3,1) | recurse |
+| 5 | `)` | `"((())"` | (3,2) | recurse |
+| 6 | `)` | `"((()))"` | (3,3) | complete → **add "((()))"** |
+| 7 | `)` | `"(()"` | (2,1) | recurse — call 2's own close branch, tried after its open branch (call 3 and everything under it) fully finished |
+| 8 | `(` | `"(()("` | (3,1) | recurse |
+| 9 | `)` | `"(()()"` | (3,2) | recurse |
+| 10 | `)` | `"(()())"` | (3,3) | complete → **add "(()())"** |
+| 11 | `)` | `"(())"` | (2,2) | recurse |
+| 12 | `(` | `"(())("` | (3,2) | recurse |
+| 13 | `)` | `"(())()"` | (3,3) | complete → **add "(())()"**; unwind to `""` |
+| 14 | `)` | `"()"` | (1,1) | recurse — call 1's own close branch, tried after its open branch (calls 2-13, the entire `"(("`-rooted subtree) fully finished |
+| 15 | `(` | `"()("` | (2,1) | recurse |
+| 16 | `(` | `"()(("` | (3,1) | recurse |
+| 17 | `)` | `"()(()"` | (3,2) | recurse |
+| 18 | `)` | `"()(())"` | (3,3) | complete → **add "()(())"** |
+| 19 | `)` | `"()()"` | (2,2) | recurse |
+| 20 | `(` | `"()()("` | (3,2) | recurse |
+| 21 | `)` | `"()()()"` | (3,3) | complete → **add "()()()"**; done |
+
+Call 3 is the constraint earning its keep: `open` hits `3 == n`, so the `if (open < n)` guard
+skips the `(` branch entirely — the *only* legal move left is `)`, and the code never has to
+check "would adding `(` here make an invalid string," because the guard already made that
+impossible.
+
+## why it works
+
+`close <= open` at every node is an invariant, not a check performed after the fact: the only way
+`close` increases is the second `if`, which only fires when `close < open` — so `close` can never
+catch up past `open`, meaning every prefix ever built has at least as many `(` as `)`. `open <= n`
+holds the same way via the first `if`. Together those two invariants are *exactly* the definition
+of a well-formed prefix, so every leaf (`path.Length == 2n` with both counters at `n`) is a
+well-formed string of `n` pairs — and every well-formed string is reachable, because at each
+position a well-formed string's next character always satisfies one of the two guards.
+
+<Watch items={[['time', 'O(4^n / sqrt(n)) — the nth Catalan number'], ['space', 'O(n) recursion (+ O(n) per output string)']]} />
+
+## common bugs
+
+- Swapping the guards — `close < n` instead of `close < open` — produces strings like `")("`
+  because it only checks the total closer budget, not whether there's an opener to match.
+- Generating all `2^(2n)` strings first and validating afterward — correct, but throws away the
+  entire point of backtracking; the two guards above are what make the "generate" and "validate"
+  steps the same step.
+- Forgetting `path.Length--` after either branch — the two branches share one `StringBuilder`,
+  so a leftover `(` from a finished `(`-branch bleeds into the `)`-branch's attempt.
+- Using `if/else if` between the two branches instead of two separate `if`s — at most nodes
+  *both* `(` and `)` are legal simultaneously (see call 7: `(2,1)` allows both), and `else if`
+  would silently explore only one of the two valid branches.
+
+## variants you can now solve
+
+- **[Word Search](/patterns/backtracking/word-search/)** (LC 79) — pruning moves from arithmetic
+  counters to a grid-adjacency check, but it's the same idea: reject a branch the instant it's
+  provably invalid, before building it further.
+- **[Combination Sum](/patterns/backtracking/combination-sum/)** (LC 39) — the mirror image:
+  there the prune is "went over budget" (`remaining < 0`), here it's "went under budget"
+  (`close >= open`) — both are one-line guards that replace a validity check.
+- **Letter Case Permutation** (LC 784) — binary choose-or-not at each character (uppercase vs.
+  lowercase for letters), no pruning needed — closer in spirit to Subsets' unconditional
+  branching than to this problem's guarded one.

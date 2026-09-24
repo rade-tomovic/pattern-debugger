@@ -1,0 +1,47 @@
+---
+import { topicBySlug, problemPath, formatLc } from '@data/curriculum';
+import DifficultyBadge from '@components/DifficultyBadge.astro';
+
+/** Auto-generated problem list for a topic — drop into the topic page. */
+interface Props {
+  topic: string;
+}
+const { topic: slug } = Astro.props;
+const topic = topicBySlug(slug);
+if (!topic) {
+  throw new Error(`<ProblemList>: unknown topic slug "${slug}"`);
+}
+---
+
+<ol class="not-prose !mt-4 space-y-2 !p-0">
+  {
+    topic.problems.map((p, i) => (
+      <li class="bg-panel border-line hover:border-muted rounded-[10px] border p-4 transition-colors">
+        <div class="flex flex-wrap items-center gap-2">
+          <span class="text-muted font-mono text-[0.72rem]">
+            {String(i + 1).padStart(2, '0')}
+          </span>
+          <a
+            href={problemPath(topic, p)}
+            class="font-mono text-[0.95rem] font-semibold text-ink hover:text-amber"
+          >
+            {p.title}
+          </a>
+          <DifficultyBadge difficulty={p.difficulty} />
+          {p.lc && <span class="watch-chip !text-[0.68rem]">LC #{formatLc(p.lc)}</span>}
+          {p.track === 'stretch' && (
+            <span class="text-purple border-purple/40 rounded-md border px-2 py-0.5 font-mono text-[0.7rem]">
+              stretch
+            </span>
+          )}
+          {p.visualizer && (
+            <span class="text-cyan border-cyan/40 rounded-md border px-2 py-0.5 font-mono text-[0.7rem]">
+              ▶ interactive
+            </span>
+          )}
+        </div>
+        <p class="text-muted mt-1.5 pl-7 text-[0.88rem]">{p.summary}</p>
+      </li>
+    ))
+  }
+</ol>

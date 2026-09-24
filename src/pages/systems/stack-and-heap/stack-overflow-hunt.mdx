@@ -1,0 +1,355 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: stack-and-heap
+problem: stack-overflow-hunt
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import Solution from '@components/Solution.astro';
+
+## the code
+
+A comment thread arrives from a client. Each comment has replies, each reply has replies, and the
+ingest path scores the whole thread. This has been in production for two years.
+
+<Solution>
+
+```csharp
+// Evidence for /systems/stack-and-heap/stack-overflow-hunt/ — run with:
+//   dotnet run bench/stack-and-heap/stack-overflow-hunt.cs -c Release
+// (Release matters here: `dotnet run file.cs` alone builds Debug, which disables the
+// JIT optimiser outright and changes the frame sizes below — not a benchmark concern,
+// a correctness one, since this page's numbers assume the optimiser exists to disable.)
+// The parent process re-executes itself (Environment.ProcessPath) for every case that
+// is supposed to die, so one run produces the whole table below. This is the part of
+// that file under review; the rest of Harness is the driver.
+using System.Runtime.CompilerServices;
+
+sealed class Comment
+{
+    public int Likes;
+    public List<Comment> Replies = [];
+}
+
+static class Feed
+{
+    // Likes on a comment plus everything hanging off it.
+    public static int TotalLikes(Comment c)
+    {
+        int total = c.Likes;
+        foreach (var reply in c.Replies)
+            total += TotalLikes(reply);
+        return total;
+    }
+}
+
+static class Harness
+{
+    // What the ingest handler looks like in the service, try/catch and all.
+    // NoInlining so the frame accounting below is about TotalLikes and nothing else.
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    static void Ingest(Comment root)
+    {
+        try
+        {
+            int likes = Feed.TotalLikes(root);
+            Console.WriteLine($"scored thread: {likes} likes");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"LOG error: failed to score thread — {ex.GetType().Name}: {ex.Message}");
+        }
+        finally
+        {
+            Console.WriteLine("LOG finally: ingest finished");
+        }
+        Console.WriteLine("still alive");
+    }
+}
+```
+
+</Solution>
+
+There is no bug in the arithmetic. `TotalLikes` is correct for every tree it will ever be handed,
+it has unit tests, and the handler catches everything and logs it. On a 1,000-deep chain it runs
+clean and prints its three lines.
+
+## find it
+
+<Callout kind="insight" label="before you scroll">
+  The recursion terminates — the structure is a tree, not a cycle, and the walk is finite. So the
+  question is not "does it stop", it is **what resource does it consume that nobody counted, and
+  what is the exact quantity of that resource?**
+
+  Commit to three answers. **(1)** What is the largest thread depth this survives on a thread with
+  a 1 MiB stack? Give a number, not "a lot". **(2)** Which of the four `Console.WriteLine` calls
+  in `Ingest` do you see when it fails? **(3)** Exit code?
+
+  If you predicted "it throws something, the `catch` logs it, and the service keeps serving",
+  you have the belief this page exists to remove.
+</Callout>
+
+## the failure
+
+Fed a 400,000-deep reply chain, on a thread created with a 1 MiB stack. Standard output was
+**empty** — not one of the four log lines ran. This is the whole of standard error, verbatim:
+
+```text
+Stack overflow.
+Repeated 9313 times:
+--------------------------------
+   at Feed.TotalLikes(Comment)
+--------------------------------
+   at Harness.Ingest(Comment)
+   at Harness.Run(System.String, Int32)
+   at Harness+<>c__DisplayClass11_0.<Main>b__2()
+   at System.Threading.Thread.StartCallback()
+```
+
+Exit code **134** — SIGABRT, the process killed itself. No `catch`. No `finally`. No exception
+object; there was nowhere to put one.
+
+Then the same input again, on four stack sizes and with two things about the frame changed, so
+that the number is not a coincidence. Every row below is one child process spawned by
+`bench/stack-and-heap/stack-overflow-hunt.cs` — the file the fence above is taken from — and the
+frame counts are the runtime's own, read back out of each child's crash report:
+
+| the run | stack | frames before death | bytes per frame | exit | logs written |
+| --- | --- | --- | --- | --- | --- |
+| main thread (`ulimit -s`) | 16,384 KiB | 149,610 | 112.1 | 134 | none |
+| `new Thread(f, 1 MiB)` | 1,024 KiB | 9,313 | 112.6 | 134 | none |
+| `new Thread(f, 4 MiB)` | 4,096 KiB | 37,399 | 112.2 | 134 | none |
+| `new Thread(f, 32 MiB)` | 32,768 KiB | 299,543 | 112.0 | 134 | none |
+| a 256-byte `stackalloc` per frame | 1,024 KiB | 3,260 | 321.6 | 134 | none |
+| tiered compilation off | 1,024 KiB | 21,733 | 48.2 | 134 | none |
+| the same code, 1,000-deep input | 1,024 KiB | — | — | 0 | all three |
+
+The one row that is not exactly reproducible is the first: the main thread's stack already has
+the runtime's startup frames, the environment block and `argv` on it before your code runs, so
+repeat runs land within a few dozen frames of each other rather than on the same integer every
+time. Every `new Thread` row repeats exactly, because a fresh thread's stack starts empty.
+
+Four different stack sizes, one bytes-per-frame number: **112**. Depth is not a mystery, it is
+division. And the last three rows say what moves it: make each frame bigger and the depth falls
+in proportion, hand the method to a better compiler and it rises, feed it shallow data and
+nothing happens at all.
+
+Here is the execution as the stack sees it, on the 1 MiB thread. Every row is a real step of the
+run above; the byte columns are the measured 112.6 bytes per frame multiplied out:
+
+| step | what is running | frames | stack bytes used | bytes left of 1,048,576 |
+| --- | --- | --- | --- | --- |
+| 1 | `Ingest` calls `TotalLikes(root)` | 1 | 113 | 1,048,463 |
+| 2 | `TotalLikes` recurses into reply 1 | 2 | 225 | 1,048,351 |
+| 3 | …into reply 2 | 3 | 338 | 1,048,238 |
+| 1,000 | the depth the shallow test used — it returns cleanly from here | 1,000 | 112,600 | 935,976 |
+| 9,312 | one more level of replies | 9,312 | 1,048,531 | 45 |
+| 9,313 | the deepest frame the runtime reported | 9,313 | 1,048,576 | 0 |
+| 9,314 | the next `call` pushes a return address past the end of the mapping; the CPU faults on unmapped memory and the runtime aborts | — | — | none |
+
+## why it breaks
+
+**A frame is bytes, and every call spends some.** The disassembly of `TotalLikes` compiled with
+optimisations on says exactly how many. Real JIT output, with tiered compilation forced off so
+this is the fully optimised body rather than the quick first-pass one:
+
+```text
+G_M000_IG01:                ;; offset=0x0000
+       push     rbp            ; 8 bytes
+       push     r15            ; 8 — the List this frame is enumerating
+       push     r14            ; 8 — the enumerator's version snapshot
+       push     r13            ; 8 — the loop index
+       push     rbx            ; 8 — the running total
+       lea      rbp, [rsp+0x20]  ; frame pointer; note there is no `sub rsp` at all
+                                 ; …loop body elided…
+       call     [Feed:TotalLikes(Comment):int]    ; pushes an 8-byte return address
+```
+
+Five pushes plus the return address the `call` instruction pushes: **48 bytes**, and the
+tiered-compilation-off row measured 48.2. The default row measured 112.6 because those frames are
+not this code. .NET compiles a method quickly and unoptimised the first time (tier 0) and
+recompiles it properly only after it has been called enough — and a recursion that never returns
+never gives the runtime a chance to swap the code under it. **The frames that overflow your stack
+are the fat unoptimised ones.** That is why the depth you get in production is worse than the
+depth your arithmetic predicts.
+
+**The stack cannot grow.** It is a mapping of fixed size, reserved when the thread was created —
+you can see the reservations on [stack vs heap](/systems/stack-and-heap/). Past its end is
+unmapped address space. The frame that does not fit is not detected by a check in your code or in
+the runtime; the CPU takes a fault on the first write past the guard page, exactly as it would
+for any wild pointer. [Virtual memory](/systems/virtual-memory/) is where that fault comes from.
+
+**And that is why you cannot catch it.** Handling an exception means running a `catch` filter, a
+`catch` body, and every intervening `finally` — all of which need stack, and there is none left
+by definition. Before .NET 2.0 the runtime let you catch it, and what you got were processes
+limping on in states nobody could reason about; since .NET 2.0 a stack overflow calls
+`FailFast`: print, abort, no unwinding, no `catch`, no `finally`. `try`/`catch (Exception)` is not a safety net around this
+class of bug, and this is the one failure where the log you rely on is guaranteed absent.
+
+## the fix
+
+Move the pending work off the stack and onto the heap, where it can grow:
+
+<Solution>
+
+```csharp
+static class FeedFixed
+{
+    public static int TotalLikes(Comment root)
+    {
+        int total = 0;
+        var pending = new Stack<Comment>();
+        pending.Push(root);
+        while (pending.TryPop(out var c))
+        {
+            total += c.Likes;
+            foreach (var reply in c.Replies)
+                pending.Push(reply);
+        }
+        return total;
+    }
+}
+```
+
+</Solution>
+
+`Stack<T>` is the data structure, not the region — it is one array on the heap that doubles when
+it fills, so its depth limit is memory rather than a 1 MiB reservation. The same 400,000-deep
+chain that killed the process now returns the correct total, **400000**, with no crash at all, and
+on a 5-deep tree the recursive and iterative versions return the same answer, which is the check
+that matters when you rewrite a traversal. The visiting order changes (this pops
+last-child-first), so anything order-dependent needs its children pushed in reverse.
+
+Two other fixes get proposed first, and it is worth knowing exactly what each is worth.
+
+<Callout kind="trap" label="fix that does not work: catch it">
+  `catch (StackOverflowException)` compiles, and the block never runs — the run above proves it,
+  with a `catch (Exception)` and a `finally` that both stayed silent. There is no `catch` you can
+  write, at any level, that sees this. Nor can you use a `finally` to clean up: the process is
+  gone.
+</Callout>
+
+<Callout kind="trap" label="fix that only moves the cliff: a bigger stack">
+  `new Thread(work, 32 * 1024 * 1024)` really does buy depth — 299,543 frames instead of 9,313 on
+  a 1 MiB thread, in exact proportion to the reservation. It also reserves 32 MiB of address
+  space per thread, it does nothing for the thread-pool threads your request actually runs on
+  (you do not create those), and it leaves the depth limit a function of attacker-supplied data.
+  If the input is untrusted, multiplying the limit by 32 is not a fix — the crash still happens,
+  just one order of magnitude further into the attacker's input.
+</Callout>
+
+The middle option is to keep the recursion and ask the runtime whether there is room, which turns
+the crash into an ordinary catchable exception:
+
+<Solution>
+
+```csharp
+static class FeedGuarded
+{
+    public static int MaxDepthSeen;
+    public static int TotalLikes(Comment c, int depth = 1)
+    {
+        if (!RuntimeHelpers.TryEnsureSufficientExecutionStack())
+            throw new InvalidOperationException($"comment tree too deep (gave up at depth {depth})");
+        if (depth > MaxDepthSeen) MaxDepthSeen = depth;
+        int total = c.Likes;
+        foreach (var reply in c.Replies)
+            total += TotalLikes(reply, depth + 1);
+        return total;
+    }
+}
+```
+
+</Solution>
+
+`TryEnsureSufficientExecutionStack` asks whether a fixed headroom — enough for "an average .NET
+function" — remains below the stack pointer. On the same 1 MiB thread it gave up at depth
+**4,750** and the handler logged, ran its `finally`, and returned; on 8 MiB it gave up at
+**42,979**.
+
+That looks like it costs you most of an order of magnitude of depth, and it is worth being
+precise about where the loss actually goes, because the reserve is not it. Run the guarded walk
+on four stack sizes — 4,750 frames on 1 MiB, 10,211 on 2 MiB, 21,134 on 4 MiB, 42,979 on 8 MiB —
+and the four points sit on one straight line: 192.0 bytes per frame, with 136,588 bytes held
+back. The headroom is a *constant* ≈133 KiB, the same at every stack size, which is 13.0% of a
+1 MiB stack and 1.6% of an 8 MiB one. Converted into frames at the *unguarded* frame size, that
+constant is only about 1,200 frames — a small piece of what actually went missing.
+
+The rest is the frame. The guarded method carries a second parameter, a call to the guard with the
+live values spilled around it, and a throw path, and it measures **192.0 bytes per frame against
+the unguarded 112.1**. The optimised code shows the same widening: the disassembly of
+`Feed.TotalLikes` builds a 48-byte frame (five pushes and the return address), and
+`FeedGuarded.TotalLikes` a 96-byte one (six pushes, `sub rsp, 40`, and the return address). That
+is the real price: not "some of the stack unused", but a fatter frame on every level, which is why
+8 MiB buys 42,979 guarded frames where it bought 74,849 unguarded ones — most of the ~31,900
+missing frames are the wider frame, only about 1,200 are the fixed headroom. It is the right tool
+when the recursion is genuinely the clearest code (a parser, a rules evaluator) and the wrong one
+when the traversal converts to a loop as easily as this one does.
+
+For the common case there is a fourth answer that is better than all of them: **cap the depth at
+the boundary, before the data reaches your code.** That is what the framework does with the same
+problem. `JsonDocument.Parse` on 200 levels of nesting:
+
+```text
+JsonReaderException: The maximum configured depth of 64 has been exceeded. Cannot read next
+JSON array. LineNumber: 0 | BytePositionInLine: 64.
+```
+
+64 levels, by default, in every `System.Text.Json` reader and serializer. Not because 64 is deep
+enough for everybody, but because a parser is recursive and its input comes from strangers.
+(`JsonReaderException` is a non-public subclass — the type you actually write `catch` for is its
+base, `JsonException`, and a real `catch (JsonException)` here does catch it.)
+
+<Watch items={[['frame (tier-0)', '112 B'], ['frame (optimised)', '48 B'], ['depth on 1 MiB', '9,313'], ['depth on 8 MiB', '74,849'], ['guarded depth on 1 MiB', '4,750'], ['exit code', '134'], ['catch blocks run', '0']]} />
+
+## what this looks like in prod
+
+The signature is a process that **vanishes**. No exception in the log, no error metric, no last
+words — the last thing in your log is whatever line ran before the request that killed it, so the
+timestamps point at an innocent request. In Kubernetes the pod restarts and the event says exit
+code 134; in systemd the unit logs `SIGABRT`. The neighbouring failure, an actual out-of-memory
+kill, is exit code 137 (SIGKILL, from the OOM killer) — different number, different problem, and
+the two get conflated constantly. If your container reports 134 and your memory graph is flat,
+stop looking at the heap.
+
+The code shapes that produce it are all "recursion whose depth follows the input": a
+recursive-descent parser or expression evaluator fed a generated query, `ToString`/`Equals`
+walking an object graph, an ORM materialising a self-referencing hierarchy where one bad row makes
+a category its own ancestor, XML/JSON handling written before the framework's depth caps existed,
+and — most often — a tree walk that was tested on tidy data and shipped.
+
+Two habits fix the class rather than the instance. Treat "how deep can this input be" as an input
+validation question, answered at the edge with a cap and a 400, the way you already cap request
+body size. And when a traversal's depth is a function of data rather than of code, write it with
+an explicit stack, which costs you three lines and removes the failure mode.
+
+## the same idea in other languages
+
+| language | what it's called | the trap |
+| --- | --- | --- |
+| Java | `StackOverflowError` — a `Throwable`, so `catch (StackOverflowError e)` genuinely does run | which makes it tempting to catch, and it is still the wrong move: the frames that unwound may have left half-updated state behind, and the JVM makes no promise about what is safe after one |
+| Go | goroutine stacks start small (kilobytes) and *grow* by copying, up to a 1 GB default limit | so deep recursion usually works where .NET would die — until the limit, where the runtime prints "goroutine stack exceeds" and kills the program. It is a fatal error, not a panic, so `recover()` does not see it either |
+| Python | `RecursionError` at `sys.getrecursionlimit()`, 1,000 frames by default | the limit counts *frames*, not bytes, so it fires long before the real stack is gone — and since CPython 3.11 changed how Python-level calls use the C stack, `setrecursionlimit(3_000_000)` really does let a plain recursive function reach depth 1,000,000 here, catchable the whole way. The trap is trusting that on every version: recursion that goes back through a C-implemented builtin (a self-referential `__repr__` calling `repr()`, say) still spends real C stack, and whether that path degrades gracefully into a catchable error or crashes the process outright is an implementation detail that has moved between CPython releases — check the interpreter you actually ship on, don't assume |
+| C / C++ | nothing. No check, no error, no exception | the write past the guard page is a `SIGSEGV` if you are lucky and a silent corruption of whatever is mapped next if you are not — which is why deep recursion on untrusted input is a memory-safety vulnerability in C, not merely a crash |
+
+## common bugs
+
+- **Believing `catch (Exception)` covers everything.** It covers every exception, and a stack
+  overflow is not delivered as one. The same is true of `finally` and of `AppDomain.UnhandledException`.
+- **Testing recursion on hand-made data.** Every tree in the test suite is 3 deep because a human
+  typed it. The depth that matters comes from production, from an import, or from an attacker,
+  and none of those are in the fixtures. Add one test with a 100,000-deep chain and it will fail
+  before the code ships.
+- **Assuming the depth limit is a round number of frames.** It is a *byte* budget divided by your
+  frame size, and your frame size changes when you add a local, when a callee gets inlined into
+  you, when a `stackalloc` appears (256 bytes per frame cost 65% of the depth here), and when the
+  method is running as unoptimised tier-0 code — which, in a recursion, it usually is.
+- **Raising the thread's stack size and calling it fixed.** It multiplies the limit and leaves it
+  a function of input. It also does nothing on a thread-pool thread, which is where ASP.NET
+  request work actually runs, because you did not create that thread.
+- **Converting recursion to a loop and forgetting the order.** An explicit `Stack<T>` reverses
+  sibling order versus recursion; if the output order is observable, push children in reverse or
+  use a queue and know you have swapped depth-first for breadth-first.
+- **Blaming the heap.** A 134 with a flat memory graph is a stack problem. Adding memory limits,
+  tuning the GC, or scaling the pod changes nothing.

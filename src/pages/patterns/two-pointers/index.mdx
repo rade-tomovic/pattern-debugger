@@ -1,0 +1,98 @@
+---
+layout: '@layouts/TopicLayout.astro'
+topic: two-pointers
+---
+
+import Callout from '@components/Callout.astro';
+import ProblemList from '@components/ProblemList.astro';
+import Cells from '@components/Cells.astro';
+
+## core idea
+
+Two indices walk the data instead of one. Because each step **permanently discards** a chunk of
+the search space — a pair, a prefix, a wall — you check what looks like O(n²) combinations in a
+single O(n) pass with O(1) extra space. The pattern has three shapes, and interviews use all
+three:
+
+| shape | pointers | typical trigger |
+| --- | --- | --- |
+| opposite ends | `left` at 0, `right` at n−1, converging | **sorted** array + pair/containment question |
+| same direction | slow `write`, fast `read` chase forward | in-place removal / compaction, "O(1) space" |
+| expand from middle | both start at a center, walk outward | palindromes, symmetry around a point |
+
+<Cells
+  data={[1, 3, 5, 7, 11]}
+  pointers={{ 0: [{ t: 'L', c: 'amber' }], 4: [{ t: 'R', c: 'cyan' }] }}
+  caption="opposite ends: L and R converge — every move discards a whole set of pairs"
+/>
+
+## when to reach for it
+
+- The input is **sorted** (or sortable without losing anything you need) and the question is
+  about a *pair*, *triple*, or *range*.
+- The words "in-place" or "O(1) space" appear anywhere in the problem.
+- You are comparing a sequence with itself reversed, or growing outward from a center —
+  palindromes, mirrors, symmetry.
+- A brute force would be two nested loops where the inner loop only moves one way.
+
+## universal templates
+
+Opposite ends — the shape you will write most often:
+
+```csharp
+public int[] OppositeEnds(int[] sorted, int target)
+{
+    int left = 0, right = sorted.Length - 1;
+
+    while (left < right)               // strict <: when they meet, no pair remains
+    {
+        int sum = sorted[left] + sorted[right];
+        if (sum == target) return [left, right];
+
+        if (sum < target) left++;      // sorted[left] is too small for *everyone* → discard it
+        else right--;                  // sorted[right] is too big for *everyone* → discard it
+    }
+    return [];                         // no pair exists
+}
+```
+
+Same direction (read/write) — the in-place workhorse:
+
+```csharp
+public int Compact(int[] nums)
+{
+    int write = 0;                             // everything before write is the answer so far
+    for (int read = 0; read < nums.Length; read++)
+    {
+        if (Keep(nums[read]))
+            nums[write++] = nums[read];        // claim the slot, then advance
+    }
+    return write;                              // new logical length
+}
+```
+
+Expand from middle — palindromes grow outward:
+
+```csharp
+public (int Start, int Length) ExpandFromCenter(string s, int left, int right)
+{
+    while (left >= 0 && right < s.Length && s[left] == s[right])
+    {
+        left--;                        // grow the mirror outward
+        right++;
+    }
+    return (left + 1, right - left - 1);   // we overshot by one on each side
+}
+```
+
+Every problem below is one of these three skeletons with a different comparison in the middle.
+
+<Callout kind="insight" label="the one question to ask">
+  Before moving a pointer, ask: *"which move lets me discard options without ever discarding
+  the answer?"* If you can't answer that, the pattern doesn't apply — and that's a signal to
+  reach for a [hashmap](/patterns/hashmap/) instead.
+</Callout>
+
+## problems
+
+<ProblemList topic="two-pointers" />

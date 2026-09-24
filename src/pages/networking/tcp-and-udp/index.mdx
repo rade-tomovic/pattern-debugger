@@ -1,0 +1,749 @@
+---
+layout: '@layouts/TopicLayout.astro'
+topic: tcp-and-udp
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import Solution from '@components/Solution.astro';
+import ProblemList from '@components/ProblemList.astro';
+
+## the ground floor
+
+- **Best-effort delivery** is the service IP actually offers: the network may drop, duplicate,
+  delay or reorder a packet, and it will never tell you.
+  [What a network actually is](/networking/network-basics/) builds that, along with "packet",
+  "header" and "payload".
+- **A segment is TCP's chunk, a datagram is UDP's**, and both ride inside an IP packet —
+  [the OSI model](/networking/osi-model/) is where the naming and the wrapping come from.
+- **IP carries a packet to a host and stops there.** It has no idea which program wants it, and
+  no idea whether it arrived. [IP addresses, subnets and routing](/networking/ip-and-routing/)
+  owns everything below this page.
+- **A port is a 16-bit field in the TCP or UDP header**, and the kernel picks a socket using the
+  four-tuple of source address, source port, destination address, destination port.
+  [Ports and sockets](/networking/ports-and-sockets/) owns that, plus `TIME_WAIT` and the accept
+  queue.
+- **MTU** is the largest payload one link carries in one frame — 1500 bytes on standard Ethernet,
+  and [the link layer](/networking/link-layer/) is where that number comes from.
+- **A socket is a kernel object behind a handle**, so every `Send` and `Receive` on this page is a
+  syscall — [processes, threads and the kernel](/systems/process-and-thread/) built that boundary.
+
+## core idea
+
+IP hands you an unreliable, unordered, per-packet delivery service addressed to a machine. Almost
+nothing you write wants that. The transport layer sits directly on top and offers two products
+instead: TCP, which spends round trips and bookkeeping to turn that into an ordered, gap-free,
+flow-controlled **byte stream** between two programs; and UDP, which adds ports and a length,
+declines to do anything else, and hands your message across whole or not at all.
+
+The sentence worth carrying: **TCP does not deliver your messages, it delivers your bytes.** Every
+guarantee it gives is about the byte stream — that every byte arrives, once, in order — and none of
+them is about where one `Send` ended and the next began. UDP is the opposite trade: it preserves
+your message boundary perfectly and guarantees nothing else at all.
+
+| | TCP | UDP |
+| --- | --- | --- |
+| header size | 20 bytes without options | 8 bytes, always |
+| unit delivered to your code | one byte | one datagram, whole or not at all |
+| connection setup | three-way handshake before any data | none — the first send is the first packet |
+| ordering | guaranteed, by sequence number | none; datagrams may arrive in any order |
+| loss | detected and retransmitted | not detected, not reported |
+| duplicates | detected and discarded | delivered, and it is your problem |
+| message boundaries | **gone** — framing is your job | preserved exactly |
+| flow control (do not outrun the reader) | yes — the receive window | none |
+| congestion control (do not outrun the network) | yes — see [the network path](/system-design/networking/) | none |
+| one-to-many | no, strictly two endpoints | yes — broadcast and multicast |
+
+## how it actually works
+
+### the TCP header, field by field
+
+Everything TCP does is bookkeeping carried in these twenty bytes. Read the header once and most of
+the protocol stops being mysterious.
+
+```text
+  byte   0        1        2        3
+       ┌────────┬────────┬────────┬────────┐
+    0  │   source port   │destination port │  16 bits each — the demultiplexing key
+       ├────────┴────────┴────────┴────────┤
+    4  │         sequence number           │  32 bits: the stream offset of THIS segment's
+       ├───────────────────────────────────┤            first data byte
+    8  │      acknowledgement number       │  32 bits: the next byte I expect FROM YOU
+       ├────┬────┬────────┬────────────────┤
+   12  │ off│rsvd│ flags  │ receive window │  off = header length in 4-byte words (5 = 20 bytes)
+       ├────┴────┴────────┼────────────────┤  flags = 8 control bits
+   16  │    checksum     │ urgent pointer  │  window = how much more I can accept, right now
+       ├─────────────────┴─────────────────┤
+   20  │ options (0–40 bytes) ...          │  MSS, window scale, SACK-permitted, timestamps
+       ├───────────────────────────────────┤
+       │ your bytes                        │
+       └───────────────────────────────────┘
+```
+
+The header is 20 bytes with no options and at most 60 with them, which is why the length is
+carried as a 4-bit count of 4-byte words. The options that matter are all negotiated in the
+handshake and never again: the maximum segment size each side will accept, whether window scaling
+is in play, and whether the receiver understands selective acknowledgement.
+
+The eight control bits are the protocol's whole vocabulary:
+
+| flag | what it means | note |
+| --- | --- | --- |
+| `SYN` | "I am opening a connection and this is my initial sequence number" | consumes one sequence number of its own |
+| `ACK` | "the acknowledgement field above is meaningful" | set on every data segment and every normal control segment after the initial `SYN` — a bare `RST` is the exception |
+| `FIN` | "I have no more data to send" | also consumes one sequence number |
+| `RST` | "this connection does not exist, or abort it now" | never acknowledged, never retransmitted |
+| `PSH` | "hand what you have to the application now" | **not** a message boundary, no matter how much you want it to be |
+| `URG` | urgent pointer is meaningful | effectively dead; never build on it |
+| `ECE`, `CWR` | explicit congestion notification | congestion control — [the network path](/system-design/networking/) owns those |
+
+### the three-way handshake
+
+A connection is not a thing the network holds. It is agreed state at the two ends, and the
+handshake exists to establish exactly one thing on each side: the other end's starting sequence
+number, acknowledged so both sides know the other received it.
+
+```text
+  client                                                      server
+  CLOSED                                                      LISTEN
+    │
+    │  SYN          seq=X                                          │
+    ├─────────────────────────────────────────────────────────────→│  SYN_RECEIVED
+  SYN_SENT                                                         │  (half-open state parked
+    │                                                              │   in the SYN queue)
+    │  SYN, ACK     seq=Y   ack=X+1                                │
+    │←─────────────────────────────────────────────────────────────┤
+    │                                                              │
+    │  ACK          seq=X+1 ack=Y+1                                │
+    ├─────────────────────────────────────────────────────────────→│  ESTABLISHED
+  ESTABLISHED                                                      │
+    │  data         seq=X+1 ...                                    │
+    ├─────────────────────────────────────────────────────────────→│
+```
+
+Three segments, one round trip before either side may send data. Note that `X+1` and `Y+1`: the
+`SYN` itself occupies one position in the sequence space, which is how each side acknowledges "I
+received your `SYN`" using the ordinary acknowledgement field rather than a special case.
+
+**The initial sequence number is not zero, and that is deliberate.** If both ends started at zero,
+a segment left over from an earlier connection between the same four-tuple could arrive during a
+new one, land inside the new connection's window, and be accepted as real data. A hard-to-guess
+starting point also means an off-path attacker cannot inject a plausible segment into your
+connection without first observing it. Both reasons are why the number is derived
+unpredictably rather than counted from one.
+
+**In the common case the `SYN` carries no application data.** There is a mechanism that allows it
+— TCP Fast Open, which reuses a cookie from a previous connection — but it needs support at both
+ends and survives middleboxes poorly, so assume a round trip before your first byte moves.
+
+<Callout kind="note" label="what the server pays for a SYN">
+  A `SYN` that arrives creates state on the server before the client has proved it can receive
+  anything: a half-open entry in the SYN queue, waiting for a third segment that may never come.
+  Flooding that queue with `SYN`s from forged addresses is the original denial-of-service attack.
+  The standard defence is SYN cookies: instead of storing the half-open entry, the server encodes
+  the state it would have stored into the initial sequence number it sends back, and reconstructs
+  it from the client's `ACK`. No state, nothing to flood. The accept queue this eventually feeds
+  belongs to [ports and sockets](/networking/ports-and-sockets/).
+</Callout>
+
+### sequence numbers count bytes, and ACKs are cumulative
+
+This is the single fact that makes the rest of TCP derivable, and it is the one most people have
+backwards. **The sequence number is a byte offset into the stream, not a packet counter.** A
+segment's sequence number is the stream position of its first data byte, and a 500-byte `Send`
+advances the sequence space by 500 whether the kernel put it on the wire as one segment or as
+four.
+
+The acknowledgement number is the mirror image: **the number of the next byte the receiver
+expects**, which implicitly acknowledges every byte below it. That is what "cumulative" means, and
+it has two consequences worth internalising.
+
+- An acknowledgement can never be taken back. Once the receiver says "I want byte 4000", it has
+  committed to holding everything below 4000 for the application, and the sender may free it.
+- An acknowledgement cannot express a gap. If bytes 1500–1999 are missing but 2000–3499 arrived,
+  the only number the receiver can put in the field is still 1500. It says nothing about the data
+  it is already holding.
+
+That second limitation is why the selective acknowledgement option exists: negotiated in the
+handshake, it lets the receiver list the out-of-order ranges it already has in a header option, so
+the sender retransmits only the hole rather than everything after it. The cumulative field keeps
+its meaning either way — SACK is extra information alongside it, not a replacement.
+
+### a lost segment, and how it comes back
+
+Two mechanisms recover a loss, and the difference between them is entirely about how long the
+sender waits before acting.
+
+The first is the retransmission timer. Every segment sent is held in the sender's buffer with a
+timer; if the acknowledgement covering it has not arrived when the timer expires, the segment goes
+out again. The timer is derived from the connection's own observed round-trip time and doubles on
+each successive failure for the same data, so a path that has genuinely gone away is not hammered.
+This is the fallback, and it is the one that waits: the sender cannot act until a timer
+deliberately set longer than an ordinary reply has expired.
+
+The second is **fast retransmit**, and it exploits the cumulative ACK's one limitation as a
+signal. When a segment goes missing but the ones behind it keep arriving, the receiver keeps
+answering with the *same* acknowledgement number — it still wants the same byte. The sender counts
+those duplicates: three of them mean data is clearly still flowing past the hole, so the hole is
+almost certainly a loss rather than a reorder, and it retransmits immediately without waiting for
+any timer.
+
+```text
+  sender                                     receiver     receiver's byte queue
+    │  seq 1000, 500 bytes ───────────────────→│         1000–1499 delivered
+    │                      ←──── ack 1500 ─────┤         "next byte I want: 1500"
+    │
+    │  seq 1500, 500 bytes ────── ✗            │         dropped somewhere on the path
+    │  seq 2000, 500 bytes ───────────────────→│         2000–2499 HELD, out of order
+    │                      ←──── ack 1500 ─────┤         duplicate #1 — still want 1500
+    │  seq 2500, 500 bytes ───────────────────→│         2500–2999 held
+    │                      ←──── ack 1500 ─────┤         duplicate #2
+    │  seq 3000, 500 bytes ───────────────────→│         3000–3499 held
+    │                      ←──── ack 1500 ─────┤         duplicate #3  ← the trigger
+    │
+    │  seq 1500, 500 bytes ───────────────────→│         the hole is filled
+    │                      ←──── ack 3500 ─────┤         ONE cumulative ack covers
+    │                                          │         everything it was holding
+```
+
+Look at the last line: the receiver had 2000–3499 in its buffer the whole time and could not say
+so. The moment the hole fills, one acknowledgement jumps past all of it. That jump is the
+cumulative rule paying off — and the four identical ACKs before it are the same rule creating the
+signal that recovered the loss.
+
+Two things this page is deliberately not telling you. What the sender does to its *sending rate*
+after a loss — halving a congestion window, slow start, the whole AIMD story — is congestion
+control, and [the network path](/system-design/networking/) covers it properly. And the receiver
+holding out-of-order bytes it cannot deliver is exactly the transport-level head-of-line blocking
+that page discusses; the mechanism you just read is where it comes from.
+
+### the receive window: the reader's brake
+
+Congestion control stops a sender from overwhelming the *network*. Flow control stops it from
+overwhelming the *receiver*, and it is a much simpler mechanism: a 16-bit field in every segment
+saying **how many more bytes I can accept right now**.
+
+That number is free space in the receiving kernel's socket buffer. Data arrives, goes into the
+buffer, and stays there until your application calls `Receive`. So the window shrinks when your
+code is slow and grows when it catches up, entirely automatically, without your code knowing.
+
+```text
+  the receiver's socket buffer                 what it advertises
+
+  [############........................]       window = free space
+   ↑          ↑                        ↑
+   app has    kernel has received      buffer end
+   not read   and acked this far
+   this yet
+
+  app stalls  → the filled region grows → window shrinks → sender slows down
+  window = 0  → sender must stop entirely
+```
+
+A **zero window** is the interesting case. It means "stop sending, I have nowhere to put it", and
+the sender obeys — but now there is a deadlock waiting to happen, because the segment that
+eventually says "I have room again" is a pure acknowledgement, and a pure acknowledgement is not
+itself acknowledged. If it is lost, the sender waits forever for a message that will never be
+resent. So a blocked sender periodically sends a **window probe**: a single byte, which forces the
+receiver to answer with its current window. The probe is the mechanism that makes flow control
+safe against the loss of its own control messages.
+
+The 16-bit field caps the window at 65,535 bytes, which is small for a modern path. The window
+scale option, offered in the handshake and only in the handshake, multiplies it by a
+negotiated power of two — up to 2¹⁴, so a window of roughly a gibibyte. If either side omits the
+option in its `SYN`, neither side scales for the whole life of the connection.
+
+<Callout kind="insight" label="a zero window is a diagnosis, not a network problem">
+  If your service is the one advertising zero, nothing is wrong with the network — your code is not
+  reading from the socket fast enough. The usual shape is a receive loop that does slow work
+  (a database write, a downstream call) per message, in line, before reading the next one. The
+  buffer fills, the window closes, and the sender stalls: TCP has quietly applied backpressure all
+  the way to the other machine. That is the right behaviour, and it is a much better outcome than
+  the alternative — a queue in your process that grows until the pod is killed.
+</Callout>
+
+### closing takes four segments, and both halves are separate
+
+TCP's close is not symmetric with its open, because each direction of the stream shuts down
+independently. `FIN` means "I have no more data to send", and it says nothing about whether the
+sender is still willing to *receive*.
+
+```text
+  A (calls Close first — the ACTIVE close)                         B (the PASSIVE side)
+    │  FIN        seq=U                                            │
+    ├─────────────────────────────────────────────────────────────→│  the kernel ACKs immediately,
+    │                                                              │  the SOCKET now sits in
+    │             ←──── ack U+1 ───────────────────────────────────┤  CLOSE_WAIT until B's
+    │                                                              │  application calls Close
+    │  ← B may still send data here; this direction stays open →   │
+    │                                                              │
+    │             ←──── FIN  seq=V ────────────────────────────────┤  B finally closes
+    │  ack V+1                                                     │
+    ├─────────────────────────────────────────────────────────────→│  CLOSED
+  TIME_WAIT                                                        │
+    │  ... 2 × MSL ...                                             │
+  CLOSED
+```
+
+Four segments, and the middle two are usually not adjacent in time — that gap is the whole point.
+The half-close is a real, usable feature (`Socket.Shutdown(SocketShutdown.Send)` in .NET): it is
+how a client says "that's my whole request, now answer" on a protocol with no length prefix, while
+still reading the response.
+
+`TIME_WAIT` sits on whichever end sent the first `FIN`, and it lasts twice the maximum segment
+lifetime. It exists for two reasons: to absorb any stray duplicate segment from this connection
+still wandering the network, so it cannot be delivered into a *new* connection that happens to
+reuse the same four-tuple; and so that the final `ACK` can be retransmitted if the peer never
+received it and resends its `FIN`. Its production consequence — a client burning ephemeral ports
+faster than they are released — belongs to
+[ports and sockets](/networking/ports-and-sockets/), along with the two folk remedies that make it
+worse.
+
+Here is the whole state machine. Every socket you have ever opened walked one of these two paths
+down the page.
+
+```text
+  opening
+
+                                   CLOSED
+            passive: Listen()  ┌──────┴──────┐  active: Connect() sends SYN
+                               ↓             ↓
+                            LISTEN       SYN_SENT
+                               │             │  SYN+ACK arrives,
+             SYN arrives,      │             │  send ACK
+             send SYN+ACK      ↓             │
+                         SYN_RECEIVED        │
+                               │  their ACK  │
+                               └──────┬──────┘
+                                      ↓
+                                 ESTABLISHED
+
+  closing
+
+                                  ESTABLISHED
+          WE close first  ┌────────────┴────────────┐  THEY close first
+          send FIN        ↓                         ↓  their FIN arrives;
+                     FIN_WAIT_1                CLOSE_WAIT   our kernel ACKs it,
+          their ACK       ↓                         ↓       then waits for US
+                     FIN_WAIT_2                LAST_ACK  ← we finally Close,
+          their FIN;      ↓                         ↓       sending our FIN
+          we ACK it   TIME_WAIT                  CLOSED  ← their ACK
+                          ↓
+          2 × MSL      CLOSED
+```
+
+<Callout kind="trap" label="a pile of CLOSE_WAIT is your bug, not theirs">
+  `CLOSE_WAIT` means: the peer sent `FIN`, the kernel already acknowledged it, and the socket is now
+  waiting for *your* process to call `Close`. Nothing in the network can move it along, and it does
+  not time out — a socket can sit there for the life of the process. So a count of `CLOSE_WAIT`
+  sockets that climbs and never falls is, essentially always, a handle leak in your own code: an
+  exception path that returns without disposing the socket, a `Socket` or `TcpClient` stored in a
+  collection nobody clears, a `using` that was removed during a refactor. Look for the path where
+  the read loop exits on an error rather than on a clean end of stream.
+
+  Its mirror image on the other side is `FIN_WAIT_2`: *you* closed, they acknowledged, and they
+  have never closed back. Same bug, viewed from the other machine, and the useful move in an
+  incident is to work out which of the two ends you are looking at before you start blaming
+  anybody.
+</Callout>
+
+You can take that census from inside the process, without `ss` or `netstat`:
+
+<Solution>
+
+```csharp
+using System.Net.NetworkInformation;
+
+// A histogram of this machine's TCP connection states, read from the OS.
+// On Linux this ends up reading /proc/net/tcp; on Windows it is an IP Helper call.
+foreach (var group in IPGlobalProperties.GetIPGlobalProperties()
+             .GetActiveTcpConnections()
+             .GroupBy(c => c.State)
+             .OrderByDescending(g => g.Count()))
+{
+    Console.WriteLine($"{group.Key,-14} {group.Count()}");
+}
+
+// TcpState.CloseWait climbing and never falling  → sockets your code never disposed.
+// TcpState.TimeWait large but stable             → you are the side closing first, which is
+//                                                  normal for a client that does not pool.
+```
+
+</Solution>
+
+If you would rather read the raw file, `/proc/net/tcp` writes the state as a hex number in its
+fourth column, and those numbers are the kernel's own enum order rather than anything
+protocol-defined:
+
+```text
+  01 ESTABLISHED    04 FIN_WAIT_1    07 CLOSE        0A LISTEN
+  02 SYN_SENT       05 FIN_WAIT_2    08 CLOSE_WAIT   0B CLOSING
+  03 SYN_RECV       06 TIME_WAIT     09 LAST_ACK
+```
+
+### RST: the connection that says no
+
+`RST` is TCP's abort. It is sent when a segment arrives that makes no sense for any existing
+connection — most commonly a `SYN` for a port with nothing listening, but also a segment for a
+connection the peer has already torn down, or one whose sequence numbers are wildly wrong. A
+process can also cause one deliberately by aborting a socket rather than closing it politely,
+which discards anything still unsent.
+
+A received `RST` kills the connection immediately: no `FIN` exchange, no `TIME_WAIT`, and any data
+still in the receive buffer is discarded. In .NET you meet it as a `SocketException` with
+`SocketError.ConnectionReset` on an established connection, or `SocketError.ConnectionRefused`
+when it came back in answer to your `SYN`.
+
+**This is the most useful diagnostic distinction in the whole section, so it is worth stating
+flatly.** A refused connection and a timed-out connection are different failures with different
+causes:
+
+- **`RST` came back** — something is alive at that address, it received your `SYN`, and it said no.
+  Nothing is listening on that port, or a firewall is configured to *reject*. The address and the
+  route are fine.
+- **Silence until your timeout** — the packet was dropped and nobody told you. A security group or
+  firewall configured to *drop*, a routing hole, a wrong address, a host that is simply not there.
+  You have learned nothing about whether anything listens on that port.
+
+Never let those two collapse into "it didn't connect".
+[Seeing the network](/networking/network-troubleshooting/) turns that distinction into a checklist.
+
+### Nagle and delayed ACK, honestly
+
+Two independent optimisations, each sensible alone, that can interact badly.
+
+**Nagle's algorithm** is on the sender: while there is unacknowledged data outstanding, do not send
+a new *small* segment — buffer the bytes until either an acknowledgement arrives or there is a full
+segment's worth to send. It exists because a program writing one byte at a time would otherwise put
+41 bytes on the wire per byte of payload.
+
+**Delayed acknowledgement** is on the receiver: do not answer a data segment with a bare
+acknowledgement straight away — wait briefly, in the hope that the application will produce a reply
+to piggyback it on, or that a second segment will arrive so one acknowledgement can cover both.
+
+Put them together on a request/response protocol where the request is written in two pieces. The
+sender ships the first piece, then holds the second because Nagle is waiting for an acknowledgement.
+The receiver holds the acknowledgement because delayed-ACK is waiting for data to piggyback on —
+and it cannot produce a reply, because it has not received the whole request. Neither side is
+broken; neither side sends; the stall ends only when the receiver's delay timer gives up. The fix
+on the sender's side is `Socket.NoDelay = true` (`TCP_NODELAY` underneath), which removes the
+sender's half of the interaction. It costs nothing on bulk transfer, where writes are already
+large enough that Nagle never holds anything back; the cost is on a program that genuinely does
+write a byte at a time, which then puts each one on the wire in its own segment. The better fix
+is usually to stop writing a logical message in several small `Send` calls in the first place.
+
+### the byte stream truth: there are no messages
+
+If you take one thing off this page, take this one. **TCP guarantees your bytes arrive, once, in
+order. It guarantees absolutely nothing about how they are grouped.**
+
+```text
+  what your code did            what went on the wire        what the reader's Receive returned
+
+  Send("GET /a")   6 bytes ─┐
+  Send("\r\n")     2 bytes ─┼──→   one segment, 12 bytes ──→  one Receive: 12 bytes
+  Send("host")     4 bytes ─┘
+
+                            ... or ...
+
+  Send("GET /a")   6 bytes ─┐      segment 1: 8 bytes    ──→  Receive: 8 bytes
+  Send("\r\n")     2 bytes ─┼──→   segment 2: 4 bytes    ──→  Receive: 4 bytes
+  Send("host")     4 bytes ─┘
+
+  three writes                     one or two segments         one, two or twelve reads
+  ─────────────────────────────────────────────────────────────────────────────────────
+  Those three counts are unrelated. Nothing in TCP preserves any of them, and every
+  grouping above is correct behaviour.
+```
+
+The grouping is decided by things you do not control and cannot observe: the kernel's send buffer,
+Nagle, the path MTU, whether the receiving application happened to be scheduled between the two
+arrivals. On a loopback connection with small writes you will usually see one read return
+everything, which is exactly why this bug survives every test you write on your laptop and appears
+the first time the traffic crosses a real network.
+
+So **framing is your job**, and there are only two designs:
+
+- **A length prefix.** Write a fixed-width length, then that many bytes. The reader reads exactly
+  the prefix, then exactly that many bytes, looping because a read may return less than you asked
+  for. This is what HTTP's `Content-Length` is, and what every binary RPC protocol does.
+- **A delimiter.** Agree on a byte sequence that cannot appear in the payload — a newline, HTTP's
+  blank line between headers and body — and scan for it, buffering the partial tail between reads.
+  Simpler to debug by eye, and it forces you to escape or reject the delimiter in payloads.
+
+HTTP uses both, in different places, and [the protocols on top](/networking/application-protocols/)
+shows the bytes. Here is the length-prefixed reader, which is the shape you should be able to write
+from memory:
+
+<Solution>
+
+```csharp
+using System.Buffers.Binary;
+
+static class Framing
+{
+    // Bound the length BEFORE allocating: it comes off the wire, so it is attacker-controlled.
+    const int MaxFrame = 1 << 20;
+
+    public static async Task<byte[]> ReadFrameAsync(Stream stream, CancellationToken ct)
+    {
+        var header = new byte[4];
+
+        // ReadExactly/ReadExactlyAsync (.NET 7+) loops until the buffer is full and throws
+        // EndOfStreamException if the peer closes mid-frame. Before it existed, everyone
+        // wrote this loop themselves, and half of them wrote it wrong.
+        await stream.ReadExactlyAsync(header, ct);
+
+        int length = BinaryPrimitives.ReadInt32BigEndian(header);   // network byte order
+        if (length is < 0 or > MaxFrame)
+            throw new InvalidDataException($"frame length {length} out of range");
+
+        var payload = new byte[length];
+        await stream.ReadExactlyAsync(payload, ct);
+        return payload;
+    }
+}
+```
+
+</Solution>
+
+[Where did my message boundary go?](/networking/tcp-and-udp/stream-vs-datagram/) is the exercise
+that makes this concrete: two writes, one read, and the loop you have to write when the answer is
+not the one you expected.
+
+### UDP: eight bytes and no promises
+
+UDP's entire job is to add ports to IP so a datagram can reach a program rather than a machine, and
+to add a length and a checksum so the receiver knows the payload is whole. That is the whole
+protocol.
+
+```text
+  byte   0        1        2        3
+       ┌────────┬────────┬────────┬────────┐
+    0  │   source port   │destination port │  the demultiplexing key, same as TCP
+       ├────────┴────────┼────────┴────────┤
+    4  │     length      │    checksum     │  length covers header + data, so its minimum is 8
+       ├─────────────────┴─────────────────┤
+    8  │ your datagram, delivered whole    │
+       └───────────────────────────────────┘
+```
+
+The checksum is mandatory over IPv6 and optional over IPv4, where a sender may write zero to mean
+"not computed" — so a UDP datagram's integrity is a weaker promise than its boundary is.
+
+There is no sequence number, so no ordering and no duplicate detection. No acknowledgement, so no
+loss detection and no retransmission. No window, so no flow control. No congestion control at all
+— a UDP sender that floods a path will keep flooding it, which is why anything doing bulk transfer
+over UDP has to implement congestion control itself or be a bad neighbour.
+
+What it does keep is the **datagram boundary**, absolutely. One `SendTo` becomes one datagram
+becomes one `ReceiveFrom`. It arrives whole or it does not arrive; there is no such thing as half
+a datagram turning up. (If your buffer is too small to hold one, the remainder is discarded rather
+than queued for a second call — that is truncation, not a short read.) With the 16-bit length
+field and an IPv4 header, the largest payload is 65,507 bytes — but sending anything near that is
+a bad idea, because a datagram larger than the path MTU is fragmented by IP, and **losing any one
+fragment loses the entire datagram**. That is why DNS traditionally kept responses under 512 bytes
+and negotiates larger ones explicitly.
+
+UDP is the right choice in four recognisable situations:
+
+- **A single request and a single reply that each fit in one datagram, where the application
+  already has to handle failure.** DNS is the canonical case: ask again, ask the other resolver.
+  Building a handshake for that would cost more round trips than the query.
+- **One-to-many.** Broadcast and multicast discovery have no TCP equivalent, because TCP is
+  strictly two endpoints.
+- **Data whose value expires before a retransmission could arrive.** A voice frame or a game state
+  update that is late is worse than useless — retransmitting it delays the fresh data behind it.
+  This is the case where TCP's guarantee is actively the wrong product.
+- **You are building your own transport.** Which brings us to the one that matters most now.
+
+**QUIC is the honest answer to "why not just use UDP".** It runs over UDP and then rebuilds, in
+user-space library code, essentially everything TCP does: connection setup, sequence numbers,
+acknowledgements, retransmission, flow control, congestion control — plus per-stream ordering
+instead of one stream per connection, and an integrated TLS handshake. It is what HTTP/3 rides on,
+and [the network path](/system-design/networking/) covers why that per-stream recovery matters.
+The reason it is built on UDP is not that UDP is fast; it is deployability. A brand-new transport
+protocol number does not get through the NATs and firewalls already sitting in the path, whereas
+UDP does — and putting the logic in a user-space library means it ships with the application
+instead of waiting for a kernel upgrade on every machine in the world.
+
+One .NET detail worth knowing: calling `Connect` on a UDP socket does not perform a handshake —
+there is nothing to negotiate — but it does fix a default peer, so you can use `Send`/`Receive`
+instead of `SendTo`/`ReceiveFrom`, and the kernel then filters out datagrams from anyone else. On
+Linux it also gives ICMP errors for that peer somewhere to be reported, which an unconnected socket
+does not have.
+
+## the mental model
+
+```text
+  IP gives you:      "this packet may reach that host. Or not. No idea. Good luck."
+
+  UDP adds:          ports + a length      → your program gets a whole message, or nothing
+                     8 bytes of header
+
+  TCP adds:          a handshake           → both ends agree where the stream starts
+                     byte sequence numbers → order, and a name for every byte
+                     cumulative ACKs       → "I have everything below N"
+                     retransmission        → the timer, or three duplicate ACKs (fast retransmit)
+                     a receive window      → the reader's brake on the writer
+                     a four-way close      → each direction shuts down separately
+                     20 bytes of header
+
+  TCP does NOT add:  message boundaries.   ← framing is yours: length prefix or delimiter
+
+  the diagnosis table you will actually use:
+    RST came back .................. something is there and said no
+    silence until timeout .......... the packet was dropped; nobody said anything
+    CLOSE_WAIT piling up on us ..... our code never called Close
+    FIN_WAIT_2 piling up on them ... their code never called Close
+    TIME_WAIT piling up on us ...... we close first, a lot — reuse connections
+    zero window from us ............ our code is not reading fast enough
+```
+
+<Watch items={[['TCP header', '20 bytes, up to 60 with options'], ['UDP header', '8 bytes, always'], ['sequence + ack fields', '32 bits each, counting bytes not packets'], ['receive window field', '16 bits, so 65,535 without scaling'], ['window scale', 'up to 2¹⁴ — offered in the SYN or never'], ['fast retransmit trigger', '3 duplicate ACKs'], ['MSS on a 1500-byte link', '1460 bytes (1500 − 20 IP − 20 TCP)'], ['TIME_WAIT', '2 × MSL, on the end that closed first'], ['largest UDP payload over IPv4', '65,507 bytes'], ['end of stream in .NET', 'a read that returns 0']]} />
+
+## why you should care
+
+**The framing bug that only happens in production.** A team writes a small TCP protocol — a length
+prefix, or newline-delimited JSON — and the reader calls `Receive` once per message. Every test
+passes, because on loopback with small messages one write really does become one read. In
+production the messages get bigger and the path has a real MTU (on the Linux box these pages were
+written on, `eth0` reports an MTU of 1400 — a tunnelled interface, below the 1500 Ethernet
+default — so a segment tops out well under 1500). Messages start arriving split across two reads,
+or two messages in one. The symptom is not a clean failure: it is deserialization errors that
+correlate with message size or with load, on a code path that has not changed in a year. The fix is
+`ReadExactly` and a loop; the lesson is that the test environment was hiding the protocol.
+
+**Sockets in `CLOSE_WAIT` that never go away.** The count climbs all day, file-handle limits are
+hit eventually, and `accept` starts failing with "too many open files" on a service that is not
+under unusual load. Nothing on the network can fix this, because the connection is waiting on your
+process: the peer closed hours ago and the socket is still there because some path in your code
+returns without disposing it. The usual culprit is a read loop that catches an exception, logs it,
+and breaks out of the loop without a `using` or a `finally` around the socket. Grep for the socket
+type, then for every `return` inside the loop.
+
+**A stalled transfer that is not the network's fault.** Data stops moving to one consumer while
+every other consumer on the same sender is fine, and there is no loss on the path. If that
+consumer's socket is advertising a zero window, the diagnosis is on the consumer: it is doing slow
+work per message before reading the next one, and TCP is correctly applying backpressure all the
+way back to the sender. The fix is on the consumer side — read into a bounded queue and do the slow work
+elsewhere, which is exactly the producer/consumer shape
+[parallelism that actually scales](/systems/parallelism-patterns/) argues for, with the same
+"bounded, or you have just moved the failure into your own heap" warning.
+
+**A connection that is dead but does not know it.** If the peer loses power, or a NAT or firewall
+between you silently drops its state, nothing arrives to tell you: TCP has no heartbeat and an idle
+connection generates no traffic. Your socket stays `ESTABLISHED` and the failure surfaces on the
+*next write*, as retransmissions that eventually give up. This is why a pooled connection fails on
+its first use after an idle period rather than during it, and why anything holding long-lived
+connections wants either TCP keepalive turned on explicitly (it is off by default;
+`SocketOptionName.KeepAlive` plus the `TcpKeepAliveTime`, `TcpKeepAliveInterval` and
+`TcpKeepAliveRetryCount` options in .NET) or an application-level ping. Which of the two you want
+depends on whether you also need to know that the process at the far end is healthy, rather than
+just that its kernel is answering — only the application-level ping tells you that.
+
+## the same idea elsewhere
+
+| where the same mechanism shows up | what matches | the trap |
+| --- | --- | --- |
+| a bounded `Channel<T>` between a producer and a consumer | the receive window: the consumer's remaining capacity is what throttles the producer, and it is announced rather than negotiated — see [parallelism that actually scales](/systems/parallelism-patterns/) | an *unbounded* channel is the zero-window case with the brake removed: the producer never slows, and the stall that TCP would have pushed back to the far machine becomes heap growth in yours |
+| committing a consumer offset in Kafka | a cumulative acknowledgement: committing offset N asserts everything before N is done, and there is no way to express a gap | committing after a batch you have only partly processed silently acknowledges the failures too, exactly like an ACK that cannot say "all but one of these" |
+| a retry policy with exponential backoff | the retransmission timer: same doubling, same purpose — do not hammer a path that is already failing — see [timeouts, retries and circuit breakers](/system-design/reliability/) | TCP is already retransmitting underneath you, so a short application-level retry on a hung connection stacks attempts on top of attempts and multiplies the load the far end sees |
+| `Content-Length` versus `Transfer-Encoding: chunked` in HTTP | the two framing schemes on this page — a length prefix and a delimited form — applied to the same byte stream, see [the protocols on top](/networking/application-protocols/) | if two devices on the path disagree about which framing applies to one message, they disagree about where it ends: that is request smuggling, and it is a framing bug with a CVE number |
+| `FileStream.Read` returning fewer bytes than you asked for | the same contract as a socket read: "up to N bytes, and at least one unless the stream ended" | the identical bug, and the identical fix — `ReadExactly` — which is why a developer who has been bitten by one recognises the other instantly |
+
+## exercises
+
+Two sends, one receive, and the answer that makes framing stop being optional.
+
+<ProblemList topic="tcp-and-udp" />
+
+## interview drills
+
+**Q.** We have thousands of sockets stuck in `CLOSE_WAIT`. What is going on?
+
+- *weak answer* — "The client isn't closing its connections properly" or "the network is flaky."
+  Both point outward, and `CLOSE_WAIT` is the one state that cannot possibly be caused from
+  outside.
+- *strong answer* — `CLOSE_WAIT` means the peer sent `FIN`, our kernel already acknowledged it, and
+  the socket is now waiting for *our* application to call `Close`. It does not time out. So this is
+  a handle leak in our code — almost always an error path in a read loop that returns or breaks
+  without disposing the socket. I would look at what happens when the read throws rather than
+  returning zero.
+- *follow-up* — "And if they were in `TIME_WAIT` instead?" That is the opposite end: we closed
+  first, it is normal, it lasts twice the maximum segment lifetime, and if the volume is a problem
+  the fix is to reuse connections rather than to shorten the timer.
+
+**Q.** Walk me through the three-way handshake, and tell me why the initial sequence number is not
+zero.
+
+- *weak answer* — "SYN, SYN-ACK, ACK." Correct and empty; the follow-up is always "why three, and
+  what is in them".
+- *strong answer* — Three segments so that each side learns the other's starting sequence number
+  *and* knows the other received its own: the `SYN` carries a starting number, the `SYN`+`ACK`
+  carries the server's and acknowledges the client's, the `ACK` closes the loop. Each `SYN`
+  consumes one sequence number, which is why the acknowledgements are the starting number plus one.
+  The starting number is unpredictable so a stale segment from an earlier connection on the same
+  four-tuple cannot be accepted into this one, and so an off-path attacker cannot inject a
+  plausible segment without observing the connection.
+- *follow-up* — "What does a `SYN` cost the server?" Half-open state waiting for a third segment
+  that may never arrive; SYN cookies remove that state by encoding it into the sequence number the
+  server sends back.
+
+**Q.** Our binary protocol works perfectly in staging and corrupts messages in production. Where do
+you look first?
+
+- *weak answer* — "An encoding or serialization bug." Plausible, and it sends the team into the
+  wrong file for two days.
+- *strong answer* — I would check whether the reader assumes one `Receive` returns one message. TCP
+  is a byte stream with no message boundaries — two writes can arrive as one read and one write can
+  arrive as three. Staging hides it because loopback with small messages almost always coalesces
+  into a single read. The fix is to read the length prefix exactly, then read exactly that many
+  bytes, looping — `ReadExactly` in modern .NET.
+- *follow-up* — "How do you know a read returning fewer bytes than you asked for isn't the
+  connection closing?" A zero-length read is the only end-of-stream signal; any positive count is
+  just a short read.
+
+**Q.** A connection to a downstream service hangs. How do you decide whether it is the network or
+the peer?
+
+- *weak answer* — "Ping it." ICMP being blocked or answered proves nothing about a TCP port, and it
+  is a different protocol taking a possibly different path.
+- *strong answer* — First separate refused from timed out. An `RST` back means something is alive
+  and answered no — nothing listening, or a firewall configured to reject; the route and address
+  are fine. Silence until the timeout means the packet was dropped, so I suspect a security group,
+  a route, or a wrong address, and I have learned nothing about the port. If the connection is
+  established and merely stalled, that is a third case: check whether our side is advertising a
+  zero window, which would make it our reader and not the network.
+- *follow-up* — "What if the peer lost power?" Nothing tells us. The socket stays `ESTABLISHED`
+  until we write, and it is the retransmissions on that write that eventually fail — which is why
+  long-lived pooled connections need keepalives or an application-level ping.
+
+**Q.** When would you deliberately choose UDP over TCP?
+
+- *weak answer* — "When you need speed" or "when you can tolerate loss." The first is not a
+  mechanism, and the second is what people say right before they rebuild TCP badly.
+- *strong answer* — When retransmission is worthless or harmful: real-time media and game state,
+  where a late packet is worse than a missing one because it delays the fresh data behind it. When
+  the exchange is one small request and one small reply and the application already retries — DNS,
+  where a handshake would cost more round trips than the query. When you need one-to-many, since
+  TCP has no multicast. And when you are deliberately building your own transport, which is what
+  QUIC does — it rebuilds acknowledgements, retransmission, flow control and congestion control in
+  user space on top of UDP, and HTTP/3 runs on it.
+- *follow-up* — "What do you now have to write yourself?" Ordering, loss detection, duplicate
+  suppression, flow control, congestion control, and staying under the path MTU — because one lost
+  fragment loses the whole datagram.
+
+**Q.** What is the difference between flow control and congestion control?
+
+- *weak answer* — "They both slow the sender down." True, and it hides the only thing the question
+  is asking about.
+- *strong answer* — Flow control protects the *receiver* and is explicit: a window field in every
+  segment saying how much buffer space is free right now, so the sender never overruns the far
+  end's socket buffer. Congestion control protects the *network* between them and is inferred, not
+  announced — the sender estimates how much the path will carry from acknowledgements and loss.
+  They are separate limits and the sender obeys the smaller of the two; a zero window is a
+  statement about the application at the far end, while a collapsed congestion window is a
+  statement about the path.
+- *follow-up* — "Which one is UDP missing?" Both, along with everything else — which is why
+  anything doing bulk transfer over UDP has to implement congestion control itself.

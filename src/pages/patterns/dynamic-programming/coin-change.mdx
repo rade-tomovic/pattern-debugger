@@ -1,0 +1,113 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: dynamic-programming
+problem: coin-change
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+
+## task
+
+Given coin denominations `coins` (unlimited supply of each) and a target `amount`, return the
+fewest coins needed to make exactly `amount`, or `-1` if it's impossible.
+
+```text
+coins = [1, 2, 5], amount = 11  →  3   (5 + 5 + 1)
+```
+
+## how to think
+
+For a target amount `a`, the last coin you place is *some* coin `c` from the list — and whichever
+one it is, what's left is "make `a - c` with the fewest coins," a smaller instance of the exact
+same problem. So `dp[a]` is `1` (for the coin just placed) plus the best of `dp[a - c]` over every
+coin `c` that fits: `dp[a] = min(dp[a - c]) + 1` for `c` in `coins` with `c <= a`. This is
+unbounded knapsack — "unbounded" because unlike Climbing Stairs's fixed two predecessors, each
+state can have as many predecessors as there are coins, and the *same* coin can be reused any
+number of times. That reuse is exactly why looping `coins` inside the `amount` loop (rather than
+the other way around) is safe here — nothing tracks which coins are "already spent."
+
+Base case: `dp[0] = 0` — making zero costs zero coins. States with no reachable predecessor need a
+sentinel meaning "impossible" that won't accidentally look like a valid minimum — `amount + 1`
+works, since no real answer can ever exceed `amount` (the worst case is all 1-coins).
+
+<Callout kind="note" label="template instance">
+  **Bottom-up tabulation.** State: `dp[a]` = fewest coins to make amount `a`. Recurrence:
+  `dp[a] = min over coins c <= a of (dp[a - c] + 1)`. Base case: `dp[0] = 0`. Order: `a` from `1`
+  to `amount`, ascending — every `dp[a - c]` is already filled by the time `a` needs it.
+</Callout>
+
+## solution
+
+```csharp
+public int CoinChange(int[] coins, int amount)
+{
+    var dp = new int[amount + 1];
+    Array.Fill(dp, amount + 1);        // amount+1 = "impossible" sentinel, larger than any real answer
+    dp[0] = 0;                         // base case: 0 coins to make 0
+
+    for (int a = 1; a <= amount; a++)
+    {
+        foreach (int coin in coins)
+        {
+            if (coin <= a)
+                dp[a] = Math.Min(dp[a], dp[a - coin] + 1);
+        }
+    }
+    return dp[amount] > amount ? -1 : dp[amount];   // sentinel survived → unreachable
+}
+```
+
+## trace
+
+`coins = [1, 2, 5]`, `amount = 11`. `dp[0] = 0`; every other slot starts at the sentinel `12`:
+
+| a | dp[a-1]+1 (coin 1) | dp[a-2]+1 (coin 2) | dp[a-5]+1 (coin 5) | dp[a] = min |
+| --- | --- | --- | --- | --- |
+| 1 | dp[0]+1=1 | — | — | 1 |
+| 2 | dp[1]+1=2 | dp[0]+1=1 | — | 1 |
+| 3 | dp[2]+1=2 | dp[1]+1=2 | — | 2 |
+| 4 | dp[3]+1=3 | dp[2]+1=2 | — | 2 |
+| 5 | dp[4]+1=3 | dp[3]+1=3 | dp[0]+1=1 | 1 |
+| 6 | dp[5]+1=2 | dp[4]+1=3 | dp[1]+1=2 | 2 |
+| 7 | dp[6]+1=3 | dp[5]+1=2 | dp[2]+1=2 | 2 |
+| 8 | dp[7]+1=3 | dp[6]+1=3 | dp[3]+1=3 | 3 |
+| 9 | dp[8]+1=4 | dp[7]+1=3 | dp[4]+1=3 | 3 |
+| 10 | dp[9]+1=4 | dp[8]+1=4 | dp[5]+1=2 | 2 |
+| 11 | dp[10]+1=3 | dp[9]+1=4 | dp[6]+1=3 | 3 |
+
+Final answer: `dp[11] = 3` (five, five, one).
+
+## why it works
+
+`dp[a]` tries every possible "last coin" and keeps the best, so it can't miss the true optimum —
+any valid way to make `a` ends with *some* coin `c`, and that path costs exactly `dp[a - c] + 1`
+for that `c`. It can't underestimate either, since `dp[a - c]` is, by induction, already the true
+optimum for the strictly smaller amount `a - c`, fully resolved before `a` is reached. The
+sentinel propagates cleanly: if every `dp[a - c]` an amount depends on is itself unreachable,
+`dp[a]` stays at (or above) the sentinel too, since `Math.Min` only ever lowers a value.
+
+<Watch items={[['time', 'O(amount · coins.Length)'], ['space', 'O(amount)']]} />
+
+## common bugs
+
+- Swapping the loop order — putting `coins` outermost and `amount` innermost computes the *number
+  of combinations* (Coin Change II), not the minimum count, unless that's deliberately what you
+  want.
+- Using `int.MaxValue` as the sentinel and then writing `dp[a - coin] + 1` — that overflows to a
+  negative number the instant an unreachable state is read, and a negative "count" silently
+  corrupts every later `Math.Min`.
+- Forgetting the `coin <= a` guard — indexing `dp[a - coin]` with a negative index throws.
+- Returning `dp[amount]` directly without checking it against the sentinel — the problem wants
+  `-1` for impossible amounts, not `amount + 1`.
+
+## variants you can now solve
+
+- **Coin Change II** (LC 518) — same coins and amount, but count *combinations* instead of
+  minimizing count: swap `min` + `1` for a running `+=`, and move the coin loop outside the
+  amount loop so each coin is "decided" once per combination, not once per amount.
+- [Word Break](/patterns/dynamic-programming/word-break/) — the same unbounded,
+  variable-predecessor shape: instead of "which coin ends here," it's "which dictionary word ends
+  here."
+- **Perfect Squares** (LC 279) — identical recurrence with the "coins" fixed to
+  `1, 4, 9, 16, ...`, every perfect square up to `amount`.

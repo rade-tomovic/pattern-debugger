@@ -1,0 +1,262 @@
+@import 'tailwindcss';
+
+/*
+ * Design system: "algorithm pattern debugger"
+ * Ported from the original artifact (~/Downloads/algorithm-visualizer.html).
+ * Dark-only, committed. Mono carries structure; sans carries prose.
+ * Pointer semantics: amber = L/slow/i · cyan = R/fast · purple = mid ·
+ * green = success · red = reject/shrink.
+ */
+@theme {
+  --color-*: initial;
+  --color-bg: #14161f;
+  --color-code: #101218;
+  --color-panel: #1c1f2b;
+  --color-panel2: #232736;
+  --color-line: #2e3345;
+  --color-ink: #d6d9e0;
+  --color-muted: #8a8fa3;
+  --color-amber: #f5b85c;
+  --color-cyan: #5cc8f5;
+  --color-purple: #b48cf2;
+  --color-green: #6fdd8b;
+  --color-red: #f56c7b;
+  /* dark fills behind accent-colored borders (from the artifact cells) */
+  --color-green-dim: #1f3a2a;
+  --color-red-dim: #37222a;
+  --color-purple-dim: #2b2440;
+  --color-win-dim: #25341f;
+
+  --font-mono: 'JetBrains Mono Variable', 'Cascadia Code', ui-monospace, Menlo, Consolas, monospace;
+  --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+}
+
+@layer base {
+  html {
+    background: var(--color-bg);
+    color: var(--color-ink);
+    font-family: var(--font-sans);
+    line-height: 1.6;
+    scrollbar-color: var(--color-line) var(--color-bg);
+  }
+  body {
+    min-height: 100dvh;
+  }
+  ::selection {
+    background: var(--color-amber);
+    color: var(--color-bg);
+  }
+  :focus-visible {
+    outline: 2px solid var(--color-cyan);
+    outline-offset: 2px;
+  }
+  kbd {
+    font-family: var(--font-mono);
+    background: var(--color-panel2);
+    border: 1px solid var(--color-line);
+    border-radius: 4px;
+    padding: 1px 6px;
+    font-size: 0.8em;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+      transition: none !important;
+      animation: none !important;
+    }
+  }
+}
+
+@layer components {
+  /* ── long-form article styling (MDX content) ─────────────────── */
+  .article {
+    max-width: 72ch;
+  }
+  .article > * + * {
+    margin-top: 1rem;
+  }
+  .article h2,
+  .article h3,
+  .article h4 {
+    font-family: var(--font-mono);
+    font-weight: 600;
+    letter-spacing: -0.02em;
+    scroll-margin-top: 5rem;
+  }
+  .article h2 {
+    font-size: 1.15rem;
+    margin-top: 2.5rem;
+  }
+  .article h3 {
+    font-size: 1rem;
+    margin-top: 2rem;
+  }
+  .article h2::before,
+  .article h3::before {
+    content: '// ';
+    color: var(--color-muted);
+    font-weight: 400;
+  }
+  .article h4 {
+    font-size: 0.9rem;
+    margin-top: 1.5rem;
+    color: var(--color-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+  }
+  .article p,
+  .article li {
+    color: var(--color-ink);
+  }
+  .article a {
+    color: var(--color-amber);
+    text-decoration: underline;
+    text-decoration-color: color-mix(in srgb, var(--color-amber) 40%, transparent);
+    text-underline-offset: 3px;
+    transition: text-decoration-color 0.15s;
+  }
+  .article a:hover {
+    text-decoration-color: var(--color-amber);
+  }
+  .article strong {
+    color: #fff;
+    font-weight: 600;
+  }
+  .article ul {
+    list-style: none;
+    padding-left: 0;
+  }
+  .article ul li {
+    padding: 0.2rem 0 0.2rem 1.25rem;
+    position: relative;
+  }
+  .article ul li::before {
+    content: '›';
+    position: absolute;
+    left: 0.25rem;
+    color: var(--color-amber);
+    font-family: var(--font-mono);
+  }
+  .article ol {
+    list-style: none;
+    counter-reset: item;
+    padding-left: 0;
+  }
+  .article ol li {
+    counter-increment: item;
+    padding: 0.2rem 0 0.2rem 1.75rem;
+    position: relative;
+  }
+  .article ol li::before {
+    content: counter(item, decimal-leading-zero);
+    position: absolute;
+    left: 0;
+    color: var(--color-muted);
+    font-family: var(--font-mono);
+    font-size: 0.78em;
+    top: 0.45em;
+  }
+  .article ul ul li::before,
+  .article ol ul li::before {
+    content: '›';
+    counter-increment: none;
+  }
+
+  /* inline code chip (matches artifact .tips code) */
+  .article :not(pre) > code {
+    font-family: var(--font-mono);
+    background: var(--color-code);
+    border: 1px solid var(--color-line);
+    border-radius: 4px;
+    padding: 1px 6px;
+    font-size: 0.85em;
+    color: var(--color-cyan);
+    white-space: nowrap;
+  }
+  .article th :not(pre) > code,
+  .article td :not(pre) > code {
+    background: var(--color-panel);
+  }
+
+  /* code blocks (shiki) */
+  .article pre {
+    background: var(--color-code) !important;
+    border: 1px solid var(--color-line);
+    border-radius: 10px;
+    padding: 1rem 1.25rem;
+    overflow-x: auto;
+    font-size: 0.85rem;
+    line-height: 1.65;
+    margin-top: 1.25rem;
+  }
+  .article pre code {
+    font-family: var(--font-mono);
+  }
+
+  /* tables: debugger locals view */
+  .article table {
+    border-collapse: collapse;
+    width: 100%;
+    font-size: 0.86rem;
+    margin-top: 1.25rem;
+    display: block;
+    overflow-x: auto;
+  }
+  .article th,
+  .article td {
+    text-align: left;
+    padding: 0.5rem 0.75rem;
+    border-bottom: 1px solid var(--color-line);
+    vertical-align: top;
+  }
+  .article th {
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--color-muted);
+    white-space: nowrap;
+  }
+  .article td {
+    font-variant-numeric: tabular-nums;
+  }
+  .article blockquote {
+    font-size: 0.9rem;
+    background: var(--color-panel2);
+    border-left: 3px solid var(--color-amber);
+    border-radius: 0 6px 6px 0;
+    padding: 0.65rem 0.9rem;
+  }
+  .article blockquote p {
+    margin: 0;
+  }
+  .article hr {
+    border: 0;
+    border-top: 1px solid var(--color-line);
+    margin: 2.5rem 0;
+  }
+
+  /* ── watch chip (debugger watch panel) ───────────────────────── */
+  .watch-chip {
+    font-family: var(--font-mono);
+    font-size: 0.78rem;
+    background: var(--color-bg);
+    border: 1px solid var(--color-line);
+    border-radius: 5px;
+    padding: 3px 9px;
+    white-space: nowrap;
+  }
+  .watch-chip b {
+    color: var(--color-cyan);
+    font-weight: 600;
+  }
+
+  /* ── pointer badge (L/R/mid markers) ─────────────────────────── */
+  .ptr-badge {
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    font-weight: 700;
+    padding: 0 5px;
+    border-radius: 4px;
+    color: var(--color-bg);
+  }
+}

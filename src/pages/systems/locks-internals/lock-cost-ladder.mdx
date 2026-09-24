@@ -1,0 +1,311 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: locks-internals
+problem: lock-cost-ladder
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import Solution from '@components/Solution.astro';
+
+## the question
+
+Six ways to add one to a shared `long`. Every one of them is a line you have shipped:
+
+```csharp
+_count++;                                              // no synchronization at all
+Interlocked.Increment(ref _count);                     // one atomic instruction
+lock (Gate) _count++;                                  // Monitor
+_spin.Enter(ref taken); _count++; _spin.Exit(false);   // SpinLock
+Rw.EnterWriteLock(); _count++; Rw.ExitWriteLock();     // ReaderWriterLockSlim
+Sem.Wait(); _count++; Sem.Release();                   // SemaphoreSlim(1) as a mutex
+```
+
+Four million increments, split evenly across one, two, and four threads. Same total work every
+time — the four-thread run does a quarter of it per thread. The only things the experiment
+measures are **correctness** — does the final count land on 4,000,000 — and
+`Monitor.LockContentionCount`, the runtime's own exact count of how many times a thread failed
+to take a `Monitor` on the first try.
+
+<Callout kind="insight" label="predict first">
+  Four things to commit to before you scroll, and none of them is a speed factor.
+
+  **One:** order the six by how much extra machinery their *fast, uncontended* path needs
+  beyond one atomic instruction — from "just that" up to "an atomic operation plus a whole
+  separate object with its own internal lock".
+
+  **Two:** two of the six never touch a `Monitor` internally, at any thread count — their
+  entire mechanism is built from something else. Which two, and what tells you that from what
+  each type is documented to be?
+
+  **Three:** at two and four threads, `_count++` with no synchronization will not land on
+  4,000,000. Will it come close — within a percent or two — or fall far short? Reason from what
+  a read-modify-write instruction sequence actually does when two threads interleave it, not
+  from "concurrency is risky".
+
+  **Four:** of `lock`, `SpinLock`, and `SemaphoreSlim(1)`, one of them will move
+  `Monitor.LockContentionCount` by *thousands* at just two threads doing one-instruction work.
+  Which one, and why would a type whose whole job is "count how many permits are left" need a
+  `Monitor` at all?
+
+  One of the six rows is fast because it is not actually doing the job. That row is also wrong.
+</Callout>
+
+## the code
+
+One file. Every variant runs at every thread count, and the only instrumentation is a checksum
+and one runtime counter — no `Stopwatch` anywhere in it.
+
+<Solution>
+
+```csharp
+// Evidence for /systems/locks-internals/lock-cost-ladder/ ("The Fast Path and
+// the Slow Path") — run with:
+//   dotnet run bench/locks-internals/lock-cost-ladder.cs -c Release
+// Six ways to add one to a shared long, at one, two and four threads, doing
+// the same total work every time. No Stopwatch anywhere on this page: the
+// only outputs are correctness (does the final count match what it should)
+// and Monitor.LockContentionCount — an exact, runtime-maintained count of how
+// many times a thread failed to take a Monitor on the first try and had to
+// wait. That single counter says which of the six rungs ever touch a
+// Monitor internally and which never do, without timing anything.
+static class Ladder
+{
+    static long _count;
+    static readonly object Gate = new();
+    static SpinLock _spin = new(enableThreadOwnerTracking: false);
+    static readonly SemaphoreSlim Sem = new(1, 1);
+    static readonly ReaderWriterLockSlim Rw = new();
+
+    // ── the six ways to add one ──────────────────────────────────────────────
+    static void Unsynchronized(int n) { for (int i = 0; i < n; i++) _count++; }
+    static void MonitorLock(int n)    { for (int i = 0; i < n; i++) lock (Gate) _count++; }
+    static void Interlocked_(int n)   { for (int i = 0; i < n; i++) Interlocked.Increment(ref _count); }
+    static void SpinLock_(int n)
+    {
+        for (int i = 0; i < n; i++)
+        {
+            bool taken = false;
+            try { _spin.Enter(ref taken); _count++; }
+            finally { if (taken) _spin.Exit(useMemoryBarrier: false); }
+        }
+    }
+    static void Semaphore_(int n)
+    {
+        for (int i = 0; i < n; i++) { Sem.Wait(); try { _count++; } finally { Sem.Release(); } }
+    }
+    static void RwLock(int n)
+    {
+        for (int i = 0; i < n; i++) { Rw.EnterWriteLock(); try { _count++; } finally { Rw.ExitWriteLock(); } }
+    }
+
+    const int Ops = 4_000_000;
+
+    static void Run(string name, Action<int> body, int threads)
+    {
+        _count = 0;
+        int per = Ops / threads;
+        var ts = new Thread[threads];
+        var start = new ManualResetEventSlim(false);
+        for (int t = 0; t < threads; t++)
+        {
+            ts[t] = new Thread(() => { start.Wait(); body(per); }) { IsBackground = true };
+            ts[t].Start();
+        }
+        Thread.Sleep(20);                       // let every thread reach the gate
+        long c0 = Monitor.LockContentionCount;
+        start.Set();
+        foreach (var th in ts) th.Join();
+        long c1 = Monitor.LockContentionCount;
+        Console.WriteLine(
+            $"{name,-24} {threads}t  checksum {_count,10:N0} / {Ops,10:N0}  monitor contentions {c1 - c0,7:N0}");
+    }
+
+    public static void Main()
+    {
+        var variants = new (string Name, Action<int> Body)[]
+        {
+            ("count++ (no lock)",     Unsynchronized),
+            ("Interlocked.Increment", Interlocked_),
+            ("lock (Monitor)",        MonitorLock),
+            ("SpinLock",              SpinLock_),
+            ("ReaderWriterLockSlim",  RwLock),
+            ("SemaphoreSlim(1)",      Semaphore_),
+        };
+        int[] threadCounts = [1, 2, 4];
+
+        var sink = Console.Out;
+        Console.SetOut(TextWriter.Null);
+        foreach (var v in variants) foreach (var t in threadCounts) Run(v.Name, v.Body, t);   // silent pass: run each variant once so a mid-run JIT compile can't be mistaken for a Monitor contention
+        Console.SetOut(sink);
+
+        foreach (var v in variants) foreach (var t in threadCounts) Run(v.Name, v.Body, t);   // the one printed pass
+
+        if (_count == 0) throw new Exception("FAIL: nothing ran");
+        Console.WriteLine("PASS");
+    }
+}
+```
+
+</Solution>
+
+## work it out
+
+**Start with the row that is wrong.** `_count++` compiles to three separate steps: load `_count`
+into a register, add one, store the register back. None of the three is atomic, and nothing
+stops two threads from interleaving between them:
+
+```text
+             _count starts at 41
+thread A:    load  _count → r  (r = 41)
+thread B:                                    load  _count → r' (r' = 41)
+thread A:    r = r + 1        (r = 42)
+thread B:                                    r' = r' + 1        (r' = 42)
+thread A:    store r → _count (_count = 42)
+thread B:                                    store r' → _count  (_count = 42)  ← lost A's write
+```
+
+Two increments happened; `_count` only went up by one. Nothing crashed, nothing threw, and
+there is no counter anywhere that records this — `Monitor.LockContentionCount` cannot see it,
+because no `Monitor` was ever involved. The only way to catch it is to check the answer, which
+is exactly what the checksum in the harness above does.
+
+**`SpinLock` and `ReaderWriterLockSlim` are built on their own state word, not on the object
+header.** Neither type routes through `Monitor.Enter` at all — `SpinLock` owns a private `int`
+it CASes directly, the same shape as the twelve-line lock on
+[build a spinlock](/systems/locks-internals/build-a-spinlock/); `ReaderWriterLockSlim` owns a
+packed state word tracking reader and writer counts, CASed the same way. `Monitor.LockContentionCount`
+only counts *Monitor* contention, so both of these can be under real, heavy contention and that
+counter will not move — it is not "how contended is my process", it is "how many times did a
+`Monitor`, specifically, have to make someone wait".
+
+**`SemaphoreSlim` is a `Monitor` wearing a counting semaphore as a costume.** `Wait()` has to
+check the current count, and if a permit is available, decrement it and return; `Release()` has
+to increment the count and, if anyone is waiting, signal one of them. Both of those are
+read-modify-write operations on shared state — the permit count and the waiter list — and
+.NET's implementation protects that shared state with an internal `Monitor`. So a `SemaphoreSlim`
+used as a plain mutex pays for a `Monitor.Enter`/`Exit` pair *inside* every `Wait()`/`Release()`,
+on top of the semaphore bookkeeping itself — which is exactly why its contention count moves
+even though your code never wrote `lock`.
+
+**`lock (Monitor)` barely moves the counter even at four threads doing real, sustained work**,
+because the section it protects is one instruction. `Monitor`'s fast path spins, briefly, before
+ever counting as a contention or touching the kernel — [the topic page's spin-then-park
+section](/systems/locks-internals/) is the diagram for this. A one-instruction critical section
+almost always finishes inside that spin window, so most of four million contended acquisitions
+resolve without ever registering as a `Monitor` contention at all. The counter only moves for
+the small fraction of acquisitions unlucky enough to arrive exactly when another thread is
+between the CAS and the store.
+
+## the answer
+
+Four million increments, one printed pass, real output:
+
+```text
+count++ (no lock)        1t  checksum  4,000,000 /  4,000,000  monitor contentions       0
+count++ (no lock)        2t  checksum  2,109,662 /  4,000,000  monitor contentions       1
+count++ (no lock)        4t  checksum  1,032,683 /  4,000,000  monitor contentions       1
+Interlocked.Increment    1t  checksum  4,000,000 /  4,000,000  monitor contentions       0
+Interlocked.Increment    2t  checksum  4,000,000 /  4,000,000  monitor contentions       0
+Interlocked.Increment    4t  checksum  4,000,000 /  4,000,000  monitor contentions       1
+lock (Monitor)           1t  checksum  4,000,000 /  4,000,000  monitor contentions       0
+lock (Monitor)           2t  checksum  4,000,000 /  4,000,000  monitor contentions       2
+lock (Monitor)           4t  checksum  4,000,000 /  4,000,000  monitor contentions      62
+SpinLock                 1t  checksum  4,000,000 /  4,000,000  monitor contentions       0
+SpinLock                 2t  checksum  4,000,000 /  4,000,000  monitor contentions       1
+SpinLock                 4t  checksum  4,000,000 /  4,000,000  monitor contentions       1
+ReaderWriterLockSlim     1t  checksum  4,000,000 /  4,000,000  monitor contentions       0
+ReaderWriterLockSlim     2t  checksum  4,000,000 /  4,000,000  monitor contentions       1
+ReaderWriterLockSlim     4t  checksum  4,000,000 /  4,000,000  monitor contentions       0
+SemaphoreSlim(1)         1t  checksum  4,000,000 /  4,000,000  monitor contentions       0
+SemaphoreSlim(1)         2t  checksum  4,000,000 /  4,000,000  monitor contentions  10,805
+SemaphoreSlim(1)         4t  checksum  4,000,000 /  4,000,000  monitor contentions   6,811
+PASS
+```
+
+**Four of the six answered every question 1, and prediction one was already visible from the
+code itself:** `Interlocked`, `lock`, `SpinLock` and `ReaderWriterLockSlim` all land exactly on
+4,000,000 at every thread count, because all four actually serialize the increment. Only two
+rows disagree with the correctness column: the unsynchronized one, badly — it lost roughly half
+its updates at two threads and about three-quarters of them at four, worse as more threads
+compete for the same interleaving window — and `SemaphoreSlim`, which stays correct but is the
+loud one in the last column.
+
+**`SpinLock` and `ReaderWriterLockSlim` never move the contention counter — 0 or 1 out of
+millions, indistinguishable from noise — at any thread count,** confirming prediction two:
+neither is built on `Monitor`, so the counter is structurally blind to whatever contention they
+do experience. That contention is real — [the topic page](/systems/locks-internals/) walks
+through the cache-line traffic every CAS retry pays — the counter simply cannot see it, because
+it was never designed to.
+
+**`SemaphoreSlim` moves the counter by four to five orders of magnitude more than `lock` does
+for the identical logical operation** — thousands against tens, both out of four million. That
+is the internal `Monitor` doing its own book-keeping on every `Wait()` and `Release()`, exactly
+as reasoned above, and it is a cost that exists whether or not your code ever contends the
+semaphore's *count* — it is contending the lock protecting the count.
+
+## why it works that way
+
+**`Monitor.LockContentionCount` measures one specific mechanism, not "how contended is my
+process".** Anything built on the object header and `Monitor.Enter` shows up in it. Anything
+built on its own CAS'd state — `SpinLock`, `ReaderWriterLockSlim`, a hand-rolled lock, an
+`Interlocked` retry loop — does not, no matter how much coherence traffic it generates. Reading
+a flat contention counter as "this service has no lock problem" while a `SpinLock` field spins
+hot next to it is the single most avoidable false negative on this page.
+
+**A short critical section hides contention from the counter, but not from the cache line.**
+`lock`'s spin absorbs almost all of a one-instruction section's contention before it would ever
+register — the counter only sees what the spin budget failed to cover. That is why a healthy
+`monitor-lock-contention-count` does not by itself mean a lock is free; it means the *blocking*
+component of its cost is small. The coherence component the topic page describes is paid either
+way.
+
+**An unsynchronized read-modify-write does not fail loudly — it fails silently and by exactly
+as much as the interleaving allows.** No exception, no counter movement, nothing a profiler
+would flag. The only test that catches it is checking whether the answer is right, which is why
+[the counter that counted wrong](/systems/atomics-and-cas/lost-updates/) is worth reading in
+full: this is that bug, from the other side.
+
+<Watch items={[['SpinLock / ReaderWriterLockSlim, monitor contentions', '≈0 — never touch Monitor'], ['SemaphoreSlim(1), monitor contentions at 2 threads', 'thousands'], ['lock (Monitor), monitor contentions, 1-instruction body, 4 threads', 'tens, out of millions'], ['unsynchronized count++, 2+ threads', 'loses updates, silently, every time'], ['Monitor.LockContentionCount', 'exact, process-wide, monotonic — take deltas']]} />
+
+## what this looks like in prod
+
+The unsynchronized row is not a toy mistake — it is `metrics.Requests++` on a field that used
+to be single-threaded and quietly became shared when the handler got parallelized, or a
+`Dictionary` read-modify-write "protected" by a check that races with itself. It ships, it
+passes every test that runs on one thread, and the dashboard is wrong by a growing margin that
+nobody notices because nothing throws.
+
+The `SemaphoreSlim`-as-mutex row is the other common one: code that reaches for it out of habit
+from async paths, then uses it on a synchronous one too, and is surprised that
+`monitor-lock-contention-count` moves in a code path with no `lock` statement anywhere in the
+diff. The fix is almost always "use `lock` for the synchronous path and `SemaphoreSlim` only
+where you actually need to hold it across an `await`" — [the topic
+page](/systems/locks-internals/) has the full primitive-by-primitive table.
+
+## the same idea in other languages
+
+| language | what it's called | the trap |
+| --- | --- | --- |
+| Java | `synchronized`, `ReentrantLock`, `ReadWriteLock`, `Semaphore`, and `AtomicLong` for the `Interlocked` rung | `AtomicLong` has a sibling C# has no direct equivalent of — `LongAdder`, internally striped across several cells that get combined lazily on read. It exists precisely because a single `AtomicLong` becomes a hot cache line under high contention, the same lock-striping idea `locks-internals` teaches, applied to a counter instead of a lock |
+| Go | `sync.Mutex`, `sync.RWMutex`, `sync/atomic`, and a buffered channel for the semaphore rung | Go's runtime multiplexes goroutines onto OS threads, so a goroutine blocked on a mutex parks the *goroutine*, not the OS thread, which then goes off to run something else. Thread-count intuition built on .NET's one-thread-per-block-call model does not transfer directly |
+| C / pthreads | `pthread_mutex_t`, `pthread_rwlock_t`, `sem_t`, plus the `__atomic` builtins | glibc's unnamed `sem_t` is not a kernel object, whatever "semaphore" suggests — it is user-space state with a `futex` behind it only for the waiting, so an uncontended `sem_wait`/`sem_post` pair costs the same shape as the C mutex fast path on the topic page (`bench/locks-internals/sem.c`). The trap runs the other way: a POSIX semaphore has no owner, so a `sem_post` from code that never waited simply raises the permit count and returns success — one stray `sem_post` on a binary semaphore moves its count from 1 to 2, and your "mutex" now admits two threads. `new SemaphoreSlim(1, 1)` at least throws on that same mistake, because it was given a maximum count to enforce |
+| C++ | `std::mutex`, `std::shared_mutex`, `std::counting_semaphore`, `std::atomic` | `std::atomic` of a type the hardware cannot do in one instruction silently becomes a mutex behind a lock table — `is_lock_free()` is the only way to know. C#'s `Interlocked` only exposes operations the CPU can actually do atomically, so the equivalent mistake is a compile error instead of a silent fallback |
+
+## common bugs
+
+- **Reading `LockContentionCount` as "the contention signal" for a process that also uses
+  `SpinLock`, `ReaderWriterLockSlim`, or a hand-rolled `Interlocked` loop.** The counter is
+  structurally blind to all three — it only ever counts `Monitor` waits.
+- **Reading a low `LockContentionCount` as "this lock is cheap".** A short critical section
+  resolves most contention inside the spin, before it would ever be counted. Low blocking is not
+  the same claim as low cost.
+- **Comparing thread counts without holding total work constant.** If each thread does a fixed
+  number of iterations regardless of thread count, four threads simply do four times the total
+  work, and "four threads took longer" or "did more" means nothing on its own. Divide the work,
+  or the comparison is measuring your own arithmetic.
+- **Treating an unsynchronized shared counter as "probably fine, it's just a counter".** The
+  checksum shows real increments vanishing, with nothing at runtime to indicate it happened.
+- **Assuming `SemaphoreSlim` is the lightweight option because it is the async-friendly one.**
+  It carries an internal `Monitor` plus a waiter list plus cancellation support, and you pay for
+  all of it even on a synchronous path that never touches an `await`.

@@ -1,0 +1,127 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: linked-lists
+problem: add-two-numbers
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+
+## task
+
+Two non-negative integers are stored as linked lists, one digit per node, **least-significant
+digit first**. Add them and return the sum, also as a list in the same format.
+
+```text
+l1 = [2, 4, 3]  (represents 342)
+l2 = [5, 6, 4]  (represents 465)
+→     [7, 0, 8]  (represents 807)
+```
+
+## how to think
+
+The tempting shortcut — convert each list to an actual integer, add, convert back — breaks the
+moment the number is bigger than fits in a `long` (LeetCode's constraints go well past that). You
+don't need the shortcut: the list is *already* storing digits in the order you add them by hand,
+ones column first. Walk both lists together, add `digit + digit + carry`, keep the ones place as
+the output digit, carry the tens place into the next column. A dummy head handles "I don't know
+the first digit of the sum until I've computed it."
+
+<Callout kind="note" label="template instance">
+  **Dummy head** skeleton, with a `carry` variable riding along for the walk. Invariant: at the
+  top of every iteration, `carry` holds the overflow from the column just finished, and every node
+  already appended is a correct digit of the final sum.
+</Callout>
+
+## solution
+
+```csharp
+public ListNode AddTwoNumbers(ListNode? l1, ListNode? l2)
+{
+    var dummy = new ListNode();
+    var curr = dummy;
+    int carry = 0;
+
+    while (l1 != null || l2 != null || carry != 0)
+    {
+        int sum = (l1?.Val ?? 0) + (l2?.Val ?? 0) + carry;
+        carry = sum / 10;
+        curr.Next = new ListNode(sum % 10);
+        curr = curr.Next;
+        l1 = l1?.Next;
+        l2 = l2?.Next;
+    }
+    return dummy.Next!;
+}
+
+// standard interview definition
+public class ListNode(int val = 0, ListNode? next = null)
+{
+    public int Val = val;
+    public ListNode? Next = next;
+}
+```
+
+## trace
+
+A carry-heavy example shows the interesting behavior better than the minimal one above:
+`l1 = [9,9,9,9,9,9,9]` (9,999,999), `l2 = [9,9,9,9]` (9,999) → 10,009,998.
+
+```text
+l1: 9 -> 9 -> 9 -> 9 -> 9 -> 9 -> 9 -> null   (7 nodes)
+l2: 9 -> 9 -> 9 -> 9 -> null                  (4 nodes)
+
+steps 1-4 walk both lists together; steps 5-7 walk l1 alone (l2 already null).
+step 8: l1 == null, l2 == null, but carry == 1 -- the loop guard keeps going
+        and appends one more node, the extra leading digit:
+
+output: 8 -> 9 -> 9 -> 9 -> 0 -> 0 -> 0 -> 1 -> null
+                                           ^-- appended at step 8, carry only
+```
+
+| step | `l1` digit | `l2` digit | carry-in | sum | output digit | carry-out |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | 9 | 9 | 0 | 18 | 8 | 1 |
+| 2 | 9 | 9 | 1 | 19 | 9 | 1 |
+| 3 | 9 | 9 | 1 | 19 | 9 | 1 |
+| 4 | 9 | 9 | 1 | 19 | 9 | 1 |
+| 5 | 9 | — | 1 | 10 | 0 | 1 |
+| 6 | 9 | — | 1 | 10 | 0 | 1 |
+| 7 | 9 | — | 1 | 10 | 0 | 1 |
+| 8 | — | — | 1 | 1 | 1 | 0 |
+
+Both lists are exhausted after step 7, but `carry` is still `1` — that's the aha moment the loop
+guard exists for: `carry != 0` alone keeps the loop alive for one more round and appends the
+extra leading digit. Output: `[8, 9, 9, 9, 0, 0, 0, 1]`, which read as least-significant-first is
+10,009,998 — exactly `9,999,999 + 9,999`.
+
+## why it works
+
+Node `i` in either input list holds the coefficient of `10^i`, because digits are stored
+least-significant-first. Summing node-by-node while propagating the carry computes precisely the
+same result full integer addition would, one column at a time — it's the grade-school algorithm,
+just running on list nodes instead of a scratchpad, and it never needs to materialize a number
+too big to fit in any fixed-width type.
+
+<Watch items={[['time', 'O(max(n, m))'], ['space', 'O(max(n, m))'], ['extra digit', '+1 node, only when the final carry is 1']]} />
+
+## common bugs
+
+- Looping on `l1 != null || l2 != null` alone, without the `|| carry != 0` — drops the final
+  carry digit whenever the sum's last column overflows (e.g. `5 + 5` should produce `[0, 1]`, not
+  just `[0]`).
+- Using `&&` instead of `||` to combine the list conditions — stops as soon as the *shorter* list
+  ends, silently dropping the longer list's remaining digits.
+- Forgetting the lists are least-significant-digit-first and trying to add from the front, the
+  way you'd read a number on paper.
+- Mixing up `sum % 10` (the digit) and `sum / 10` (the carry) — an easy swap under pressure that
+  produces numbers that are almost right.
+
+## variants you can now solve
+
+- [Merge Two Sorted Lists](/patterns/linked-lists/merge-two-sorted-lists/) (LC 21) — same
+  dummy-head skeleton, a different per-node rule.
+- **Add Two Numbers II** (LC 445) — digits stored most-significant-first instead: reverse both
+  lists first (or use two stacks), then run this exact loop.
+- **Multiply Strings** (LC 43) — the same carry-propagation idea one level up, spreading partial
+  products across a running array instead of list nodes.

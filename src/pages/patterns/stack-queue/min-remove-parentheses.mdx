@@ -1,0 +1,133 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: stack-queue
+problem: min-remove-parentheses
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+
+## task
+
+Given a string containing lowercase letters and the characters `(` and `)`, remove the minimum
+number of parentheses so the result is valid (every `(` has a matching `)` and vice versa, in the
+right order). Any valid result is accepted; letters are never removed or reordered.
+
+```text
+s = "a)b(c)d"  →  "ab(c)d"     (the lone ')' at index 1 has no opener — remove it)
+```
+
+## how to think
+
+[Valid Parentheses](/patterns/stack-queue/valid-parentheses/) answers a yes/no question and can
+bail on the first mismatch. This problem needs more: it wants to *identify every offending
+character* without stopping, then produce the string with exactly those characters gone.
+
+Same stack, different job. Instead of pushing the character, push the **index** — you'll need it
+later to know which position to drop. A `)` with nothing on the stack is unmatched: mark that
+index for removal right away. A `(` that's still on the stack when the scan ends never found its
+`)`: after the loop, whatever indices remain on the stack are unmatched too. Collect both kinds of
+offenders in a set, then rebuild the string keeping everything *except* those indices.
+
+<Callout kind="note" label="template instance">
+  **LIFO matching** skeleton, extended: instead of failing on the first mismatch, every mismatch
+  gets recorded and the scan continues. Invariant: the stack holds indices of `(` not yet matched;
+  a `)` popped against an empty stack, and any `(` left on the stack when the string ends, are
+  both offenders.
+</Callout>
+
+## solution
+
+```csharp
+public string MinRemoveToMakeValid(string s)
+{
+    var chars = s.ToCharArray();
+    var openIdx = new Stack<int>();                     // indices of '(' not yet matched
+    var toRemove = new HashSet<int>();
+
+    for (int i = 0; i < chars.Length; i++)
+    {
+        if (chars[i] == '(')
+        {
+            openIdx.Push(i);
+        }
+        else if (chars[i] == ')')
+        {
+            if (openIdx.Count > 0) openIdx.Pop();        // matched: this ')' is legal
+            else toRemove.Add(i);                          // no opener waiting: this ')' is an offender
+        }
+    }
+    while (openIdx.Count > 0) toRemove.Add(openIdx.Pop()); // any '(' left unmatched is an offender too
+
+    var sb = new StringBuilder();
+    for (int i = 0; i < chars.Length; i++)
+    {
+        if (!toRemove.Contains(i)) sb.Append(chars[i]);   // rebuild, skipping offenders
+    }
+    return sb.ToString();
+}
+```
+
+## trace
+
+`s = "a)b(c)d"`:
+
+| i | char | action | `openIdx` (top-to-bottom) | `toRemove` |
+| --- | --- | --- | --- | --- |
+| 0 | `a` | letter, skip | *(empty)* | `{}` |
+| 1 | `)` | no opener waiting → offender | *(empty)* | `{1}` |
+| 2 | `b` | letter, skip | *(empty)* | `{1}` |
+| 3 | `(` | push | `3` | `{1}` |
+| 4 | `c` | letter, skip | `3` | `{1}` |
+| 5 | `)` | matches opener at 3 → pop | *(empty)* | `{1}` |
+| 6 | `d` | letter, skip | *(empty)* | `{1}` |
+
+Scan ends with `openIdx` empty, so nothing new is added in the cleanup pass. `toRemove = {1}` —
+rebuild skipping index 1:
+
+```text
+s:       a ) b ( c ) d
+indices: 0 1 2 3 4 5 6
+remove:    ^
+result:  a   b ( c ) d   ->  "ab(c)d"
+```
+
+## why it works
+
+The stack's invariant is exactly the one from Valid Parentheses — at any point it holds the
+openers still waiting for a closer — but here nothing short-circuits on a mismatch. A `)` that
+finds the stack empty can *never* be matched by anything to its left (there's no opener left of it
+that isn't already used), so marking it immediately is safe and final. Symmetrically, a `(` still
+on the stack after the whole string is scanned has no `)` anywhere to its right, or it would have
+been matched already. Each `)` that hits an empty stack proves that, among everything kept so far,
+closers now outnumber openers — that imbalance forces one removal, though not necessarily *this*
+exact character (for `s = "())"`, dropping index 1 instead of the algorithm's index 2 is an equally
+valid fix). Each `(` left on the stack at the end forces one opener removal the same way. The
+algorithm removes exactly one character per forced imbalance, so the removal *count* is minimal —
+it's the count that's forced, not the specific characters.
+
+<Watch items={[['time', 'O(n)'], ['space', 'O(n)']]} />
+
+## common bugs
+
+- Removing characters from the string (or a `List<char>`) while iterating instead of marking
+  indices and rebuilding afterward — mutating during the scan shifts every index after the
+  removal point and corrupts the stack's recorded positions.
+- Forgetting the cleanup pass — handling unmatched `)` characters but never draining leftover `(`
+  indices still on the stack after the loop (e.g. `"(a"` would wrongly return `"(a"` instead of
+  `"a"`).
+- Using a `List<int>` and checking `Contains` for removal — correctness survives but membership
+  checks become `O(n)` each, turning the rebuild into `O(n^2)`; a `HashSet<int>` keeps it `O(n)`.
+- Assuming only one pass is needed and trying to fix unmatched openers *during* the forward scan
+  — you can't know a `(` is unmatched until you've seen the rest of the string (or the stack, not
+  the string).
+
+## variants you can now solve
+
+- [Valid Parentheses](/patterns/stack-queue/valid-parentheses/) — the yes/no version of the exact
+  same scan; this problem is what you get when you refuse to stop at the first mismatch.
+- **Remove Invalid Parentheses** (LC 301, hard) — a much harder relative: minimum removals
+  again, but now you must return *every* distinct valid result, which needs BFS/backtracking over
+  removal choices instead of one greedy scan.
+- **Check if a Parenthesis String Can Be Valid** (LC 2116) — same stack-of-indices idea,
+  complicated by a set of positions where the bracket is "locked" and can't be removed.

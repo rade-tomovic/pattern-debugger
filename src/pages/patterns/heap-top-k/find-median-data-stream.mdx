@@ -1,0 +1,127 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: heap-top-k
+problem: find-median-data-stream
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+
+## task
+
+Design a structure that supports adding integers from a stream and finding the median of every
+element added so far, at any point. `void AddNum(int num)` inserts a value; `double FindMedian()`
+returns the current median. LeetCode #295.
+
+```text
+addNum(1); addNum(2); findMedian()  -> 1.5
+addNum(3);             findMedian() -> 2.0
+```
+
+## how to think
+
+Keeping the whole stream sorted (say, binary-search-insert into a `List<int>`) makes
+`FindMedian` `O(1)` but `AddNum` `O(n)` per call — inserting into the middle of a list shifts
+everything after it. Flip which side pays: split the stream into two halves around the median.
+A max-heap `_lo` holds the smaller half, a min-heap `_hi` holds the larger half, kept balanced so
+their sizes never differ by more than one. The median then falls out in `O(1)`: whichever heap
+has the extra element (odd total count), or the average of both roots (even count) — either way,
+both roots are always exactly the values closest to the middle.
+
+Insertion has to preserve two things at once: every value in `_lo` stays `<=` every value in
+`_hi`, and the size balance. The trick that does both with one code path, no branching on where
+the value "should" go: always push into `_lo` first, then immediately shuttle `_lo`'s new max
+over to `_hi` — that enforces the ordering invariant unconditionally — and finally, if that left
+`_hi` bigger, shuttle `_hi`'s min back. The new value ends up wherever it belongs, and the sizes
+stay within one of each other, no matter which half it turned out to land in.
+
+<Callout kind="note" label="template instance">
+  **Two heaps, balanced.** Invariant: every value in `_lo` is `<=` every value in `_hi`, and
+  `0 <= _lo.Count - _hi.Count <= 1`. What varies: nothing structural — every insert runs the
+  same three-line dance regardless of where the new value ultimately belongs.
+</Callout>
+
+## solution
+
+```csharp
+public class MedianFinder
+{
+    private readonly PriorityQueue<int, int> _lo = new(Comparer<int>.Create((a, b) => b.CompareTo(a))); // max-heap: lower half
+    private readonly PriorityQueue<int, int> _hi = new();                                                // min-heap: upper half
+
+    public void AddNum(int num)
+    {
+        _lo.Enqueue(num, num);
+        _hi.Enqueue(_lo.Peek(), _lo.Peek());   // shuttle lo's current max into hi unconditionally...
+        _lo.Dequeue();
+
+        if (_hi.Count > _lo.Count)             // ...then undo it if that left hi too big
+        {
+            _lo.Enqueue(_hi.Peek(), _hi.Peek());
+            _hi.Dequeue();
+        }
+    }
+
+    public double FindMedian()
+    {
+        if (_lo.Count > _hi.Count) return _lo.Peek();
+        return (_lo.Peek() + _hi.Peek()) / 2.0;
+    }
+}
+```
+
+## trace
+
+Stream `[5, 15, 1, 3, 8, 7, 9, 2]`, `FindMedian()` called after every insert:
+
+| call | `_lo` (max-heap, root first) | `_hi` (min-heap, root first) | median |
+| --- | --- | --- | --- |
+| `AddNum(5)` | `{5}` | `{}` | 5 |
+| `AddNum(15)` | `{5}` | `{15}` | 10 |
+| `AddNum(1)` | `{5,1}` | `{15}` | 5 |
+| `AddNum(3)` | `{3,1}` | `{5,15}` | 4 |
+| `AddNum(8)` | `{5,3,1}` | `{8,15}` | 5 |
+| `AddNum(7)` | `{5,3,1}` | `{7,8,15}` | 6 |
+| `AddNum(9)` | `{7,5,3,1}` | `{8,9,15}` | 7 |
+| `AddNum(2)` | `{5,3,2,1}` | `{7,8,9,15}` | 6 |
+
+Step 3 (`AddNum(1)`) is the shuttle dance actually earning its keep: `1` pushes into `_lo`
+(now `{5,1}`, max still 5), `5` shuttles over to `_hi` (making it `{5,15}`, size 2 against
+`_lo`'s size 1), which trips the rebalance — `_hi`'s new min, `5`, shuttles straight back to
+`_lo`. Net effect: `1` settled into `_lo` where it belongs, `_hi` is untouched at `{15}`, and no
+branch ever asked "does 1 belong in the lower half?" directly.
+
+## why it works
+
+The push-then-immediately-shuttle sequence compares every new value against both heaps' current
+extremes before it settles, so it's routed into whichever half it actually belongs in without
+the code ever branching on that question explicitly. The follow-up rebalance step only ever
+moves the single boundary element, never disturbs the internal order of either heap, and runs
+after *every* insert — so the size invariant `0 <= _lo.Count - _hi.Count <= 1` is restored
+immediately, not left to drift.
+
+<Watch items={[['time', 'O(log n) per AddNum, O(1) per FindMedian'], ['space', 'O(n)']]} />
+
+## common bugs
+
+- Branching on `if (num < currentMedian) lo.Enqueue(...) else hi.Enqueue(...)` instead of the
+  push-then-shuttle dance — looks equivalent, but a bad guess relative to the *current* median
+  (which shifts every call) can silently break the size-balance invariant.
+- Rebalancing with `>=` instead of `>` — flips which heap ends up with the "extra" element on an
+  odd-length stream, and `FindMedian`'s own parity check goes out of sync with reality.
+- `(_lo.Peek() + _hi.Peek()) / 2` without the `.0` — integer division truncates `1.5` down to
+  `1`.
+- Forgetting `_lo` needs an explicit comparer — `PriorityQueue` is a min-heap by default, so
+  without `Comparer<int>.Create((a, b) => b.CompareTo(a))`, `_lo` would track the wrong half of
+  the data entirely.
+
+## variants you can now solve
+
+- **Sliding Window Median** (LC 480) — this same two-heap balance, plus
+  [lazy deletion](/patterns/advanced-graphs/network-delay-time/) once a value slides out of the
+  window and needs to leave a heap it isn't at the root of.
+- **IPO** (LC 502) — two heaps again, but the condition that unlocks moving a value between them
+  is available capital, not position.
+- [Merge K Sorted Lists](/patterns/heap-top-k/merge-k-sorted-lists/) (LC 23) — a different heap
+  shape (K-way merge, not two balanced halves) if two heaps starts to feel like the only tool
+  you reach for.

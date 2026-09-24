@@ -1,0 +1,131 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: two-pointers
+problem: container-with-most-water
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import Cells from '@components/Cells.astro';
+
+## task
+
+Given `height[0..n)`, where `height[i]` is the height of a vertical line at `x = i`, find two
+lines that, together with the x-axis, form a container holding the most water. Return that
+maximum area. The container's area is `min(height[L], height[R]) * (R - L)` — water can't sit
+higher than the shorter wall.
+
+```text
+height = [1,8,6,2,5,4,8,3,7]  →  49   (walls at index 1 and 8: min(8,7) * 7 = 49)
+```
+
+## how to think
+
+Brute force checks every pair of walls — O(n²). Opposite-end pointers get you to O(n), but the
+move rule here isn't a sum comparison like Two Sum II; it's a proof that one of the two walls
+you're currently looking at can be safely discarded forever.
+
+Start with the widest possible container: `left = 0`, `right = n - 1`. Whichever wall is
+**shorter** is the one capping this container's area — and it caps *every* container that wall
+could ever be part of, no matter what it's paired with, because area can never exceed
+`shortWall * width`, and width only shrinks as the pointers move inward. So keeping the shorter
+wall around and moving the other one can never do better than what you'd get by moving the
+shorter wall instead. There's no reason to ever move the taller one.
+
+<Callout kind="note" label="template instance">
+  **Opposite ends** skeleton. What varies: the move rule isn't "too small / too big" against a
+  target — it's a discard proof. Invariant: the wall you're about to move past has already had
+  its best possible area recorded (the current `area`), and no pair that keeps that same wall
+  and shrinks the width could ever beat it.
+</Callout>
+
+## solution
+
+```csharp
+public int MaxArea(int[] height)
+{
+    int left = 0, right = height.Length - 1;
+    int best = 0;
+
+    while (left < right)
+    {
+        int width = right - left;
+        int area = Math.Min(height[left], height[right]) * width;
+        best = Math.Max(best, area);
+
+        // the shorter wall caps every area it's part of — only moving it can find better
+        if (height[left] < height[right]) left++;
+        else right--;
+    }
+    return best;
+}
+```
+
+## trace
+
+`height = [1,8,6,2,5,4,8,3,7]`:
+
+| step | L | R | h[L] | h[R] | width | area | best | move |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | 0 | 8 | 1 | 7 | 8 | 8 | 8 | `left++` (h[L] shorter) |
+| 2 | 1 | 8 | 8 | 7 | 7 | **49** | **49** | `right--` (h[R] shorter) |
+| 3 | 1 | 7 | 8 | 3 | 6 | 18 | 49 | `right--` |
+| 4 | 1 | 6 | 8 | 8 | 5 | 40 | 49 | `right--` (tie → move right) |
+| 5 | 1 | 5 | 8 | 4 | 4 | 16 | 49 | `right--` |
+| 6 | 1 | 4 | 8 | 5 | 3 | 15 | 49 | `right--` |
+| 7 | 1 | 3 | 8 | 2 | 2 | 4 | 49 | `right--` |
+| 8 | 1 | 2 | 8 | 6 | 1 | 6 | 49 | `right--` — loop ends (`left == right`) |
+
+Step 1 — the wall at index 0 is shorter, and there is no pairing that lets it beat 8:
+
+<Cells
+  data={[1, 8, 6, 2, 5, 4, 8, 3, 7]}
+  pointers={{ 0: [{ t: 'L', c: 'amber' }], 8: [{ t: 'R', c: 'cyan' }] }}
+  cells={{ 0: 'warn' }}
+  caption="h[L]=1 < h[R]=7 — L is capped at 1 no matter what it pairs with next; discard it"
+/>
+
+Step 2 — the winning container, found one move later:
+
+<Cells
+  data={[1, 8, 6, 2, 5, 4, 8, 3, 7]}
+  pointers={{ 1: [{ t: 'L', c: 'amber' }], 8: [{ t: 'R', c: 'cyan' }] }}
+  cells={{ 1: 'ok', 8: 'ok' }}
+  caption="min(8,7) * 7 = 49 — every later step only shrinks the width, so nothing beats this"
+/>
+
+## why it works
+
+Fix any pair `(i, j)` where `i` is left of `j` and `height[i] <= height[j]` (the shorter-or-equal
+wall on the left, without loss of generality). For any index `k` strictly between `i` and `j` — a
+step `left` could take before ever reaching `j` — the pair `(i, k)` has a
+smaller width *and* is still capped by `height[i]` (since `height[i]` is the constraint, not
+`height[k]`) — so `(i, k)` can never beat `(i, j)`. That means once `(i, j)` has been evaluated,
+every pair that keeps wall `i` and moves the other one inward is already provably worse, so it's
+safe to advance past `i`. Since one pointer always moves and they start `n - 1` apart, the loop
+terminates in at most `n - 1` steps, having implicitly ruled out every pair.
+
+<Watch items={[['time', 'O(n)'], ['space', 'O(1)'], ['passes', '1']]} />
+
+## common bugs
+
+- Moving the **taller** wall instead of the shorter one — the proof above only holds for
+  discarding the shorter wall; moving the taller one can silently skip the actual answer.
+- Computing area as `height[left] + height[right]` or as the *sum* of the two heights instead of
+  `Math.Min(...) * width` — water sits only as high as the shorter wall.
+- Off-by-one on width: `right - left + 1` counts fence posts, not the gap between two vertical
+  lines — it should be `right - left`.
+- Assuming the two tallest bars in the array must form the answer — they often don't; the
+  algorithm has to actually run, eyeballing the input is a trap.
+- Using `left <= right` instead of `left < right` — not actually a correctness bug: the extra
+  `left == right` iteration just computes a zero-width area (a wall paired with itself) and
+  vanishes into `Math.Max`. Harmless to the result, but a sign you're reasoning about the
+  invariant sloppily rather than precisely.
+
+## variants you can now solve
+
+- **[Trapping Rain Water](/patterns/two-pointers/trapping-rain-water/)** (LC 42) — the capstone:
+  same converging walls, but now every unit of space between them can hold water, tracked with
+  two running invariants (`maxLeft`, `maxRight`) instead of one `best`.
+- **Trapping Rain Water II** (LC 407) — the 3D version, on a grid; needs a min-heap frontier
+  instead of two pointers, since "inward" isn't well-defined in two dimensions.

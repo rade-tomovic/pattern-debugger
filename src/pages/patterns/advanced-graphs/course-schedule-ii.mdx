@@ -1,0 +1,125 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: advanced-graphs
+problem: course-schedule-ii
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+
+## task
+
+Same setup as Course Schedule: `numCourses` labeled `0` to `numCourses - 1`,
+`prerequisites[i] = [a, b]` meaning `b` before `a`. Instead of a yes/no answer, return **an**
+ordering in which all courses can be taken. If none exists, return an empty array. LeetCode #210.
+
+```text
+numCourses = 4, prerequisites = [[1,0],[2,0],[3,1],[3,2]]  →  [0, 1, 2, 3]  (or [0, 2, 1, 3])
+```
+
+## how to think
+
+Nothing about the algorithm changes from
+[Course Schedule](/patterns/advanced-graphs/course-schedule/) — same graph, same in-degree array,
+same queue. This is Kahn's BFS from that page, reused wholesale; the only question is what to do
+with the order it produces instead of throwing it away.
+
+Kahn's already discovers courses in a valid dependency order, one zero-in-degree course at a time
+— nothing gets enqueued until everything it depends on has already been dequeued. Course Schedule
+reported a count and discarded that order; this problem just keeps it. The only new line is
+`order.Add(course)` on the dequeue — everything else, including why the result is guaranteed
+valid, carries over unchanged.
+
+<Callout kind="note" label="template instance">
+  Same **topological sort (Kahn's)** skeleton as
+  [Course Schedule](/patterns/advanced-graphs/course-schedule/), byte-for-byte through the queue
+  mechanics. What varies: append the dequeued node to `order` instead of a bare counter; the
+  final check compares `order.Count` to `numCourses` instead of `processed`.
+</Callout>
+
+## solution
+
+```csharp
+public int[] FindOrder(int numCourses, int[][] prerequisites)
+{
+    var graph = new List<int>[numCourses];
+    var inDegree = new int[numCourses];
+    for (int i = 0; i < numCourses; i++) graph[i] = [];
+
+    foreach (var p in prerequisites)
+    {
+        graph[p[1]].Add(p[0]);      // p[1] must come before p[0]
+        inDegree[p[0]]++;
+    }
+
+    var queue = new Queue<int>();
+    for (int i = 0; i < numCourses; i++)
+        if (inDegree[i] == 0) queue.Enqueue(i);
+
+    var order = new List<int>();
+    while (queue.Count > 0)
+    {
+        int course = queue.Dequeue();
+        order.Add(course);
+        foreach (var next in graph[course])
+            if (--inDegree[next] == 0) queue.Enqueue(next);
+    }
+
+    return order.Count == numCourses ? [.. order] : [];   // fewer than all courses => a cycle
+}
+```
+
+## trace
+
+`numCourses = 4`, `prerequisites = [[1,0],[2,0],[3,1],[3,2]]`:
+
+```text
+      1
+    ↗   ↘
+  0       3
+    ↘   ↗
+      2
+```
+
+Initial in-degree: `[0, 1, 1, 2]`. Initial queue: `[0]`.
+
+| step | dequeue | order so far | in-degree updates | queue after |
+| --- | --- | --- | --- | --- |
+| 1 | 0 | `[0]` | `1: 1→0`, `2: 1→0` | `[1, 2]` |
+| 2 | 1 | `[0, 1]` | `3: 2→1` | `[2]` |
+| 3 | 2 | `[0, 1, 2]` | `3: 1→0` | `[3]` |
+| 4 | 3 | `[0, 1, 2, 3]` | — | `[]` |
+
+`order.Count == 4 == numCourses` → return `[0, 1, 2, 3]`.
+
+## why it works
+
+The order Kahn's BFS dequeues in is a valid topological order by construction: a course only
+enters the queue once every prerequisite ahead of it has already been dequeued (and therefore
+already sits earlier in `order`). So for every edge `b → a`, `b` appears in `order` strictly
+before `a` — which is precisely what "valid ordering" means. Multiple correct orders can exist
+whenever more than one course is queue-eligible at the same moment; this run picks `1` before `2`
+only because `1` happened to be enqueued first (the queue is FIFO), but `[0, 2, 1, 3]` would have
+been equally valid. LeetCode's judge checks that property, not exact equality to one array.
+
+<Watch items={[['time', 'O(V + E)'], ['space', 'O(V + E)']]} />
+
+## common bugs
+
+- Returning `order` where an `int[]` is expected instead of `[.. order]` — a `List<int>` and an
+  array aren't interchangeable at the signature boundary.
+- Treating the produced order as *the* unique answer and hardcoding an exact expected array in a
+  test — check validity (every edge respected) instead of equality to one fixed sequence.
+- Reusing `order` as if it doubled as the traversal queue — keep them separate; conflating the
+  two makes the dequeue/enqueue bookkeeping easy to get backwards.
+- The same edge-direction bug as Course Schedule: swap `p[0]`/`p[1]` and you print a valid order
+  for the *reverse* graph, which silently fails on any input where direction actually matters.
+
+## variants you can now solve
+
+- [Course Schedule](/patterns/advanced-graphs/course-schedule/) (LC 207) — the yes/no version
+  this builds on directly.
+- **Alien Dictionary** (LC 269) — the order is the whole answer here too, except you build the
+  DAG first from adjacent-word letter comparisons before running the same BFS.
+- [Number of Provinces](/patterns/advanced-graphs/number-of-provinces/) (LC 547) — a different
+  question shape entirely: components, not order.

@@ -1,0 +1,341 @@
+---
+layout: '@layouts/TopicLayout.astro'
+topic: estimation
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+
+## the ground floor
+
+- **peak-to-average ratio** — traffic is not flat across a day. Sizing off the average QPS
+  under-provisions for exactly the hours that matter; you size off the peak, and the average is
+  only an input to computing it.
+- **working set** — the subset of your data actually touched inside a given window, not the
+  total bytes stored. It's the number that decides whether "fits in RAM" is true, and it can be
+  a tiny fraction of total storage.
+- **percentile (`pNN`)** — the latency below which `NN` percent of requests fall. `p50` is the
+  median, `p99` is the 99th percentile, `p999` is one request in a thousand. None of these is
+  the mean, and none of them is computed by averaging other percentiles — more on that below.
+- **stable queueing system** — arrival rate stays below service capacity over the window you
+  care about, so the system doesn't queue without bound. Most of the arithmetic on this page
+  assumes this holds, and the failure section is largely about what happens when it stops.
+
+## core idea
+
+Estimation is not about precision — it's about finding the dominant term fast enough to make a
+design decision before you've built the thing the decision was about. Every capacity question
+on this page reduces to three primitives: how many events per second, how many bytes, and how
+many round trips — and a small, memorable set of published reference numbers is what lets you
+turn "round trips" into an actual latency budget. The skill a staff engineer has that a
+mid-level engineer doesn't is not knowing bigger numbers; it's knowing which two or three
+numbers actually move the answer, and being able to defend the arithmetic out loud.
+
+## how it actually works
+
+### the latency ladder
+
+These are not measured on this site — there is nothing here to benchmark. They are
+**published, order-of-magnitude industry reference figures** (the lineage traces back to Jeff
+Dean's widely circulated "latency numbers every programmer should know," periodically updated
+for SSD- and cloud-era hardware). Treat every row as "roughly this many orders of magnitude,"
+never as a number to three significant figures — actual values vary by hardware generation,
+cloud region, and instance type.
+
+| operation | published order of magnitude |
+| --- | --- |
+| L1 cache reference | about 1 nanosecond |
+| branch mispredict | a few nanoseconds |
+| main memory reference | roughly 100 nanoseconds |
+| SSD random read | tens to low hundreds of microseconds |
+| same-datacenter round trip | roughly half a millisecond |
+| HDD seek | single-digit to low double-digit milliseconds |
+| cross-region round trip | tens of milliseconds, up to ~100-150ms across continents |
+
+The reason this table earns a whole section: every layer exists because the layer below it is
+orders of magnitude slower, and the same shape repeats at every level of a system — a fact
+worth making explicit, not just implicit. [Caches & the memory hierarchy](/systems/memory-hierarchy/)
+covers the CPU-side rungs of this exact ladder; this page's table is its software-visible
+continuation. A design decision like "can this read hit a follower in another region" is not a
+vibe, it's this table: same-datacenter is sub-millisecond, cross-region is two-to-three orders
+of magnitude worse, and that gap is what a synchronous cross-region call actually costs the
+caller.
+
+### Little's Law
+
+Little's Law is the one formula on this page that is not an approximation. For any stable
+queueing system — any arrival process, any service-time distribution, any number of servers —
+the long-run average number of items in the system equals the arrival rate times the average
+time each item spends in the system:
+
+`L = λW`
+
+The proof is short enough to carry in your head, and carrying it is what lets you trust the
+formula under conditions that don't look like a textbook queue: over a long window `T`, the
+total person-time spent inside the system is `L · T` by definition of the average `L`. It is
+also, counted a different way, `(arrivals in T) × W`, because each arrival contributes `W` time
+on average. Divide both expressions by `T` and the arrival count over `T` is `λ`, giving
+`L = λW`. Nothing in that argument assumed Poisson arrivals or exponential service times —
+which is exactly why the law applies just as well to a database connection pool, a thread pool
+queue, or the number of open TCP connections your service is holding.
+
+The use in an interview is almost always the same shape: you know the request rate and the
+expected time each request occupies a resource, and you want the concurrency that resource must
+support. 5,000 requests/sec, each holding a database connection for an average of 20
+milliseconds, needs `5000 × 0.02 = 100` concurrent connections on average — not 5,000, and not
+one per request.
+
+<Watch items={[["Little's Law", "L = λW"], ['utilization', 'ρ = λ / μ'], ['M/M/1 wait', 'Wq = ρ / (μ(1 − ρ))'], ['fan-out tail', 'P(≥1 slow) = 1 − (1 − p)^N']]} />
+
+### why utilization, not load, is what breaks you
+
+Little's Law tells you the average concurrency. It says nothing about how that average behaves
+as you approach saturation, and that's where the intuition of "we're only at 80% CPU, we have
+headroom" goes wrong. The simplest queueing model with a closed-form answer — a single server,
+Poisson arrivals, exponential service time, the classic M/M/1 — gives the average wait *in the
+queue* as a function of utilization `ρ = λ/μ` (arrival rate over service rate):
+
+`Wq = ρ / (μ(1 − ρ))`
+
+Real production traffic is neither Poisson nor exponential, so don't reuse this formula for an
+exact capacity number. What's worth internalizing is the *shape*, because the shape is far more
+general than the assumptions behind this particular formula — wait time relative to a single
+service time, at increasing utilization:
+
+| utilization (`ρ`) | relative wait (`ρ / (1 − ρ))`, in multiples of one service time |
+| --- | --- |
+| 0.50 | 1.0× |
+| 0.70 | 2.3× |
+| 0.80 | 4.0× |
+| 0.90 | 9.0× |
+| 0.95 | 19.0× |
+| 0.99 | 99.0× |
+
+The curve is hyperbolic, not linear. Going from 50% to 80% utilization looks like "we used 30
+more points of a resource we already had"; the wait time it buys you is 4x, not 1.6x. This is
+why "we're at 80% CPU, we're fine" is a claim that needs a follow-up question — 80% of *what
+capacity*, and how close is that to the ρ where the curve turns vertical.
+
+### why the mean is the least useful number on the dashboard
+
+The mean answers "what does a typical request cost." It does not answer the question that
+actually determines whether users are happy, which is closer to "what does the request the user
+in front of me right now experience." Two things make the mean actively misleading rather than
+just incomplete:
+
+First, latency distributions in production are heavily right-skewed — most requests are cheap,
+a long tail is expensive (a cold cache line, a GC pause, a lock wait, a query that missed an
+index) — and the mean of a right-skewed distribution is pulled toward the tail without telling
+you the tail exists. A `p50` near the mean and a `p99` an order of magnitude higher is normal,
+not a bug; a dashboard that only plots the mean shows you neither number.
+
+Second, and more dangerous: fan-out amplifies the tail rather than averaging it away. If a
+single logical request depends on many independent backend calls in parallel, the parent
+request isn't done until the *slowest* of them returns — it's a max, not a mean:
+
+```text
+one incoming request
+  │
+  ├──▶ backend call 1    (P(slow) = 1%)
+  ├──▶ backend call 2    (P(slow) = 1%)
+  ├──▶ backend call 3    (P(slow) = 1%)
+  │         ⋮                                the parent response is not ready until
+  └──▶ backend call 100  (P(slow) = 1%)       ALL 100 have returned — it's a max(), not a mean
+
+P(this request is entirely fast)  = 0.99^100 ≈ 0.366
+P(this request hits the slow tail) = 1 − 0.366 ≈ 0.634
+```
+
+A dependency whose own `p99` looks perfectly healthy at "1% of calls are slow" turns into a
+parent request that is slow **63% of the time** once it fans out to 100 of them. This is why a
+[timeout budget](/system-design/reliability/) is arithmetic and not a guess: the number of
+things you fan out to determines how aggressively the tail dominates the aggregate, independent
+of how good any individual dependency's own numbers are. It's also why "average latency 40ms,
+p99 800ms" is not two facts about the same system that happen to disagree — the p99 is the one
+that predicts what a request touching several dependencies will actually feel like.
+
+### worked capacity arithmetic
+
+Stated as assumptions, because that's what they are — an interviewer expects you to name them,
+not discover them halfway through:
+
+- 50 million daily active users
+- 20 requests per user per day on average
+- peak-to-average ratio of 3x (a consumer app with a daytime peak, no special event)
+- a write:read ratio of 1:20 (one write for every twenty reads)
+- an average write is 200 bytes on the wire, replicated 3x for durability
+- 5-year retention, decimal units throughout (`1 GB = 10^9 bytes`)
+
+Working it through:
+
+- total requests/day = `50,000,000 × 20 = 1,000,000,000`
+- average QPS = `1,000,000,000 / 86,400 ≈ 11,574 req/s`
+- peak QPS = `11,574 × 3 ≈ 34,722 req/s`
+- of that peak, writes ≈ `34,722 / 21 ≈ 1,653/s`, reads ≈ `20 × 1,653 ≈ 33,069/s`
+- writes/day = `1,000,000,000 / 21 ≈ 47,619,048`
+- raw bytes/day = `47,619,048 × 200 ≈ 9.52 GB/day`
+- physically stored bytes/day, replication factor 3 = `9.52 × 3 ≈ 28.57 GB/day`
+- over 5 years (~1,826 days) = `28.57 × 1,826 ≈ 52.2 TB`
+
+Two things worth saying out loud when you present numbers like these: the peak factor is doing
+more work than any other input — get it wrong by 2x and every downstream number is wrong by 2x
+— and the replication factor triples your storage bill before a single secondary index does,
+which is the multiplier [storage engines](/system-design/storage-engines/) accounts for in full.
+
+## the tradeoff
+
+| | back-of-envelope arithmetic | load test / production telemetry |
+| --- | --- | --- |
+| when it's available | before a line of infrastructure exists | only once there's something real to point traffic at |
+| cost to obtain | minutes, on a whiteboard | hours to weeks, and an environment that resembles production |
+| what it's good for | the *shape* of the design — order of magnitude for partition count, whether a cache is structurally necessary, whether one database can hold the working set | the actual *numbers* — pool sizes, autoscaling thresholds, timeout budgets |
+| what it misses | GC pauses, lock contention, cold caches, real traffic skew, the tail | nothing structural — but it only reflects the load pattern you actually generated |
+| confidence | good to roughly 2-3x, no better | ground truth, conditional on the test traffic resembling production traffic |
+
+The default: use the arithmetic to decide the shape of the thing, because shape decisions
+(single instance versus sharded, cache or no cache, synchronous versus queued) are expensive to
+reverse once real data and real callers exist. Use a load test or live telemetry to set the
+actual thresholds — a connection pool size, an autoscaling trigger, a stated SLO like `p99 <
+200ms` — because the arithmetic's assumptions about arrival distribution and service-time
+distribution are never exactly right once real traffic shows up. Departing from
+arithmetic-only earlier than that is warranted only when the decision itself is the expensive,
+hard-to-reverse one — a data model, a partition key — not when you're tuning a number that a
+config change can fix next week.
+
+## how it fails
+
+- **Capacity falls over during exactly the event that mattered.** Cause: the peak-to-average
+  ratio was estimated too low, or skipped entirely — someone divided a daily total by 86,400
+  and called it QPS. On a dashboard: months of flat, comfortable CPU and latency graphs, then a
+  cliff during a launch or a sale, with autoscaling reacting to the spike instead of having
+  headroom for it.
+- **The average latency dashboard looks healthy while support tickets pile up.** Cause:
+  timeouts and errors are often excluded from the latency histogram entirely — a request that
+  times out at 5 seconds gets counted as an error, not as a 5,000ms sample, so the "average" is
+  silently computed only over the fast survivors. On a dashboard: latency average flat or even
+  improving while the error/timeout counter climbs in the same window — a survivorship-bias
+  trap that looks like the opposite of what it is.
+- **Connection pool exhaustion cascades from a single slow dependency.** Cause: Little's Law
+  running in reverse — a spike in query latency (`λ` unchanged, `W` way up) means the
+  concurrent connections in use, `L`, spikes proportionally, and once `L` exceeds the pool's
+  max, waiting for a connection itself adds latency, feeding back into `W`. On a dashboard: pool
+  wait time and pool-exhaustion errors spike together, correlated with one slow downstream
+  dependency, and the blast radius is every caller of that pool, not just the slow query's own
+  callers.
+- **The fleet-wide `p99` the dashboard reports doesn't match what any single host reports.**
+  Cause: percentiles are not additive. Averaging (or otherwise combining) per-instance `p99`
+  values is not the same as computing the percentile of the merged raw distribution, and a
+  handful of "grey failure" hosts can dominate the true merged tail while each individually
+  still reports a healthy number of its own. On a dashboard: an alert on "the average of
+  per-instance p99s" never fires while the customer-facing SLO is burning.
+- **Storage or memory usage creeps up faster than the estimate predicted.** Cause: the estimate
+  counted only primary row bytes, not secondary indexes, write-ahead-log retention, and
+  replica copies — the multiplier that [storage engines](/system-design/storage-engines/) owns.
+  On a dashboard: disk usage grows 2-4x faster than "rows written × row size," and nobody agrees
+  on why until someone accounts for every index and every replica separately.
+
+## in practice
+
+- **`HttpClient` / `SocketsHttpHandler`.** `MaxConnectionsPerServer` is the "`L`" from Little's
+  Law for a given downstream — if it's set below `(peak requests/sec to that host) × (that
+  host's own p99, not its average)`, requests queue up *inside your own process*, and it shows
+  as a latency floor on outbound calls that doesn't correlate with anything the downstream
+  service itself reports.
+- **Polly.** A bulkhead policy literally *is* a concurrency cap — size it from the same
+  arithmetic instead of a round number, and give it a bounded queue rather than an unbounded
+  one. An unbounded queue doesn't prevent the failure, it just changes the symptom from "some
+  requests rejected fast" to "everything is slow," which is strictly worse to diagnose.
+- **ASP.NET Core / the CLR thread pool.** Thread-pool starvation shows the exact queueing
+  signature from this page: `p99` (and eventually `p50`) climbing while CPU utilization stays
+  low, because work items are waiting in the global queue rather than running. It's Little's
+  Law with `W` dominated by queue wait rather than actual service time — `ThreadPool.SetMinThreads`
+  is a blunt fix; finding what's blocking a pool thread synchronously is the real one.
+- **SQL Server / Npgsql connection pooling.** The pool's max size is exactly `L` from Little's
+  Law for that database. Size it from `(peak QPS to that database) × (its own p99 query
+  latency)` — provisioning off the *mean* query latency under-sizes the pool for precisely the
+  moments (a lock wait, a missing index) when headroom is needed most.
+- **Percentile aggregation in telemetry.** A dashboard config that reports a `p99` per instance
+  and then averages those per-instance numbers across the fleet produces a number with no
+  statistical meaning — the earlier "how it fails" row about grey failures is this, exactly.
+  What's needed instead is either the true percentile of the merged raw samples, or a proper
+  quantile sketch designed to be mergeable, not an average of already-computed percentiles.
+- **EF Core `N+1`.** Unlike the parallel fan-out in the diagram above, a classic `N+1` is
+  usually *sequential* — each lazy-loaded navigation property is awaited before the next one
+  fires — so the parent request's latency is closer to the **sum** of `N` round trips than the
+  max of them. That's often worse than the parallel case: latency grows linearly with `N`
+  instead of being dominated by whichever call is slowest. `Include`/projection collapses `N`
+  round trips into 1, which is why it matters more than "a few extra queries" suggests.
+
+## the same idea elsewhere
+
+| concept here | its cousin | the trap |
+| --- | --- | --- |
+| the latency ladder | [the memory hierarchy's own ladder](/systems/memory-hierarchy/) | it's the same shape at every layer — a level exists because the level below it is orders of magnitude slower — but "cache" as a noun (Redis) makes people forget the CPU has been running this exact argument since before either of you started |
+| a cache key, evicted from Redis | a cache line, evicted from L1/L2 | both go stale and need an invalidation story, but a cache-key miss costs a network round trip while a cache-line miss costs tens of cycles — six orders of magnitude apart, so the two deserve very different urgency, not the same one |
+| Little's Law sizing a database connection pool | a `SemaphoreSlim` or [in-process work queue](/systems/parallelism-patterns/) sizing in-process concurrency | it's the same `L = λW` arithmetic either way, but an engineer who'd never guess a Npgsql pool size will cheerfully write `new SemaphoreSlim(10)` with no arithmetic behind the 10 |
+
+## interview drills
+
+**Q.** Estimate the QPS and storage for a URL shortener: 100 million new URLs per day, a
+100:1 read:write ratio, redirects retained for 5 years.
+
+- *weak answer* — computes one flat "QPS" from the daily total without separating reads from
+  writes or applying a peak factor, and gives a storage number with no stated row size or
+  replication assumption.
+- *strong answer* — works write QPS and read QPS separately from the ratio, applies a stated
+  peak-to-average factor to both, and computes storage as `URLs written over 5 years × row
+  size × replication factor`, naming every assumption before doing the arithmetic.
+- *follow-up* — "20% of URLs account for 80% of reads — does that change your estimate?" A
+  Zipfian skew like that means a modest cache absorbs most read traffic, so the QPS the
+  *database* actually sees is far below raw read QPS — the estimate for the origin store should
+  use effective QPS after the cache, not total traffic.
+
+**Q.** Your dashboard shows average latency at 40ms and users are filing tickets anyway. What
+do you check?
+
+- *weak answer* — "the average looks fine, so the problem must be on the client."
+- *strong answer* — check the percentiles, not just the mean, and check whether timed-out or
+  errored requests are excluded from the latency histogram — a healthy-looking average is
+  exactly what survivorship bias produces when the slow requests get counted as errors instead
+  of as slow samples.
+- *follow-up* — "every single instance individually reports `p99` under 200ms, but the
+  fleet-wide `p99` is 800ms — how?" Percentiles don't average; the true fleet percentile comes
+  from the merged raw distribution, and a small number of grey-failure hosts can dominate that
+  merged tail while each one's own self-reported number still looks fine.
+
+**Q.** How many concurrent database connections does a service need at 5,000 requests/sec, 20ms
+average query latency?
+
+- *weak answer* — "5,000 — one per request."
+- *strong answer* — Little's Law: `L = λW = 5000 × 0.02s = 100` concurrent connections on
+  average. Provision with headroom above that for variance, not equal to peak request rate.
+- *follow-up* — "query latency spikes to 200ms during a lock-contention incident, request rate
+  stays the same — what happens to the pool?" `L = 5000 × 0.2 = 1000`, a 10x jump in required
+  concurrency against an unchanged pool size — this is the exact mechanism behind a pool
+  exhaustion cascade, not a separate failure mode from Little's Law.
+
+**Q.** 500 million rows. Does that mean it's time to shard?
+
+- *weak answer* — "500 million rows sounds big, so yes."
+- *strong answer* — compute the actual working set (rows actively touched in a window × row
+  size, not total row count) against available memory for the buffer cache. If the working set
+  fits in memory with room to grow, a single well-tuned instance serves far more QPS than
+  intuition suggests, because reads never touch disk at all — shard when the arithmetic says
+  the working set or the write rate has outgrown one machine, not when the row count merely
+  sounds large.
+- *follow-up* — "the working set fits comfortably, but write throughput is still capped — by
+  what?" A single leader's durable-commit rate — the `fsync`ed log — which is a ceiling set by
+  durability, not by data size, and adding read replicas does nothing to raise it.
+
+**Q.** The design doc says "add a cache" to fix a latency problem. How do you validate that with
+numbers instead of intuition?
+
+- *weak answer* — "Redis makes things faster, so add Redis."
+- *strong answer* — estimate the hit ratio the access pattern actually supports (skew/Zipfian
+  shape of the keys, cache size versus working set), then show origin QPS dropping by roughly
+  that hit ratio — the arithmetic that makes [caching](/system-design/caching/) a sizing
+  decision rather than a reflex.
+- *follow-up* — "every key shares one fixed TTL and the cache just cold-started — what
+  happens?" Synchronized expiry: every key set at startup expires in the same window, and the
+  origin sees a load spike shaped exactly like the traffic that just got cached — the reason TTL
+  jitter exists.

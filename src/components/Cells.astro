@@ -1,0 +1,67 @@
+---
+/**
+ * Static snapshot of the artifact's array-cell visualization: a row of cells
+ * with pointer badges above and indices below. Zero JS — use for the key
+ * moments of a trace.
+ *
+ * pointers: map index → badges, e.g. { 0: [{ t: 'L', c: 'amber' }] }
+ * cells:    map index → state:  ok (green, scaled) · win (in-window) ·
+ *           warn (red) · mid (purple) · dim (faded)
+ */
+type BadgeColor = 'amber' | 'cyan' | 'purple' | 'green' | 'red';
+type CellState = 'ok' | 'win' | 'warn' | 'mid' | 'dim';
+
+interface Props {
+  data: (string | number)[];
+  pointers?: Record<number, { t: string; c: BadgeColor }[]>;
+  cells?: Record<number, CellState>;
+  indices?: boolean;
+  caption?: string;
+}
+const { data, pointers = {}, cells = {}, indices = true, caption } = Astro.props;
+
+const badgeBg: Record<BadgeColor, string> = {
+  amber: 'bg-amber',
+  cyan: 'bg-cyan',
+  purple: 'bg-purple',
+  green: 'bg-green',
+  red: 'bg-red',
+};
+const cellCls: Record<CellState, string> = {
+  ok: 'bg-green-dim border-green scale-108',
+  win: 'bg-win-dim border-green',
+  warn: 'bg-red-dim border-red',
+  mid: 'bg-purple-dim border-purple',
+  dim: 'opacity-30',
+};
+---
+
+<figure class="not-prose my-5">
+  <div class="flex justify-start gap-1.5 overflow-x-auto pb-1 sm:justify-center">
+    {
+      data.map((v, i) => (
+        <div class="flex flex-col items-center gap-1">
+          <div class="flex h-[18px] gap-0.5 font-mono text-[0.72rem] font-bold">
+            {(pointers[i] ?? []).map((p) => (
+              <span class:list={['ptr-badge', badgeBg[p.c]]}>{p.t}</span>
+            ))}
+          </div>
+          <div
+            class:list={[
+              'bg-panel2 border-line flex h-11 min-w-11 items-center justify-center rounded-lg border px-1 font-mono text-[0.95rem] transition-transform',
+              cells[i] && cellCls[cells[i]],
+            ]}
+          >
+            {v}
+          </div>
+          {indices && <div class="text-muted font-mono text-[0.65rem]">{i}</div>}
+        </div>
+      ))
+    }
+  </div>
+  {caption && (
+    <figcaption class="text-muted mt-2 text-center font-mono text-[0.78rem]">
+      {caption}
+    </figcaption>
+  )}
+</figure>

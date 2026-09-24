@@ -1,0 +1,277 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: atomics-and-cas
+problem: false-sharing
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import Solution from '@components/Solution.astro';
+
+## the question
+
+Four threads, four counters, one each. No thread ever touches another thread's counter. There is
+no lock, no shared variable, and nothing in the logic that any two threads have in common — this
+is the embarrassingly parallel case, the one that is supposed to need no coordination at all.
+
+The only thing that changes between two versions of this program is the *index* each thread uses:
+
+```csharp
+static readonly long[] cells = new long[4096];
+
+// thread t increments cells[t * stride]
+static void Bump(int n, int slot) { for (int i = 0; i < n; i++) cells[slot]++; }
+
+RunStride(threads: 4, stride: 1, Bump);   // cells[0], [1], [2], [3]
+RunStride(threads: 4, stride: 8, Bump);   // cells[0], [8], [16], [24]
+```
+
+A `long` is 8 bytes and a cache line is 64. `cells[0]`, `cells[1]`, `cells[2]` and `cells[3]` sit
+32 bytes apart from first to last, which fits inside one line with room to spare. `cells[0]` and
+`cells[8]` sit 64 bytes apart — one full line — and every stride from there on only widens the
+gap.
+
+<Callout kind="insight" label="predict first">
+  Answer these by reasoning about addresses, not by guessing a number.
+
+  **One.** With `stride: 1`, how many distinct 64-byte cache lines do the four threads' counters
+  occupy between them? With `stride: 8`?
+
+  **Two.** At what stride, exactly, is it *guaranteed* that no two threads ever share a line —
+  guaranteed by arithmetic, not just likely?
+
+  **Three.** Two `long` fields, `Hits` and `Misses`, declared next to each other in one ordinary
+  class. `Hits` is always the object's first field and `Misses` its second, eight bytes later. Is
+  whether they share a cache line decided by your source code, by the CLR's layout rules, or by
+  something else entirely — and if "something else," what?
+
+  **Four.** `Interlocked.Increment` on `cells[slot]` and a plain `cells[slot]++` execute the exact
+  same address arithmetic. If two threads share a line, does a `lock`-prefixed increment have to
+  pay for that sharing the same way a plain increment does, or is there a mechanical reason one of
+  them could get away cheaper?
+</Callout>
+
+## the code
+
+`bench/atomics-and-cas/false-sharing.cs` pins the array and a `Stats` object with `GCHandle` and
+prints their real addresses, so "the same cache line" is a fact in the output rather than an
+assumption in the prose. The second half runs the same allocation many times with a filler object
+in front of it, so where `Stats` lands — and therefore whether its two fields share a line — is
+decided by the same allocator a real service uses, not stacked in the experiment's favour.
+
+<Solution>
+
+```csharp
+using System.Runtime.InteropServices;
+
+// two counters that a code review would never look at twice
+sealed class Stats { public long Hits; public long Misses; }
+
+// the same two counters, one cache line each
+[StructLayout(LayoutKind.Explicit, Size = 128)]
+struct PaddedStats
+{
+    [FieldOffset(0)] public long Hits;
+    [FieldOffset(64)] public long Misses;
+}
+
+static class FalseSharing
+{
+    static readonly long[] cells = new long[4096];
+
+    public static void Main()
+    {
+        var h = GCHandle.Alloc(cells, GCHandleType.Pinned);
+        long baseAddr = h.AddrOfPinnedObject().ToInt64();
+        foreach (int idx in new[] { 0, 1, 2, 3, 8, 16, 24 })
+            Console.WriteLine($"cells[{idx}]  0x{baseAddr + idx * 8:X}"
+                             + $"  line {(baseAddr + idx * 8) / 64}  byte {(baseAddr + idx * 8) % 64} of that line");
+        h.Free();
+
+        // a fresh Stats, many times, with a variable-size filler allocation
+        // ahead of it each round — so the object lands at a different offset
+        // inside a line depending on what the allocator did just before it
+        var rng = new Random(1);
+        int sameLine = 0, twoLines = 0;
+        for (int r = 0; r < 32; r++)
+        {
+            GC.KeepAlive(new byte[24 + 8 * rng.Next(0, 8)]);
+            var s = new Stats();
+            var hr = GCHandle.Alloc(s, GCHandleType.Pinned);
+            long addr = hr.AddrOfPinnedObject().ToInt64();
+            bool same = addr / 64 == (addr + 8) / 64;   // Hits at +0, Misses at +8
+            if (same) sameLine++; else twoLines++;
+            hr.Free();
+        }
+        Console.WriteLine($"same line: {sameLine}/32   two lines: {twoLines}/32");
+    }
+}
+```
+
+</Solution>
+
+## work it out
+
+**Question one and two.** A cache line is a contiguous, 64-byte-aligned block: every address
+belongs to line number `address / 64`, using integer division. Two addresses land in the same
+line exactly when they floor-divide to the same number.
+
+```text
+   stride 1 (8 bytes apart):  cells[0] cells[1] cells[2] cells[3]
+                               └────────────── 32 bytes ──────────────┘
+        ┌────────────────────────────────────────────────────────────┐
+        │            ONE 64-byte line: [c0][c1][c2][c3][ … 32B free ] │
+        └────────────────────────────────────────────────────────────┘
+              four threads, one owner at a time — this line ping-pongs
+
+   stride 8 (64 bytes apart):  cells[0]      cells[8]      cells[16]     cells[24]
+        ┌──────────────┐┌──────────────┐┌──────────────┐┌──────────────┐
+        │  line N: [c0] ││ line N+1:[c8]││line N+2:[c16]││line N+3:[c24]│
+        └──────────────┘└──────────────┘└──────────────┘└──────────────┘
+              four lines, four owners, zero contention — nobody asks
+              another core to give anything up
+```
+
+At `stride: 1` the four counters cannot be more than 32 bytes apart from first to last, so they
+always fit inside one 64-byte-aligned block — one line, regardless of exactly where the array
+starts. At `stride: 8` consecutive counters are exactly 64 bytes apart, and for any address `a`,
+`(a + 64) / 64 == a / 64 + 1` always — floor division of a multiple of the line size shifts the
+line index by exactly one, with no dependency on where `a` sits inside its line. **Stride 64 bytes
+is not "usually enough" — it is the smallest stride that is guaranteed sufficient by arithmetic
+alone**, for any starting address.
+
+**Question three.** `Hits` is at offset 0 in `Stats`, `Misses` at offset 8 — the default class
+layout in .NET lays reference-type fields out close to declaration order for simple cases, and
+neither offset is something your source code controls directly. What decides whether the *pair*
+shares a line is the object's own starting address, and that address comes from wherever the GC's
+bump allocator happened to be when `new Stats()` ran — which depends on everything allocated
+immediately before it in that thread. Nothing in the class declaration pins that down.
+
+**Question four.** Both increments compute the same address and touch the same line. The
+difference is what each one is allowed to do with the store. A plain `cells[slot]++` retires its
+store into the small per-core store buffer and moves on immediately — several plain stores in a
+row can sit in that buffer and drain to the cache together the next time the core has the line, so
+one line-ownership transfer can cover a whole burst of increments. A `lock`-prefixed instruction
+cannot use the store buffer at all: [atomics and compare-and-swap](/systems/atomics-and-cas/)
+covers why — it is not complete until it is globally visible, so it forces its own transfer on
+every single access. Sharing the line costs something for both; only the locked instruction is
+forced to pay for a transfer every time.
+
+## the answer
+
+Real addresses, from a run of the file above:
+
+```text
+cells[ 0]  0x7C2E1C801B68  line 2133398257773  byte 40 of that line
+cells[ 1]  0x7C2E1C801B70  line 2133398257773  byte 48 of that line
+cells[ 2]  0x7C2E1C801B78  line 2133398257773  byte 56 of that line
+cells[ 3]  0x7C2E1C801B80  line 2133398257774  byte  0 of that line
+cells[ 8]  0x7C2E1C801BA8  line 2133398257774  byte 40 of that line
+cells[16]  0x7C2E1C801BE8  line 2133398257775  byte 40 of that line
+cells[24]  0x7C2E1C801C28  line 2133398257776  byte 40 of that line
+```
+
+`cells[0]`, `[1]` and `[2]` share line 2133398257773; `[3]` is one line over because the array's
+payload happens to start 40 bytes into its first line, so three elements fit before the boundary
+and the fourth crosses it — exactly the "it depends where the array starts" case question one
+warns about. `cells[8]`, `[16]` and `[24]` each land on their own line, one apart each time, as the
+arithmetic in the previous section predicts for any 64-byte-or-larger stride.
+
+The lottery, 32 fresh `Stats` objects with a randomised filler in front of each one:
+
+```text
+same line: 31/32   two lines: 1/32
+```
+
+Thirty-one times out of thirty-two, `Hits` and `Misses` landed in the same 64-byte line on this
+run — not because the class is unlucky, but because an 8-byte offset between two fields is small
+relative to a 64-byte line, so most starting addresses put both fields inside one line and only a
+narrow band of starting offsets (56 through 63) splits them. Nobody wrote different code between
+rounds. Whether this exact class has the false-sharing bug on a given day is decided by an
+allocation elsewhere in the same thread.
+
+## why it works that way
+
+**A cache line has one owner.** Coherence is maintained per line, not per byte: before a core can
+write any byte of a line, the hardware's coherence protocol must give that core exclusive
+ownership of the *whole* line, which means every other core's copy of it is invalidated first. Two
+counters 8 bytes apart are one line, so two cores writing "their own" counters are two cores
+contending for one piece of hardware state. The protocol has no concept of a variable — it tracks
+64-byte blocks and nothing smaller. That is false sharing: all of the mechanical cost of sharing,
+none of the logical reason for it.
+
+<Callout kind="trap" label="the folklore overstates plain writes">
+  Plenty of write-ups treat any write to a shared line as equally expensive. It is not: an ordinary
+  store can sit in the store buffer, so a core that holds the line can run a whole burst of plain
+  writes before another core needs the line back, and the one transfer that eventually happens is
+  amortised across that burst. A locked instruction — `Interlocked`, the CAS inside a `lock`, the
+  word a spinlock spins on — cannot be buffered, so it pays for a transfer on every single access.
+  False sharing is a story about *synchronised* operations on a shared line, not about shared data
+  in general. Look for it where atomics and locks already are.
+</Callout>
+
+**The fix is to stop leaving the layout to chance.** In C# the options are an explicit layout
+(`StructLayout(LayoutKind.Explicit)` with `FieldOffset(0)` and `FieldOffset(64)`, as in the
+benchmark's `PaddedStats`), a struct sized to 64 bytes so an array of them is line-aligned per
+element, or simply not sharing the counter at all — one per thread or per partition, summed on
+read. Padding costs memory: 64 bytes per counter instead of 8, which is nothing for a handful of
+worker counters and wasteful for a million small objects. It is a fix for hot, few, and written by
+different threads — nothing else.
+
+<Watch items={[['cache line', '64 B'], ['line = address / 64', 'floor division'], ['guaranteed-safe stride', '64 B, by arithmetic'], ['what decides object layout', 'the allocator, not the class body'], ['what a plain write can dodge', 'store buffer amortises the transfer'], ['what a locked instruction cannot dodge', 'a transfer on every access']]} />
+
+## what this looks like in prod
+
+The signature is throughput that stops scaling while every CPU is busy and no lock is contended.
+Nothing appears in a lock-contention profile because there is no lock; nothing appears in an
+allocation profile; the code looks perfectly parallel. If hardware performance counters are
+available, the event to look at is cache-line invalidation traffic or "HITM" (a load that hit a
+line another core had just modified). Without them, the structural check is the one this page is
+built on: print the addresses, or the field offsets, and see whether two things written by
+different threads share a line.
+
+Where it comes from in real .NET code, in rough order of frequency: an array of per-worker
+counters or per-partition state, packed tight (`long[] processed = new long[workerCount]` is the
+canonical one, and it is exactly the `stride: 1` case above); several hot `Interlocked` fields
+declared next to each other in one singleton — a hit counter, a miss counter, a sequence number;
+a hand-rolled ring buffer whose head and tail indices are adjacent fields, written by producer and
+consumer respectively (the head/tail pair is the classic case, and the reason high-performance
+queue implementations pad between them); and any object that pairs a lock word with the data it
+protects, so that spinning on the lock invalidates the payload sitting right next to it.
+
+Java exposes an annotation for this, `@Contended`, and .NET does not, so in C# it is manual: an
+explicit layout, a padded struct, or per-thread state. Since the padding is invisible in behaviour
+and only visible in a profile, write down *why* it is there in a comment next to it — it is the
+first thing a well-meaning reviewer deletes.
+
+## the same idea in other languages
+
+| language | what it's called | the trap |
+| --- | --- | --- |
+| Java | `@jdk.internal.vm.annotation.Contended` (`-XX:-RestrictContended` to use it outside the JDK); `LongAdder` pads its cells for exactly this reason | the JVM lays out fields in whatever order it likes, so hand-inserted `long` padding fields are not guaranteed to end up *between* the two hot fields — which is why the annotation exists, and why hand-rolled padding is less reliable there than a C# explicit layout, where you name the offsets |
+| C/C++ | `alignas(64)`, and C++17's `std::hardware_destructive_interference_size` | the constant is a compile-time guess at the line size and is not required to match the machine you run on; ARM cores in the wild use 64- and 128-byte lines, so padding to 64 on a 128-byte-line machine only half-fixes it |
+| Go | manual padding — `_ [64]byte` fields between hot variables; the runtime pads its own per-P structures | Go's `sync.Pool` and per-P caches exist partly to avoid this, but user code gets no help: a `[]int64` of per-goroutine counters has exactly the layout described here, and `go test -race` will not say a word about it because there is no race |
+| Rust | `#[repr(align(64))]` on the counter type, or the `crossbeam` crate's `CachePadded` | Rust's ownership rules prevent data races but say nothing about layout, so a `Vec<AtomicU64>` of per-worker counters is as false-shared as any other language's. The type system's guarantees are about correctness, not about cache lines |
+
+## common bugs
+
+- **Assuming false sharing is about plain writes.** The dramatic version needs a locked
+  instruction — `Interlocked`, a spinlock word, the CAS inside `lock` — because that is what
+  cannot be buffered. Ordinary field writes on a shared line pay far less, because the store
+  buffer amortises the transfer across a burst. Look for the bug where atomics already are, not
+  everywhere two threads touch nearby memory.
+- **Padding without checking, everywhere.** 64 bytes per counter is a fine trade for a handful of
+  worker slots and a real cost for a million-element array. If the state is not hot and not
+  written by several cores, padding just wastes cache.
+- **Padding with fields the layout engine may reorder.** In C#, `LayoutKind.Sequential` is what a
+  class gets only if you ask for it; the default for a class is `Auto`, and the runtime is free to
+  reorder fields. Dummy `long` fields between counters are not a guarantee — an explicit layout,
+  or a 64-byte struct per counter, is.
+- **Forgetting that objects move.** The GC can compact and relocate an object, so which line a
+  field lands on is not fixed for the process's lifetime unless the layout itself forces the
+  separation. What you observed today can change after the next compacting collection.
+- **Testing on one thread.** False sharing is invisible to any test that does not run the writer
+  threads at the same time, which is most unit tests.
+- **Blaming "allocator bad luck" for a run-to-run difference and stopping there.** A class whose
+  two hot fields sometimes share a line and sometimes do not is not unlucky — it has a latent
+  false-sharing bug whose cost on any given day is currently being decided by chance.

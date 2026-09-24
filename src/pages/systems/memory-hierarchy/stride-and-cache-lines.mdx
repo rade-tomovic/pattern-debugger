@@ -1,0 +1,267 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: memory-hierarchy
+problem: stride-and-cache-lines
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import Solution from '@components/Solution.astro';
+
+## the question
+
+One 64 MB `int[]`. One sum. Every element is read exactly once, and the answer is identical
+every time. The only thing that changes is the *order* the elements are visited in:
+
+```csharp
+for (int off = 0; off < stride; off++)
+    for (int i = off; i < n; i += stride) sum += a[i];
+```
+
+With `stride = 1` that is an ordinary sequential scan. With `stride = 16` it visits index 0,
+16, 32 … to the end of the array, then comes back for 1, 17, 33 …, and so on sixteen times.
+Sixteen `int` values is 64 bytes. Every element is still read exactly once; the total is still
+the same number; the loop is still the same compiled method with `stride` in a register.
+
+You already know from [the topic page](/systems/memory-hierarchy/) that a cache line on this
+kind of machine is 64 bytes. The point of this exercise is that you do not have to take that on
+faith — you can make the loop tell you, by *counting* rather than timing.
+
+<Callout kind="insight" label="predict first">
+  Give the loop a different job: instead of summing, count how many times consecutive visits
+  land in a *different* 64-byte-aligned block than the one just visited — call that a
+  transition. At a 4-byte stride (plain sequential), how many reads share one transition? At a
+  32-byte stride? At what stride, in bytes, does every single read start costing its own
+  transition — and does going past that stride ever bring the count back down?
+</Callout>
+
+## the code
+
+Not timed. The array is far larger than any level of this box's cache, so a block not touched by
+the *immediately preceding* read has certainly been evicted by the time the sweep returns to it
+— which makes "did the block just change" a real, countable stand-in for "did this read need a
+fresh line fetch," with no clock involved.
+
+<Solution>
+
+```csharp
+// Evidence for /systems/memory-hierarchy/stride-and-cache-lines/ — run with:
+//   dotnet run bench/memory-hierarchy/stride-and-cache-lines.cs
+//
+// Not timed. One 64 MB int[]. For a growing stride, the sweep visits every element
+// exactly once: offset 0, stride, 2*stride, ... to the end, then offset 1, and so
+// on. The file counts how many times that visit order crosses into a DIFFERENT
+// 64-byte-aligned block than the block it just visited — a real, countable proxy
+// for "how many times does this loop need a fresh cache line", since the array is
+// far larger than any cache on this box, so a line not touched by the immediately
+// preceding access has certainly been evicted by the time the sweep returns to it.
+using System.Runtime.CompilerServices;
+
+static class Stride
+{
+    const int LineBytes = 64;
+
+    static (long transitions, long reads) Sweep(int[] a, int strideInts)
+    {
+        long transitions = 0, reads = 0;
+        int prevLine = -1, n = a.Length, lineInts = LineBytes / 4;
+        for (int off = 0; off < strideInts; off++)
+            for (int i = off; i < n; i += strideInts)
+            {
+                int line = i / lineInts;
+                if (line != prevLine) { transitions++; prevLine = line; }
+                reads++;
+            }
+        return (transitions, reads);
+    }
+
+    public static void Main()
+    {
+        const int Bytes = 64 << 20;
+        int[] a = new int[Bytes / 4];
+        for (int i = 0; i < a.Length; i++) a[i] = i & 7;
+
+        string reported = File.Exists("/sys/devices/system/cpu/cpu0/cache/index0/coherency_line_size")
+            ? File.ReadAllText("/sys/devices/system/cpu/cpu0/cache/index0/coherency_line_size").Trim()
+            : "unknown";
+        Console.WriteLine($"array {Bytes >> 20} MB ({a.Length:N0} ints)   L1d line size reported by the kernel: {reported} bytes\n");
+
+        // correctness: every stride must sum to the same total
+        long expected = 0;
+        for (int i = 0; i < a.Length; i++) expected += a[i];
+
+        Console.WriteLine($"{"stride(B)",10} {"reads",12} {"transitions",13} {"reads/transition",17}");
+        bool plateaued = false;
+        foreach (int strideBytes in (int[])[4, 8, 16, 32, 64, 96, 128, 256, 512, 4096])
+        {
+            int si = strideBytes / 4;
+            // correctness check, walked separately from the counted sweep above
+            long sum = 0;
+            for (int off = 0; off < si; off++)
+                for (int i = off; i < a.Length; i += si) sum += a[i];
+            if (sum != expected) throw new Exception($"FAIL: stride {strideBytes} summed {sum}, expected {expected}");
+
+            var (transitions, reads) = Sweep(a, si);
+            long readsPerTransition = reads / transitions;
+            Console.WriteLine($"{strideBytes,10} {reads,12:N0} {transitions,13:N0} {readsPerTransition,17}");
+            if (strideBytes >= LineBytes)
+            {
+                if (readsPerTransition != 1) throw new Exception($"FAIL: stride {strideBytes} >= line size but reads/transition = {readsPerTransition}, expected 1");
+                plateaued = true;
+            }
+            else if (plateaued) throw new Exception("FAIL: plateau broken — a later stride went back to sharing lines");
+        }
+        Console.WriteLine($"\nPASS: every stride produced the same sum ({expected}), and reads/transition falls monotonically to exactly 1 at stride {LineBytes} B and holds there");
+    }
+}
+```
+
+</Solution>
+
+## work it out
+
+Picture one 64-byte block as 16 consecutive `int` slots. A single *pass* — one fixed `off`,
+stepping by `stride` ints — visits this block on however many of its iterations happen to land
+inside those 16 slots, and because a pass walks forward in fixed steps with nothing else
+interleaved into it, every visit it makes to one block happens on **consecutive iterations of
+that pass** — there is no other pass's access in between to evict the block first.
+
+```text
+stride = 8 B (2 ints), one 64-byte block, two passes
+
+  block:  [ 0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15 ]
+
+  pass off=0 (step 2):  0     2     4     6     8    ...   <- 8 hits, all consecutive
+  pass off=1 (step 2):     1     3     5     7     9  ...  <- 8 hits, all consecutive
+```
+
+Pass `off=0` enters this block once (a transition) and then takes seven more reads from it before
+moving to the next block — those seven are free, because nothing else touched the block in
+between. Pass `off=1` does the same for the other eight slots, on its own separate transition.
+Two transitions, sixteen reads: **one transition per eight reads**, exactly what an 8-byte stride
+measures in the table below.
+
+Generalize that: for a stride of `s` bytes with `s ≤ 64`, exactly `s ÷ 4` passes exist, and — since
+that count is at most 16 — *every* pass touches *every* block, contributing exactly one transition
+each. So each block costs `s ÷ 4` transitions to deliver its 16 reads: **transitions per read is
+`(s ÷ 4) ÷ 16`, i.e. `s ÷ 64`.** At `s = 4` that is `1⁄16` — sixteen reads share one transition,
+the best a sequential scan can do. At `s = 64` it reaches exactly `1` — every read is its own
+transition, because now a single pass takes only one read out of any given block before the block
+boundary ends that pass's business with it.
+
+Past 64 bytes, a pass cannot touch more than one slot of any given 16-int block at all — its step
+is now bigger than the block itself — so the ratio has nowhere left to go. It cannot exceed one
+transition per read, because a "transition" is defined as at most one per read to begin with. That
+ceiling, not anything about the data, is what turns the climb into a flat line.
+
+## the answer
+
+```text
+array 64 MB (16,777,216 ints)   L1d line size reported by the kernel: 64 bytes
+
+ stride(B)        reads   transitions  reads/transition
+         4   16,777,216     1,048,576                16
+         8   16,777,216     2,097,152                 8
+        16   16,777,216     4,194,304                 4
+        32   16,777,216     8,388,608                 2
+        64   16,777,216    16,777,216                 1
+        96   16,777,216    16,777,216                 1
+       128   16,777,216    16,777,216                 1
+       256   16,777,216    16,777,216                 1
+       512   16,777,216    16,777,216                 1
+      4096   16,777,216    16,777,216                 1
+
+PASS: every stride produced the same sum (58720256), and reads/transition falls
+monotonically to exactly 1 at stride 64 B and holds there
+```
+
+`reads ÷ transition` is 16, 8, 4, 2 at strides 4, 8, 16, 32 — halving exactly as the derivation
+above predicts (`64 ÷ s`) — then hits 1 at stride 64 and stays there through 4096. The kernel's
+`coherency_line_size` file already said 64; this table derives the same number from behaviour,
+with nothing but a definition of "transition" and a loop. **The stride where the climb stops is
+the cache line size**, full stop — not because 64 is special, but because that is the stride past
+which no single pass can touch two elements of the same block, so there is nothing left to share.
+
+<Watch items={[['line, from the kernel', '64 B'], ['line, from the counted transitions', '64 B'], ['elements per line', '16'], ['transitions per read', 'min(1, stride ÷ 64)'], ['utilisation at a 4096 B stride', '4 of 64 bytes fetched used']]} />
+
+## why it works that way
+
+The general rule, stated once so it transfers: **for a stride `s ≤ line size L`, a sequential
+access pattern needs one line fetch per `L ÷ s` elements; for `s ≥ L`, it needs exactly one line
+fetch per element, and cannot need fewer.** The plateau is not "large strides stop mattering" —
+every read past 64 bytes still moves a full 64-byte line to deliver 4 useful bytes, a fixed 16×
+waste that does not get worse, only stays exactly as bad. "The cost stopped climbing" and "the
+cost stopped being wasteful" are different sentences, and only the first one is true here.
+
+There is a second effect this transition count cannot see, and it is worth naming rather than
+pretending it does not exist. A stride does not just decide *how many* lines get fetched — past
+64 bytes, where every fetch is already its own line, it also decides *which cache sets* those
+lines land in, because a cache line's set is chosen by a slice of bits in the middle of its
+address. A stride that shares a large factor with the machine's page size can concentrate many
+fetches onto a handful of sets while the rest of the cache sits idle — the same mechanism, worked
+through in full with real address arithmetic, that decides which matrix sizes suffer a set
+conflict on
+[two loops, same Big-O](/systems/memory-hierarchy/loop-order/). This page's counting method
+cannot distinguish a stride that spreads evenly across sets from one that does not, because both
+produce exactly one transition per read; that is the honest limit of what a fetch *count* can
+tell you without a hardware performance counter, which this container does not expose.
+
+## what this looks like in prod
+
+Nobody writes a stride loop. Everybody writes the equivalent:
+
+- **A column of a table.** Any row-major store — a flattened array, a `DataTable`, a struct
+  array, a bitmap — turns "read one field from every row" into a stride equal to the row size.
+  This is exactly what [array of structs vs struct of arrays](/systems/memory-hierarchy/aos-vs-soa/)
+  works through, and why analytical databases are columnar.
+- **A `class` per element.** An array of references is a stride of 8 bytes over the references
+  and then a scatter over the objects. The object header alone means the useful payload of a
+  48-byte object is a fraction of the 64-byte line fetched for it.
+- **Padding you added for alignment or for a flag.** Growing a hot record from 56 to 72 bytes
+  moves it from one line to two, and every scan over it fetches proportionally more lines for the
+  fields nobody reads. See [struct size and padding](/systems/bits-and-memory/sizeof-and-layout/)
+  for how the size is actually computed.
+- **Power-of-two dimensions.** Grids, tiles, buffers and textures sized to exact powers of two are
+  the case that concentrates fetches into the fewest cache sets, per the "why" section above. If
+  resizing a buffer changes behaviour in a way its Big-O cannot explain, suspect a stride that
+  shares too much with the page size before you suspect a rounding bug.
+
+The diagnostic move is the one this page is built on: hold the work constant and vary only the
+order. If a *count* — of lines, of allocations, of anything the runtime can report without a
+clock — changes, the mechanism is real regardless of what any particular machine's stopwatch says
+about it.
+
+## the same idea in other languages
+
+| language | what it's called | the trap |
+| --- | --- | --- |
+| C / C++ | the same 64-byte line; C++17 exposes `std::hardware_destructive_interference_size`, and `alignas(64)` places data on a line boundary | The constant is baked in at compile time, so a binary built on one microarchitecture carries that number to machines whose line size differs. Reading the value from the OS at run time, as the file above does, is the portable move. |
+| Java | identical hardware behaviour, but no primitive struct array — `Integer[]`, `Long[]` and every object array are arrays of references | The stride you think you have (4 or 8 bytes) is the stride over the *references*; the payload is a scatter over the heap. `int[]` is the only shape with the layout this page assumes. |
+| Go | `[]T` stores `T` inline, so a slice of structs has exactly the stride analysed here | Go's standard library does not expose the line size; padding for it is hand-written as a `[64]byte` filler field, which means it is silently wrong on a machine with a different line size. |
+| Python + NumPy | `ndarray` carries an explicit `strides` tuple, and `a[:, 0]` is a strided *view* rather than a copy | The stride is visible in `a.strides` and costs exactly what this page derives, but nothing in the syntax hints at it — `a[0, :]` and `a[:, 0]` look symmetric and are not. `np.ascontiguousarray` is the copy-to-fix-it escape hatch. |
+| Rust | `#[repr(align(64))]` on a type, and `crossbeam`'s `CachePadded` wrapper | `Vec<T>` is contiguous but `Vec<Box<T>>` is a pointer array — the same distinction as Java's, made visible in the type instead of hidden by it. |
+
+## common bugs
+
+- **Letting the footprint shrink with the stride.** The natural design — "with stride k, do n/k
+  reads" — means the largest strides touch the fewest blocks and start fitting inside a small
+  cache, and any count taken from that design tracks "how much data is left" rather than "how
+  costly is this order." The interleaved-pass sweep above keeps every stride's total reads at
+  exactly n, so the only variable left is order.
+- **Testing on an array small enough to fit in cache.** The whole method rests on "a block not
+  touched by the immediately preceding read has been evicted by the time the sweep returns to
+  it," which is only true once the working set is larger than every level of cache. Shrink the 64
+  MB array and a real cache would keep far more resident than this page's counting model assumes
+  — the count would stop predicting anything.
+- **Assuming 64 and moving on.** 64 bytes is right on x86-64 and on common ARM64 servers, but it
+  is a property of the machine, not of the universe. `coherency_line_size` is one file read away,
+  and the counted derivation above is a loop away.
+- **Believing the plateau means large strides are equally fine.** They cost the same number of
+  transitions per read past the line size — exactly one — but a stride of 4096 bytes still uses 4
+  of the 64 bytes it fetches. The plateau is the point where you have finished getting worse at
+  wasting bandwidth, not the point where the waste stops.
+- **Treating "one transition per read" as proof that set conflicts do not matter.** This counting
+  method answers "how many fresh line fetches," not "which cache sets do those fetches land in" —
+  two strides can produce an identical transition count and a very different set-conflict picture.
+  [Two loops, same Big-O](/systems/memory-hierarchy/loop-order/) works through the arithmetic that
+  answers the second question.

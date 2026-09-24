@@ -1,0 +1,159 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: sliding-window
+problem: minimum-window-substring
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import Cells from '@components/Cells.astro';
+
+## task
+
+Given strings `s` and `t`, return the shortest substring of `s` that contains every character of
+`t` (with at least the multiplicity `t` requires — two `'A'`s in `t` means at least two `'A'`s in
+the window). Return `""` if no such window exists.
+
+```text
+s = "ADOBECODEBANC", t = "ABC"  →  "BANC"
+```
+
+## how to think
+
+This is a **shortest** problem, and it needs two dictionaries: `need` (built once from `t` —
+character to required count) and `window` (built incrementally as `right` scans `s`). A window is
+valid when every character `need` asks for has been matched in `window` — track that with a
+single counter, `have`, that increments each time a character in `window` first *reaches* its
+required count in `need`. Expand `right` until `have == need.Count`; the moment it does, the
+window is valid, so shrink `left` as far as possible while it *stays* valid, recording the length
+on every step of the shrink — the smallest length recorded before validity breaks is the answer.
+
+Shrink-while-valid is the mirror image of the two problems before this one: there, growing past
+the invalid point never helps, so you hold the window open. Here, a *smaller* valid window is
+strictly better, so you give up ground as long as you're still allowed to.
+
+<Callout kind="note" label="template instance">
+  **Variable window, shortest**, shrink-while-valid. Window state: two
+  [`Dictionary<char, int>`](/patterns/hashmap/)s (`need`, built once; `window`, built live) plus
+  a `have`/`needCount` pair standing in for `IsValid()`. What varies from the two longest-window
+  problems: the shrink loop runs *while valid* and records on every iteration, instead of running
+  while invalid and only checking after.
+</Callout>
+
+## solution
+
+```csharp
+public string MinWindow(string s, string t)
+{
+    if (t.Length == 0 || s.Length < t.Length) return "";
+
+    var need = new Dictionary<char, int>();
+    foreach (char c in t) need[c] = need.GetValueOrDefault(c) + 1;
+
+    var window = new Dictionary<char, int>();
+    int have = 0, needCount = need.Count;
+    int left = 0, bestLen = int.MaxValue, bestStart = 0;
+
+    for (int right = 0; right < s.Length; right++)
+    {
+        char c = s[right];
+        window[c] = window.GetValueOrDefault(c) + 1;
+        if (need.ContainsKey(c) && window[c] == need[c]) have++;   // this char JUST reached its required count
+
+        while (have == needCount)                    // shrink while VALID, recording as we go
+        {
+            if (right - left + 1 < bestLen)
+            {
+                bestLen = right - left + 1;
+                bestStart = left;
+            }
+            char lc = s[left];
+            window[lc]--;
+            if (need.ContainsKey(lc) && window[lc] < need[lc]) have--;  // this char just fell BELOW its required count
+            left++;
+        }
+    }
+    return bestLen == int.MaxValue ? "" : s.Substring(bestStart, bestLen);
+}
+```
+
+## trace
+
+`s = "ADOBECODEBANC"` (indices 0-12), `t = "ABC"` → `need = {A:1, B:1, C:1}`, `needCount = 3`:
+
+| right | char | window (A,B,C only) | have/need | activity this step | left after | best so far |
+| --- | --- | --- | --- | --- | --- | --- |
+| 0 | A | `{A:1,B:0,C:0}` | 1/3 | — | 0 | — |
+| 1 | D | `{A:1,B:0,C:0}` | 1/3 | — | 0 | — |
+| 2 | O | `{A:1,B:0,C:0}` | 1/3 | — | 0 | — |
+| 3 | B | `{A:1,B:1,C:0}` | 2/3 | — | 0 | — |
+| 4 | E | `{A:1,B:1,C:0}` | 2/3 | — | 0 | — |
+| 5 | C | `{A:1,B:1,C:1}` | 3/3 | record `"ADOBEC"` (len 6); drop `A` | 1 | 6 |
+| 6 | O | `{A:0,B:1,C:1}` | 2/3 | — | 1 | 6 |
+| 7 | D | `{A:0,B:1,C:1}` | 2/3 | — | 1 | 6 |
+| 8 | E | `{A:0,B:1,C:1}` | 2/3 | — | 1 | 6 |
+| 9 | B | `{A:0,B:2,C:1}` | 2/3 | — | 1 | 6 |
+| 10 | A | `{A:1,B:2,C:1}` | 3/3 | drop `D,O,B,E,C` — no new record, length never `< 6` | 6 | 6 |
+| 11 | N | `{A:1,B:1,C:0}` | 2/3 | — | 6 | 6 |
+| 12 | C | `{A:1,B:1,C:1}` | 3/3 | drop `O,D` → record `"EBANC"` (5); drop `E` → record `"BANC"` (4); drop `B` | 10 | **4** |
+
+Result: `"BANC"` (`s[9..12]`).
+
+`right = 5`: the first valid window closes — `have` hits `3/3` for the first time —
+
+<Cells
+  data={['A', 'D', 'O', 'B', 'E', 'C', 'O', 'D', 'E', 'B', 'A', 'N', 'C']}
+  pointers={{ 0: [{ t: 'L', c: 'amber' }], 5: [{ t: 'R', c: 'cyan' }] }}
+  cells={{ 0: 'ok', 1: 'ok', 2: 'ok', 3: 'ok', 4: 'ok', 5: 'ok' }}
+  caption='right=5: "ADOBEC" (len 6) — the first valid window, and the first recorded best'
+/>
+
+`right = 12`: after two more shrinks past the length-6 detour at `right=10`, the true minimum
+lands on indices 9-12 —
+
+<Cells
+  data={['A', 'D', 'O', 'B', 'E', 'C', 'O', 'D', 'E', 'B', 'A', 'N', 'C']}
+  pointers={{ 9: [{ t: 'L', c: 'amber' }], 12: [{ t: 'R', c: 'cyan' }] }}
+  cells={{ 9: 'ok', 10: 'ok', 11: 'ok', 12: 'ok' }}
+  caption='final: "BANC" (indices 9-12) — the shortest window containing A, B, and C'
+/>
+
+## why it works
+
+`have == needCount` is exactly "every required character has met its quota" — no more, no less;
+`have` only rises when a character *reaches* its quota (not on every increment) and only falls
+when a character drops *below* it, so it's a precise validity flag, not an approximation. Because
+the `while` shrinks on every `right` where the window is valid, and records the length **before**
+each shrink, every valid window that ever exists gets measured — you can't skip past a shorter
+answer, because shrinking one step at a time never jumps over a length. `right` and `left` each
+advance at most `n` times across the whole run, so despite the nested loop this is `O(n)` — the
+`right=10` row above shows the "aha": one step of `right` can trigger five shrinks in a row, and
+that's fine, because those five shrinks are still bounded by `left`'s total lifetime budget of
+`n`.
+
+<Watch items={[['time', 'O(|s| + |t|)'], ['space', 'O(|s| + |t|)']]} />
+
+## common bugs
+
+- Comparing `window[c] == need[c]` for the `have++` check but forgetting the mirrored
+  `window[lc] < need[lc]` for `have--` — a naive `!=` on the way down double-counts characters
+  that overshoot their quota (e.g. three `'B'`s in the window when only one is needed).
+- Recording the best length **after** the shrink instead of before — that measures the
+  post-shrink (possibly invalid) window, not the valid one you just found.
+- Using `if` instead of `while` for the shrink — a single shrink might still leave the window
+  valid (see `right=12`, where three shrinks happen back to back), and stopping early misses
+  shorter answers.
+- Forgetting the `t.Length == 0 || s.Length < t.Length` guard — an impossible case that should
+  short-circuit to `""`, not run the whole scan for nothing.
+- Building `need` fresh inside the loop instead of once before it — `need` is fixed for the whole
+  run; only `window` and `have` change per iteration.
+
+## variants you can now solve
+
+- [Longest Repeating Character Replacement](/patterns/sliding-window/longest-repeating-character-replacement/)
+  (LC 424) — the shrink-while-**invalid** mirror image: there, more is always fine until it
+  isn't; here, less is always better until it can't be.
+- **Substring with Concatenation of All Words** (LC 30) — same need/have counting, but the unit
+  is a whole word instead of a character, and the window size is fixed at `words.Count * word.Length`.
+- **Permutation in String** (LC 567) — a fixed-size version of the same need/have counting: no
+  shrinking at all, just slide and compare `have == needCount` at each fixed-size position.

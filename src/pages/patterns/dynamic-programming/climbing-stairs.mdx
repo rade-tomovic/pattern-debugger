@@ -1,0 +1,98 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: dynamic-programming
+problem: climbing-stairs
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+
+## task
+
+You're climbing a staircase with `n` steps. Each move you take either 1 or 2 steps. Return the
+number of distinct ways to reach the top.
+
+```text
+n = 5  →  8   (ways: 11111, 1112, 1121, 1211, 2111, 122, 212, 221)
+```
+
+## how to think
+
+Think about the *last* move that lands you on step `n`: it was either a 1-step from step `n-1`,
+or a 2-step from step `n-2`. Every distinct way to reach `n` falls into exactly one of those two
+cases, and the cases never overlap — so the count at `n` is just the sum of the counts at `n-1`
+and `n-2`. That recurrence, `ways(n) = ways(n-1) + ways(n-2)`, with `ways(1) = 1` and
+`ways(2) = 2`, is Fibonacci wearing a word problem's clothes.
+
+Brute-force recursion re-derives `ways(n-2)` from both the `ways(n-1)` branch and the `ways(n-2)`
+branch — the call tree doubles in size at every step, O(2ⁿ). But there are only `n` distinct
+states (`ways(1)` through `ways(n)`), and each one gets asked for repeatedly — that's the
+overlapping-subproblems signal. Caching collapses the tree to `n` real computations; unrolling the
+recursion into a forward loop that carries just the last two values does the same in O(1) space.
+
+<Callout kind="note" label="template instance">
+  **Bottom-up tabulation** skeleton from the [topic page](/patterns/dynamic-programming/), rolled
+  down to two variables. State: `ways(i)` = number of distinct ways to reach step `i`. Recurrence:
+  `ways(i) = ways(i-1) + ways(i-2)`. Base cases: `ways(1) = 1`, `ways(2) = 2`.
+</Callout>
+
+## solution
+
+```csharp
+public int ClimbStairs(int n)
+{
+    if (n <= 2) return n;              // ways(1) = 1, ways(2) = 2 — the base cases
+
+    int prev2 = 1, prev1 = 2;          // ways(1), ways(2)
+    for (int i = 3; i <= n; i++)
+    {
+        int current = prev1 + prev2;   // last move was 1 step from i-1, or 2 steps from i-2
+        prev2 = prev1;
+        prev1 = current;
+    }
+    return prev1;
+}
+```
+
+## trace
+
+`n = 5`, starting from `prev2 = ways(1) = 1`, `prev1 = ways(2) = 2`:
+
+| i | prev1 (ways(i-1)) | prev2 (ways(i-2)) | current = prev1 + prev2 | new prev2 | new prev1 |
+| --- | --- | --- | --- | --- | --- |
+| 3 | 2 | 1 | 3 | 2 | 3 |
+| 4 | 3 | 2 | 5 | 3 | 5 |
+| 5 | 5 | 3 | 8 | 5 | 8 |
+
+Final answer: `prev1 = 8` — matching the 8 sequences listed in the task.
+
+## why it works
+
+`ways(i)` only ever depends on `ways(i-1)` and `ways(i-2)` — never anything older — so carrying
+exactly those two values forward is a complete, lossless compression of the full table. By
+induction: the invariant holds at `i = 1, 2` (the base cases themselves), and if `prev1`/`prev2`
+hold the true `ways(i-1)`/`ways(i-2)` before an iteration, the recurrence computes the true
+`ways(i)` after it, and the roll (`prev2 = prev1; prev1 = current`) keeps the same invariant true
+one step later.
+
+<Watch items={[['time', 'O(n)'], ['space', 'O(1)']]} />
+
+## common bugs
+
+- Off-by-one on the base cases: starting `prev1`/`prev2` at `0, 1` (plain Fibonacci) instead of
+  `1, 2` — this problem's counts are shifted from the textbook sequence.
+- Recursing with no cache — correct, but exponential; always name the overlapping state before
+  writing the recursion.
+- Forgetting the `n <= 2` guard and indexing before the loop has produced anything, or running the
+  loop for `n <= 2` and reading uninitialized values.
+- Confusing this with Coin Change's shape: here every state has exactly 2 fixed predecessors
+  (`i-1`, `i-2`); Coin Change loops over a variable-size set of "coins" at every state instead.
+
+## variants you can now solve
+
+- **Min Cost Climbing Stairs** (LC 746) — same two-predecessor recurrence, but minimizing cost
+  instead of counting ways: `dp[i] = cost[i] + min(dp[i-1], dp[i-2])`.
+- Fibonacci itself, or any "count the ways using steps from a small fixed set" question — the
+  recurrence just gains one term per step size.
+- [House Robber](/patterns/dynamic-programming/house-robber/) — the same two-predecessor shape,
+  `max` instead of `+`, because skipping a house is always allowed but skipping a stair isn't.

@@ -1,0 +1,141 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: two-pointers
+problem: three-sum
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import Cells from '@components/Cells.astro';
+
+## task
+
+Given an integer array `nums`, return every triplet `[nums[i], nums[j], nums[k]]` with distinct
+indices that sums to zero. The output must not contain duplicate triplets (as multisets of
+values — the input can and will contain repeated numbers).
+
+```text
+nums = [-1,0,1,2,-1,-4]  →  [[-1,-1,2],[-1,0,1]]
+```
+
+## how to think
+
+This is Two Sum II with one more degree of freedom. Sort first, then fix one element with an
+outer loop — call it the anchor — and the remaining question becomes "find two numbers in the
+suffix that sum to `-anchor`," which is exactly the
+[Two Sum II](/patterns/two-pointers/two-sum-ii/) template run on `nums[i+1..]`.
+
+The only new work is dedup, and it has to happen at two levels because the input isn't
+guaranteed distinct: skip an anchor that repeats the previous one (it would just rediscover
+every triplet the previous anchor already found), and after recording a hit, skip past any runs
+of repeated values on both `left` and `right` before continuing — otherwise the same triplet gets
+emitted multiple times.
+
+<Callout kind="note" label="template instance">
+  **Opposite ends** skeleton, run once per distinct anchor value. What varies: an outer loop
+  fixes `nums[i]` and searches `nums[i+1..]` for a pair summing to `-nums[i]`; three separate
+  duplicate-skip checks (anchor, `left`, `right`) keep the output triplet-unique despite repeats
+  in the input.
+</Callout>
+
+## solution
+
+```csharp
+public IList<int[]> ThreeSum(int[] nums)
+{
+    Array.Sort(nums);
+    var result = new List<int[]>();
+
+    for (int i = 0; i < nums.Length - 2; i++)
+    {
+        if (i > 0 && nums[i] == nums[i - 1]) continue;   // same anchor as last time — already covered
+        if (nums[i] > 0) break;                           // sorted + positive: no triplet can reach 0
+
+        int left = i + 1, right = nums.Length - 1;        // re-anchored fresh each outer iteration
+        while (left < right)
+        {
+            int sum = nums[i] + nums[left] + nums[right];
+            if (sum == 0)
+            {
+                result.Add([nums[i], nums[left], nums[right]]);
+                left++; right--;
+                while (left < right && nums[left] == nums[left - 1]) left++;    // skip dup left values
+                while (left < right && nums[right] == nums[right + 1]) right--; // skip dup right values
+            }
+            else if (sum < 0) left++;
+            else right--;
+        }
+    }
+    return result;
+}
+```
+
+## trace
+
+`nums = [-1,0,1,2,-1,-4]` sorts to `[-4,-1,-1,0,1,2]`:
+
+| i (anchor) | L | R | sum | action |
+| --- | --- | --- | --- | --- |
+| 0 (-4) | 1 | 5 | -4 + -1 + 2 = -3 | too small → `left++` |
+| 0 (-4) | 2 | 5 | -4 + -1 + 2 = -3 | too small → `left++` |
+| 0 (-4) | 3 | 5 | -4 + 0 + 2 = -2 | too small → `left++` |
+| 0 (-4) | 4 | 5 | -4 + 1 + 2 = -1 | too small → `left++`, `L` meets `R` — inner loop ends |
+| 1 (-1) | 2 | 5 | -1 + -1 + 2 = 0 | **hit** → record `[-1,-1,2]`, `L→3, R→4` |
+| 1 (-1) | 3 | 4 | -1 + 0 + 1 = 0 | **hit** → record `[-1,0,1]`, `L→4, R→3` — inner loop ends |
+| 2 (-1) | — | — | — | `nums[2] == nums[1]` — duplicate anchor, skip entire `i` |
+| 3 (0) | 4 | 5 | 0 + 1 + 2 = 3 | too big → `right--`, `L` meets `R` — loop ends (`i` stops at `nums.Length - 2`) |
+
+The first hit — anchor `-1` at index 1, pointers converge on the suffix:
+
+<Cells
+  data={[-4, -1, -1, 0, 1, 2]}
+  pointers={{ 1: [{ t: 'i', c: 'purple' }], 2: [{ t: 'L', c: 'amber' }], 5: [{ t: 'R', c: 'cyan' }] }}
+  cells={{ 1: 'ok', 2: 'ok', 5: 'ok' }}
+  caption="anchor -1, L=2, R=5 → -1 + -1 + 2 = 0, first triplet"
+/>
+
+Index 2 — the anchor-level dedup check fires before the inner loop even starts:
+
+<Cells
+  data={[-4, -1, -1, 0, 1, 2]}
+  pointers={{ 2: [{ t: 'i', c: 'purple' }] }}
+  cells={{ 1: 'dim', 2: 'warn' }}
+  caption="nums[2] repeats nums[1] — every triplet starting here was already found at i=1"
+/>
+
+## why it works
+
+For a fixed, non-duplicate anchor, the inner loop is exactly Two Sum II's proof applied to
+`nums[i+1..]` with target `-nums[i]`: every comparison discards a whole family of pairs, so all
+pairs summing to `-nums[i]` are found in a single sweep. Skipping repeated anchors is safe
+because a duplicate anchor faces the identical suffix and target as the anchor before it — it
+cannot find any triplet the previous anchor didn't already report. Skipping repeated `left`/`right`
+values after a hit is the same argument one level down: re-using the exact same value at the same
+position would just re-emit the triplet already recorded. The `nums[i] > 0` break is valid
+because the array is sorted — once the anchor is positive, `nums[left]` and `nums[right]` are too,
+so the sum can only grow.
+
+<Watch items={[['time', 'O(n^2)'], ['space', 'O(1) extra'], ['sort', 'O(n log n), paid once']]} />
+
+## common bugs
+
+- Forgetting the anchor-level dedup (`i > 0 && nums[i] == nums[i-1]`) — produces the same
+  triplet once per repeated anchor value.
+- Getting the post-hit dedup direction backwards: it's `nums[right] == nums[right + 1]`
+  (compare to the value just walked past), not `nums[right] == nums[right - 1]` (compares
+  against a value you haven't looked at yet, at the position you're about to move to).
+- Reusing `left`/`right` across outer-loop iterations instead of resetting them to `i + 1` and
+  `nums.Length - 1` for every new anchor — this is *not* a single sweep across the whole array.
+- Dropping the `nums[i] > 0` break — still correct without it, but it turns a fast exit into
+  scanning the rest of a sorted-positive tail for nothing.
+- Comparing `nums[i] + nums[left] + nums[right]` for overflow blindness — fine for `int` given
+  LeetCode's constraints, but the instinct to check is worth having out loud.
+
+## variants you can now solve
+
+- **[Two Sum II](/patterns/two-pointers/two-sum-ii/)** (LC 167) — the inner loop, standalone,
+  once you drop the outer anchor.
+- **3Sum Closest** (LC 16) — same skeleton, but instead of stopping on an exact hit you track
+  whichever sum has landed nearest the target so far.
+- **4Sum** (LC 18) — one more layer: two nested anchors around the same two-pointer core, with
+  dedup at every level.

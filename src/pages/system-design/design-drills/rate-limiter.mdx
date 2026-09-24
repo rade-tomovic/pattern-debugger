@@ -1,0 +1,147 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: design-drills
+problem: rate-limiter
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+
+## the brief
+
+"Design a rate limiter: given a request, decide whether to allow or reject it against a limit
+(say, 100 requests/minute per user), without one heavy user starving everyone else."
+
+## clarify first
+
+- **Is this enforced on one instance, or many behind a load balancer?** The actual fork in the
+  whole design — an in-process counter is only correct if there's exactly one instance, and
+  there almost never is.
+- **What's the limit keyed on** — user, API key, IP, endpoint, some combination? Each needs its
+  own counter, and the cardinality of that key set is what drives the state you have to hold.
+- **Must the rate be smooth, or is a burst allowed?** Token bucket and leaky bucket answer this
+  differently, and "is a burst OK" is the interviewer's tell for which one they want.
+- **What happens to a rejected request** — a hard `429`, or is it queued for later? Rejecting
+  and queuing are different failure modes for the caller, and only one of them needs a place to
+  put the deferred work.
+- **Does the limit need to be exact, or is a small overshoot acceptable for much less
+  coordination?** Most production limiters choose approximate on purpose — see the numbers
+  below for why.
+
+## the numbers
+
+Assumptions, stated as assumptions:
+
+- The service runs behind 20 stateless instances; the limit is 100 requests/minute per user.
+- 10 million distinct users are active in a rolling window at any time.
+- Sliding-window-*counter* state per user: one count plus one window-start timestamp (~16
+  bytes). Sliding-window-*log* state per user, worst case: one timestamp per request, up to the
+  limit (`100 × 8 bytes = 800` bytes).
+
+**Counter-scheme memory:** `10,000,000 × 16 bytes ≈ 160 MB` — trivially a single Redis
+instance's job, replicated for durability.
+
+**Exact-log memory:** `10,000,000 × 800 bytes ≈ 8 GB` for the same user count — fifty times
+larger, purely because it stores a timestamp per request instead of a count. That fifty-times
+multiplier is the actual argument for choosing an approximate scheme over an exact one once the
+user count is large: the difference isn't precision, it's memory.
+
+**Load on the shared counter:** if the service handles, say, 50,000 requests/sec on average
+across those 20 instances and every request is checked against the limiter, that's 50,000
+operations/sec against whatever holds the shared counters — load the store never carried before
+the limiter existed. That's the real cost of correctness across instances: not the 160 MB, but
+that a formerly free, local operation now sits on the network, on every request's hot path.
+
+## the sketch
+
+```text
+        instance A ─┐
+        instance B ─┼──▶  shared counter store (Redis)  ──▶ allow / reject
+        instance C ─┘        INCR key, compare to limit
+                              (atomic per key)
+```
+
+Request arrives at whichever instance the load balancer picked → the instance computes a key
+from the identity being limited plus the current window → atomically increments that key's
+counter in the shared store → compares the result to the limit → allow, or `429`. No
+coordination between instances beyond that one shared store.
+
+**Where the counter lives is the real fork.**
+
+An in-process counter — a `ConcurrentDictionary<string, int>` behind `Interlocked.Increment` —
+is free: no network round trip. But every instance has its own count, so with 20 instances the
+*effective* limit isn't 100/minute, it's up to 2,000/minute, because a client's requests get
+spread across instances and each one independently believes it's under budget. That's not a bug
+in `Interlocked.Increment` — it answers "am I, this one process, over budget," and that stopped
+being the right question the moment there was more than one instance.
+
+A centralized counter (Redis `INCR`, or an atomic increment against a shared store) gives every
+instance the same view, so the limit holds regardless of routing — at the cost of a network
+round trip per request and a new dependency every request now goes through. This is the same
+shape [locks-internals](/systems/locks-internals/) describes for a mutex versus a distributed
+lock: a shared, network-visible primitive buys correctness across processes by giving up the
+near-zero cost of a purely local one, and it inherits failure modes a local primitive never
+had — the store being unreachable, or slow. Redis `INCR` is a single atomic command, so the
+naive race — two instances both read `count = 99`, both decide to allow — doesn't happen the way
+it would with a separate read-then-write; that shape is the same check-then-act race from
+[concurrency hazards](/systems/concurrency-hazards/), just moved across the network instead of
+across threads.
+
+<Watch items={[['algorithm', 'token bucket'], ['counter store', 'centralized (Redis INCR)'], ['on store outage', 'fail open']]} />
+
+## the tradeoffs
+
+<Callout kind="trap" label="token bucket ≠ leaky bucket">
+  They get swapped constantly. **Token bucket** accumulates capacity while idle and lets a
+  request spend a burst of it at once — burst-friendly by design. **Leaky bucket** drains at a
+  constant rate regardless of how bursty the input is — it shapes traffic to a steady output,
+  which is a different goal (smoothing egress to a downstream call) than gating inbound requests.
+</Callout>
+
+| algorithm | burst behavior | memory/key | precision |
+| --- | --- | --- | --- |
+| fixed window | up to 2x the limit right across a window boundary | one counter | approximate, with a known edge case |
+| sliding window log | none beyond the limit itself | one timestamp per request | exact |
+| sliding window counter | smooths the boundary case | one counter + one timestamp | approximate, no known burst hole |
+| token bucket | burst up to bucket size, then throttles to the refill rate | one count + one timestamp | approximate by design |
+| leaky bucket | none — constant output rate | a queue, or an equivalent count | approximate; shapes rather than gates |
+
+For most APIs, token bucket (or sliding-window-counter) backed by a centralized store is the
+right default: it tolerates a brief burst instead of a hard reject-and-retry, and neither needs
+per-request storage growth. Name the fixed-window boundary-burst by name so it doesn't get
+chosen by accident — it's the folklore trap here. Reach for leaky bucket specifically when the
+goal is shaping outbound traffic to a rate-limited third party, not gating inbound requests.
+
+## how it fails
+
+- **The shared store becomes a new single point of latency.** If it's slow, either every request
+  is now slow too (fail-closed: block on the check), or the limiter silently stops limiting
+  (fail-open: allow through past a timeout). Both are legitimate defaults — fail-open is usually
+  right for a rate limiter specifically, because a broken limiter shouldn't take down the
+  product it's protecting; fail-closed is right for something like an auth check, where the
+  cost of being wrong runs the other way.
+- **Clock skew across instances** breaks any scheme (fixed window, token bucket) that computes
+  "current window" from each instance's local clock instead of trusting the store's clock
+  (Redis `TIME`, or a timestamp the store supplies) — instances can disagree about which window
+  a request falls in.
+- **A hot key** — one very heavy user, or a shared API key used by many customers — puts a
+  disproportionate share of the increment traffic on a single counter. It can't be sharded
+  without changing what it means (splitting one key's count across shards just makes the limit
+  approximate in a new way), so this is usually accepted rather than partitioned away.
+- **Retries against the limiter double-count.** A client that times out and retries the request
+  can burn its own budget on calls that never reached the underlying API at all — a
+  self-inflicted failure worth naming, not a limiter bug.
+
+## what they ask next
+
+- **"How do you rate-limit fairly behind a shared corporate NAT?"** Per-IP limiting punishes
+  everyone behind that IP together. Key on the most specific identity actually available — an
+  API key, a session token — and treat IP-based limiting as a coarse, last-resort layer.
+- **"What protects the limiter's own store from becoming the bottleneck?"** Wrap the store call
+  in a circuit breaker (Polly, in .NET) so a slow or unreachable store degrades to a fixed
+  fail-open/fail-closed decision instead of piling up threads waiting on it.
+- **"How is this different from a circuit breaker?"** A rate limiter caps a client's own request
+  rate regardless of the target's health; a circuit breaker reacts to the target's observed
+  health regardless of the caller's configured rate. They compose — see
+  [timeouts, retries & circuit breakers](/system-design/reliability/) — and production systems
+  run both.

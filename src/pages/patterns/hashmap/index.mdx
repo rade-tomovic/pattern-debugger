@@ -1,0 +1,118 @@
+---
+layout: '@layouts/TopicLayout.astro'
+topic: hashmap
+---
+
+import Callout from '@components/Callout.astro';
+import ProblemList from '@components/ProblemList.astro';
+import Cells from '@components/Cells.astro';
+
+## core idea
+
+A hashmap turns "have I seen this before?" and "where did I see it?" into O(1) operations. You
+trade O(n) space for the lookup, and in exchange you get to process **unsorted** data in one
+pass — no sort step, no lost original indices. The whole skill is picking the right key. Four
+shapes cover almost every hashmap problem you'll meet:
+
+| shape | key → value | answers |
+| --- | --- | --- |
+| value → index | `Dictionary<int, int>` | "where did I see the number I need?" |
+| value → count | `Dictionary<T, int>` | "how many times has this appeared?" |
+| prefixSum → count | `Dictionary<int, int>` | "how many earlier running totals make a valid range?" |
+| membership | `HashSet<T>` | "have I seen this at all?" (no value needed, just yes/no) |
+
+<Cells
+  data={[2, 7, 11, 15]}
+  pointers={{ 0: [{ t: 'i', c: 'amber' }] }}
+  cells={{ 1: 'ok' }}
+  caption="value -> index: the dictionary key answers 'who is waiting for this number?'"
+/>
+
+## when to reach for it
+
+- The brute force is a nested loop checking every pair or every prior element — and the input
+  is **not** sorted, or sorting would destroy something you need (original indices, order).
+- The question is phrased as "have I seen X before" or "how many times does X occur" —
+  `HashSet<T>` membership answers the first in one line; that one line, on its own, is the
+  entire trick behind Contains Duplicate (LC 217).
+- You need a **running total** (sum, count, balance) and the question is "how many
+  sub-ranges hit a target" — that's prefixSum → count.
+- Grouping or bucketing items by some derived property ("same letters", "same remainder") —
+  the derived property becomes the key.
+
+<Callout kind="insight" label="key = what I need">
+  Before reaching for a dictionary, ask: *"what do I wish I already knew about the elements
+  I've passed?"* Whatever that is becomes the key. Two Sum: "is my complement already here?"
+  → key is the value. Subarray Sum: "has this running total shown up before?" → key is the
+  prefix sum.
+</Callout>
+
+## universal templates
+
+value → index — the lookup that turns O(n²) pair-checking into O(n):
+
+```csharp
+public int[] ValueToIndex(int[] nums, int target)
+{
+    var seen = new Dictionary<int, int>();      // value -> index already seen
+
+    for (int i = 0; i < nums.Length; i++)
+    {
+        int need = target - nums[i];            // "key = what I need"
+        if (seen.TryGetValue(need, out int j)) return [j, i];
+
+        seen[nums[i]] = i;                       // record AFTER checking — can't pair with itself
+    }
+    return [];
+}
+```
+
+value → count — the frequency table underneath anagrams, majority elements, and top-K:
+
+```csharp
+public Dictionary<int, int> Frequencies(int[] nums)
+{
+    var counts = new Dictionary<int, int>();
+    foreach (int n in nums)
+        counts[n] = counts.GetValueOrDefault(n) + 1;   // 0 the first time, then increments
+    return counts;
+}
+```
+
+prefixSum → count — every "how many subarrays sum to k" question is this loop:
+
+```csharp
+public int PrefixSumToCount(int[] nums, int k)
+{
+    var prefixCount = new Dictionary<int, int> { [0] = 1 };  // empty prefix seen once
+    int sum = 0, count = 0;
+
+    foreach (int n in nums)
+    {
+        sum += n;
+        count += prefixCount.GetValueOrDefault(sum - k);      // earlier prefixes that complete a sum-k run
+        prefixCount[sum] = prefixCount.GetValueOrDefault(sum) + 1;
+    }
+    return count;
+}
+```
+
+membership — the whole idea in three lines:
+
+```csharp
+public bool HasDuplicate(int[] nums)
+{
+    var seen = new HashSet<int>();
+    foreach (int n in nums)
+    {
+        if (!seen.Add(n)) return true;   // Add returns false when the value was already present
+    }
+    return false;
+}
+```
+
+Every problem below is one of these four skeletons with a different key.
+
+## problems
+
+<ProblemList topic="hashmap" />

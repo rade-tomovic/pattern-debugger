@@ -1,0 +1,120 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: hashmap
+problem: valid-anagram
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+
+## task
+
+Given two strings `s` and `t`, return `true` if `t` is an anagram of `s` — same letters, same
+multiplicities, any order.
+
+```text
+s = "anagram", t = "nagaram"  →  true
+s = "rat",      t = "car"     →  false
+```
+
+## how to think
+
+Two strings are anagrams exactly when they have the same *letter frequency*. So build a
+frequency table for `s`, then walk `t` and subtract: every letter `t` contributes should cancel
+one that `s` contributed. If `t` ever tries to subtract a letter `s` didn't have (count goes
+negative) or has too many of one, they aren't anagrams. If the lengths matched going in and
+nothing ever went negative, every count lands on exactly zero and they are.
+
+The value → count skeleton fits directly — the only design decision is *what* the dictionary is.
+
+<Callout kind="note" label="template instance">
+  **value → count** skeleton. Invariant: `counts[c]` always equals (occurrences of `c` in `s`
+  so far) minus (occurrences of `c` in `t` so far). Key: the character. Terminates `false` the
+  moment any count would go negative.
+</Callout>
+
+For English lowercase letters specifically, there's a sharper move than a general dictionary:
+the key space is exactly 26 values, contiguous from `'a'`. That's a fixed-size array, not a
+hash table.
+
+<Callout kind="tip" label="int[26] beats Dictionary">
+  A `Dictionary<char, int>` hashes every character and pays for bucket lookups. An `int[26]`
+  indexed by `c - 'a'` is a direct array access — no hashing, no allocation churn, better cache
+  behavior. Whenever the key space is a small known range (lowercase letters, digits, byte
+  values), prefer the array. Reach for `Dictionary` when the alphabet is open-ended (Unicode,
+  arbitrary strings, arbitrary objects).
+</Callout>
+
+## solution
+
+```csharp
+public bool IsAnagram(string s, string t)
+{
+    if (s.Length != t.Length) return false;      // different lengths can never be anagrams
+
+    var counts = new int[26];                    // int[26]: the specialized dictionary
+    foreach (char c in s) counts[c - 'a']++;
+
+    foreach (char c in t)
+    {
+        if (--counts[c - 'a'] < 0) return false;  // t used a letter s didn't have enough of
+    }
+    return true;
+}
+```
+
+## trace
+
+`s = "anagram"`, `t = "nagaram"`. After counting `s`: `a:3, g:1, m:1, n:1, r:1` (all other
+letters `0`). Then walk `t`, decrementing:
+
+| i | letter | count after decrement | full nonzero counts |
+| --- | --- | --- | --- |
+| 0 | `n` | `n: 0` | `a:3, g:1, m:1, r:1` |
+| 1 | `a` | `a: 2` | `a:2, g:1, m:1, r:1` |
+| 2 | `g` | `g: 0` | `a:2, m:1, r:1` |
+| 3 | `a` | `a: 1` | `a:1, m:1, r:1` |
+| 4 | `r` | `r: 0` | `a:1, m:1` |
+| 5 | `a` | `a: 0` | `m:1` |
+| 6 | `m` | `m: 0` | *(empty)* |
+
+Every letter `t` contributed cancelled one from `s`; nothing went negative; return `true`.
+
+For `s = "rat"`, `t = "car"`: counts after `s` are `a:1, r:1, t:1`. Walking `t`: `c` decrements
+`counts['c' - 'a']`, which was never incremented by `s` — it's already `0`, so it drops to `-1`
+and the function returns `false` immediately, without finishing `t`.
+
+## why it works
+
+`counts[k]` is a running difference: `+1` for every occurrence in `s`, `-1` for every occurrence
+in `t`, in the order they're processed. If `s` and `t` are anagrams, every letter's occurrences
+match exactly, so every counter returns to `0` by the end — and since `s` and `t` have equal
+total length, the `+1`s and `-1`s are equal in number, so nothing can go negative along the way
+either. If they aren't anagrams, either some letter's `-1`s outnumber its `+1`s at some point
+(caught immediately, short-circuiting the scan) or the length check at the top catches a gross
+mismatch before you even start.
+
+<Watch items={[['time', 'O(n)'], ['space', 'O(1)'], ['note', '26 slots, independent of n']]} />
+
+## common bugs
+
+- Skipping the length check and relying on counts alone — without it, a longer `s` (`"aab"` vs
+  `"ab"`) never drives any count negative: `t`'s letters are a subset of `s`'s, every decrement
+  lands at `0` or above, and the function wrongly returns `true`. The catch only fires in the
+  other direction (`s = "ab"`, `t = "aab"`). The length check isn't an optimization — it's what
+  makes subtract-and-check sufficient at all.
+- Sorting both strings and comparing (`O(n log n)`) when you reach for this problem in an
+  interview — it works, but say out loud that the counting approach is the `O(n)` upgrade.
+- Using `int[26]` on a problem that says Unicode or mixed case — the fixed array only works for
+  a known, small, contiguous key space; fall back to `Dictionary<char, int>` otherwise.
+- Off-by-one on the index math: it's `c - 'a'`, not `c - 'A'`, and case-sensitivity should be
+  resolved (or explicitly ruled out) before you pick the key.
+
+## variants you can now solve
+
+- **[Group Anagrams](/patterns/hashmap/group-anagrams/)** (LC 49) — same "same letters" idea,
+  but grouping a whole array instead of checking one yes/no pair.
+- **Find All Anagrams in a String** (LC 438) — this frequency-table idea, but sliding a
+  fixed-size window across a longer string instead of comparing two fixed strings.
+- **Ransom Note** (LC 383) — the same subtract-and-check idea with only a one-directional
+  constraint (the magazine just needs *at least* as many of each letter).

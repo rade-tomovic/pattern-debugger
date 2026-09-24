@@ -1,0 +1,138 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: stack-queue
+problem: daily-temperatures
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import Cells from '@components/Cells.astro';
+
+## task
+
+Given daily temperatures, return for each day how many days you'd have to wait for a warmer
+temperature. If there's no future day that's warmer, the answer for that day is `0`.
+
+```text
+temperatures = [73, 74, 75, 71, 69, 76]  →  [1, 1, 3, 2, 1, 0]
+```
+
+## how to think
+
+Brute force is "for each day, scan forward until something warmer" — `O(n^2)`, and most of that
+scanning is repeated work: day 0's scan and day 1's scan both walk past day 2, day 3, and so on.
+
+The fix is to stop scanning forward and instead let the *future* tell the *past* when it arrives.
+Walk left to right keeping a stack of days that are still waiting for a warmer day — by
+construction, their temperatures are non-increasing from bottom to top: any day strictly warmer
+than the top has already resolved it and been popped off, and a tie isn't "warmer," so equal
+temperatures just stack up and keep waiting together. When day `i` arrives, it resolves every
+waiting day whose temperature it beats, in one shot, then joins the stack itself to wait for its
+own answer.
+
+Every day is pushed once and popped at most once, so the total work across the whole array is
+`O(n)` even though some individual days trigger a burst of pops.
+
+<Callout kind="note" label="template instance">
+  **Monotonic stack** skeleton, verbatim. Invariant: the stack holds indices whose temperature is
+  still unresolved, and those temperatures are non-increasing from the bottom of the stack to the
+  top. Move rule: while today's temperature beats the stack's top, pop it and record the gap; then
+  push today.
+</Callout>
+
+## solution
+
+```csharp
+public int[] DailyTemperatures(int[] temperatures)
+{
+    int[] answer = new int[temperatures.Length];
+    var pending = new Stack<int>();                      // indices, waiting for a warmer day
+
+    for (int i = 0; i < temperatures.Length; i++)
+    {
+        while (pending.Count > 0 && temperatures[pending.Peek()] < temperatures[i])
+        {
+            int j = pending.Pop();                        // day j found its warmer day: i
+            answer[j] = i - j;
+        }
+        pending.Push(i);                                  // day i waits for someone warmer
+    }
+    return answer;                                        // anything still pending stays 0
+}
+```
+
+## trace
+
+`temperatures = [73, 74, 75, 71, 69, 76]`:
+
+| i | temp | pops (day → gap) | `pending` after (top-to-bottom, indices) |
+| --- | --- | --- | --- |
+| 0 | 73 | — | `0` |
+| 1 | 74 | day 0: `74 > 73` → `answer[0] = 1 - 0 = 1` | `1` |
+| 2 | 75 | day 1: `75 > 74` → `answer[1] = 2 - 1 = 1` | `2` |
+| 3 | 71 | — (`71 < 75`, stack top not beaten) | `3, 2` |
+| 4 | 69 | — (`69 < 71`, stack top not beaten) | `4, 3, 2` |
+| 5 | 76 | day 4: `answer[4] = 1`; day 3: `answer[3] = 2`; day 2: `answer[2] = 3` | `5` |
+
+`answer = [1, 1, 3, 2, 1, 0]` — day 5 (`76`) never gets beaten, so it's left pending and its slot
+stays `0`.
+
+Day 5 is the "aha": one comparison against the stack top isn't enough — `76` beats everyone still
+waiting, so it pops three days in a row before pushing itself:
+
+```text
+before i=5:  pending (top->bottom) = 4, 3, 2      temps: 69, 71, 75
+i=5, temp=76:
+  pop 4 (69 < 76) -> answer[4] = 5 - 4 = 1
+  pop 3 (71 < 76) -> answer[3] = 5 - 3 = 2
+  pop 2 (75 < 76) -> answer[2] = 5 - 2 = 3
+  stack empty -> push 5
+```
+
+Same moment as cells — `76` is warmer than every day still waiting, so all three resolve before
+`i` joins the (now empty) stack:
+
+<Cells
+  data={[73, 74, 75, 71, 69, 76]}
+  pointers={{ 5: [{ t: 'i', c: 'amber' }] }}
+  cells={{ 2: 'warn', 3: 'warn', 4: 'warn' }}
+  caption="i=5: 76 beats every waiting day — 75, 71, 69 all resolve in one burst"
+/>
+
+## why it works
+
+The stack's decreasing-temperature invariant means the entry on top is always the *closest*
+unresolved day — if a colder, closer day existed above it, that day would already be on top
+instead. So when day `i` beats the top, `i` is provably the first warmer day for it (nothing
+closer could have resolved it first, since every earlier day was checked in order). Popping and
+re-checking against the new top handles the case where `i` beats not just the nearest waiting day
+but several in a row, which is exactly why the inner loop is a `while`, not an `if`. Each index is
+pushed exactly once and popped at most once, so the amortized cost per element is `O(1)` even
+though a single iteration of the outer loop can trigger many pops.
+
+<Watch items={[['time', 'O(n)'], ['space', 'O(n)']]} />
+
+## common bugs
+
+- Using `if` instead of `while` when checking the stack top — misses the "resolves multiple days
+  at once" case (day 5 above would only resolve day 4 and leave 2 and 3 wrong).
+- Pushing the temperature instead of the **index** — you need `i - j` for the answer, and once
+  you've popped, the raw temperature no longer tells you which day it was.
+- Using `<=` instead of `<` in the comparison — a tie (`temperatures[j] == temperatures[i]`)
+  should NOT count as "warmer," so `j` should keep waiting, not resolve.
+- Forgetting that indices left in the stack at the end simply keep their default `answer[j] = 0`
+  — no explicit cleanup pass is needed, but it's easy to add one out of habit and get it wrong.
+
+## variants you can now solve
+
+- **Next Greater Element I / II** (LC 496 / 503) — the same monotonic stack, but the array is
+  circular (II) or you're mapping the "next greater" back through a second array (I) instead of
+  returning a day-gap.
+- **Asteroid Collision** (LC 735) — a monotonic stack where "resolves" means "one asteroid
+  destroys another," and the comparison and push/pop rules encode collision physics instead of
+  temperature.
+- **Largest Rectangle in Histogram** (LC 84, hard) — a monotonic *increasing* stack of bar
+  heights; popping computes a rectangle's area instead of a wait time.
+- [Min Remove to Make Valid Parentheses](/patterns/stack-queue/min-remove-parentheses/) — a
+  different stack shape (LIFO matching, not monotonic), but the same "let the stack tell you who's
+  still unresolved" instinct.

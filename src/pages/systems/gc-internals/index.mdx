@@ -1,0 +1,689 @@
+---
+layout: '@layouts/TopicLayout.astro'
+topic: gc-internals
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import ProblemList from '@components/ProblemList.astro';
+import Solution from '@components/Solution.astro';
+
+## the ground floor
+
+- **heap** — the region of a process's address space where objects live, shared by every thread.
+  [The stack and the heap](/systems/stack-and-heap/) is where it comes from; this page is about
+  who cleans it.
+- **reference** — a machine address the runtime is allowed to change. That last clause is the
+  whole page: the collector moves objects and rewrites the references that point at them.
+- **root** — a reference the collector starts from without being told: a live local or parameter
+  on any thread's stack, a CPU register, a static field, a GC handle. Everything reachable from a
+  root is live; everything else is garbage, by definition.
+- **stop-the-world (STW)** — a window in which the runtime suspends every managed thread so the
+  heap cannot change while it is being examined. Your request handlers are not running during it.
+- **committed / resident** — how much address space the process has asked the OS to back, versus
+  how much is actually in RAM right now. [Virtual memory](/systems/virtual-memory/) owns those
+  words; "GC heap size" is a third number again, and confusing the three is a classic incident.
+- **JIT** — the compiler that turns your IL into machine code at runtime. It emits the allocation
+  call and the write barrier described below; [source to machine code](/systems/il-jit-codegen/)
+  is its page.
+
+## core idea
+
+Allocating is cheap: the runtime keeps a pointer into a chunk of free heap, and `new` moves it
+forward. What you are actually buying is a promise that somebody will later work out which
+objects are still reachable — and that work is proportional to what **survives**, not to what
+you allocated. A generational heap exists because most objects die young, so the collector can
+usually look at a small recent slice and ignore the rest.
+
+Everything about the GC follows from that one asymmetry:
+
+| what you do | what it costs |
+| --- | --- |
+| allocate an object | a pointer bump, plus a zeroed header |
+| let it die immediately | very close to nothing — it is never even visited |
+| keep it alive across a collection | it gets marked, and every reference to it may get rewritten |
+| keep a lot alive | marking work proportional to the live set — a stop-the-world pause when the collection blocks, throughput cost when it runs in the background |
+| allocate 85,000 bytes or more | it lands on a heap that is only collected by full collections |
+
+## how it actually works
+
+### allocation is a pointer bump
+
+Each thread gets an *allocation context* — a small chunk of gen0 it owns exclusively. `new` adds
+the object's size to a pointer, writes the type header, and returns. No free list, no search, no
+lock. When the chunk runs out, the thread asks for another; when gen0's budget is exhausted, that
+request triggers a collection instead. **A collection is triggered by an allocation** — never by
+a `Dispose`, a scope exit, or a variable going out of use. (Any thread can still be *suspended*
+for a collection that some other thread triggered; what it cannot do is start one by tidying up.)
+
+The exact bytes each `new` is charged, read from `GC.GetAllocatedBytesForCurrentThread` — this
+and every fact below comes from `bench/gc-internals/index.cs`, run as
+`dotnet run bench/gc-internals/index.cs`:
+
+```text
+=== bytes charged per allocation ===
+  new Node()     charged      32 B   gen=0
+  new byte[64]   charged      88 B   gen=0
+```
+
+`Node` declares one `int` (4 B) and one reference (8 B) — 12 B of your own data. The rest is
+overhead: a 16-byte object header (an 8-byte method-table pointer that says what type this is,
+plus an 8-byte word used for locking and the hash code), and the runtime rounds every object's
+total size up to a multiple of 8 bytes, which adds 4 more here. `byte[64]` shows the array
+variant of the same header: arrays carry an extra 8-byte length field, so 64 data bytes plus a
+24-byte header lands exactly on 88. [The stack and the heap](/systems/stack-and-heap/) measures
+this overhead across more shapes.
+
+How much you may allocate before a collection is a budget the runtime picks and adapts. Measured
+directly on this machine, by recording the allocated-bytes counter every time
+`GC.CollectionCount(0)` changes:
+
+```text
+=== bytes allocated between consecutive gen0 collections ===
+  median gap 16,728,160 B over 11 collections
+  all gaps: 15 MB 15 MB 15 MB 15 MB 15 MB 15 MB 15 MB 15 MB 15 MB 15 MB 15 MB
+```
+
+≈16 MB, and remarkably stable run to run. That number explains a lot of profiler output: a
+service allocating 2 KB per request gets a gen0 collection roughly every 8,000 requests, whatever
+else it is doing — and the exact figure moves with core count and heap heuristics, so treat it as
+"tens of megabytes," not a constant to hardcode.
+
+### garbage means unreachable, not unreferenced
+
+The collector never counts references. It walks: start from the roots, follow every reference,
+mark everything it can touch. Whatever is left unmarked is garbage — including objects that
+still point at each other, as long as nothing outside the group points in.
+
+```csharp
+var x = new Node();
+var y = new Node();
+x.Next = y;                 // x → y
+y.Next = x;                 // y → x — refcounting would never free these
+```
+
+Both objects are dropped, then a full collection is forced, then two `WeakReference`s are asked
+whether their targets survived:
+
+```text
+=== a reference cycle is still garbage ===
+  before GC: a alive=True  b alive=True
+  after  GC: a alive=False  b alive=False   (each still points at the other)
+```
+
+This is the single biggest difference from C++'s `shared_ptr` and from CPython's refcounting, and
+it is why .NET has no `weak_ptr`-shaped ceremony for breaking cycles. It is also why a "memory
+leak" in .NET is never a missing free — it is always **something still reachable from a root**,
+which is exactly what [the leak that was not a leak](/systems/gc-internals/the-leak-hunt/) hunts.
+
+### generations, and the hypothesis behind them
+
+The heap is divided by age, not by type:
+
+```text
+   ┌─ small object heap ─────────────────────────────────────────────┐
+   │                                                                 │
+   │  gen0            gen1              gen2                         │
+   │  ┌──────────┐    ┌──────────┐      ┌───────────────────────┐    │
+   │  │ new new  │    │ survived │      │ survived twice or more│    │
+   │  │ new →    │    │ once     │      │ (long-lived, caches,  │    │
+   │  │  ↑ alloc │    │          │      │  statics, singletons) │    │
+   │  └──────────┘    └──────────┘      └───────────────────────┘    │
+   │   tens of MB of budget, adapted at runtime                      │
+   └─────────────────────────────────────────────────────────────────┘
+
+   ┌─ large object heap (LOH) ───────────────────────────────────────┐
+   │  objects ≥ 85,000 bytes. Collected only with gen2.              │
+   │  Not compacted by default.                                      │
+   └─────────────────────────────────────────────────────────────────┘
+
+   a gen0 collection looks at gen0.        ← cheap, frequent
+   a gen1 collection looks at gen0 + gen1.
+   a gen2 collection looks at everything.  ← expensive, and includes the LOH
+```
+
+An object promotes one generation per collection it survives. Watched directly, on one object
+that is deliberately never dropped:
+
+```text
+=== one object that is never dropped, after each forced collection ===
+  freshly allocated                      gen=0
+  after gen0 collection #1               gen=1
+  after gen0 collection #2               gen=1
+  after gen0 collection #3               gen=1
+  after gen0 collection #4               gen=1
+  after a gen1 collection                gen=2
+  after a gen2 collection                gen=2
+```
+
+Note rows 2-5: further gen0 collections do not touch it, because a gen0 collection does not look
+at gen1. Promotion needs a collection *of the generation the object is in*.
+
+The hypothesis is that this is a good deal because most objects die in gen0. The collection
+counts prove it directly. Every row below allocates exactly 2,000,000 objects and performs
+exactly 2,000,000 array stores; the only difference is how many of those objects are still
+reachable at the end:
+
+| survivors | gen0 | gen1 | gen2 |
+| --- | --- | --- | --- |
+| 1 (≈0%) | 3 | 0 | 0 |
+| 20,000 (1%) | 3 | 2 | 0 |
+| 200,000 (10%) | 3 | 2 | 0 |
+| 1,000,000 (50%) | 4 | 3 | 1 |
+
+At 0% and 1% survival gen1 and gen2 are barely touched — nothing lived long enough to reach
+them. At 50% survival, every one of those gen0 collections has almost nothing to reclaim, so the
+survivors get promoted wholesale, gen1 fills, and a gen2 collection follows. **The generation a
+collection reaches is decided by how much survives it, not by how much you allocated** — all four
+rows allocate the same 2,000,000 objects. [Watching the generations](/systems/gc-internals/generations-in-action/)
+walks this exact experiment by hand, including where a fully-retained 2,000,000-object cache ends
+up on the generation ladder.
+
+### what a collection physically does
+
+Four phases, of which the first three are stop-the-world in a workstation gen0/gen1 collection:
+
+```text
+   1. SUSPEND    every managed thread is stopped at a safe point — a place the JIT
+                 recorded where it knows exactly which registers and stack slots
+                 hold references. This is why threads stop *between* instructions
+                 you would recognise, not wherever they happen to be.
+
+   2. MARK       from every root (stack slots, registers, statics, GC handles),
+                 follow every reference and set a mark bit.
+                 cost ∝ number of LIVE objects. Garbage is never visited.
+
+   3. PLAN +     compute where each surviving object will move so the survivors end
+      RELOCATE   up contiguous, copy them, then rewrite EVERY reference that pointed
+                 at them — including the ones in your locals and registers.
+                 Not every collection does this: the collector may instead sweep,
+                 leaving the survivors where they are and reusing the holes.
+
+   4. RESUME     if it relocated, free space is one contiguous block again and the
+                 allocation pointer is set to its start.
+```
+
+Phase 3 is the one that is easiest to disbelieve, so here it is happening. The address of a
+managed object is not exposed by the public API, but it can be read straight out of the
+reference. One object, never dropped, watched across five forced collections
+(`dotnet run bench/gc-internals/index.cs -- move`, run on its own — the pattern of
+which collections relocate an object depends on the rest of the heap's state, so this phase is
+not meant to be run alongside the others):
+
+```text
+=== does this object move? (address read straight out of the reference) ===
+  freshly allocated             gen=0  addr=0x7142026cad78
+  after blocking gen0               gen=1  addr=0x7142026cad78  moved=False delta=0
+  after blocking gen1               gen=2  addr=0x7142056889c8  moved=True  delta=50060368
+  after blocking gen2               gen=2  addr=0x7142056889c8  moved=False delta=0
+  after blocking gen2, compacting   gen=2  addr=0x714205681630  moved=True  delta=-29592
+  after background gen2             gen=2  addr=0x714205681630  moved=False delta=0
+```
+
+It sat still through the gen0 collection that promoted it, moved 50 MB down the address space
+when the gen1 collection compacted, sat still through the plain gen2, then moved again — by
+29,592 bytes — only when a *compacting* gen2 was explicitly requested. That is the honest shape
+of it: **the runtime may relocate an object at a collection, and does not relocate at every
+collection.** Which collections move a given object depends on the state of the heap, and this is
+not a stable pattern to memorise. The invariant is only the negative one: you cannot assume an
+address, which is why holding a raw pointer to a managed object requires `fixed` or a pinning
+`GCHandle`.
+
+Two consequences fall straight out of this. Compaction is why allocation can stay a pointer bump
+— free space never fragments into a list of holes to search. And background GC's genuine trick is
+visible in that last row: the *mark* phase for that collection ran concurrently with the rest of
+the process, and only two short, real pauses remain — one to take a consistent starting snapshot,
+one to catch up on what changed while marking ran. Neither of those pauses scales with the live
+set the way a blocking mark does; that is the entire reason background GC exists.
+
+Background collection is not unconditional, though — a heap has to be worth the concurrent
+machinery. Requesting a non-blocking gen2 (`GC.Collect(2, blocking: false)`) and reading
+`GC.GetGCMemoryInfo().Concurrent` afterwards — a fact the runtime states about the collection it
+actually ran, not a timing — shows the floor directly:
+
+```text
+=== does a non-blocking GC.Collect(2) actually run in the background? ===
+  live objects | live heap MB | Concurrent | Compacted
+       100,000 |          3.9 | False      | False
+       400,000 |         15.3 | False      | False
+     1,600,000 |         61.1 | True       | False
+     6,400,000 |        244.2 | True       | False
+```
+
+At 4 MB and 15 MB of live heap, a `blocking: false` request is silently promoted to a *blocking*
+collection anyway — `Concurrent` reports `False`, meaning the collector decided the heap was too
+small for the background machinery to be worth starting. Only once the live set reached 61 MB did
+it actually run in the background. **"Background GC" is a heap the runtime judges big enough to
+bother, not a mode you can force on every collection** — a service with a small live set gets the
+blocking behaviour of workstation GC even with background collection turned on, because there was
+never enough marking work to hide behind the concurrency.
+
+### the write barrier and the card table
+
+A gen0 collection only looks at gen0. But an old object can point at a young one —
+`cache.Head = newNode`, where the cache reached gen2 an hour ago and the node was allocated a
+microsecond ago — and if the collector does not know, it will free an object that is still
+referenced. It cannot scan all of gen2 to find out; that would make gen0 collections cost what
+gen2 ones do.
+
+So every reference store into the heap goes through a **write barrier**: a short piece of runtime
+code that performs the store *and*, when that store could have created an old→young edge, records
+that a small region of the old heap has been dirtied. That record is the **card table** — one
+byte per region of heap (a "card"), set to "dirty" when a younger reference is written into it. At
+gen0 collection time the collector treats the objects in dirty cards as extra roots, and skips
+every clean card. This is documented CLR behaviour, not something visible through a public
+counter, so treat the card-table half of this section as the reasoning it is rather than a
+measured result — the barrier call itself, below, is not.
+
+You can see the barrier in the generated code. These two one-line methods, dumped with
+`DOTNET_TieredCompilation=0 DOTNET_JitDisasm="Bench:*" dotnet run bench/gc-internals/index.cs -c Release -- barrier`
+(x86-64, real output, comments added):
+
+```csharp
+public static void StoreRef(Node h, Node n) => h.Next = n;
+public static void StoreInt(Node h, int i) => h.Id = i;
+```
+
+```text
+; Assembly listing for method Bench:StoreRef(Node,Node) (FullOpts)
+G_M000_IG02:                ;; offset=0x0000
+       lea      rdi, bword ptr [rdi+0x08]   ; address of the Next field
+       call     CORINFO_HELP_ASSIGN_REF     ; ← the write barrier: store, then decide about the card
+       nop
+G_M000_IG03:                ;; offset=0x000A
+       ret
+; Total bytes of code 11
+
+; Assembly listing for method Bench:StoreInt(Node,int) (FullOpts)
+G_M000_IG02:                ;; offset=0x0000
+       mov      dword ptr [rdi+0x10], esi   ; the whole thing: one store, no barrier
+G_M000_IG03:                ;; offset=0x0003
+       ret
+; Total bytes of code 4
+```
+
+Storing an `int` is a single `mov`. Storing a reference is always a `call` — the JIT emits the
+same barrier call whether the value being stored is a brand-new gen0 node or an object that has
+been in gen2 for an hour, because the JIT cannot know the age of the value at compile time. The
+decision about whether to actually dirty a card happens *inside* that helper, at runtime, by
+comparing the addresses — which is the folklore this section corrects: "storing a reference marks
+a card" is not quite right. Storing a reference always pays for the call; only a store that could
+create an old→young edge additionally marks a card. In a long-lived service, most reference
+stores put an old object into an old object, so the common case pays for the call and skips the
+card write.
+
+Not a reason to avoid reference fields — but it is one reason a `struct` array is cheaper to fill
+than an array of class instances, and the reason writing references in a tight loop is not free
+even when nothing is allocated.
+
+### the large object heap, and why 85,000
+
+Copying a 1 MB array to compact it costs more than living with the hole it leaves. So objects at
+or above a threshold go on a separate heap that is swept but, by default, not compacted — and
+that heap is only collected as part of a **gen2** collection. The threshold is a size in bytes of
+the whole object, header included, and it is exactly 85,000. Measured by allocating `byte[]` of
+increasing length and asking `GC.GetGeneration`:
+
+```text
+  new byte[84973]   object size  84997 B   gen=0
+  new byte[84974]   object size  84998 B   gen=0
+  new byte[84975]   object size  84999 B   gen=0
+  new byte[84976]   object size  85000 B   gen=2
+  new byte[84977]   object size  85001 B   gen=2
+  new byte[84978]   object size  85002 B   gen=2
+```
+
+A `byte[]` carries 24 bytes of header, so the cliff lands at 84,976 elements. Measured the same
+way, a `double[]`, `long[]` or `object[]` crosses at 10,622 elements and an `int[]` at 21,244.
+That arithmetic is why the amortized `O(1)` you quote for `List<T>.Add` in
+[Big-O](/foundations/big-o/) has a second cost hiding in it: growth doubles the backing array, and
+one of those doublings silently lands on the LOH. One element either side of that line changes
+which collection the same churn provokes — the same ≈2 GB of array allocation, one byte size
+below the line and one above:
+
+| array size | gen0 | gen1 | gen2 |
+| --- | --- | --- | --- |
+| 84,000 B (small object heap) | 119 | 29 | 0 |
+| 86,000 B (large object heap) | 628 | 628 | 628 |
+
+Below the line, 119 gen0 collections and a couple dozen gen1 promotions, but not one gen2 — the
+arrays are small enough for the generational fast path to handle them normally. One size class
+above it, **every single collection is a full gen2**, because the LOH is only ever visited
+alongside gen2 work.
+Allocating on the LOH does not just add bytes, it changes which collection you provoke — and gen2
+is the one whose mark work scales with your entire live heap.
+
+<Callout kind="trap" label="the 84 KB buffer">
+  `new byte[100_000]` per request is one of the more expensive lines you can write in a .NET
+  service, and it looks completely innocent. Anything sized in "about a hundred KB" — a scratch
+  buffer, a serialization workspace, an image tile, a `List` that grew past 10,622 doubles — is a
+  gen2 trigger. Pool it, or shrink it below the line.
+</Callout>
+
+### workstation, server, and background
+
+Three mode choices and a fourth knob that reshapes one of them — and the names do not mean what
+they look like:
+
+| setting | what it changes | the service shape it fits |
+| --- | --- | --- |
+| workstation (default) | one heap, collections run on the allocating thread | desktop apps, and containers with 1-2 cores |
+| server (`ServerGarbageCollection`) | several heaps, each with its own dedicated GC thread and its own gen0 budget, so collection work is parallel and each budget is much larger | throughput services with cores to spare and a large live heap |
+| background (on by default) | gen2 marking runs concurrently with your threads; only the two short pauses above remain STW | anything latency-sensitive — it is why gen2 no longer means "the app stops for a long time" |
+| DATAS (`GCDynamicAdaptationMode`, on by default with server GC since .NET 9) | starts server GC at **one** heap and adds heaps only as sustained throughput demands them, shrinking the heap back when load drops | containerized services where the old server-GC memory footprint was the problem — and the reason a server-GC service on .NET 9+ does not behave like the one you tuned on .NET 6 |
+
+Background is not "instead of" workstation or server — both modes have a background variant, and
+both have it on unless you turn it off. The heap count is the part that changed: "one heap per
+core" was the server-GC default through .NET 8, and on .NET 9+ it is the *maximum*, with DATAS
+deciding at runtime how many of those heaps are actually in use.
+
+The same four threads, each allocating 2,000,000 objects with 1% surviving, run once per mode
+(the GC mode is fixed at process start, so this needs three separate processes:
+`dotnet run bench/gc-internals/index.cs -- mode`,
+`env DOTNET_gcServer=1 dotnet run ... -- mode`,
+`env DOTNET_gcServer=1 DOTNET_GCDynamicAdaptationMode=0 dotnet run ... -- mode`):
+
+| mode | gen0 | gen1 | gen2 | heap after |
+| --- | --- | --- | --- | --- |
+| workstation | 15 | 14 | 0 | 8.2 MB, every run |
+| server, DATAS on (the .NET 9+ default) | 69-82 | 68-81 | 1-3 | 5.4-7.9 MB, across three runs |
+| server, `GCDynamicAdaptationMode=0` (classic server GC) | 0 | 0 | 0 | 245.5 MB, every run |
+
+Workstation and classic server GC are exactly repeatable across runs — same counts, same heap,
+every time. DATAS is not: three otherwise-identical runs gave three different collection counts.
+That difference is itself informative. Workstation and classic server GC both size their budgets
+once, at startup, from fixed inputs (core count, a configured limit); DATAS instead watches
+real-time allocation-rate signals while the process runs and decides moment to moment whether the
+current heap count is keeping up, so a workload whose timing varies even slightly run to run gets
+a different number of small heap adjustments along the way. What stayed constant across all three
+DATAS runs is the shape: dozens of small gen0/gen1 collections and a small single-digit number of
+gen2s, nothing like the zero-collection outcome below.
+
+Turning DATAS *off* changed everything: **zero** collections of any generation, every single run,
+because classic server GC opened one heap per core with a gen0 budget large enough that the
+entire 8,000,000-allocation workload fit inside the budgets without a single collection — at the
+cost of ending the run holding 245.5 MB instead of roughly 8 MB.
+
+That is the trade in one pair of rows: server GC without DATAS buys fewer (or, here, zero)
+collections by reserving far more memory up front. On a bare-metal box with cores to spare, that
+memory is idle capacity being put to use. In a container with a memory limit, the runtime sizing
+itself for the whole node's core count while the orchestrator has budgeted you a fraction of it is
+exactly how you get OOM-killed with no leak anywhere — which is what DATAS exists to prevent, and
+why "should we turn on server GC" is now two questions rather than one.
+
+<Callout kind="trap" label="server GC in a small container">
+  Server GC is the default for ASP.NET Core, and with DATAS off it sizes its heap count and its
+  budgets from the core count — one heap per core, each with its own gen0 budget. Since .NET Core
+  3.0 the runtime reads the cgroup limits, so in a container with a CPU *quota* and a memory limit,
+  `Environment.ProcessorCount` already reflects the quota and `GCHeapHardLimit` already defaults
+  to 75% of the memory limit. The incident still happens, but it now needs one of the gaps: a
+  container with **no** memory limit set, or CPU *shares/requests* rather than a hard quota — in
+  both cases the runtime sizes itself for the whole node while the orchestrator kills you at your
+  request. `DOTNET_gcServer=0`, or setting `GCHeapHardLimit` explicitly, is the fix, and the first
+  thing to check is what `Environment.ProcessorCount` and `GCMemoryInfo.TotalAvailableMemoryBytes`
+  actually report *inside* the pod.
+</Callout>
+
+### finalizers, `IDisposable`, and the extra life
+
+A finalizer (`~Type()`) is not a destructor. When an object with a finalizer is found unreachable,
+it is not freed — it is put on a queue, and a dedicated finalizer thread will call the finalizer
+later. Only the collection *after* that can reclaim it. Watched with two `WeakReference`s per
+object, a short one (cleared as soon as the object is unreachable) and a long one
+(`trackResurrection: true`, cleared only when the memory is actually gone):
+
+```text
+  main thread id = 1
+  after 1st GC:  plain unreachable=True gone=True   finalizable unreachable=True gone=False
+  after 2nd GC:  plain unreachable=True gone=True   finalizable unreachable=True gone=True
+  finalizer ran 1 time(s), on thread id 2
+```
+
+The plain object is gone after one collection. The finalizable one is unreachable after the first
+collection but its bytes are still there — it takes a second collection, after the finalizer has
+run, on a different thread. Allocating and dropping 500,000 objects makes the count difference
+concrete:
+
+| kind | gen0 | gen1 | gen2 |
+| --- | --- | --- | --- |
+| plain class | 0 | 0 | 0 |
+| identical class with `~Finalizer()` | 1 | 0 | 0 |
+
+The plain run never even provoked a gen0 collection — 500,000 objects of that size fit inside a
+single gen0 budget and died before it filled. The finalizable run forced one. And because
+surviving a collection promotes, a finalizable object that dies in gen0 is promoted to gen1
+anyway before the finalizer thread gets to it, which is the most expensive way possible to be
+garbage: an extra generation *and* an extra collection, on nothing more than an empty
+`~Finalizer()`.
+
+`IDisposable` is the opposite tool and does the opposite thing: it releases the resource *now*,
+at a point in your code you chose, with no collector involvement. The modern rule is short:
+
+<Solution>
+
+```csharp
+using Microsoft.Win32.SafeHandles;        // SafeFileHandle lives here
+
+// The type you should write: no finalizer, because the unmanaged thing it owns
+// already has one. SafeFileHandle is a SafeHandle, and SafeHandle has the finalizer.
+sealed class LogWriter : IDisposable
+{
+    private readonly SafeFileHandle _handle;
+    private bool _disposed;
+
+    public LogWriter(string path) =>
+        _handle = File.OpenHandle(path, FileMode.Create, FileAccess.Write);
+
+    public void Write(ReadOnlySpan<byte> bytes)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        RandomAccess.Write(_handle, bytes, fileOffset: 0);
+    }
+
+    public void Dispose()
+    {
+        if (_disposed) return;                // Dispose must be idempotent
+        _disposed = true;
+        _handle.Dispose();                    // releases the OS handle now, not "eventually"
+    }
+}
+```
+
+</Solution>
+
+Write a finalizer only when your type directly owns a raw unmanaged handle that nothing else will
+release — which, since `SafeHandle` exists, is almost never. If you do write one, call
+`GC.SuppressFinalize(this)` in `Dispose` so the common path never pays for the extra generation
+and the extra collection.
+
+### pooling: the escape hatch
+
+If the cost is survival and promotion, the fix is to stop creating objects that have to survive.
+`ArrayPool<T>.Shared` hands you an existing array and takes it back; the array is allocated once,
+promotes to gen2 once, and is never collected again. Renting 20,000 buffers of 86,000 bytes
+against allocating 20,000 fresh ones:
+
+| strategy | bytes allocated | gen2 collections |
+| --- | --- | --- |
+| `new byte[86_000]` | 1,720,480,000 | 540 |
+| `ArrayPool.Shared.Rent` | 132,320 | 0 |
+
+1.72 GB of allocation and 540 full collections become 132 KB (the pool's own bookkeeping) and
+none. This is the largest honest gap on the page, and it is large precisely because the pooled
+version does *no* GC work at all — the comparison is "allocating 1.72 GB, all of it landing on the
+LOH" against "not allocating." `Rent` returns a buffer that may be **larger** than you asked for
+and is **not** cleared, so always use the length you asked for and never assume the contents are
+zero. [Does this allocate?](/systems/stack-and-heap/does-this-allocate/) prices `stackalloc`
+against `ArrayPool` for the small sizes where the answer flips.
+
+## the mental model
+
+Three sentences, and they answer most GC questions you will ever be asked:
+
+1. **Allocation is a pointer bump; collection is the bill, and the bill is proportional to what
+   survives.** Nothing you throw away immediately is ever visited.
+2. **An object is garbage when no root can reach it** — not when nothing references it, and not
+   when you stop using it. If memory grows, something is still reachable, and the only question
+   is what.
+3. **Generations are an optimisation for objects that die young.** Anything that survives gets
+   promoted, and anything in gen2 or the LOH is scanned only by the collection whose pause you
+   care about most.
+
+| symptom you see | what it means |
+| --- | --- |
+| high allocation rate, flat heap | healthy: everything dies in gen0, gen0 collections are cheap |
+| gen2 count climbing steadily | something is being promoted every cycle — a cache, a leak, or LOH churn |
+| heap size flat, request latency growing | your live set grew; mark work is linear in it |
+| latency fine, throughput dropped | collection work moved off the pause and onto your cores (background GC) |
+| p99 spikes, mean unchanged | a small fraction of requests is landing inside a collection |
+
+<Watch items={[['object header', '16 B + alignment'], ['array header', '24 B'], ['gen0 budget, this box', '≈16 MB'], ['LOH threshold', '85,000 B'], ['finalizer', '+1 generation, +1 collection'], ['background floor, this box', 'between 400K and 1.6M live objects']]} />
+
+## why you should care
+
+**The metric that moves is p99, and the mean will not tell you why.** Two hundred thousand
+"requests", each needing an 8 KB buffer — one version allocates the buffer, the other rents it:
+
+| strategy | gen0 | gen1 | gen2 |
+| --- | --- | --- | --- |
+| `new byte[8192]` | 99 | 3 | 0 |
+| `ArrayPool.Rent` | 0 | 0 | 0 |
+
+Ninety-nine gen0 collections and three gen1 collections happened during the allocating run, and
+zero happened during the pooled one. Each of those collections stopped every thread — including
+whichever request happened to be executing at that instant. That request pays for the pause; the
+other 199,801 do not. That is the entire shape of a GC latency incident: the average looks fine
+because most
+requests never overlap a collection, the tail is on fire because some unlucky fraction always
+does, and CPU looks normal because the work is real work, just not the request's own work.
+
+**The three incident shapes**, and what each one actually is:
+
+| what you observe | what is happening | where to look first |
+| --- | --- | --- |
+| p99 doubles under load, mean flat, CPU flat | requests are landing inside gen0/gen1 pauses | allocation rate per request; `dotnet-counters monitor System.Runtime` for `gen-0-gc-count` and `alloc-rate` |
+| gen2 count rising monotonically, heap growing | promotion — a cache with no eviction, or LOH churn | `gen-2-gc-count` and `loh-size`; then an allocation profile |
+| memory grows forever, no `OutOfMemoryException` yet | something reachable from a static, a subscribed event, or a timer | a heap dump and `gcroot` on a sample instance — see [the leak hunt](/systems/gc-internals/the-leak-hunt/) |
+
+The third one is the one that gets misdiagnosed hardest, because everyone's first instinct is
+"the GC isn't running." It is running. It ran, it walked the graph, and it correctly found your
+object still reachable from a static event handler that a request-scoped service registered eight
+million requests ago.
+
+**"Memory usage" is at least three numbers and they are not interchangeable.** GC heap size
+(`GC.GetTotalMemory`) counts managed objects. Committed bytes counts address space the runtime
+asked the OS to back — which includes memory the GC has freed but not returned. Resident set is
+what the container's limit is actually measured against.
+[Virtual memory](/systems/virtual-memory/) is where those three come apart, and it shows a
+process holding several GiB resident with a near-empty GC heap. When your pod gets OOM-killed
+while your GC dashboards look fine, that gap is why.
+
+**The code review you can now do:** flag per-request buffers sized near or above 85,000 bytes;
+flag `static event`, `static Dictionary` and long-lived `Timer` registrations for a matching
+unsubscribe; flag empty or "just in case" finalizers; flag caches with no eviction policy (they
+are not memory bugs so much as collection-cost bugs — throughput while background GC keeps up,
+and a stop-the-world pause the moment a full collection has to block); and stop flagging `new` on
+principle — a short-lived allocation is close to free, and the reviewer who says otherwise is
+optimising the wrong half of the mechanism.
+
+## the same idea in other languages
+
+| language | what it's called | the trap |
+| --- | --- | --- |
+| Java | generational tracing collector; G1 is the default since Java 9, with ZGC and Shenandoah as low-pause alternatives | the same reachability model, but `System.gc()` is only a *request* the JVM may ignore, and `finalize()` was deprecated in Java 9 and then deprecated *for removal* in 18 by JEP 421, which added `--finalization=disabled` to turn it off — it still runs by default, and `AutoCloseable` with try-with-resources is the `IDisposable` equivalent you should be using instead. G1 has no LOH; instead an object larger than half a region is "humongous" and allocated straight into old-generation regions, which is the same cliff wearing a different name |
+| Go | concurrent tri-colour mark-sweep, **not generational and not moving** | Go's collector is designed to keep stop-the-world phases as short as possible because marking runs concurrently with your goroutines the whole time — but the work did not disappear, it moved into your CPU budget as throughput cost. And because Go never moves a heap object, its addresses are stable, so `unsafe.Pointer` is usable in ways C# forbids — where .NET *may* relocate a small-object-heap object at a collection, so its address is never guaranteed to stay put, which is why a raw pointer into it needs `fixed` or a pinning `GCHandle`. The LOH is the exception .NET carves out: swept, not compacted, by default, which is where .NET keeps Go's fragmentation failure mode. `GOGC` sets a heap-growth ratio, not a byte budget |
+| Python (CPython) | reference counting, **plus** a generational cycle detector for what refcounting cannot free | the opposite failure mode: destruction is usually immediate, so code comes to depend on `__del__` running at the end of a scope — and then one reference cycle, or a traceback holding a frame alive, silently defers it forever. In .NET nothing is ever immediate, which is why `IDisposable` exists |
+| C++ | no collector; RAII, `unique_ptr`, and `shared_ptr` reference counting | `shared_ptr` cycles never free, which is why `weak_ptr` exists — that entire category of bug is impossible in .NET, because a tracing collector asks "can a root reach it," not "does anything point at it." The cost you pay instead is that you never know exactly when memory comes back |
+| JavaScript (V8) | generational mark-sweep: a copying scavenger for the young generation, mark-compact for the old | the same tracing model and the same leak: `addEventListener` without `removeEventListener` keeps the listener — and everything its closure captured — alive exactly the way a C# `static event` subscription does. `WeakMap` and `WeakRef` are the escape hatches, and they are the direct analogue of `ConditionalWeakTable` and `WeakReference` |
+
+## exercises
+
+The first prices the generational hypothesis directly, by collection count rather than by clock;
+the second is the incident that a garbage collector is supposed to make impossible and does not.
+
+<ProblemList topic="gc-internals" />
+
+## interview drills
+
+**Q.** Our p99 latency doubled after the last release. Mean is unchanged, CPU is unchanged.
+Where do you start?
+
+- *weak answer* — "Profile it" or "check the database." Neither engages with the *shape* of the
+  problem: a flat mean with a bad tail means something is happening to a small fraction of
+  requests, hard, not to all requests slightly.
+- *strong answer* — That shape is a pause: GC or lock contention. I'd look at GC counters first —
+  gen0/gen1/gen2 collection counts and allocation rate. If gen0 count went up with the release,
+  something new is allocating per request; if gen2 count went up, something is being promoted or
+  landing on the LOH. Then I'd take an allocation profile rather than guess which line it is.
+- *follow-up* — "Say gen2 count went up. What kinds of change do that?" A cache that now retains
+  more, a buffer that crossed 85,000 bytes, or an object graph that now outlives the request —
+  and all three look like a two-line diff.
+
+**Q.** Is allocation in .NET expensive?
+
+- *weak answer* — "Yes, avoid `new` in hot paths." Cargo cult, and it dies to the first follow-up.
+- *strong answer* — The allocation itself is a pointer bump in a thread-local chunk, so it is
+  close to free. What costs is survival: anything still reachable when a collection runs gets
+  marked and, if the collector compacts, copied — and every reference to it gets rewritten. So
+  the thing to control is allocation *rate* and object *lifetime*, not the cost of `new`. On the
+  same 2,000,000 allocations, going from ≈0% survivors to 50% survivors took the run from 3 gen0
+  collections and nothing promoted to a full ladder — 4 gen0, 3 gen1, and a gen2 collection.
+- *follow-up* — "How would you prove a change helped?"
+  `GC.GetAllocatedBytesForCurrentThread` around the operation gives an exact byte delta with no
+  timer noise, and gen0/gen2 counts before and after confirm the rate actually moved.
+
+**Q.** We have a garbage collector, so how can this service leak memory?
+
+- *weak answer* — "It must be unmanaged memory" or "the GC isn't keeping up." Possible, and both
+  are much rarer than the real cause.
+- *strong answer* — A .NET leak is never un-freed memory; it is memory that is still *reachable*.
+  Something has a root path to objects you think are dead — a static collection, an event whose
+  subscribers never unsubscribe, a `Timer` or a cache holding closures, or a captured `this` in a
+  long-lived delegate. The proof is a heap dump: take two, diff the object counts, then `gcroot`
+  one instance of whatever grew and read the path back to the root.
+- *follow-up* — "Why does forcing a collection not help?" Because the objects are reachable, and
+  reachable is the definition of live. `GC.Collect` will faithfully keep all of them.
+
+**Q.** What is special about 85,000 bytes?
+
+- *weak answer* — "That's the large object heap threshold." True, and it is trivia until you say
+  what follows from it.
+- *strong answer* — Objects that size or larger are allocated on the LOH, which is not compacted
+  by default and is only collected as part of a **gen2** collection. So a per-request buffer that
+  crosses the line stops causing cheap gen0 collections and starts causing full ones, whose mark
+  work scales with your entire live heap. Measured here, the same ≈2 GB of churn in 86,000-byte
+  arrays turned into 628 gen2 collections; in 84,000-byte arrays it stayed almost entirely gen0.
+- *follow-up* — "How do you fix it without changing the size?" Pool the buffers so the LOH
+  allocation happens once, or set `GCSettings.LargeObjectHeapCompactionMode` for a one-off
+  compaction after a known fragmenting phase — never as a routine setting.
+
+**Q.** When should a class have a finalizer?
+
+- *weak answer* — "When it holds unmanaged resources, to be safe." The "to be safe" is the
+  problem: it is what puts empty finalizers on types that own nothing.
+- *strong answer* — Almost never. A finalizer forces the object to survive an extra collection
+  before the memory comes back, and surviving a collection promotes it a generation too — an
+  empty `~Finalizer()` on an object that would otherwise die in gen0 forces a promotion and a
+  second collection to reclaim something that owns nothing. If you own a raw OS handle, wrap it
+  in a `SafeHandle` — which already has the finalizer — and implement `IDisposable` only. If you
+  truly must write one, call `GC.SuppressFinalize(this)` in `Dispose`.
+- *follow-up* — "What does `GC.SuppressFinalize` actually do?" It clears the object's entry in
+  the finalization queue, so once you have disposed deterministically the collector can reclaim
+  it in one collection like any other object.
+
+**Q.** Would you switch this service to server GC?
+
+- *weak answer* — "Yes, it's a server." The name is about the workload shape, not the deployment.
+- *strong answer* — Only after checking the container's memory limit, and on .NET 9 or later it
+  is two flags rather than one: server GC, and DATAS. Server GC gives multiple heaps, each with
+  its own GC thread and its own much larger gen0 budget, which is why it can turn a workload that
+  costs workstation GC dozens of collections into one that costs classic server GC none at all —
+  but that comes from reserving far more memory up front, which in a container whose memory limit
+  the runtime cannot see can get you OOM-killed with no leak anywhere. DATAS, on by default with
+  server GC since .NET 9, exists to undo exactly that: it starts at one heap and adds heaps only
+  when sustained throughput demands them.
+- *follow-up* — "So why is DATAS the default?" Because most services are memory-limited
+  containers, not throughput benchmarks, and the classic server-GC footprint was the more common
+  production problem. It is a default tuned for the fleet, not for your service — which is the
+  reason to check both settings' collection counts and committed memory under production-shaped
+  load before choosing.

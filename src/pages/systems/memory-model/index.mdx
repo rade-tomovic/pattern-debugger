@@ -1,0 +1,514 @@
+---
+layout: '@layouts/TopicLayout.astro'
+topic: memory-model
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import ProblemList from '@components/ProblemList.astro';
+import Solution from '@components/Solution.astro';
+
+## the ground floor
+
+- **thread** — a stack, a set of registers, and a scheduling entity. Threads in one process
+  share the heap and share every static field; they do not share stacks.
+  [Processes, threads and the kernel](/systems/process-and-thread/) builds that.
+- **core** — one hardware execution engine with its own registers and its own L1 cache. Two
+  threads on two different cores run *simultaneously*, not interleaved.
+- **cache line** — the 64-byte block that is the smallest unit of transfer between a core and
+  memory. Nothing moves in smaller pieces. [The memory hierarchy](/systems/memory-hierarchy/)
+  is where that comes from.
+- **out-of-order execution** — the CPU runs instructions as their inputs become ready rather
+  than in the order you wrote them, and retires the results in order.
+  [The pipeline](/systems/cpu-pipeline/) is that machinery; this page is its bill.
+- **the JIT** — the compiler that turns your IL into machine code at run time, and is allowed to
+  move, merge and delete your reads and writes. [Source to machine code](/systems/il-jit-codegen/).
+- **barrier** (also *fence*) — one instruction that constrains how loads and stores either side
+  of it may be reordered. It orders nothing else and locks nothing.
+
+<Callout kind="note" label="which 'memory model'">
+  On this page "memory model" means **the rules about when one thread's writes become visible to
+  another, and in what order** — the .NET memory model, the C++11 memory model, the Java memory
+  model. It does *not* mean "how memory is laid out", which is the other thing people call a
+  memory model and which lives on [stack vs heap](/systems/stack-and-heap/) and
+  [bits and memory](/systems/bits-and-memory/).
+</Callout>
+
+## core idea
+
+"Thread-safe" is not one property. It is three, and code can have any subset of them.
+
+| guarantee | the question it answers | what a failure looks like | what buys it |
+| --- | --- | --- | --- |
+| **atomicity** | does this operation happen all at once, or can another thread see it half-done? | a reader sees a value that was never written | `Interlocked`, `lock`, or a small enough aligned type |
+| **visibility** | will another thread ever see my write at all? | a loop that never exits; a flag that stays stale forever | `volatile`, `Volatile.Read`/`Write`, `Interlocked`, `lock` |
+| **ordering** | will another thread see my writes in the order I made them? | an outcome no interleaving of the source lines can produce | a barrier, `Interlocked`, or `lock` |
+
+Every synchronisation primitive you know is a bundle of some of these. `lock` gives you all
+three. `volatile` gives you visibility and *part* of ordering — and the part it leaves out is the
+one this page spends most of its time on, because it is the part that produces bugs that survive
+years of production.
+
+## how it actually works
+
+### atomicity: how many stores is one assignment?
+
+`pair = new Pair { Lo = n, Hi = n };` is one line of C#. `Pair` holds two `long`s, so it is 16
+bytes, and there is no x86-64 instruction that stores 16 bytes to memory in one indivisible step.
+The JIT emits two separate stores. A reader on another core that catches the gap between them
+sees the new `Lo` sitting next to the old `Hi` — a value that was never written by anybody. That
+is **tearing**, and because the writer never stops, a reader spinning alongside it catches the
+gap on very close to every read: run the two threads against each other for even a fraction of a
+second and the torn-read counter is never zero.
+
+The `long` row is the contrast. A naturally aligned load or store of up to 8 bytes is a single
+instruction and is atomic on x86-64 — run the same two threads over an aligned `long` field
+instead of a `Pair`, alternating it between two full-width values, and the torn-read counter
+stays at zero no matter how long you run it. That is a *hardware* guarantee about the width and
+alignment, not a language one, and the C# spec's own promise is narrower: reads and writes of
+`bool`, `char`, `byte`, `sbyte`, `short`, `ushort`, `int`, `uint`, `float` and reference types are
+atomic. `long`, `ulong`, `double`, `decimal` and every `struct` are not, by the spec, whatever the
+hardware happens to do.
+
+Which is why the compiler will not let you paper over it:
+
+```text
+error CS0677: 'C.big': a volatile field cannot be of the type 'long'
+error CS0677: 'C.d': a volatile field cannot be of the type 'double'
+```
+
+`volatile` is not available on the types that are not atomic, because ordering a store that can
+tear would be a promise the runtime cannot keep. For those, `Interlocked.Read`/`Exchange` or a
+lock is the whole menu. Note the gap between the spec and this hardware: on 64-bit x86, an
+aligned 8-byte load or store of a `long` or `double` *is* atomic — but the C# spec's list of
+atomic types predates 64-bit-only runtimes and still has to hold on a 32-bit CLR, where an 8-byte
+access is two 32-bit ones. The compiler enforces the spec's promise, not what this particular
+chip can do.
+
+<Callout kind="trap" label="atomicity is not the same as thread-safety">
+  `Interlocked.Increment(ref count)` makes the increment atomic. It does not make
+  `if (count < limit) count++` correct, because *that* is two atomic operations with a hole
+  between them. Atomicity is a property of one operation; correctness is a property of the whole
+  transaction. [Races and deadlock](/systems/concurrency-hazards/) is where check-then-act lives.
+</Callout>
+
+### visibility: the read that stopped happening
+
+This loop never exits. Not "usually finishes late" — never.
+
+<Solution>
+
+```csharp
+static bool stop;                      // a perfectly ordinary bool field
+static long spins;
+
+[MethodImpl(MethodImplOptions.NoInlining)]
+static void SpinPlain() { long n = 0; while (!stop) n++; spins = n; }
+
+// ...and on the main thread:
+//   worker.Start(); Thread.Sleep(1000); stop = true; worker.Join(3000);
+```
+
+</Solution>
+
+The worker never observes `stop` becoming `true`. `spins` stays at its initial value of `0`
+forever, because the line that would assign it — the one right after the loop — is never
+reached. Here is why, from a real JIT disassembly of `SpinPlain`, obtained with
+`DOTNET_JitDisasm=SpinPlain DOTNET_JitDisasmDiffable=1 dotnet run` (the diffable flag replaces
+address constants with the placeholder `(reloc)`; nothing else is edited):
+
+```text
+; Assembly listing for method Hoist:SpinPlain() (FullOpts)
+G_M000_IG02:
+       xor      eax, eax
+       movzx    rcx, byte  ptr [(reloc)]   ; read `stop` — ONCE, before the loop
+       test     ecx, ecx
+       je       SHORT G_M000_IG05          ; if it was false, go to...
+       mov      qword ptr [(reloc)], rax
+G_M000_IG05:
+       jmp      SHORT G_M000_IG05          ; ...this. an unconditional jump to itself.
+```
+
+The counter is gone. The loop is gone. What is left is `jmp` to its own address, forever, because
+the JIT proved that within this method nothing writes `stop`, hoisted the read above the loop, and
+then had a loop with a constant condition. Every one of those steps is legal: the .NET memory
+model lets a compiler assume a plain field does not change under it unless you say otherwise.
+
+The same method over a `volatile bool` keeps the load inside the loop — real disassembly of
+`SpinVolatile`, same flags:
+
+```text
+; Assembly listing for method Hoist:SpinVolatile() (FullOpts)
+G_M000_IG03:
+       inc      rax
+       cmp      byte  ptr [rcx], 0         ; re-read `vstop` every single iteration
+       je       SHORT G_M000_IG03
+```
+
+That is the entire difference, and it is the *first* thing `volatile` buys you: the read is
+performed, every time, from memory. Notice what it is not: there is no fence, no `lock`-prefixed
+instruction, nothing that costs a cycle beyond an ordinary read. On x86-64 a volatile read is an
+ordinary `mov`.
+
+<Callout kind="insight" label="visibility bugs are compiler bugs you asked for">
+  This failure has nothing to do with cores, caches or the store buffer. Caches are coherent —
+  a write on core 0 *will* reach core 1's L1, without you doing anything. The reason the loop
+  never sees the flag is that the loop no longer contains a read. Compiler reordering and hardware
+  reordering are two independent problems, and `volatile` is the one keyword that addresses both.
+</Callout>
+
+### where a store actually goes
+
+Now the hardware half. When a core executes `x = 1`, the value does not go to the cache. It goes
+into a **store buffer** — a small per-core queue of pending writes — so the core can carry on
+without waiting for the cache line to arrive in a writable state. The buffer drains into the
+cache in order, but *when* is up to the hardware.
+
+Meanwhile, a load on the same core checks that core's store buffer first (so you always see your
+own writes), and otherwise goes to the cache. And the cache is coherent: it holds one agreed
+value per line.
+
+```text
+   core 0                                   core 1
+   ┌──────────────────────────┐             ┌──────────────────────────┐
+   │ 1. x = 1                 │             │ 1. y = 1                 │
+   │      └───► store buffer  │             │      └───► store buffer  │
+   │            [ x = 1 ]     │             │            [ y = 1 ]     │
+   │            still pending │             │            still pending │
+   │                          │             │                          │
+   │ 2. r1 = y  ──────────┐   │             │ 2. r2 = x  ──────────┐   │
+   └──────────────────────┼───┘             └──────────────────────┼───┘
+                          │                                        │
+                          ▼                                        ▼
+          ┌──────────────────────────────────────────────────────────────┐
+          │      coherent cache — one agreed value per line              │
+          │             x is still 0            y is still 0             │
+          └──────────────────────────────────────────────────────────────┘
+           ▲ the two pending stores drain into here, some time later
+```
+
+Both cores have written. Neither write has drained. Both loads go to the cache and read the old
+value. Both threads conclude the other one has not written yet. **Both are wrong, and no
+interleaving of the four source lines produces that outcome** — which is exactly what makes it a
+memory-model bug rather than a race you can find by staring at the code.
+
+The store buffer is not a mistake or a missing feature. Waiting for a store to become globally
+visible before doing anything else costs the core dozens of otherwise-productive cycles; a core
+that stalled on every write would spend most of its life idle, for a guarantee almost no code
+needs.
+
+### the four reorderings, and which ones you actually get
+
+There are exactly four ways two memory operations can swap, and an architecture's memory model is
+mostly the list of which it allows.
+
+| reordering | the pair, in program order | x86-64 | ARM64 |
+| --- | --- | --- | --- |
+| StoreStore | store A, store B — B becomes visible first | forbidden | allowed |
+| LoadLoad | load A, load B — B reads a newer value than A | forbidden | allowed |
+| LoadStore | load A, store B — B is visible before A has read | forbidden | allowed |
+| **StoreLoad** | store A, load B — B reads before A is visible | **allowed** | allowed |
+
+<Callout kind="note" label="what that table is">
+  The two right-hand columns are the architecture manuals' rules, not something demonstrated here.
+  StoreLoad is the one row you can trigger on demand — that is exactly the diagram above, and it
+  is the shape of the exercise at the bottom of this page. The other three rows say what x86-64
+  *forbids*; you cannot demonstrate the absence of a reordering by failing to see it, and this
+  page does not pretend to.
+</Callout>
+
+x86-64's model (**TSO**, total store order) forbids three of the four. That is why a
+message-passing handshake — one thread writes `data` then `flag`, the other reads `flag` then
+`data` — is safe on x86-64 without any barrier at all: neither the writer's StoreStore nor the
+reader's LoadLoad is a legal reordering on this architecture, so seeing the flag without the data
+cannot happen. On ARM64 both of those reorderings are legal and the same code is broken.
+
+The one x86 does allow is exactly the store buffer diagram above: your store sits in the queue
+while your subsequent load goes to cache and returns. That is the shape behind the exercise at the
+bottom of this page, which is those four lines dressed as production code.
+
+<Callout kind="trap" label="'it worked on my laptop' is a memory-model story">
+  A missing barrier costs nothing on x86 until it does. The same binary on an ARM64 machine — an
+  Apple Silicon dev box, a Graviton instance, an Ampere node in your cloud provider's cheaper
+  pool — has three more legal reorderings, and code that has been correct in production for five
+  years starts failing on the new fleet. Nothing changed in your code. What changed is which
+  guarantees the hardware was handing you for free.
+</Callout>
+
+### what `volatile` compiles to, and what it does not do
+
+Four ways to talk about ordering in C#, and what the JIT emits for each on x86-64. Real
+disassembly, same dump flags as before:
+
+```text
+; Fences:WriteVolatile(int)  —  `vol = v;` where vol is a volatile int
+       mov      dword ptr [(reloc)], edi        ; a plain store. that is the whole method.
+
+; Fences:ReadVolatile():int  —  `return vol;`
+       mov      eax, dword ptr [(reloc)]        ; a plain load. also the whole method.
+
+; Fences:FullFence()         —  `x = 1; Interlocked.MemoryBarrier(); r1 = y;`
+       mov      dword ptr [(reloc)], 1
+       lock
+       or       dword ptr [rsp], 0              ; ← the fence: a locked no-op on the stack top
+       mov      eax, dword ptr [(reloc)]
+       mov      dword ptr [(reloc)], eax
+
+; Fences:ExchangeIt(int):int —  `Interlocked.Exchange(ref x, v)`
+       mov      rax, 0xD1FFAB1E
+       mov      ecx, edi
+       xchg     dword ptr [rax], ecx            ; xchg on memory is implicitly locked
+       mov      eax, ecx
+```
+
+A `volatile` write is a **release store**: nothing that comes before it in program order may move
+after it. A `volatile` read is an **acquire load**: nothing after it may move before it. On x86-64
+the hardware already forbids StoreStore, LoadLoad and LoadStore unconditionally, so the JIT emits
+nothing extra for either — the entire effect of `volatile` on this architecture is on the
+*compiler*, which is precisely the visibility fix from two sections ago.
+
+What acquire/release does not do is stop a store from being reordered with a *later* load. That is
+the StoreLoad case, it is the one x86 permits, and no combination of release stores and acquire
+loads forbids it — read the disassembly above again: a volatile write and a volatile read are both
+plain `mov`, so a program built entirely out of them contains none of the four reorderings'
+forbidding machinery. Only the fence and the `Interlocked.Exchange` rows carry the `lock` prefix
+that actually blocks StoreLoad, because `lock` forces the store buffer to drain before the next
+memory operation on that core may proceed.
+
+<Callout kind="trap" label="the two other `volatile`s">
+  C's `volatile` means "this memory may be changed by something outside the program" — it stops
+  the compiler caching the value and nothing else. It provides **no ordering and no atomicity**,
+  and using it for thread synchronisation in C or C++ is simply a bug. Java's `volatile` is the
+  strong one: since JSR-133 a Java volatile write/read pair is sequentially consistent — one
+  keyword, three languages, three different contracts. `bench/memory-model/StoreBuffer.java` and
+  `bench/memory-model/storebuffer.go` are line-for-line ports of the store-buffer litmus above; run
+  either and the anomaly never shows up once the shared fields are marked `volatile` (Java) or
+  swapped for `sync/atomic` (Go) — because both languages' equivalents are sequentially consistent
+  where C#'s `volatile` is release/acquire and stops one step short.
+</Callout>
+
+### acquire and release, in plain language
+
+Forget the formalism; there are two jobs.
+
+**Release** is *publishing*. "Everything I wrote before this point is finished and visible before
+this store is." You use it on the write that hands something over — setting the `ready` flag,
+storing the reference to the finished object.
+
+**Acquire** is *subscribing*. "Nothing I read after this point may be fetched before this load."
+You use it on the read that discovers the handover — the load of the `ready` flag.
+
+Paired, they make the message-passing pattern correct on every architecture: the reader that sees
+the flag is guaranteed to see everything the writer did before setting it. That pairing is the
+foundation of `Lazy<T>`, of double-checked locking, and of every "publish an immutable object by
+swapping a reference" design.
+
+Here is what that pairing costs in real instructions, on x86-64, from the same C source compiled
+with `gcc -O2 -S bench/memory-model/fences.c`:
+
+```c
+int flag; int data;
+void publish_release(int v) { data = v; __atomic_store_n(&flag, 1, __ATOMIC_RELEASE); }
+void publish_seq_cst(int v) { data = v; __atomic_store_n(&flag, 1, __ATOMIC_SEQ_CST); }
+int  observe_acquire(void)  { return     __atomic_load_n(&flag,    __ATOMIC_ACQUIRE); }
+```
+
+```text
+publish_release:
+  movl  %edi, data(%rip)
+  movl  $1, flag(%rip)     ; a plain store — release costs nothing extra on x86-64
+
+publish_seq_cst:
+  movl  %edi, data(%rip)
+  movl  $1, %eax
+  xchgl flag(%rip), %eax   ; xchg on memory is implicitly LOCKed — this is what sequential
+                            ; consistency costs here
+
+observe_acquire:
+  movl  flag(%rip), %eax   ; a plain load — acquire is also free on x86-64
+```
+
+Read it straight: on x86-64, release and acquire are free — the compiler emits the same `mov` it
+would for an ordinary access — and sequential consistency costs one locked instruction. This is
+x86-64 only, compiled here; ARM64 is not, per the site's own verification rule, but it is worth
+knowing the shape of the trade, because it is the opposite one. The ARMv8 architecture defines
+dedicated load-acquire and store-release instructions (`ldar`/`stlr`) distinct from a plain
+`ldr`/`str`, so acquire and release cost something explicit there that x86-64 gives away for free
+— and having already paid for that instruction, promoting it to sequentially consistent is nearly
+free on top, because the same `stlr`/`ldar` pair already does the job. The two architectures put
+the price in different places, which is one more reason a C# program that omits the annotations
+and happens to work is leaning on x86-64 specifically.
+
+### `lock` gives you all three, and that is why you rarely need any of this
+
+A monitor acquire is an acquire operation, a monitor release is a release operation, and every
+`Interlocked` used in the implementation carries a full fence, so `lock (gate) { ... }` gives you:
+
+- **atomicity** — mutual exclusion makes the whole block one operation with respect to other
+  holders of the same lock.
+- **visibility** — the release on exit flushes; the acquire on entry re-reads.
+- **ordering** — nothing inside the block escapes either end of it, StoreLoad included.
+
+That is strictly more than `volatile` gives you, for the price of mutual exclusion instead of a
+single memory access. [What a lock is made of](/systems/locks-internals/) is where that price is
+actually accounted for — the uncontended fast path, and what happens once a second thread has to
+wait. This page's conclusion is narrower and cheaper to state: the reason to reach past `lock` for
+hand-rolled `volatile` flags is essentially never the uncontended cost of the lock. It is almost
+always a mistaken belief that `volatile` gives ordering it does not give.
+
+## the mental model
+
+Three questions, in order, about any field two threads touch:
+
+1. **Is one operation on it indivisible?** Aligned, at most 8 bytes, and not a struct → yes on
+   this hardware. Bigger, or a `struct`, or a read-modify-write like `count++` → no, and you need
+   `Interlocked` or a lock.
+2. **Will the other thread's read actually happen?** If the read sits in a tight loop with no
+   barrier and nothing opaque to the JIT inside it, the read can be hoisted out and the loop will
+   spin forever. `volatile` or `Volatile.Read` fixes that, and costs nothing extra on x86-64.
+3. **Does the order of two operations matter to another thread?** If the pattern is *publish then
+   observe* (write data, set flag / read flag, read data), release-acquire is enough. If the
+   pattern is *write mine then read yours*, on both threads, you need a full fence — and that is
+   the only case `volatile` does not cover.
+
+| you wrote | you got | you did not get |
+| --- | --- | --- |
+| plain field | nothing. the JIT may cache the read, delete it, or move it | any of the three guarantees |
+| `volatile` field, `Volatile.Read`/`Write` | the read/write really happens; release on write, acquire on read | StoreLoad ordering; atomicity for anything over 8 bytes |
+| `Interlocked.MemoryBarrier()` | a full fence — all four reorderings forbidden across it | atomicity of the operations either side |
+| `Interlocked.*` | that one operation is atomic, plus a full fence | atomicity of two of them in a row |
+| `lock` | all three, for everything inside the block | anything about threads holding a *different* lock |
+
+<Watch items={[['guarantees', '3'], ['reorderings', '4'], ['x86 allows', 'StoreLoad'], ['volatile write emits', 'plain mov'], ['fence emits', 'lock or'], ['volatile gives', 'release + acquire']]} />
+
+## why you should care
+
+**The incident shape is a bug that only reproduces in production, on some machines, under load.**
+A race that needs two threads inside the same nanosecond-wide window sounds like something a test
+would catch, and it is — but only because a harness can be built to force that window to happen
+over and over, in a tight loop, on purpose. Real code hits that window when two requests happen
+to land on two cores inside the same few nanoseconds. At low traffic that is rare; at high
+traffic it is routine. The bug's rate is proportional to your traffic, which is why it appears the
+week after a successful launch and not during the load test.
+
+**The metric that moves is nothing.** This is the part that makes memory-model bugs expensive.
+There is no counter for it, no GC pause, no thread-pool queue depth, no lock-contention event. The
+symptom is a wrong answer: a job that ran twice, a cache entry initialised half-built, a total
+that is short by an amount nobody can reproduce. You find it by reading the code with the three
+guarantees in mind, which is the only reason to have them in your head.
+
+**The review you can now do.** When you see a field touched by two threads without a lock, ask
+the three questions. Concretely, flag these:
+
+- A `bool` or `int` flag written by one thread and spun on by another with no `volatile`. Either
+  it is a visibility bug or it works by accident because there is a call in the loop the JIT would
+  not inline.
+- A `long`, `double`, `decimal` or `struct` field read and written by different threads without
+  `Interlocked` or a lock. That is a tearing bug on any architecture.
+- `count++`, `list.Count == 0` then `list.Add`, `if (cache == null) cache = Build()` — any
+  read-modify-write or check-then-act on shared state. Atomicity of the parts does not give you
+  atomicity of the whole.
+- Double-checked locking written by hand where the field is not `volatile`. The pattern needs the
+  release on the write and the acquire on the read to be correct; without them the second thread
+  can get a non-null reference to an object whose constructor has not finished. `Lazy<T>` is the
+  answer you should reach for instead, and [races and deadlock](/systems/concurrency-hazards/)
+  covers why.
+- Two threads that each announce themselves and then check the other, with no fence. That is the
+  exercise below, and it is the shape of most hand-rolled "only one of us should do this" code.
+
+**The hand-off from here.** This page has said what you lose and named the instruction that buys
+it back. [Atomics and compare-and-swap](/systems/atomics-and-cas/) is that instruction in detail:
+what the `lock` prefix does to a cache line, why `count++` needs it, and how a CAS loop turns one
+atomic operation into an arbitrary one. From there,
+[what a lock is made of](/systems/locks-internals/) shows a mutex being built out of exactly those
+pieces — which is where the "just use `lock`" advice on this page gets its price tag.
+
+## the same idea in other languages
+
+| language | what it's called | the trap |
+| --- | --- | --- |
+| Java | the Java Memory Model (JSR-133); `volatile`, `final` field semantics, `VarHandle` | Java's `volatile` is strictly stronger than C#'s: a volatile write/read pair is sequentially consistent, so the store-buffer litmus on this page never shows the anomaly under `volatile` in Java, where it does show up under C#'s `volatile` — on the very same x86-64 hardware. An engineer carrying `volatile` intuition from Java into C# will under-synchronise, and the exercise below is exactly the shape of bug that habit produces |
+| C | `volatile` and, since C11, `_Atomic` with `memory_order_*` | C's `volatile` gives no ordering and no atomicity at all — it only stops the compiler caching the value. It is the right tool for memory-mapped device registers and the wrong tool for threads, and the two uses look identical in a diff |
+| C++ | `std::atomic<T>` with an explicit `std::memory_order` per operation | the default for every `std::atomic` operation is `seq_cst`, so C++ code is correct-by-default and gives away performance by default; the optimisation is to weaken it to `acquire`/`release`, and getting that wrong reintroduces exactly the bug this page describes |
+| Go | the Go memory model, defined in terms of happens-before over channel operations and `sync` primitives | Go deliberately offers no `volatile` and no per-operation memory order — `sync/atomic` operations are sequentially consistent, so the ported litmus never shows the anomaly under `sync/atomic`. The `sync/atomic` package documentation still tells you to prefer channels or `sync`, so the Go answer to this page is mostly "do not be in this situation" |
+| Python | the GIL serialises bytecode execution in CPython | the GIL makes individual bytecodes atomic, which is why `x += 1` on a shared int is usually fine — but it is several bytecodes with switch points between them, so it is still a lost-update bug. And the guarantee is CPython's, not Python's: it does not hold under free-threaded builds |
+
+## exercises
+
+One exercise, and it is the whole page in four lines of code: a handshake that every sequential
+reading says is correct, and a machine that disagrees.
+
+<ProblemList topic="memory-model" />
+
+## interview drills
+
+**Q.** What does `volatile` do in C#?
+
+- *weak answer* — "It stops the value being cached in a register, so threads see each other's
+  writes." Half right, and it invites the follow-up that ends badly, because it implies `volatile`
+  makes things thread-safe.
+- *strong answer* — It does two things: it forces the read or write to actually be emitted, so the
+  JIT cannot hoist it out of a loop or fold it away, and it gives ordering — a volatile write is a
+  release store, a volatile read is an acquire load. It gives no atomicity, so `volatile int i;
+  i++` is still a lost-update bug, and it does not prevent a store being reordered with a later
+  load, which is the one reordering x86 allows.
+- *follow-up* — "So when do you use it?" A flag written by one thread and polled by another, where
+  the only requirement is that the reader eventually sees the write. For anything where two
+  variables must be consistent with each other, use a lock.
+
+**Q.** Two threads each set their own flag and then check the other's, and neither sees the other's
+flag. Explain.
+
+- *weak answer* — "There's a race — the threads interleaved badly." There is no interleaving of
+  those four operations that produces the outcome, so this answer means the candidate is still
+  reasoning about the source rather than the machine.
+- *strong answer* — Each core buffers its store in a per-core store buffer so it does not stall
+  waiting for the cache line, and a load is allowed to be serviced from cache while an earlier
+  store from the same core is still queued. That is StoreLoad reordering, the one reordering x86-64
+  permits, and it is why the pattern needs a full fence and not `volatile` — release and acquire
+  do not constrain a store against a later load.
+- *follow-up* — "How would you fix it?" `Interlocked.MemoryBarrier()` between the write and the
+  read on both threads makes it correct. But the pattern itself is a hand-rolled Dekker, and the
+  right production answer is one word and one `Interlocked.CompareExchange`, or a lock.
+
+**Q.** Is `lock` expensive?
+
+- *weak answer* — "Yes, avoid locks in hot paths, use `volatile` or `Interlocked` instead."
+  Cargo cult, and it trades a real correctness risk for a cost that mostly is not there.
+- *strong answer* — Uncontended, taking a lock is one atomic compare-and-exchange-shaped operation
+  on the lock's word plus a little bookkeeping — no kernel involvement, no thread parked. What is
+  expensive is *contention*: once a thread has to wait, you are paying a context switch and
+  cache-line ping-pong, and the cost becomes a function of how many threads want it. So the
+  question is never "is `lock` slow", it is "how many threads want this lock and for how long".
+- *follow-up* — "How would you reduce it without removing the lock?" Shrink the critical section,
+  stripe the lock across partitions so different keys take different locks, or make the shared
+  state per-thread and merge at the end.
+
+**Q.** Our service has been fine for three years. We are moving to Graviton instances. What
+concurrency risk does that introduce?
+
+- *weak answer* — "None, .NET is portable." Portable means it compiles and runs; it does not mean
+  the same reorderings are legal.
+- *strong answer* — ARM64 has a weak memory model: StoreStore, LoadLoad and LoadStore reorderings
+  are all permitted, and x86-64 forbids all three. Any code that has been relying on x86's ordering
+  by omission — a publish-then-flag pattern with plain fields, a hand-rolled double-checked lock
+  with a non-volatile field — becomes genuinely broken there while looking unchanged. The runtime
+  inserts the barriers the .NET memory model requires, so anything correctly annotated is fine; it
+  is the accidentally-correct code that breaks.
+- *follow-up* — "How would you find it before shipping?" Audit shared fields for the three
+  guarantees, prefer `Lazy<T>` and concurrent collections over hand-rolled patterns, and run the
+  test suite with stress on an ARM64 node — races that are impossible on x86 surface there at
+  ordinary rates.
+
+**Q.** Why isn't `count++` on a `volatile int` thread-safe?
+
+- *weak answer* — "Because `volatile` doesn't lock anything." True but empty; it does not say what
+  is actually going wrong.
+- *strong answer* — Because it is three operations: a load, an add, and a store. `volatile`
+  constrains when each of those becomes visible and in what order relative to other operations; it
+  does nothing to stop another thread's load landing between this thread's load and store, so both
+  compute the same new value and one update is lost. Atomicity is a separate guarantee from
+  ordering, and `Interlocked.Increment` is the one that provides it.
+- *follow-up* — "And if I need to increment two counters together?" Then neither `volatile` nor
+  `Interlocked` helps, because atomicity of each operation says nothing about the pair. That is a
+  lock, or a single struct swapped with `CompareExchange`.

@@ -1,0 +1,111 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: linked-lists
+problem: remove-nth-from-end
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+
+## task
+
+Given the `head` of a linked list, remove the `n`th node from the **end** of the list and return
+the head, in one pass.
+
+```text
+head = [1, 2, 3, 4, 5], n = 2  →  [1, 2, 3, 5]   (removed the 2nd node from the end: 4)
+```
+
+## how to think
+
+The two-pass answer is easy: walk once to get the length `L`, walk again to node `L - n - 1`,
+unlink its successor. One pass instead: open a gap of exactly `n` nodes between two pointers,
+then slide both forward together until the front one falls off the end. The moment it does, the
+back pointer is sitting exactly `n` nodes from the end — one node *before* the one you need to
+remove, which is exactly the position you need to unlink from. The dummy head exists so that
+removing the head itself (when `n` equals the list's length) isn't a special case either.
+
+<Callout kind="note" label="template instance">
+  **Dummy head** skeleton, plus a fixed-gap pointer pair borrowed from the fast/slow family.
+  Invariant once the gap is open: `fast` is always exactly `n` nodes ahead of `slow`.
+</Callout>
+
+## solution
+
+```csharp
+public ListNode? RemoveNthFromEnd(ListNode? head, int n)
+{
+    var dummy = new ListNode(0, head);
+    ListNode fast = dummy, slow = dummy;
+
+    for (int i = 0; i < n; i++)
+        fast = fast.Next!;               // open a gap of n nodes
+
+    while (fast.Next != null)
+    {
+        fast = fast.Next;
+        slow = slow.Next!;
+    }
+
+    slow.Next = slow.Next!.Next;         // slow sits right before the node to remove
+    return dummy.Next;
+}
+
+// standard interview definition
+public class ListNode(int val = 0, ListNode? next = null)
+{
+    public int Val = val;
+    public ListNode? Next = next;
+}
+```
+
+## trace
+
+`head = [1, 2, 3, 4, 5]`, `n = 2`:
+
+| phase | `slow` | `fast` | note |
+| --- | --- | --- | --- |
+| open gap | dummy (`0`) | `2` | `fast` walked `n = 2` steps ahead of `slow` |
+| step 1 | `1` | `3` | |
+| step 2 | `2` | `4` | |
+| step 3 | `3` | `5` | `fast.Next == null` now — stop |
+| remove | — | — | `slow.Next = slow.Next.Next` unlinks node `4` |
+
+```text
+dummy -> 1 -> 2 -> 3 -> 4 -> 5 -> null
+                   ^slow     ^fast (fast.Next is null, loop stops)
+
+after removal:
+dummy -> 1 -> 2 -> 3 -> 5 -> null
+```
+
+## why it works
+
+The gap between `slow` and `fast` is fixed at `n` the instant it's opened, and both pointers
+advance together afterward — so the gap never changes. The walk stops when `fast.Next == null`,
+i.e. when `fast` is sitting on the *last* node. At that moment `slow` is `n` nodes behind `fast`,
+which means `slow` is `n` nodes behind the last node — exactly the predecessor of the node that
+is `n`th from the end. `slow.Next` is therefore precisely the node to delete, and unlinking it
+needs no second pass.
+
+<Watch items={[['time', 'O(L)'], ['space', 'O(1)'], ['passes', '1']]} />
+
+## common bugs
+
+- Off-by-one on the gap size — opening a gap of `n` when the walk logic expects `n + 1` (or vice
+  versa) removes the wrong node or leaves `slow` pointing *at* the target instead of before it.
+- Skipping the dummy head — when `n` equals the list length (removing the actual head), there's
+  no "node before the head" left to hold the new `.Next` without one.
+- Writing the walking loop as `while (fast != null)` instead of `while (fast.Next != null)` —
+  lands `slow` one node too late, off the end of the intended predecessor.
+- Not validating `n` is within `[1, length]` before opening the gap — a malformed `n` walks
+  `fast` off the end mid-gap and throws a `NullReferenceException`.
+
+## variants you can now solve
+
+- [Middle of the Linked List](/patterns/linked-lists/middle-of-linked-list/) (LC 876) — the same
+  gap-and-slide idea, with a gap that grows to `length / 2` instead of a fixed `n`.
+- **Remove Duplicates from Sorted List** (LC 83) — no gap needed, but the same dummy-head
+  discipline the moment a duplicate run reaches the head.
+- **Rotate List** (LC 61) — find the new tail with a gap-of-`k` walk, then splice the list into a
+  ring and reopen it at the right point.

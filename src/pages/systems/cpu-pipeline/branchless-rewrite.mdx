@@ -1,0 +1,380 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: cpu-pipeline
+problem: branchless-rewrite
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import Solution from '@components/Solution.astro';
+
+## the question
+
+[The previous exercise](/systems/cpu-pipeline/sorted-array-branch/) built a software model of
+what a branch predictor remembers. The obvious follow-up: what if there is no branch to predict
+at all?
+
+The predicate is `data[i] >= 128`. For a byte value read into a 32-bit `int`, `v - 128` is
+negative exactly when `v < 128`, and an *arithmetic* right shift by 31 copies that sign bit
+across the entire 32-bit word — all ones when the value should be dropped, all zeros when it
+should be kept. Invert that and it is a mask you can `AND` with the value:
+
+```csharp
+int v = data[i];
+int keep = ~((v - 128) >> 31);   // 0 when v < 128, -1 (all ones) when v >= 128
+sum += v & keep;                 // adds v, or adds nothing -- with no branch at all
+```
+
+Three ways to write the same rule, then: the `if`, a ternary that *looks* like it should compile
+to "pick a value, don't branch", and this mask.
+
+<Callout kind="insight" label="predict first">
+  Three things to commit to before you scroll. **Is `v >= 128 ? v : 0` branchless on .NET** —
+  does writing it as an expression instead of a statement change what the JIT emits? **Work out
+  by hand** what `keep` evaluates to for `v = 200` and for `v = 50` — trace the subtraction, the
+  shift, and the `~` one step at a time. And **does the mask agree with the branch on every one
+  of the 256 possible byte values**, including the edges `v = 0`, `v = 127`, `v = 128` and
+  `v = 255` — or is there a value where signed overflow or a shift-by-31 edge case quietly
+  breaks it?
+</Callout>
+
+## the code
+
+<Solution>
+
+```csharp
+// Three ways to write "keep v if v >= 128, else 0" -- checked against every one of the 256
+// possible byte values, not sampled. The vector version operates on 32 bytes at once, so it is
+// checked separately, against many random 32-byte blocks.
+using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.X86;
+
+// A. the branch -- the source of truth this exercise checks the other two against.
+static long Branchy(byte v) => v >= 128 ? v : 0;
+
+// B. the ternary -- same logic, written as an expression instead of a statement.
+static long Ternary(byte v) => v >= 128 ? v : 0;
+
+// C. the mask -- pure arithmetic, no comparison that can be "taken" or "not taken" at all.
+static long Masked(byte v)
+{
+    int x = v;
+    int keep = ~((x - 128) >> 31);   // 0 when x < 128, -1 (all ones) when x >= 128
+    return x & keep;
+}
+
+int mismatches = 0;
+for (int b = 0; b <= 255; b++)
+{
+    long expected = Branchy((byte)b);
+    if (Ternary((byte)b) != expected) { mismatches++; Console.WriteLine($"ternary mismatch at {b}"); }
+    if (Masked((byte)b) != expected)  { mismatches++; Console.WriteLine($"masked mismatch at {b}"); }
+}
+Console.WriteLine($"checked all 256 byte values: {mismatches} mismatches");
+if (mismatches != 0) throw new Exception("FAIL: a branchless rewrite disagreed with the branch somewhere in the byte domain");
+
+// D. 32 bytes at once: the comparison becomes a per-byte mask, the mask selects, and
+// SumAbsoluteDifferences (the psadbw instruction) folds 32 masked bytes into four 64-bit lanes.
+// x86-64 with AVX2, which is what this box has.
+if (Avx2.IsSupported)
+{
+    var rng = new Random(2024);
+    for (int trial = 0; trial < 1000; trial++)
+    {
+        var block = new byte[32];
+        rng.NextBytes(block);
+        var threshold = Vector256.Create((byte)128);
+        var v = Vector256.LoadUnsafe(ref block[0]);
+        var keep = Avx2.CompareEqual(Avx2.Max(v, threshold), v);   // v >= 128, per byte
+        var kept = Avx2.And(v, keep);
+        var lanes = Avx2.SumAbsoluteDifferences(kept, Vector256<byte>.Zero).AsUInt64();
+        long simdSum = 0;
+        for (int lane = 0; lane < 4; lane++) simdSum += (long)lanes[lane];
+
+        long scalarSum = 0;
+        for (int i = 0; i < 32; i++) scalarSum += Branchy(block[i]);
+        if (simdSum != scalarSum)
+            throw new Exception($"FAIL: simd/scalar mismatch on trial {trial}: {simdSum} vs {scalarSum}");
+    }
+    Console.WriteLine("1,000 random 32-byte blocks: simd sum matches scalar sum every time");
+}
+Console.WriteLine("PASS");
+```
+
+</Solution>
+
+## work it out
+
+### the mask, one value at a time
+
+`v = 200` (should be kept — it's ≥ 128):
+
+```text
+v - 128        = 72                      (positive: 200 is ≥ 128)
+(v - 128) >> 31 = 0                      (arithmetic shift of a non-negative 32-bit value is 0)
+~0             = -1  =  0xFFFFFFFF       (all one-bits)
+v & 0xFFFFFFFF = 200                     (kept, unchanged)
+```
+
+`v = 50` (should be dropped — it's under 128):
+
+```text
+v - 128        = -78                     (negative: 50 is < 128)
+(v - 128) >> 31 = -1  =  0xFFFFFFFF      (arithmetic shift smears the sign bit across all 32 bits)
+~0xFFFFFFFF    = 0                       (invert every bit)
+v & 0           = 0                      (dropped)
+```
+
+The trick lives entirely in that one shift: `>>` on a signed `int` in C# is an *arithmetic*
+shift, which copies the sign bit rather than filling with zero, so a negative 32-bit value
+shifted right by 31 becomes exactly `-1` — thirty-two one-bits — and a non-negative one becomes
+exactly `0`. Everything else is bit-inversion and `AND`.
+
+<Callout kind="trap" label="the edges, by the same reasoning">
+  `v = 128` gives `v - 128 = 0`, which is non-negative, so `keep = -1` and the value is kept —
+  correct, `128 >= 128`. `v = 0` gives `v - 128 = -128`, negative, `keep = 0`, dropped — correct.
+  `v = 255` gives `v - 128 = 127`, non-negative, kept — correct. No overflow is possible because
+  `v` is a `byte` widened into an `int` before the subtraction: the smallest possible result is
+  `0 - 128 = -128` and the largest is `255 - 128 = 127`, both comfortably inside `int`'s range.
+  The 256-value check above is not a sample of this reasoning, it is a restatement of it in
+  code.
+</Callout>
+
+### the ternary is not a request for a conditional move
+
+Compiled here, `Tier1-OSR` code (optimised, entered mid-loop — the same tier the previous
+exercise's methods ran under), the three inner loops actually look like this — real
+`DOTNET_JitDisasm` output, trimmed only of the method prologue, the epilogue, the assembler's own
+zero-byte alignment markers, and the out-of-range helper stub every bounds check jumps to, all
+four identical boilerplate in every one of the three. Labels, instructions and order are
+otherwise exactly as compiled:
+
+```text
+;  A -- the if
+G_M000_IG02:
+       mov      edi, dword ptr [rax+0x08]       ; edi = data.Length
+       cmp      edi, edx
+       jle      SHORT G_M000_IG07
+G_M000_IG03:
+       mov      edx, edx
+       jmp      SHORT G_M000_IG06
+G_M000_IG04:
+       mov      esi, esi
+       add      rcx, rsi                        ; sum += data[i]
+G_M000_IG05:
+       inc      edx
+       cmp      edi, edx
+       jle      SHORT G_M000_IG07
+G_M000_IG06:
+       cmp      edx, edi
+       jae      SHORT G_M000_IG09              ; bounds check
+       movzx    rsi, byte  ptr [rax+rdx+0x10]  ; load data[i]
+       cmp      esi, 128
+       jl       SHORT G_M000_IG05              ; the branch this exercise is about -- skip the add
+       jmp      SHORT G_M000_IG04              ; falls through to the add otherwise
+
+;  B -- the ternary
+G_M000_IG02:
+       mov      edi, dword ptr [rax+0x08]
+       cmp      edi, edx
+       jle      SHORT G_M000_IG07
+G_M000_IG03:
+       mov      edx, edx
+       jmp      SHORT G_M000_IG05
+G_M000_IG04:
+       movsxd   rsi, esi
+       add      rcx, rsi                        ; sum += (data[i] or 0) -- unconditionally reached
+       inc      edx
+       cmp      edi, edx
+       jle      SHORT G_M000_IG07
+G_M000_IG05:
+       cmp      edx, edi
+       jae      SHORT G_M000_IG09
+       movzx    rsi, byte  ptr [rax+rdx+0x10]
+       cmp      esi, 128
+       jge      SHORT G_M000_IG04              ; still a branch -- opposite polarity, same idea
+G_M000_IG06:
+       xor      esi, esi                        ; the "0" side of the ternary
+       jmp      SHORT G_M000_IG04
+
+;  C -- the mask
+G_M000_IG02:
+       mov      edi, dword ptr [rax+0x08]
+       cmp      edi, edx
+       jle      SHORT G_M000_IG05
+G_M000_IG03:
+       mov      edx, edx
+G_M000_IG04:
+       cmp      edx, edi
+       jae      SHORT G_M000_IG07              ; bounds check -- a branch, but never taken
+       movzx    rsi, byte  ptr [rax+rdx+0x10]
+       lea      r8d, [rsi-0x80]                 ; v - 128
+       sar      r8d, 31                          ; smear the sign bit: 0 or -1
+       andn     esi, r8d, esi                    ; BMI1: esi = (~r8d) & esi -- mask and AND, one instr
+       movsxd   rsi, esi
+       add      rcx, rsi                         ; sum += masked value -- nothing here asks about data
+       inc      edx
+       cmp      edi, edx
+       jg       SHORT G_M000_IG04
+```
+
+All three carry the same `IG02`/`IG03` pair — the loop-bound check and the OSR compiler's own
+bookkeeping for being entered mid-loop rather than from a cold call, identical in shape across
+all three and not where the interesting difference is. The difference is what each loop does
+with the *result* of the comparison against `128`. Loop A (the `if`) branches to skip the `add`
+entirely when `v < 128` (`jl SHORT G_M000_IG05`, in its `IG06`), and falls through to the add
+otherwise. Loop B (the ternary) branches the *other* way — `jge SHORT G_M000_IG04` sends the
+`v >= 128` case straight to the add — and for the case it does not send there, it does not skip
+anything: its `IG06` zeroes `esi` and jumps to that same `IG04`, so the add instruction runs on
+*every* element regardless of which side of the comparison it came from, with the "0 or v" choice
+already made before it gets there. That is a real branch with a different shape from the `if`'s,
+not a conditional move by another name. Loop C (the mask) is the only one of the three whose loop
+body, `IG04`, contains no comparison against `128` and no branch that depends on `v` at all —
+only the bounds check, which never depends on the data being summed.
+
+That is not because RyuJIT cannot emit a conditional move: compiled standalone, outside a loop,
+`static int Sel(int a, int b) => a > b ? a : b;` becomes exactly this at full optimisation,
+verified on this runtime:
+
+```text
+G_M000_IG02:
+       cmp      edi, esi
+       mov      eax, esi
+       cmovg    eax, edi
+G_M000_IG03:
+       ret
+```
+
+Three instructions, no branch. So the JIT has `cmov` and will use it — it applies a heuristic
+inside the loop above and decided a real branch was cheaper there, and there is no source-level
+way to insist otherwise. **Writing a ternary and hoping is not a technique.** If you want
+branchless code, you have to write arithmetic that has no comparison-and-jump in it at all,
+which is what the mask does — count the mask loop's instructions above and there is no `cmp`
+against `128` anywhere in it, only against the bounds check, which never depends on the data.
+
+### the mask trades a comparison for guaranteed extra work
+
+Read the three listings as instruction counts instead of as a mechanism, and the trade is
+already on the page. The `if` loop's `add` is only reached when the value clears the threshold —
+it has a path that skips work entirely. The mask loop's `lea`/`sar`/`andn`/`add` chain runs on
+*every* element, no exceptions, whether that element was going to be kept or not. **The mask
+does not do less work than the branch; it does the same fixed amount of work every time,
+guaranteed, in exchange for never asking the front end to guess anything about the data.** That
+trade is only worth making when the thing it removes — a guess that is wrong often enough to
+matter — is expensive enough to be worth paying a fixed cost instead. The previous exercise is
+the tool for deciding that: if the predicate has a period a real predictor's history table can
+learn, there is very little guess-cost to remove in the first place.
+
+### 32 lanes at once, traced by hand
+
+The real code checks 32 bytes per vector; here is the same idea traced on 8, small enough to
+follow by eye. Values `[10, 200, 128, 127, 255, 0, 130, 5]`, threshold 128 in every lane:
+
+```text
+lane          v0   v1   v2   v3   v4   v5   v6   v7
+value         10  200  128  127  255    0  130    5
+Max(v,128)   128  200  128  128  255  128  130  128
+v == Max?      no  yes  yes   no  yes   no  yes   no    ← the per-byte "v >= 128" mask
+kept value      0  200  128    0  255    0  130    0
+```
+
+`Max(v, 128)` equals `v` exactly when `v >= 128` (if `v < 128` the max is `128`, which differs
+from `v`; if `v >= 128` the max *is* `v`). `CompareEqual` turns that per-lane equality into an
+all-ones or all-zeros mask, `And` applies it, and the real code's `SumAbsoluteDifferences`
+instruction folds the 32 (or, by hand, 8) masked bytes into 64-bit lane totals in one
+instruction: `0 + 200 + 128 + 0 + 255 + 0 + 130 + 0 = 713`.
+
+## the answer
+
+```text
+checked all 256 byte values: 0 mismatches
+1,000 random 32-byte blocks: simd sum matches scalar sum every time
+PASS
+```
+
+The reasoning and the check agree at every level: the mask matches the branch on all 256
+possible byte values, including every edge case worked out by hand above, and the AVX2 path
+matches a scalar sum on a thousand random 32-byte blocks. The ternary genuinely compiles to a
+branch — a second `cmp`/conditional-jump pair, not a `cmov` — while the mask genuinely compiles
+to zero comparisons against the data.
+
+## why it works that way
+
+**A branch asks a question and skips work on one answer. Branchless arithmetic computes an
+answer for both cases and throws one away with a data-independent operation — a mask-and-AND, a
+conditional move, a `min`/`max` clamp.** The second form has no "skip" to speed up, so it costs
+the same regardless of what the data looks like; the first form's cost is entirely a function of
+how often the skip actually happens and how often the predictor guesses which way. Neither form
+is faster in general — they trade a variable cost for a fixed one, and which trade is worth
+making depends on how variable the branch actually is, which is exactly what
+[the previous exercise](/systems/cpu-pipeline/sorted-array-branch/) gives you a way to reason
+about instead of guess at.
+
+<Watch items={[['ternary in C#', 'still compiles to a real conditional branch here'], ['standalone a > b ? a : b', 'does compile to cmov -- context-dependent, not syntax-dependent'], ['the mask', 'zero comparisons against the data; fixed work every element'], ['sign-smear trick', '(v - 128) >> 31 is 0 or -1 only because the arithmetic shift is signed'], ['AVX2 width on this box', '32 bytes per vector instruction'], ['branchless code', 'trades a variable cost for a fixed one -- not automatically a win']]} />
+
+## what this looks like in prod
+
+**This is not the first move.** Making a branch predictable — grouping data so a predicate is
+constant for long runs, splitting one loop into two uniform ones, hoisting a per-request
+condition out of a per-item loop — wins in every regime and leaves code a colleague can read
+without decoding a bit trick. Reach for arithmetic only when the predicate is genuinely close to
+random per element *and* the loop body around it is small enough for a fixed extra cost to
+matter.
+
+**Where branchless is not about speed at all.** Cryptographic comparisons must avoid branching
+on secret data, because a branch's very presence — not its cost — leaks information through
+which code path executed. That is why .NET ships `CryptographicOperations.FixedTimeEquals`
+instead of letting you compare two MACs with a loop that returns on the first mismatch: the
+early return is the vulnerability, independent of how fast either path runs. If you ever
+hand-roll a comparison of secrets, this stops being a performance decision and becomes a
+correctness one.
+
+**Where you are already using it without noticing.** `bool`-to-`int` arithmetic and a lookup
+table indexed by a computed value are branch elimination in disguise, and so is the hand-written
+vector code inside `IndexOf`, `Contains` and `SequenceEqual` — the practical reason those
+framework methods beat an equivalent hand-rolled loop even when the loop looks equivalent on
+paper. What is *not* automatically branchless is every conditional-looking API: `Math.Max` and
+friends compile per call site, under the same JIT heuristic that kept a branch in the ternary
+above, not under a blanket guarantee.
+
+**Verify across the whole domain the code will actually see, not a handful of examples.** A
+hand-rolled bit trick that is correct for the three values you tried it on and wrong at a
+boundary is a worse outcome than the branch it replaced. Where the input space is small enough
+to enumerate — a `byte`, an `enum`, a small `int` range — checking every value, as this exercise
+does, costs nothing and removes the guesswork entirely.
+
+## the same idea in other languages
+
+| language | who decides whether the branch survives | the trap |
+| --- | --- | --- |
+| C / C++ | the compiler, by a cost heuristic you can nudge but not command | Verified on this box: `gcc -O2` compiles the equivalent `if` and ternary to the identical `cmovs` instruction sequence — no branch, no vector code — because the loop's trip count is a runtime value the vectoriser's cost model declines to touch. Give the same loop a compile-time-constant bound instead and plain `-O2` vectorises it fully, as seen in the previous exercise. You cannot tell from C source alone whether a branch exists in the binary; `objdump -d` is how you find out, and it is worth the ten seconds every time you are about to reason from "the compiler probably handled this." |
+| Java (HotSpot) | the JIT, by a heuristic, at runtime, on the compiled method | HotSpot can if-convert small conditionals into branchless code, but — like RyuJIT — only when its own cost model says to, not on request. The trap is identical to the C# ternary above: "the JIT already made this branchless" is a claim about a disassembly, not about syntax, and it is worth checking rather than assuming either way. |
+| Rust | LLVM, aggressively, and the same shape can flip between releases | `rustc -O` shares LLVM's back end with clang, and idiomatic index-based Rust routinely comes out vectorised or `cmov`-converted with no branch at all — an outcome that depends on LLVM's cost model at the version you happen to be building with, not on anything guaranteed by the source. The discipline is the same as C's: check the emitted code before reasoning about a branch that might not exist. |
+| Go | mostly you | Go's compiler applies comparatively little of this kind of transformation, so a source-level `if` is close to a reliable predictor of a machine-level branch. The upside of a simpler compiler is that what you write is closer to what you get; the downside is you get none of the free rescues the rows above sometimes provide. |
+
+## common bugs
+
+- **Believing the ternary is branchless because it "looks like an expression."** Verified above:
+  it compiled to a real conditional jump on this runtime, plus an extra unconditional jump the
+  `if` version does not pay. The same runtime does emit `cmov` for a standalone comparison
+  outside a loop, which is exactly what makes the belief durable — check the disassembly, don't
+  infer it from syntax.
+- **Sign-extension bugs in a hand-rolled mask.** `(v - 128) >> 31` only works because `v` is
+  widened from a `byte` before the subtraction, keeping the result inside a *signed* range no
+  wider than `-128..127`. Reach for the same trick on a `uint` or a wider threshold and `>>`
+  stops being an arithmetic shift, or the subtraction can land outside the range the smear
+  assumes — always re-derive the bit widths for the actual types in play, and check the whole
+  domain the way this exercise's 256-value loop does, not a handful of hand-picked cases.
+- **Forgetting that both sides of a branchless rewrite now always execute.** The branch was also
+  skipping work, not just skipping a guess. If the taken side dereferences something, calls
+  something, or divides by something that might be zero, there is no branchless version of it
+  without first making the skipped operation safe to run unconditionally.
+- **Reaching for a bit trick before checking whether the branch was ever a problem.** A
+  predicate that is 95% one-directional on real data costs almost nothing once a predictor has
+  seen a few hundred rows of it — the previous exercise's "sorted" and "blocks of 64" rows are
+  exactly this case. Rewriting that predicate as unconditional arithmetic replaces a nearly-free
+  branch with guaranteed extra work on every element, for no benefit at all.
+- **Shipping a vector path with no scalar tail.** 16,384 is divisible by 32; most real input
+  lengths are not. Every SIMD loop needs a remainder loop for the last `length % 32` elements,
+  and a hand test whose length happens to be a clean multiple of the vector width will never
+  exercise the bug.

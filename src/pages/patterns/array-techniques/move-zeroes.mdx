@@ -1,0 +1,116 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: array-techniques
+problem: move-zeroes
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import Cells from '@components/Cells.astro';
+
+## task
+
+Given an array `nums`, move every `0` to the end while keeping the relative order of the
+non-zero elements. Do it **in place** — no extra array.
+
+```text
+nums = [0, 1, 0, 3, 12]  →  [1, 3, 12, 0, 0]
+```
+
+## how to think
+
+This is [Remove Duplicates from Sorted Array](/patterns/two-pointers/remove-duplicates/) again,
+wearing a different condition. You've already built the read/write skeleton once: `write` marks
+the end of the finished region, `read` scans ahead looking for values worth keeping, and every
+kept value gets written into the next free slot. The only thing that changes here is the
+predicate — "keep if non-zero" instead of "keep if different from the last kept value" — and
+the fact that the *rejected* values need to end up somewhere too (at the end), not just get
+dropped.
+
+That second point is the only new wrinkle. Instead of overwriting `nums[write]` with
+`nums[read]` (which would lose whatever was sitting at `write`), **swap** them. Everything
+strictly between `write` and `read` is guaranteed to be zero — if it weren't, it would already
+have been swapped into the front region on an earlier iteration — so swapping a non-zero into
+`write` always sends a zero backward into `read`'s old slot, and the zeros drift to the end for
+free.
+
+<Callout kind="note" label="template instance">
+  **In-place read/write** skeleton, recalled from Remove Duplicates. Invariant: `[0, write)` is
+  the finished, non-zero, order-preserved region; everything in `[write, read)` is zero.
+  What varies: overwrite becomes swap, so the rejected zeros land at the back instead of
+  vanishing.
+</Callout>
+
+## solution
+
+```csharp
+public void MoveZeroes(int[] nums)
+{
+    int write = 0;                                  // [0, write) holds the non-zero values seen so far
+    for (int read = 0; read < nums.Length; read++)
+    {
+        if (nums[read] != 0)
+        {
+            (nums[write], nums[read]) = (nums[read], nums[write]);  // swap, not overwrite — keeps the zero
+            write++;
+        }
+    }
+}
+```
+
+## trace
+
+`nums = [0, 1, 0, 3, 12]`:
+
+| read | nums[read] | action (indices swapped) | write (after) | nums (after) |
+| --- | --- | --- | --- | --- |
+| 0 | 0 | skip | 0 | `[0, 1, 0, 3, 12]` |
+| 1 | 1 | swap write=0, read=1 | 1 | `[1, 0, 0, 3, 12]` |
+| 2 | 0 | skip | 1 | `[1, 0, 0, 3, 12]` |
+| 3 | 3 | swap write=1, read=3 | 2 | `[1, 3, 0, 0, 12]` |
+| 4 | 12 | swap write=2, read=4 | 3 | `[1, 3, 12, 0, 0]` |
+
+<Cells
+  data={[1, 0, 0, 3, 12]}
+  pointers={{ 1: [{ t: 'W', c: 'amber' }], 3: [{ t: 'R', c: 'cyan' }] }}
+  cells={{ 0: 'ok' }}
+  caption="after read=1: 1 is settled at index 0; write=1 and read=3 are about to swap 3 into place"
+/>
+
+<Cells
+  data={[1, 3, 12, 0, 0]}
+  pointers={{ 3: [{ t: 'W', c: 'amber' }] }}
+  cells={{ 0: 'ok', 1: 'ok', 2: 'ok', 3: 'warn', 4: 'warn' }}
+  caption="final: three non-zero values in original order, both zeros pushed to the back"
+/>
+
+## why it works
+
+The invariant holds at every step: `[0, write)` is the finished, non-zero, order-preserved
+front; `[write, read)` is all zeros (anything non-zero there would already have been swapped
+forward). When `nums[read]` is non-zero, swapping it into `nums[write]` extends the front region
+by one and sends whatever was at `write` — always a zero, by the invariant — back to `read`'s
+position, which is about to be passed over anyway. `read` visits every index once, so this is a
+single O(n) pass with zero extra space.
+
+<Watch items={[['time', 'O(n)'], ['space', 'O(1)'], ['passes', '1']]} />
+
+## common bugs
+
+- Overwriting then zeroing the tail (`nums[write++] = nums[read]` in one loop, then filling
+  `[write..n)` with zeros in a second) — works, but needs two loops; zeroing `nums[read]` inline
+  instead destroys the value just written whenever `write == read`.
+- Advancing `write` on every iteration instead of only when a non-zero is found — that's just a
+  copy, not a compaction, and loses the "skip zeros" behavior entirely.
+- Swapping `nums[write]` and `nums[read]` when `write == read` — harmless (it's a no-op swap),
+  but writing it as an `if (write != read)` guard "for safety" is dead code worth recognizing as
+  unnecessary, not adding.
+- Trying to delete/remove zeros with `List<T>` methods mid-loop — mutating a collection's length
+  while iterating it is a different bug class entirely; arrays don't have this trap, use it.
+
+## variants you can now solve
+
+- **[Remove Duplicates from Sorted Array](/patterns/two-pointers/remove-duplicates/)** (LC 26) —
+  the problem this one recalls; same skeleton, overwrite instead of swap.
+- **Remove Element** (LC 27) — identical shape again: keep if `nums[read] != val`.
+- **Sort Array By Parity** (LC 905) — same swap trick, predicate becomes "even goes first".

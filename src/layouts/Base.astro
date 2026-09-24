@@ -1,0 +1,39 @@
+---
+import '@fontsource-variable/jetbrains-mono';
+import '@styles/global.css';
+import Sidebar from '@components/Sidebar.astro';
+
+interface Props {
+  title: string;
+  description: string;
+}
+const { title, description } = Astro.props;
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{title} · pattern debugger</title>
+    <meta name="description" content={description} />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="sitemap" href="/sitemap-index.xml" />
+    <meta property="og:title" content={title} />
+    <meta property="og:description" content={description} />
+    <meta property="og:type" content="article" />
+    <meta name="generator" content={Astro.generator} />
+  </head>
+  <body>
+    <div class="mx-auto flex min-h-dvh max-w-6xl">
+      <Sidebar />
+      <main class="min-w-0 flex-1 px-4 pt-16 pb-24 sm:px-8 lg:pt-8">
+        <slot />
+        <footer class="border-line text-muted mt-20 border-t pt-6 font-mono text-xs">
+          <span class="text-muted">//</span> algorithm patterns for coding interviews · all
+          solutions in C# · step through everything
+        </footer>
+      </main>
+    </div>
+  </body>
+</html>

@@ -1,0 +1,43 @@
+---
+import { topicBySlug, topicPath } from '@data/curriculum';
+
+/**
+ * Cross-pattern links panel, generated from curriculum.ts — the single source
+ * of the link graph. Pages never hand-author these.
+ */
+interface Props {
+  topic: string;
+}
+const { topic: slug } = Astro.props;
+const topic = topicBySlug(slug);
+if (!topic) {
+  throw new Error(`<Connections>: unknown topic slug "${slug}"`);
+}
+const resolved = topic.connections.map((c) => {
+  const target = topicBySlug(c.to)!; // validated at module load
+  return { title: target.title, path: topicPath(target), reason: c.reason };
+});
+---
+
+{
+  resolved.length > 0 && (
+    <section class="border-line mt-12 border-t pt-6">
+      <h2 class="font-mono text-[1.05rem] font-semibold">
+        <span class="text-muted">// </span>connections
+      </h2>
+      <ul class="mt-3 space-y-2">
+        {resolved.map((c) => (
+          <li class="text-[0.9rem]">
+            <a
+              href={c.path}
+              class="font-mono text-amber underline decoration-amber/40 underline-offset-3 hover:decoration-amber"
+            >
+              {c.title}
+            </a>
+            <span class="text-ink"> — {c.reason}</span>
+          </li>
+        ))}
+      </ul>
+    </section>
+  )
+}

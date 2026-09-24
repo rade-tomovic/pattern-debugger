@@ -1,0 +1,118 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: linked-lists
+problem: reverse-linked-list
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+
+## task
+
+Given the `head` of a singly linked list, reverse it in place and return the new head.
+
+```text
+head = [1, 2, 3, 4, 5]  →  [5, 4, 3, 2, 1]
+```
+
+## how to think
+
+Copying values into a stack or an array and rebuilding gets you there in O(n) space, but the
+list already has everything you need — you just need to flip each arrow without losing the rest
+of the chain. The trap: the instant you write `curr.Next = prev`, you've destroyed your only
+route to the rest of the original list. So you save it first. That's the whole algorithm, and it
+compresses to a four-line mantra you should be able to recite without looking at code: **save
+next, flip the arrow, advance prev, advance curr.**
+
+<Callout kind="note" label="template instance">
+  **Iterative reversal** skeleton, verbatim — this page *is* the template. Invariant: everything
+  from `head` up to (but not including) `curr` has already been flipped and is reachable by
+  walking from `prev`; everything from `curr` onward is still in its original order, untouched.
+</Callout>
+
+## solution
+
+```csharp
+public ListNode? ReverseList(ListNode? head)
+{
+    ListNode? prev = null;
+    ListNode? curr = head;
+
+    while (curr != null)
+    {
+        ListNode? next = curr.Next;   // save — about to overwrite curr.Next
+        curr.Next = prev;             // flip the arrow backward
+        prev = curr;                  // advance prev
+        curr = next;                  // advance curr
+    }
+    return prev;                      // curr ran off the end; prev is the new head
+}
+
+// standard interview definition
+public class ListNode(int val = 0, ListNode? next = null)
+{
+    public int Val = val;
+    public ListNode? Next = next;
+}
+```
+
+## trace
+
+`head = [1, 2, 3, 4, 5]`:
+
+| step | node flipped | `prev` after | `curr` after |
+| --- | --- | --- | --- |
+| 1 | `1` | 1 | 2 |
+| 2 | `2` | 2 | 3 |
+| 3 | `3` | 3 | 4 |
+| 4 | `4` | 4 | 5 |
+| 5 | `5` | 5 | `null` |
+
+The midpoint is the moment worth staring at — right after step 2, the list has physically split
+into two independent chains:
+
+```text
+after step 2 (prev = 2, curr = 3):
+
+  reversed prefix (walk from prev):    2 -> 1 -> null
+  untouched suffix (walk from curr):        3 -> 4 -> 5 -> null
+```
+
+Nothing connects them yet — `curr.Next` for node `3` still points to `4`, exactly as it did in
+the input. Step 3 is what splices node `3` onto the reversed prefix and shrinks the untouched
+suffix by one.
+
+`curr` becomes `null` after step 5, so the loop stops and `prev` (node `5`) is returned as the
+new head: `5 -> 4 -> 3 -> 2 -> 1 -> null`.
+
+## why it works
+
+The invariant holds by induction: before the first iteration, the "reversed" part is empty
+(`prev = null`) and the "untouched" part is the whole list — trivially true. Each iteration moves
+exactly one node — the current `curr` — from the front of the untouched part to the front of the
+reversed part, and because `next` was captured before `curr.Next` was overwritten, the untouched
+part never loses a node in the process. When `curr` finally becomes `null`, the untouched part is
+empty and the reversed part is the entire list, with `prev` sitting on its new head.
+
+<Watch items={[['time', 'O(n)'], ['space', 'O(1)']]} />
+
+## common bugs
+
+- Not saving `curr.Next` before reassigning it — the rest of the list is gone, unrecoverable,
+  the moment `curr.Next = prev` runs.
+- Returning `head` instead of `prev` — by the end, `head` is the new *tail*; its `.Next` is
+  `null`.
+- Advancing only one of `prev` / `curr` in an iteration — the loop either infinite-loops or skips
+  nodes.
+- In a recursive version, forgetting to set the original head's `.Next = null` after the
+  recursion unwinds — leaves a two-node cycle at the new tail.
+
+## variants you can now solve
+
+- **Reverse Linked List II** (LC 92) — reverse only the sublist between positions `left` and
+  `right`: splice this exact loop into the middle, then reconnect the untouched head and tail
+  around it.
+- **Reverse Nodes in k-Group** (LC 25) — run this loop for exactly `k` nodes, recurse (or
+  iterate) on the rest, and reconnect group boundaries as you unwind.
+- [Palindrome Linked List](/patterns/linked-lists/palindrome-linked-list/) (LC 234) — reverses
+  just the second half using this exact loop, then walks both halves to compare.

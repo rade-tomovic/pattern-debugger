@@ -1,0 +1,111 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: dynamic-programming
+problem: house-robber
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import Cells from '@components/Cells.astro';
+
+## task
+
+Houses stand in a line, house `i` holding `nums[i]` dollars. Adjacent houses share a connected
+alarm system, so you can't rob two neighbors on the same night. Return the maximum you can steal.
+
+```text
+nums = [2, 7, 9, 3, 1]  →  12   (rob houses 0, 2, 4: 2 + 9 + 1)
+```
+
+## how to think
+
+At house `i` there are exactly two choices: skip it (carry forward whatever the best total was
+through `i-1`), or rob it (take `nums[i]` plus the best total through `i-2` — house `i-1` is now
+off-limits). The best total through `i` is whichever choice wins:
+`dp[i] = max(dp[i-1], dp[i-2] + nums[i])`. It's the same two-predecessor recurrence shape as
+Climbing Stairs, with `max` standing in for `+` because here one of the two branches is allowed
+to lose.
+
+Brute force tries both choices at every house recursively — 2ⁿ paths, most of them re-deriving
+the same `dp[i-2]` result from different directions. Because `dp[i]` only ever needs the two
+totals immediately before it, the whole history compresses to two rolling variables, same as
+before.
+
+<Callout kind="note" label="template instance">
+  **Bottom-up tabulation**, rolled to two variables. State: `dp[i]` = the max take using only
+  houses `0..i`. Recurrence: `dp[i] = max(dp[i-1], dp[i-2] + nums[i])`. Base case: an empty
+  prefix contributes `0`.
+</Callout>
+
+## solution
+
+```csharp
+public int Rob(int[] nums)
+{
+    int prev2 = 0, prev1 = 0;                    // dp[-2], dp[-1] — no houses seen yet
+
+    foreach (int n in nums)
+    {
+        int current = Math.Max(prev1, prev2 + n); // skip house n, or rob it and add dp[i-2]
+        prev2 = prev1;
+        prev1 = current;
+    }
+    return prev1;
+}
+```
+
+## trace
+
+`nums = [2, 7, 9, 3, 1]`, starting from `prev2 = 0`, `prev1 = 0`:
+
+| house | nums[i] | prev1 (skip) | prev2 + nums[i] (rob) | current = max(...) | new prev2 | new prev1 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 0 | 2 | 0 | 0 + 2 = 2 | 2 | 0 | 2 |
+| 1 | 7 | 2 | 0 + 7 = 7 | 7 | 2 | 7 |
+| 2 | 9 | 7 | 2 + 9 = 11 | 11 | 7 | 11 |
+| 3 | 3 | 11 | 7 + 3 = 10 | 11 | 11 | 11 |
+| 4 | 1 | 11 | 11 + 1 = 12 | 12 | 11 | 12 |
+
+Final answer: `prev1 = 12` — houses 0, 2, 4 (`2 + 9 + 1`).
+
+At house 3, robbing loses to skipping — the moment the "adjacent" constraint actually costs
+something:
+
+<Cells
+  data={[2, 7, 9, 3, 1]}
+  pointers={{ 3: [{ t: 'i', c: 'amber' }] }}
+  cells={{ 2: 'ok', 3: 'warn' }}
+  caption="skip (carry 11 from house 2) beats rob (7 + 3 = 10) — house 3 stays unrobbed"
+/>
+
+## why it works
+
+`dp[i]` weighs both possible fates of house `i` — robbed or skipped — and keeps the better one,
+so it can never underestimate the true optimum through `i`. It can't overestimate either: robbing
+house `i` correctly forbids house `i-1` by reading `dp[i-2]`, not `dp[i-1]`. By induction, the
+invariant "`prev1` = true optimum through the last house processed, `prev2` = true optimum
+through the one before that" holds after every step, so it holds at the end.
+
+<Watch items={[['time', 'O(n)'], ['space', 'O(1)']]} />
+
+## common bugs
+
+- Reading `prev1 + nums[i]` instead of `prev2 + nums[i]` for the "rob" branch — that would rob
+  two adjacent houses.
+- Initializing both rolling variables to `nums[0]` instead of `0` — breaks on a 1- or 2-house
+  input, where the "before the array" state must contribute nothing.
+- Treating this as plain Kadane (extend-or-restart) — it isn't. You need *both* trailing values,
+  not just a running best, because robbing depends on skipping the immediate neighbor.
+- Applying this unmodified to a circular arrangement (House Robber II) — house `0` and house
+  `n-1` are adjacent there, which this recurrence has no way of knowing.
+
+## variants you can now solve
+
+- **House Robber II** (LC 213) — houses form a circle, so house `0` and house `n-1` are now
+  adjacent too. Run this exact function twice — once excluding house `0`, once excluding house
+  `n-1` — and take the max; excluding either endpoint breaks the circle back into a line.
+- [Climbing Stairs](/patterns/dynamic-programming/climbing-stairs/) — the same two-predecessor
+  recurrence with `+` instead of `max`, because every stair-count contributes rather than
+  competes.
+- **House Robber III** (LC 337) — houses form a binary tree instead of a line; the recurrence
+  becomes "rob this node plus skip its children" vs. "skip this node," combined postorder.

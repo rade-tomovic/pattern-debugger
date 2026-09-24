@@ -1,0 +1,142 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: tree-traversals
+problem: lowest-common-ancestor-bst
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+
+## task
+
+Given the root of a **binary search tree** and two of its nodes `p` and `q`, find their lowest
+common ancestor: the deepest node that has both `p` and `q` as descendants (a node is allowed to
+be its own descendant).
+
+```text
+            6
+          /   \
+         2     8
+        / \   / \
+       0   4 7   9
+          / \
+         3   5
+```
+
+`LCA(2, 8) = 6` · `LCA(2, 4) = 2` (one node is an ancestor of the other)
+
+## how to think
+
+On a general tree, finding the LCA means searching both subtrees and combining what each one
+finds — real recursion, real work. A BST hands you something a general tree doesn't: **order**.
+At any node, you can tell which subtree `p` and `q` are in *without searching* — just compare
+values. Both smaller than the current node? They're both further left. Both bigger? Both further
+right. One smaller and one bigger (or one of them *is* the current node)? You've found the exact
+point where their paths from the root diverge — the split point, which is by definition the
+lowest common ancestor.
+
+That turns the whole problem into a walk, not a search: start at the root, and at every step
+either step left, step right, or stop. No backtracking, no combining results from two children —
+you know which single direction to go before you move. It's the same "let BST order pick the
+direction" idea as the bounds-narrowing walk in
+[Validate Binary Search Tree](/patterns/tree-traversals/validate-bst/), pointed at a different
+question.
+
+<Callout kind="note" label="template instance">
+  A **BST walk**, the same left/right decision you'd make in a plain BST search, run once with
+  two targets instead of one. Invariant: at every step, both `p` and `q` are guaranteed to be
+  descendants of the current node (true at the root by the problem's premise, and preserved
+  because you only step toward the side that provably contains both). The walk stops the instant
+  that invariant would break for a single side — which is exactly the LCA.
+</Callout>
+
+## solution
+
+```csharp
+public TreeNode? LowestCommonAncestor(TreeNode? root, TreeNode p, TreeNode q)
+{
+    var node = root;
+
+    while (node is not null)
+    {
+        if (p.Val < node.Val && q.Val < node.Val)
+            node = node.Left;                  // both targets are smaller -> LCA is further left
+        else if (p.Val > node.Val && q.Val > node.Val)
+            node = node.Right;                 // both targets are bigger -> LCA is further right
+        else
+            return node;                       // split point (or node IS one of the targets)
+    }
+
+    return null;                                // unreachable given the problem's guarantees
+}
+
+// standard interview definition
+public class TreeNode(int val = 0, TreeNode? left = null, TreeNode? right = null)
+{
+    public int Val = val;
+    public TreeNode? Left = left;
+    public TreeNode? Right = right;
+}
+```
+
+## trace
+
+`p = 3`, `q = 5`, on the tree above:
+
+```text
+            6
+          /   \
+         2     8
+        / \   / \
+       0   4 7   9
+          / \
+         3   5
+```
+
+| step | node | `3` vs node | `5` vs node | decision |
+| --- | --- | --- | --- | --- |
+| 1 | 6 | `3 < 6` | `5 < 6` | both smaller -> go left |
+| 2 | 2 | `3 > 2` | `5 > 2` | both bigger -> go right |
+| 3 | 4 | `3 < 4` | `5 > 4` | split -> return `4` |
+
+Three steps, no backtracking, no visit to `0`, `7`, `8`, or `9` at all — the BST's ordering ruled
+out both of the root's whole subtrees except the one path that could possibly contain the split.
+
+## why it works
+
+`p` and `q` each have a unique root-to-node path. Their lowest common ancestor is, by definition,
+the last node those two paths share before diverging. Because this is a BST, "which subtree
+contains value `v`" is decided purely by comparison — no ambiguity, no need to check both sides.
+So walking from the root and always stepping toward the side that provably contains *both*
+targets retraces the shared prefix of both paths exactly. The walk can only stop for one reason:
+the two targets stop agreeing on a direction, which happens at precisely the node where their
+paths fork — or, in the case where one target is an ancestor of the other (like `LCA(2, 4) = 2`
+above), the walk stops the moment it *reaches* that ancestor, since a node is never "less than"
+or "greater than" itself.
+
+<Watch items={[['time', 'O(h) — O(log n) balanced, O(n) worst case'], ['space', 'O(1) — iterative, no recursion stack']]} />
+
+## common bugs
+
+- Using `<=`/`>=` instead of strict `<`/`>` in the branch conditions — with `<=`, a node equal to
+  `p` or `q` never triggers the "split" `else` branch and the walk overshoots past the actual
+  target.
+- Writing this recursively and forgetting it needs no combining step (unlike a general-tree LCA)
+  — a common instinct is to search both children and merge results, which is unnecessary work a
+  BST specifically lets you skip.
+- Assuming `p` and `q` are given in a fixed left/right order — they're not; the two comparisons
+  in the solution are symmetric on purpose so it doesn't matter which one is "smaller."
+- Forgetting the self-ancestor case entirely when reasoning about correctness: if `p` is an
+  ancestor of `q` (or vice versa), the walk correctly reaches `p` itself and returns it via the
+  `else` branch, without ever explicitly checking "is node equal to p or q."
+
+## variants you can now solve
+
+- **Lowest Common Ancestor of a Binary Tree** (LC 236) — the general-tree version, where you no
+  longer have order to exploit: recurse into both children, and if both come back non-null, the
+  current node *is* the split point; otherwise pass up whichever side found something.
+- **Delete Node in a BST** (LC 450) — the same "walk down using BST order" shape, now searching
+  for one value instead of comparing two, then splicing the found node out once you get there.
+- **Insert into a Binary Search Tree** (LC 701) — the gentlest version of this walk: no split
+  condition to check at all, just descend left or right by comparison until you fall off the
+  tree, and attach the new node there.

@@ -1,0 +1,96 @@
+---
+layout: '@layouts/TopicLayout.astro'
+topic: intervals
+---
+
+import Callout from '@components/Callout.astro';
+import ProblemList from '@components/ProblemList.astro';
+
+## core idea
+
+Interval problems are array problems wearing a calendar costume: each element is a `[start, end]`
+pair, and before you write a single comparison, one question decides the whole solution — *what
+do you sort by*. Sort by **start** and every overlap becomes adjacent, so a single left-to-right
+sweep can fold ranges together. Sort by **end** and the earliest-finishing option becomes the
+provably safe greedy pick, so the same kind of sweep can choose among conflicting ranges instead.
+Almost everything else in this topic is one of those two sweeps, occasionally with a heap bolted
+on to track how many ranges are open at once.
+
+| sub-shape | sort by | goal | typical trigger |
+| --- | --- | --- | --- |
+| merge | `start` | fold overlapping ranges into fewer, wider ones | "merge", "combine", "insert a meeting" |
+| select | `end` | keep the largest non-conflicting subset (or count what you'd drop) | "how many can you keep/attend", "minimum removals" |
+
+## when to reach for it
+
+- The input is a list of `[start, end]` pairs — bookings, log windows, free/busy blocks,
+  "meetings," version ranges.
+- You need to **combine** overlapping ranges into fewer, wider ones → sort by start, sweep once.
+- You need to **pick** the largest non-conflicting subset, or count the minimum you'd remove →
+  sort by end, greedy sweep.
+- You need to know how many ranges are alive **at the same instant** (rooms, connections,
+  workers) → sort by start, track live count with a heap of end times.
+- Brute force compares every pair of intervals — `O(n^2)`. One sort turns that into a single
+  linear sweep.
+
+## universal templates
+
+Merge — sort by start, extend the open run or close it and start a new one:
+
+```csharp
+public int[][] MergeTemplate(int[][] intervals)
+{
+    Array.Sort(intervals, (a, b) => a[0].CompareTo(b[0]));  // sort by START — merging only cares what runs into what
+
+    var result = new List<int[]> { intervals[0] };
+    for (int i = 1; i < intervals.Length; i++)
+    {
+        var last = result[^1];
+        if (intervals[i][0] <= last[1])                // current starts before (or exactly when) last ends
+            last[1] = Math.Max(last[1], intervals[i][1]);   // widen the open run to cover both
+        else
+            result.Add(intervals[i]);                   // no overlap — close the run, start a new one
+    }
+    return [.. result];
+}
+```
+
+Select — sort by end, keep whatever doesn't conflict with the last thing you kept:
+
+```csharp
+public int SelectTemplate(int[][] intervals)
+{
+    Array.Sort(intervals, (a, b) => a[1].CompareTo(b[1]));  // sort by END — greedy needs the earliest finisher first
+
+    int kept = 0;
+    int lastEnd = int.MinValue;
+    foreach (var iv in intervals)
+    {
+        if (iv[0] >= lastEnd)          // doesn't conflict with the last interval you kept
+        {
+            kept++;
+            lastEnd = iv[1];           // this is now the interval to beat
+        }
+    }
+    return kept;                       // "minimum removals" = intervals.Length - kept
+}
+```
+
+Every problem below is one of these two skeletons — sometimes with a min-heap layered on top of
+the merge template's start-sort to track how many ranges are open at once, instead of merging
+them.
+
+<Callout kind="insight" label="the one question to ask">
+  Before you write a comparison, ask: *"do I need to combine ranges, or choose among them?"*
+  Combine → sort by start. Choose → sort by end. Get that backwards and you'll write a
+  correct-looking sweep that silently returns the wrong number — the proof behind the select
+  half lives in [greedy](/patterns/greedy/), and the sort itself is [sorting](/foundations/sorting/)'s
+  bread and butter.
+</Callout>
+
+## problems
+
+Four problems, and every one of them is the merge template, the select template, or the merge
+template with a heap standing in for the single running interval:
+
+<ProblemList topic="intervals" />

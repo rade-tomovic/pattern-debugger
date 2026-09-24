@@ -1,0 +1,117 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: stack-queue
+problem: evaluate-rpn
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+
+## task
+
+Evaluate an arithmetic expression given in Reverse Polish (postfix) Notation. Tokens are either
+integers or one of `+ - * /`; division truncates toward zero.
+
+```text
+tokens = ["4", "13", "5", "/", "+"]  →  6      (13 / 5 = 2, 4 + 2 = 6)
+```
+
+## how to think
+
+Postfix notation exists precisely so you never need parentheses or precedence rules: every
+operator applies to whatever two values arrived most recently. "Most recently arrived, not yet
+consumed" is a stack, and the algorithm falls straight out — push numbers as they come, and when
+an operator shows up, pop the two most recent values, combine them, and push the result back as
+if it were just another number that arrived.
+
+The order matters once: the top of the stack is the *second* operand (it arrived last), the one
+below it is the *first*. Get that backwards and every non-commutative operator (`-`, `/`) gives
+the wrong answer.
+
+<Callout kind="note" label="template instance">
+  A close cousin of the **stack-backed design** skeleton: the stack holds intermediate results
+  instead of raw input, and "operator" tokens read-and-replace the top two entries instead of
+  just pushing. Invariant: at every point, the stack holds exactly the not-yet-consumed
+  values — operands and previously computed sub-results, indistinguishable to the rest of the
+  algorithm.
+</Callout>
+
+## solution
+
+```csharp
+public int EvalRPN(string[] tokens)
+{
+    var stack = new Stack<int>();
+
+    foreach (string tok in tokens)
+    {
+        if (int.TryParse(tok, out int num))
+        {
+            stack.Push(num);                            // operand: wait on the stack
+        }
+        else
+        {
+            int b = stack.Pop();                          // second operand came in last
+            int a = stack.Pop();
+            stack.Push(tok switch
+            {
+                "+" => a + b,
+                "-" => a - b,
+                "*" => a * b,
+                "/" => a / b,                              // truncates toward zero, like the problem wants
+                _ => throw new ArgumentException($"bad token {tok}")
+            });
+        }
+    }
+    return stack.Pop();
+}
+```
+
+## trace
+
+`tokens = ["4", "13", "5", "/", "+"]`:
+
+| step | token | action | stack (top-to-bottom) |
+| --- | --- | --- | --- |
+| 1 | `"4"` | operand → push | `4` |
+| 2 | `"13"` | operand → push | `13, 4` |
+| 3 | `"5"` | operand → push | `5, 13, 4` |
+| 4 | `"/"` | pop `5` (b), pop `13` (a), push `13 / 5 = 2` | `2, 4` |
+| 5 | `"+"` | pop `2` (b), pop `4` (a), push `4 + 2 = 6` | `6` |
+
+One value left on the stack when the tokens run out — that's the answer, `6`.
+
+## why it works
+
+Postfix guarantees that by the time you reach an operator, both of its operands have already
+appeared and nothing else is waiting between them and the top of the stack — that's what "every
+operator applies to the two most recent values" means formally. Popping twice always retrieves
+exactly that operator's operands, in the right order (second-popped is the first operand,
+first-popped is the second), and pushing the result re-inserts it as a single value ready to be
+consumed by whatever operator needs it next. By induction, the stack always holds precisely the
+not-yet-reduced sub-expressions, so after the last token only the fully-reduced final answer
+remains.
+
+<Watch items={[['time', 'O(n)'], ['space', 'O(n)']]} />
+
+## common bugs
+
+- Popping the operands in the wrong order (`a = Pop(); b = Pop();`) — commutative operators (`+`,
+  `*`) hide the bug; `-` and `/` expose it immediately.
+- Using regular `/` on `int` and forgetting C# already truncates toward zero for two `int`s the
+  way the problem wants — the bug shows up when people "fix" it with `Math.Floor` and break
+  negative results instead.
+- Not guarding `int.TryParse` for negative numbers like `"-3"` — a naive check for a leading `-`
+  to detect operators will misclassify negative operands as the subtraction operator.
+- Assuming the input is always well-formed and skipping validation — fine for LeetCode's
+  guarantees, but say out loud in an interview that you're relying on that guarantee.
+
+## variants you can now solve
+
+- [Valid Parentheses](/patterns/stack-queue/valid-parentheses/) — same "stack holds what's not
+  yet resolved" instinct, applied to matching instead of computing.
+- **Basic Calculator** (LC 224 / 227) — infix instead of postfix: you still push/pop on a stack,
+  but now you also have to handle precedence and parentheses before you get to "reduce the top
+  two."
+- **Implement a postfix-to-infix converter** — same traversal, but instead of computing a number
+  you push a *string*, wrapped in parentheses, and concatenate on each operator.

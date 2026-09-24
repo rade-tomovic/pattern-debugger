@@ -1,0 +1,121 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: tree-traversals
+problem: maximum-depth
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+
+## task
+
+Given the root of a binary tree, return its maximum depth: the number of nodes along the
+longest path from the root down to the farthest leaf.
+
+```text
+      3
+     / \
+    9   20
+       /  \
+      15   7
+```
+
+maxDepth = 3 (the path `3 -> 20 -> 15`, or `3 -> 20 -> 7`).
+
+## how to think
+
+A node's depth is "1 (for itself) plus whichever child's subtree goes deeper." You cannot know
+that until both children have already answered — this is the first problem in this section
+where the visit order isn't optional. Swap children (invert) didn't care about order; this one
+does, because the parent's answer is a *function of* the children's answers, not an independent
+step.
+
+That's the postorder shape: recurse into left, recurse into right, *then* combine. There's a
+BFS alternative too — count how many full levels you process with a level-order queue — but
+that's a heavier tool for a question that a three-line recursion answers directly.
+
+<Callout kind="note" label="template instance">
+  **Postorder** shape. Invariant: `MaxDepth(node)` returns the height of the subtree rooted at
+  `node` — `0` for `null`, `1 + max(left height, right height)` otherwise. What varies from the
+  plain template: the "visit" step combines two return values into one, instead of appending to
+  a shared output list.
+</Callout>
+
+## solution
+
+```csharp
+public int MaxDepth(TreeNode? root)
+{
+    if (root is null) return 0;                      // empty subtree contributes no depth
+
+    int left = MaxDepth(root.Left);                   // children answer first...
+    int right = MaxDepth(root.Right);
+
+    return 1 + Math.Max(left, right);                 // ...parent combines: itself + the taller side
+}
+
+// standard interview definition
+public class TreeNode(int val = 0, TreeNode? left = null, TreeNode? right = null)
+{
+    public int Val = val;
+    public TreeNode? Left = left;
+    public TreeNode? Right = right;
+}
+```
+
+## trace
+
+```text
+      3
+     / \
+    9   20
+       /  \
+      15   7
+```
+
+Calls finish in postorder — leaves first, root last:
+
+| finishes | node | left height | right height | height returned |
+| --- | --- | --- | --- | --- |
+| 1 | 9 | 0 | 0 | `1 + max(0,0)` = 1 |
+| 2 | 15 | 0 | 0 | `1 + max(0,0)` = 1 |
+| 3 | 7 | 0 | 0 | `1 + max(0,0)` = 1 |
+| 4 | 20 | 1 | 1 | `1 + max(1,1)` = 2 |
+| 5 | 3 (root) | 1 | 2 | `1 + max(1,2)` = 3 |
+
+Node 9 and node 20's subtree finish independently — 9 doesn't know or care that 20's side is
+deeper. Only at the root, where both heights are finally available, does the answer (3) exist.
+
+## why it works
+
+Induction on subtree height, same shape as invert's induction but now the combine step actually
+*uses* both children's results instead of ignoring them. A leaf's subtree has height 1 by
+definition (base case `null` returns 0, and the leaf itself adds 1). If both children correctly
+report their own subtree's height, the deeper of the two plus one *is* the height of the current
+subtree — there's no path through this node that skips into the shallower child and still ends
+up longer.
+
+<Watch items={[['time', 'O(n)'], ['space', 'O(h) recursion stack — O(n) worst case, O(log n) balanced']]} />
+
+## common bugs
+
+- Dropping the `+ 1`: returning `Math.Max(left, right)` alone undercounts every node's own
+  contribution, and the whole tree's depth comes out one short.
+- Missing the `root is null` base case — the very next line dereferences `root.Left`, so an
+  empty subtree throws instead of contributing 0.
+- Confusing depth-as-node-count with depth-as-edge-count: LC 104 wants nodes, so a single-node
+  tree has `MaxDepth == 1`, not 0.
+- Reaching for a full BFS level-order traversal (queue, `queue.Count` snapshot per level) when
+  this recursion is strictly less code and no extra data structure — save BFS for when you
+  actually need level-by-level values, as in
+  [Binary Tree Level Order Traversal](/patterns/bfs-dfs/level-order-traversal/).
+
+## variants you can now solve
+
+- **[Diameter of Binary Tree](/patterns/tree-traversals/diameter-of-binary-tree/)** (LC 543) —
+  next up: the identical postorder recursion, now updating a running best alongside the height
+  it still has to return.
+- **Minimum Depth of Binary Tree** (LC 111) — `Math.Min` instead of `Math.Max`, with a wrinkle:
+  a node with only one child isn't a leaf, so you can't just swap the operator blindly.
+- **Balanced Binary Tree** (LC 110) — the same postorder call, checking `Math.Abs(left - right)
+  <= 1` at every node instead of only returning the taller side.

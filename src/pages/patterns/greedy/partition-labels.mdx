@@ -1,0 +1,132 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: greedy
+problem: partition-labels
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import Cells from '@components/Cells.astro';
+
+## task
+
+Given a lowercase string `s`, partition it into as many parts as possible so that each letter
+appears in **at most one** part. Return the size of each part, in order.
+
+```text
+s = "abcabcz"  →  [6, 1]   ("abcabc" | "z")
+```
+
+## how to think
+
+Trying every possible set of cut points is exponential. The insight: once a character is
+included in a part, that part **must** extend at least as far as that character's *last*
+occurrence in the whole string — cut any earlier, and the character reappears later in a
+different part, breaking the "at most one part" rule. So the last-occurrence index of every
+character you've seen so far is a hard lower bound on where the current part can end.
+
+That gives a one-pass algorithm: precompute `lastIndex[c]` for every character with a single
+forward scan, then scan again maintaining `end` — the max `lastIndex` among every character seen
+since the current part started. The moment the scan pointer `i` reaches `end`, every character
+in the part so far has had its last occurrence accounted for, so it's safe to cut right there.
+
+<Callout kind="note" label="template instance">
+  **Extend a boundary until it closes** skeleton. Invariant: `end` is the smallest index the
+  current part is *forced* to reach, given every character seen since `start`. What varies: the
+  boundary source is a `lastIndex` lookup built by a first pass, instead of an externally given
+  interval list.
+</Callout>
+
+## solution
+
+```csharp
+public List<int> PartitionLabels(string s)
+{
+    var lastIndex = new int[26];
+    for (int i = 0; i < s.Length; i++)
+        lastIndex[s[i] - 'a'] = i;                 // remember the last place each letter shows up
+
+    var sizes = new List<int>();
+    int start = 0, end = 0;
+
+    for (int i = 0; i < s.Length; i++)
+    {
+        end = Math.Max(end, lastIndex[s[i] - 'a']); // this char pins the partition open until at least here
+
+        if (i == end)                               // every char seen so far is fully covered — safe to cut
+        {
+            sizes.Add(end - start + 1);
+            start = i + 1;
+        }
+    }
+    return sizes;
+}
+```
+
+## trace
+
+`s = "abcabcz"` (indices `0..6`), `lastIndex`: `a` → `3`, `b` → `4`, `c` → `5`, `z` → `6`.
+`start = 0`, `end = 0`:
+
+| i | s[i] | lastIndex[s[i]] | end = max(end, ...) | i == end? |
+| --- | --- | --- | --- | --- |
+| 0 | a | 3 | max(0, 3) = **3** | no |
+| 1 | b | 4 | max(3, 4) = **4** | no |
+| 2 | c | 5 | max(4, 5) = **5** | no |
+| 3 | a | 3 | max(5, 3) = **5** | no |
+| 4 | b | 4 | max(5, 4) = **5** | no |
+| 5 | c | 5 | max(5, 5) = **5** | yes → cut, size `5 - 0 + 1 = 6`, `start = 6` |
+| 6 | z | 6 | max(5, 6) = **6** | yes → cut, size `6 - 6 + 1 = 1`, `start = 7` |
+
+`i = 0, 1, 2` each widen `end`. `i = 3, 4` see characters that were already going to reappear —
+`end` doesn't move, because their last occurrences (`3`, `4`) are already covered. Only at
+`i = 5` does the scan pointer finally catch the boundary it built. Result: `[6, 1]`.
+
+<Cells
+  data={['a', 'b', 'c', 'a', 'b', 'c', 'z']}
+  pointers={{ 4: [{ t: 'i', c: 'amber' }] }}
+  cells={{ 0: 'win', 1: 'win', 2: 'win', 3: 'win', 4: 'win' }}
+  caption="i=4: end has been stuck at 5 since i=2 — b's second appearance here changes nothing, its last index was already covered"
+/>
+
+<Cells
+  data={['a', 'b', 'c', 'a', 'b', 'c', 'z']}
+  pointers={{ 5: [{ t: 'i', c: 'amber' }] }}
+  cells={{ 0: 'ok', 1: 'ok', 2: 'ok', 3: 'ok', 4: 'ok', 5: 'ok', 6: 'dim' }}
+  caption="i=5: i finally equals end — cut here. abcabc is sealed; z starts its own part next"
+/>
+
+## why it works
+
+`end` is, at every step, the true minimum size the current part must have: it's the max last
+occurrence among characters already seen, so shrinking the part below `end` is provably invalid,
+and nothing *not yet seen* can force it wider retroactively — by the time index `i` is reached,
+every character at or before `i` has already contributed its last-occurrence bound to `end`. So
+`i == end` is exactly the first safe moment to cut: any earlier and a seen character reappears
+outside the part; any later and you're paying for space you didn't need to claim.
+
+<Watch items={[['time', 'O(n)'], ['space', 'O(1)'], ['passes', '2']]} />
+
+## common bugs
+
+- Building `lastIndex` with `TryAdd`-style "first write wins" logic instead of always
+  overwriting — that records the *first* occurrence, not the last, and inverts the algorithm.
+- Forgetting `start = i + 1` after a cut — later sizes get computed against a stale `start`,
+  quietly inflating every part after the first.
+- Off-by-one on the size formula: `end - start + 1`, not `end - start` — both endpoints are
+  inclusive.
+- Assuming two identical characters right next to each other force a cut between them — they
+  don't; only whether a character reappears **later in the string** matters, not adjacency.
+- Using a `HashSet<char>` of "characters seen" instead of the `lastIndex` map — membership alone
+  doesn't tell you *where* to stop; the decision is purely positional.
+
+## variants you can now solve
+
+- [Merge Intervals](/patterns/intervals/merge-intervals/) (LC 56) — the same problem in
+  disguise: treat each character as the interval `[firstOccurrence, lastOccurrence]`, merge
+  overlapping ones, and the merged group sizes are this problem's answer.
+- **Split a String in Balanced Strings** (LC 1221) — a simpler greedy: no last-index map
+  needed, just cut whenever a running open/close counter returns to zero.
+- **Video Stitching** (LC 1024) — the same "extend the reachable boundary, cut when the scan
+  catches it" shape as this problem, applied to intervals instead of characters — close cousin
+  of [Jump Game](/patterns/greedy/jump-game/)'s frontier too.

@@ -1,0 +1,478 @@
+---
+layout: '@layouts/TopicLayout.astro'
+topic: network-basics
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+
+## the ground floor
+
+- **A byte** is eight bits, and every message that crosses a network is a sequence of them —
+  [bits, bytes and addresses](/systems/bits-and-memory/) builds that up from nothing.
+- **A host** is a machine that sends and receives traffic on its own behalf: your laptop, a VM, a
+  container, a phone. A machine that forwards traffic on *other* hosts' behalf is a **router**.
+  One box can be both.
+- **A link** is one segment that two devices can hand bytes to each other over directly, with
+  nothing in between — a cable, a Wi-Fi association, a virtual interface pair inside one Linux box.
+- **A network interface** is the hardware or virtual device that puts bytes onto a link and takes
+  them off again. A host has one per link it is attached to.
+- **A protocol** is an agreement between two peers about what the bytes mean and who is allowed to
+  speak next: a message format plus a state machine of legal sequences. Nothing more mystical.
+- **Getting data off an interface is a syscall.** The kernel owns the interface, so every receive
+  is a crossing into the kernel and back — [processes and threads](/systems/process-and-thread/)
+  owns that boundary.
+
+## core idea
+
+A network moves a message between two machines that share no memory. The internet does it by
+**chopping every message into packets** and letting them share every wire with everybody else's,
+rather than holding a private circuit open for the length of the conversation. That choice buys
+enormous efficiency and costs every guarantee you might have wanted, which leaves **best-effort
+delivery**: the network will try, and along the way it may drop, delay, reorder or duplicate
+anything you hand it.
+
+The sentence worth carrying out of this page: *the network guarantees nothing, and every guarantee
+you actually rely on — an ordered byte stream, a reply that matches its request, a message that
+arrives once — was rebuilt on top of that nothing by software running at the two ends.*
+
+## how it actually works
+
+### two machines and a wire
+
+A link is a physical medium plus an agreed way to encode bits onto it — voltage on copper, light
+in a fibre, modulated radio for Wi-Fi — and that is very nearly the last time this section cares
+what the medium is, because everything above treats a link as one thing: a way to hand a chunk of
+bytes to exactly one neighbour, most of the time successfully.
+
+With two machines and one cable there is no interesting question. Add a third machine and you need
+addressing. Add a network somebody else owns, run by people you will never meet, and you need
+everything else on these pages.
+
+### why a message gets chopped into packets
+
+The alternative was the telephone network, and it is worth taking seriously because it is the
+design that loses. **Circuit switching** reserves a share of the path for the whole conversation:
+you get a guaranteed slice, in order, with a delay that does not vary — and you hold it whether or
+not you are saying anything. **Packet switching** cuts the message into labelled chunks and lets
+chunks from everyone interleave on the same wire, first come first served.
+
+```text
+one shared link, several senders
+
+circuit switching — a share reserved for the whole call
+  time →
+  A  [AAAA........AAAA........]   A's share: idle between A's sentences, still A's
+  B  [....BB..........BB......]   B's share: mostly wasted
+  C  [........................]   C reserved a share and has said nothing at all
+  D  refused — no share left, on a wire that is mostly carrying nothing
+
+packet switching — one queue, packets interleaved
+  time →
+     [A1|B1|A2|A3|C1|B2|A4|D1|A5|D2]   the link carries whoever has a packet ready
+     nobody reserved anything, nobody was refused,
+     and when everyone talks at once the queue fills and packets are DROPPED
+```
+
+That is the sharing argument, and it is the famous one, but it is not the only reason to chop. Three
+more, each of which stands on its own:
+
+**Head-of-line delay stays bounded.** If a host may put one indivisible ten-gigabyte message on the
+wire, every other message behind it waits for all ten gigabytes. Cap the size of a chunk and the
+worst a small message waits behind any one sender is the chunk currently being transmitted.
+
+**Hops overlap.** Every device in the middle receives a whole packet, checks it, and only then sends
+it on — store-and-forward. With one indivisible message, the second hop cannot start until the first
+hop has received the entire thing. Chopped up, the path runs like an assembly line:
+
+```text
+one message across three links (A → R1 → R2 → B), store-and-forward
+
+sent whole:   each hop waits for ALL of it before passing ANY of it
+  A→R1   [==========]
+  R1→R2              [==========]
+  R2→B                           [==========]
+
+chopped into four packets:   the hops overlap
+  A→R1   [1][2][3][4]
+  R1→R2     [1][2][3][4]
+  R2→B         [1][2][3][4]
+```
+
+**Loss gets cheap.** When a chunk is corrupted or dropped, the retry costs one chunk, not the whole
+message. That single property is what makes reliability affordable to build at the ends.
+
+### a packet is a header and a payload
+
+Two parts, and the split is the entire design.
+
+The **payload** is the bytes you wanted to move. Nothing in the middle of the network looks at them
+or is allowed to care what they are.
+
+The **header** is a fixed set of fields sitting at known byte offsets from the start of the packet:
+where it is going, where it came from, what kind of thing is inside, how long it is, a checksum over
+some of it.
+
+"At known offsets" is the whole trick, and it is the same trick as a struct's field layout in
+[bits and memory](/systems/bits-and-memory/). A router does not *parse* a packet. It reads a fixed
+range of bytes as the destination address because the format says the destination lives there, and
+it can do that in fixed-function hardware precisely because it never has to search for anything.
+
+```text
+a packet, schematically
+
+  byte 0                                  header ends here
+  |                                       |
+  [ fixed fields at known offsets ][ payload: opaque bytes ]
+    where to, where from,                   the thing you actually
+    what is inside, how long,               wanted to send
+    a checksum
+```
+
+Two real sizes worth keeping: an IPv4 header is 20 bytes when it carries no options, and a TCP
+header is 20 bytes when it carries no options. Both formats carry a length field exactly because
+options can make them longer, and everything downstream needs to know where the header stopped
+before it can find the payload.
+
+The recursion is the part that surprises people: **a payload is very often another entire packet,
+header and all.** Your HTTP request is the payload of a TCP segment, which is the payload of an IP
+packet, which is the payload of an Ethernet frame. That nesting is called encapsulation, and
+[the OSI model](/networking/osi-model/) walks one request through every wrapper with the byte counts.
+
+<Callout kind="note" label="two words that each mean two things">
+  **Packet.** In conversation — including on these pages — "packet" means any chunk of bytes on a
+  wire. Used precisely it means the internet-layer unit specifically: a **frame** is the link-layer
+  unit, a **packet** is the IP unit, a **segment** (TCP) or **datagram** (UDP) is the transport
+  unit. Everyone says "packet" for all of them and it is almost never a problem; it becomes one the
+  moment somebody says "the packet was dropped" and the useful question is which layer noticed.
+
+  **Address.** An IP address, a MAC address, and the memory address you have just spent a whole
+  section on are three unrelated kinds of number that share one word. When a page here means one of
+  them, it says which.
+</Callout>
+
+### hosts, links, routers, and what a hop is
+
+A path is a chain of links. Each device in the middle receives a whole packet on one link, decides
+which link it should leave by, and transmits it again. **One hop is one of those forwarding steps —
+one link traversed.** "Three hops away" means the packet gets put on a wire four times.
+
+```text
+your pod                                                    the database
+   │                                                             │
+ [host]──link──[switch]──link──[router]══ WAN link ══[router]──link──[host]
+          1              2             3                    4
+   └────────────────────────┘  └────────────────────────────────────┘
+        your own network          somebody else's network, and then
+                                  somebody else's, and then somebody else's
+
+  a hop = one forwarding step from one link onto the next
+  the switch is not a hop in this sense: it moves a frame along inside one
+  link-layer network without ever opening the packet's own header
+```
+
+What a router does to a packet is short and worth memorising: it reads the destination out of the
+header, looks up which of its links leads that way, **decrements a hop counter** so that a routing
+mistake makes packets die instead of circulating forever, re-wraps the packet in a frame suited to
+whatever link it is going out on, and sends it. What it does *not* do is change the source and
+destination addresses — a box performing NAT does exactly that, and
+[IP and routing](/networking/ip-and-routing/) covers both the lookup and the rewrite.
+
+Two consequences fall out of "re-wraps for the next link". First, the link technologies along a path
+are free to differ; each hop only has to agree with its immediate neighbour, which is
+[the link layer](/networking/link-layer/)'s subject. Second, each link caps how large a single chunk
+may be, and those caps are not equal — a packet that fitted on the first link may not fit on the
+third. That is where "small requests work, large ones hang" incidents come from, and both pages
+above own the mechanism.
+
+### best-effort delivery, and what it costs you
+
+The strongest promise the internet makes is that it will probably try. Four things can happen to a
+packet, and every one of them is normal operation rather than a fault:
+
+- **It is dropped.** A router's queue is full, so the arriving packet is discarded — there is
+  nowhere to put it and no one to complain to. Or the receiver's checksum fails and it throws the
+  frame away rather than passing on bytes it knows are wrong. Corruption is turned into loss on
+  purpose. Loss is not an error condition on this network; it is a signal, and the classic way a
+  sender learns it is asking for more than the path can carry.
+- **It is delayed, by an amount that varies.** Every hop queues, and the queue's length depends on
+  traffic you neither see nor control, so what happened to packet 5 tells you remarkably little
+  about packet 6.
+- **It is reordered.** Two packets to the same destination can take different paths — parallel
+  links, load-balanced routes — so packet 2 can arrive before packet 1. Nothing in the middle is
+  required to preserve your order, and nothing does.
+- **It is duplicated.** Worth being exact here, because it is usually taught wrong: the wire itself
+  duplicates rarely. Duplicates overwhelmingly come from whatever is *retrying* above it — a sender
+  retransmits because an acknowledgement went missing, the original had actually arrived, and the
+  receiver now has two. Duplication is mostly a consequence of building reliability on top of loss,
+  not an independent hazard of the medium.
+
+Everything you use daily is built out of that. Ordering, delivery and deduplication are numbering,
+acknowledgements and timers, implemented **at the two ends** — that is what
+[TCP](/networking/tcp-and-udp/) is, and UDP is the choice to skip it and take what arrives.
+
+<Callout kind="insight" label="the end-to-end argument">
+  A function like reliable delivery can only be *completely* implemented with knowledge that only
+  the two endpoints have, so it has to live at the endpoints. Putting a version of it in the
+  network — Wi-Fi retrying a frame, a link layer with its own checksums — does not remove that
+  requirement; it is at best a performance optimisation for a hop that loses a lot. This is why
+  the middle of the internet stayed simple while the ends got complicated, and why "we will just
+  make the network reliable" has never been the answer to anything.
+</Callout>
+
+The practical edge of best-effort, for someone who ships services: **a timeout tells you nothing
+about whether the far end did the work.** Silence covers both "the request never arrived" and "the
+request was executed and the response was lost", and no amount of waiting distinguishes them. So
+at-least-once is the delivery semantic you actually have, and exactly-once is an application
+property you construct with idempotency keys and deduplication —
+[timeouts, retries and circuit breakers](/system-design/reliability/) is where that becomes a design
+decision rather than a fact about wires.
+
+### bandwidth and latency are two different things
+
+**Bandwidth** is how many bits a link can carry per unit of time: a rate, and roughly the width of
+the pipe. **Latency** is how long one bit takes to get from one end to the other: a delay, and
+mostly a function of distance. They are independent, and you can have either one without the other.
+
+The intuition that fixes this permanently: a truck full of hard drives driven across a continent has
+spectacular bandwidth and appalling latency. A single wire that carries one bit at a time to the
+next rack has the reverse.
+
+Which is why **adding bandwidth does not fix a chatty protocol.** If rendering a page takes thirty
+sequential queries, each one waiting for the previous answer before it is even sent, the cost is
+thirty round trips. Widening the link changes none of them: you are not waiting for the wire to
+drain, you are waiting for a signal to travel there and back, thirty times over. Every fix is a
+count reduction — batch the queries, issue them concurrently, or move the logic to where the data
+is. And distance sets a floor that no budget removes: no signal beats the speed of light in the
+medium, so a round trip between continents has a minimum you cannot buy your way under.
+
+There is a third quantity people fold into the first two, and it is the one that actually shows up
+in a transfer: **how much data a protocol allows to be outstanding before it must stop and wait.** A
+protocol that permits one message in flight at a time can never use more than one message's worth of
+capacity per round trip, however wide the link is. That is why the round-trip count keeps being the
+number that matters, and it is why every cost in this section is quoted as a count of round trips
+rather than a duration. [The network path](/system-design/networking/) does that accounting for a
+real HTTPS request, and covers why a freshly opened connection has to earn its speed instead of
+starting at full tilt.
+
+### LAN, WAN, and a network of networks
+
+- A **LAN** is the set of links under one administration in one place: an office floor, a rack, the
+  virtual network inside one Kubernetes node. Hosts on a LAN reach each other without a router
+  getting involved.
+- A **WAN** is links joining sites across distance, usually rented from an organisation whose
+  business is long cable.
+- The **internet** is not a big network. It is tens of thousands of independently operated networks
+  that agreed on exactly two things: a common packet format and addressing scheme, and a way to tell
+  each other at the borders which destinations they can reach.
+
+That last point reads like trivia and is not. Nobody is in charge of the path between your pod and
+somebody's API. There is no operator with a view of the whole route, no one who can promise it, and
+no one to escalate to. A guarantee that cannot be enforced by anybody in the middle has to be
+manufactured at the ends — which is the same conclusion the end-to-end argument reached from the
+other direction, and it is the reason the next section exists.
+
+### the argument for layering
+
+Nobody can change all of it at once. There is no maintenance window for the internet, no release
+train that every network on earth is on, and no version number they all agree to bump. Any design
+that required simultaneous change would have frozen solid decades ago.
+
+So the whole thing is built as a stack of layers, and each layer is defined by exactly two things:
+
+- **a peer conversation** — a protocol spoken with the matching entity on the other side, which
+  behaves *as if* the two of them were connected directly;
+- **a service interface to the layer above** — "hand me a chunk of bytes and a destination, and I
+  will probably deliver it."
+
+The horizontal conversations are the useful illusion. The vertical path is what physically happens.
+
+```text
+what each layer believes is happening (the peer conversation)
+
+  your code    ── "GET /orders/42" ───────────────────────→   their code
+  transport    ── "here are bytes 1000-2400 of the stream" →   their transport
+  internet     ── "deliver this packet to 203.0.113.7" ────→   their internet
+  link         ── "hand this frame to my neighbour" ───────→   the next device only
+
+what actually happens (the vertical path)
+
+  your code                                                    their code
+     │ down through each layer                                     ↑ up through each
+     ↓ each one wraps what it was handed                           │ each one unwraps
+   link ──→ [router] ──→ [router] ──→ [router] ──→ link
+
+   a router opens the internet-layer header and nothing above it;
+   the transport and application headers are payload it never looks inside
+```
+
+Three things that structure buys, all of which you can point at:
+
+- **Independent evolution.** Wi-Fi replaced Ethernet cables underneath applications that were never
+  recompiled. HTTP/3 changed the transport protocol underneath HTTP without a single router in the
+  middle being touched — possible precisely because a router forwarding a packet reads the
+  internet-layer header and stops there. (Boxes that *do* look higher exist — a NAT and a firewall
+  both read the transport header — and the fact that they do is exactly what makes deploying a new
+  transport protocol hard.)
+- **A narrow waist.** Every link technology and every application meets at one common packet format,
+  so N link types and M applications cost N plus M implementations instead of N times M.
+- **You only have to be right about your peer.** Your code speaks HTTP with their code. Whether
+  there is a Wi-Fi hop, a satellite, or a tunnel somewhere in between is genuinely not your problem.
+
+And the price, stated honestly, because half of this section's troubleshooting content exists to pay
+it: layering hides exactly the information you eventually need. A layer below yours retries without
+telling you. A layer below yours caps how big a message may be and reports the failure in terms that
+do not mention size. An encrypted layer hides from a middlebox the very thing the middlebox was
+deployed to see. A symptom at one layer routinely has its cause three layers down, which is what
+makes [seeing the network](/networking/network-troubleshooting/) a skill rather than a lookup. The
+other standing cost is simpler: every layer adds a header, so small messages pay proportionally more
+overhead than large ones.
+
+That is the argument. What the layers actually are, how many of them there are on the exam versus in
+the code, and what one HTTP request physically looks like as it grows a header per layer on the way
+out — [the OSI model](/networking/osi-model/) is the next page, and it exists to answer exactly that.
+
+## the mental model
+
+```text
+  message   → chopped into packets → each packet = [ header | payload ]
+  packet    → hops link to link; a router reads the header, re-frames, forwards
+  network   → promises nothing: may drop, delay, reorder, duplicate
+  the ends  → rebuild what they need from numbering, acknowledgements and timers
+
+  the cost of a network call, in the only honest units:
+    bandwidth   = the width of the pipe   → fixes "the response is enormous"
+    latency     = the length of the pipe  → fixes nothing you can buy
+    round trips = how many times you asked and then waited  → the one you control
+```
+
+Three lines to carry around:
+
+1. A packet is a header — fields at known offsets, for whoever is handling it in the middle — and a
+   payload nobody in the middle looks at. The payload is usually another whole packet.
+2. The network is best-effort, so every guarantee above it was built at the ends out of numbering
+   and retries. This is why a timeout tells you nothing about whether the work happened, and why
+   your handler has to be safe to run twice.
+3. Bandwidth and latency are independent. "Chatty" is a round-trip count problem, and no link
+   upgrade has ever fixed one.
+
+<Watch items={[['a packet', 'header + payload, nothing else'], ['IPv4 header', '20 bytes without options'], ['TCP header', '20 bytes without options'], ['one hop', 'one forwarding step onto the next link'], ['the network promises', 'nothing — drop, delay, reorder, duplicate'], ['the unit of network cost', 'round trips, not durations']]} />
+
+## why you should care
+
+**The errors you have been calling transient are the design, not a defect.** A dropped packet is how
+this network signals congestion; a varying delay is how queues work. So `SocketException` on connect,
+an `HttpRequestException` wrapping it, and a request that simply never returns are all things a
+correct service is expected to survive, not evidence that something is broken. That is why every
+outbound call gets a deadline and why retries exist at all. It is also why the retry is the dangerous
+half: if a `POST` times out, it may already have been executed, so retrying it duplicates the effect
+unless the operation is idempotent or carries a key the far end can deduplicate on. The classic
+fallacies of distributed computing open with exactly these two — "the network is reliable" and
+"latency is zero" — and both of them are on this page as mechanisms rather than slogans.
+
+**Chattiness is a round-trip count, and it is visible in the shape of the code.** The reviewable
+pattern is an `await` inside a `foreach` where the body talks to another machine: a query per row, a
+cache lookup per item, a service call per element. The tell in production is latency that scales
+with the number of items while CPU, memory and bandwidth all stay flat — because nothing is working,
+everything is waiting, once per item. The fix is never a faster link; it is fetching the set in one
+call, issuing the calls concurrently, or moving the decision to where the data already is. This is
+the same argument, one boundary further out, as counting syscalls in
+[processes and threads](/systems/process-and-thread/): when the per-crossing cost is fixed, the only
+variable you control is how many crossings you make.
+
+**Two incident shapes on this page's material, both of which have a proper home elsewhere.** Small
+requests succeed while large ones hang: something on the path has a smaller size cap than the sender
+assumed, and the sender is not being told —
+[IP and routing](/networking/ip-and-routing/) has the mechanism. And a connection *refused* is a
+completely different diagnosis from a connection that *times out*: refused means something answered
+and said no, silence means the packet was discarded on the way and nobody said anything at all.
+Conflating those two costs more debugging time in this section's subject than any other single
+mistake, and [seeing the network](/networking/network-troubleshooting/) turns it into a ladder you
+can walk down.
+
+**The design review you can now do.** Ask, of any cross-machine call: how many round trips is this,
+what happens if the response is lost after the work was done, and is the caller's deadline shorter
+or longer than the callee's? Those three questions come straight out of packet switching,
+best-effort delivery, and the fact that latency is a property of distance — and they are most of
+what separates a service that degrades from one that falls over.
+
+## the same idea elsewhere
+
+| the network idea | where else it shows up | the connection |
+| --- | --- | --- |
+| packet switching: share a link by interleaving small chunks | preemptive multitasking: a scheduler interleaves threads on one core — [processes and threads](/systems/process-and-thread/) | both replace a reservation with a queue, both trade a guaranteed share for utilisation, and both degrade the same way under overload — queueing first, then dropping work on the floor |
+| header at fixed offsets, payload nobody parses | a struct's field offsets, or a length-prefixed file format — [bits and memory](/systems/bits-and-memory/) | the reader is fast because it knows where each field is before it looks; the cost in both cases is that the format is then very hard to change |
+| store-and-forward across hops | a buffered stage in any pipeline, hardware or software | throughput comes from overlapping stages, not from making one stage quicker; the smaller the unit, the sooner the next stage can start |
+| best-effort plus retry at the ends | at-least-once delivery in a message queue — [timeouts and retries](/system-design/reliability/) | in both, the duplicate is produced by the retry rather than by the medium, and in both the consumer is the one that has to be idempotent |
+| bandwidth versus latency | memory bandwidth versus memory latency — [the memory hierarchy](/systems/memory-hierarchy/) | a wide bus does not help a pointer chase, because each load's address depends on the previous load's result; dependent loads are round trips wearing a different hat |
+
+## interview drills
+
+**Q.** Why is the internet packet-switched rather than circuit-switched? What did we give up?
+
+- *weak answer* — "Packet switching is more efficient." True and empty; the follow-up is "efficient
+  at what, and what did it cost", and there is nothing underneath.
+- *strong answer* — Reservations waste capacity, because traffic is bursty and a reserved share sits
+  idle between bursts while a new conversation gets refused on a wire that is mostly empty.
+  Interleaving small labelled chunks lets the link carry whoever has something to send, bounds how
+  long a small message waits behind a large one, and lets hops overlap instead of each waiting for
+  the whole message. What we gave up is every guarantee: with no reservation there is no promised
+  share, no bounded delay, and when queues fill, packets are dropped.
+- *follow-up* — "So how does anything work?" The guarantees moved to the endpoints — numbering,
+  acknowledgements and timers — which is what TCP is, and it is also why real-time media adds a
+  jitter buffer rather than asking the network for a stable delay.
+
+**Q.** We doubled the bandwidth to the database and the page is exactly as slow. Explain.
+
+- *weak answer* — "Must be the database then." Maybe, but you have skipped the measurement that
+  distinguishes the two cases.
+- *strong answer* — Bandwidth and latency are independent, and this workload is almost certainly
+  latency-bound: if the page issues thirty queries in sequence, each waiting for the previous
+  answer, the cost is thirty round trips and nothing about the width of the pipe touches that. I
+  would count the round trips per request first, and look for latency that scales with row count
+  while CPU and bandwidth stay flat.
+- *follow-up* — "How would you fix it?" Reduce the count, not the size: one query instead of N,
+  concurrent issue where the calls are independent, or push the work to where the data lives.
+  Reusing an already-open connection helps too, because a fresh one costs its own round trips before
+  yours goes out.
+
+**Q.** A junior asks what a packet actually is. Walk them through it.
+
+- *weak answer* — "It's a piece of your data with an address on it." Right shape, no mechanism, and
+  it leaves them unable to reason about anything downstream.
+- *strong answer* — Bytes in two parts: a header of fixed fields at known offsets — destination,
+  source, length, what is inside, a checksum — and a payload the middle of the network never looks
+  at. Fixed offsets are what let a router forward at line rate without parsing anything. And the
+  payload is usually another entire packet with its own header, which is what encapsulation means:
+  an HTTP request inside a TCP segment inside an IP packet inside an Ethernet frame.
+- *follow-up* — "Why fixed offsets and not a self-describing format?" Because the devices in the
+  middle have to be simple and fast, and because they must be able to handle a payload whose format
+  they have never heard of.
+
+**Q.** The service timed out calling the payment API. Did the payment happen?
+
+- *weak answer* — "No, it timed out." That is the single most expensive wrong answer in this
+  subject.
+- *strong answer* — Unknown, and unknowable from the timeout alone. Silence is consistent with the
+  request never arriving *and* with the request being processed and the response being lost on the
+  way back; the network gives you no way to tell them apart. So the retry must be safe: an
+  idempotency key the far end deduplicates on, or a follow-up query on the operation's own
+  identifier before retrying. Blind retries on a non-idempotent operation are how one timeout
+  becomes two charges.
+- *follow-up* — "What if the API is not idempotent and you cannot change it?" Then you own the
+  reconciliation — record intent before the call, and settle the record afterwards from the far
+  end's state rather than from your own optimism.
+
+**Q.** Why is the network built in layers at all? Wouldn't one protocol be simpler?
+
+- *weak answer* — "Separation of concerns." A slogan; the interviewer is asking what it bought.
+- *strong answer* — Nothing can be upgraded everywhere at once, and no one owns the whole path. Each
+  layer speaks a protocol with its peer on the other side and treats everything below as a pipe that
+  might lose things, so pieces can be replaced independently: Wi-Fi replaced cables under unchanged
+  applications, and HTTP/3 changed the transport without a router in the middle being touched,
+  because a forwarding router reads the internet-layer header and stops. The other win is a narrow
+  waist — N link
+  types plus M applications, instead of N times M.
+- *follow-up* — "What does layering cost you?" Hidden information: a lower layer retrying silently,
+  a lower layer's size limit surfacing as an unexplained hang, and every incident where the symptom
+  is at one layer and the cause is three layers down.

@@ -1,0 +1,525 @@
+---
+layout: '@layouts/TopicLayout.astro'
+topic: stack-and-heap
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import ProblemList from '@components/ProblemList.astro';
+import Solution from '@components/Solution.astro';
+
+## the ground floor
+
+- **address** — an index into the one flat array of bytes that is your process's memory.
+  [Bits, bytes and addresses](/systems/bits-and-memory/) builds that from nothing.
+- **allocator** — code that hands out a range of those bytes and decides when you may stop
+  using it. There are two in every .NET process, and they work nothing alike.
+- **call frame** — the block of bytes one running method owns: its parameters, its locals, and
+  the address to return to. Frames stack up as calls nest.
+- **stack** — the region a thread's frames live in, one per thread, private by convention.
+  [Processes, threads and the kernel](/systems/process-and-thread/) is where that split comes
+  from. (The other "stack" — `Stack<T>`, the data structure — is a different thing that happens
+  to share the name; this page always means the region.)
+- **heap** — the region objects live in, shared by every thread in the process, cleaned up by
+  the garbage collector rather than by scope.
+- **GC** — the .NET garbage collector: the thing that decides when heap bytes may be reused.
+  [GC internals](/systems/gc-internals/) is its own page; here it only matters as *the reason
+  heap memory is not free*.
+
+## core idea
+
+Both allocators hand you bytes. The difference is who decides when you are done with them.
+
+The stack decides for you: a frame is created by moving one register down, destroyed by moving
+it back, and it is destroyed exactly when the method returns. That is why stack allocation is
+close to free and why nothing on the stack can outlive the call that made it. The heap does not
+decide — you allocate, and the memory stays reachable until nobody can reach it any more, which
+is a question only the collector can answer, later, at a cost.
+
+| | stack | heap |
+| --- | --- | --- |
+| allocate | move the stack pointer | bump an allocation pointer, sometimes call the collector |
+| free | move the stack pointer back | nothing you do; the GC decides |
+| lifetime | exactly the enclosing call | until unreachable |
+| who can see it | one thread, by convention | every thread in the process |
+| typical size | a few MiB per thread, fixed at thread creation | as much as the OS will map |
+| when it runs out | the process dies, uncatchable | `OutOfMemoryException`, or the OOM killer |
+
+## how it actually works
+
+### the two allocators, in machine code
+
+Nothing hides the difference like a managed runtime does, so here it is in C, where both
+allocators are visible. Two functions that both produce four `int`s and hand them to
+`use`. Compiled with `gcc -O2 -fno-stack-protector -c alloc.c` and disassembled
+with `objdump -dr --no-show-raw-insn` — x86-64, AT&T syntax. This is the real output: the only
+edits are the comments after each `;`, and one line of alignment padding (`nopl`) removed from
+*between* the two functions. Nothing inside either function body has been touched.
+
+```c
+#include <stdlib.h>
+int use(int *p);
+
+int on_stack(void) {
+    int a[4];
+    a[0] = 1;
+    return use(a);
+}
+
+int on_heap(void) {
+    int *a = malloc(4 * sizeof(int));
+    a[0] = 1;
+    int r = use(a);
+    free(a);
+    return r;
+}
+```
+
+```text
+0000000000000000 <on_stack>:
+   0:   endbr64
+   4:   sub    $0x18,%rsp        ; ← THE ENTIRE ALLOCATION. 24 bytes, one instruction
+   8:   mov    %rsp,%rdi         ; the array's address is just the stack pointer
+   b:   movl   $0x1,(%rsp)       ; a[0] = 1
+  12:   call   17 <on_stack+0x17>
+                        13: R_X86_64_PLT32      use-0x4
+  17:   add    $0x18,%rsp        ; ← THE ENTIRE DEALLOCATION. no bookkeeping, no free list
+  1b:   ret
+
+0000000000000020 <on_heap>:
+  20:   endbr64
+  24:   push   %rbp
+  25:   mov    $0x10,%edi        ; 16 bytes wanted
+  2a:   push   %rbx
+  2b:   sub    $0x8,%rsp
+  2f:   call   34 <on_heap+0x14> ; ← a function call into the allocator
+                        30: R_X86_64_PLT32      malloc-0x4
+  34:   movl   $0x1,(%rax)       ; a[0] = 1, through whatever pointer malloc returned
+  3a:   mov    %rax,%rbx         ; keep it — we have to give it back later
+  3d:   mov    %rax,%rdi
+  40:   call   45 <on_heap+0x25>
+                        41: R_X86_64_PLT32      use-0x4
+  45:   mov    %rbx,%rdi         ; the saved pointer, back into the first argument register
+  48:   mov    %eax,%ebp         ; park use()'s result — free() is about to clobber %eax
+  4a:   call   4f <on_heap+0x2f> ; ← and a second call to release it
+                        4b: R_X86_64_PLT32      free-0x4
+  4f:   add    $0x8,%rsp
+  53:   mov    %ebp,%eax         ; …and retrieve it, now that free() has returned
+  55:   pop    %rbx
+  56:   pop    %rbp
+  57:   ret
+```
+
+`sub $0x18,%rsp` *is* the allocation. There is no data structure behind it, no search, no
+metadata: the stack pointer is a register, and everything below it is yours. `add $0x18,%rsp`
+is the deallocation, and it costs the same as the allocation, which is nothing. The heap version
+has two function calls in it that the stack version does not, and it pays for them in registers:
+`on_stack` touches no callee-saved register at all, while `on_heap` opens by pushing `%rbx` and
+`%rbp` and closes by popping them back. `%rbx` holds the pointer, because somebody must eventually
+hand it back to `free`, and `%rbx` is one of the registers a called function promises not to
+disturb. `%rbp` holds the value `use` returned, because it has to survive the `free` call and
+return values come back in `%eax`, which `free` is free to trash — hence the `mov %eax,%ebp`
+before the call and the `mov %ebp,%eax` after it. Manual lifetime management is not one extra
+instruction; it is a shape the whole function is bent around.
+
+### what a .NET allocation compiles to
+
+C# has no `malloc`, but `new` is still a call. This is the real JIT output for one method,
+with the JIT's tiered compilation forced off so what you see is the method's final optimised
+body rather than its quick, unoptimised first pass:
+
+```csharp
+class Small { public int A, B; }
+
+[MethodImpl(MethodImplOptions.NoInlining)]
+public static object MakeOne(int a, int b) => new Small { A = a, B = b };
+```
+
+```text
+G_M000_IG02:                ;; offset=0x0009
+       mov      rdi, 0x7F091072B418     ; the method table for Small — its type identity
+       call     CORINFO_HELP_NEWSFAST   ; the allocator. returns the new object in rax
+       mov      dword ptr [rax+0x08], ebx     ; A  → 8 bytes past the reference
+       mov      dword ptr [rax+0x0C], r15d    ; B  → 12 bytes past the reference
+```
+
+Three things are visible there and all three matter. The reference you hold in C# is a machine
+address — `rax` is an ordinary pointer. Your fields do not start at that address: `A` lands at
+`+8`, because the 8 bytes at `+0` are the method-table pointer (the object's type), and there is
+another header word *behind* the reference at `-8` used for locking and the hash code. And
+allocation is a *call*, not an instruction — `CORINFO_HELP_NEWSFAST` is the fast path, which
+bumps a per-thread allocation pointer and returns; when that pointer runs past the end of the
+chunk the thread was given, the same helper goes and gets another chunk, and that is where a
+collection can happen.
+
+So .NET's heap allocation is much closer to the stack's `sub rsp` than C's `malloc` is: the
+common case really is "bump a pointer". What you are buying with `new` is not the allocation.
+It is the bookkeeping that lets somebody else work out when the object died —
+[GC internals](/systems/gc-internals/) is the bill.
+
+The header costs are measurable. `GC.GetAllocatedBytesForCurrentThread` reports exactly what
+each `new` charged, with no sampling and no timer involved — every address and byte count on
+this page comes from one runnable file, `bench/stack-and-heap/index.cs`:
+
+| allocation | your data | charged | what the rest is |
+| --- | --- | --- | --- |
+| `new object()` | 0 bytes | 24 | header, plus the 8-byte minimum object size |
+| `(object)42` (boxing an `int`) | 4 bytes | 24 | 16 header + 4 payload, rounded up |
+| `new Node()` where `Node` holds a `Point` and an `int` | 12 bytes | 32 | 16 header + 12, rounded to 8 |
+| `new int[8]` | 32 bytes | 56 | 24 array header (header + length) + 32 |
+
+### where your values actually live
+
+Here is the address of six things in one run, each looked up in `/proc/self/maps` — the kernel's
+list of which address ranges this process has, and what they are:
+
+```text
+  local int                            0x7FFD619B16E8      136 KiB mapping [stack]
+  local Point (a struct)               0x7FFD619B16F0      136 KiB mapping [stack]
+  stackalloc int[16]                   0x7FFD619B15A0      136 KiB mapping [stack]
+  node.P — struct field of a class     0x7F7DA2C0AE5C      388 KiB mapping (anonymous)
+  node.Id — int field of a class       0x7F7DA2C0AE58      516 KiB mapping (anonymous)
+  arr[0] — int[8]                      0x7F7DA2C0AE80      580 KiB mapping (anonymous)
+  two stack locals are 8 bytes apart
+```
+
+`Point` is a `struct`. `node.P` is a `Point`. Its address begins `0x7F7D`, in the same anonymous
+mapping as the array and hundreds of gigabytes of virtual address space away from the locals,
+which begin `0x7FFD`. It is on the heap, because the object that owns it is on the heap. (The
+mapping's size grows from line to line — 388 KiB, then 516, then 580 — because `/proc/self/maps`
+is re-read for each lookup and printing the previous line allocated. That growth is the heap
+doing its job.)
+
+<Callout kind="trap" label="the folklore, corrected">
+  "Structs go on the stack, classes go on the heap" is wrong, and it is wrong in the direction
+  that costs you money. **A struct lives wherever the variable that holds it lives.** A `struct`
+  local lives in the frame. A `struct` field of a class lives inside that object, on the heap. A
+  `struct` element of an array lives in the array, on the heap. A `struct` captured by a lambda
+  lives in the closure object, on the heap. A boxed struct is a heap object with a header.
+
+  The rule that *is* true: a reference-type variable holds an address of something on the heap;
+  a value-type variable holds the bytes themselves, wherever the variable happens to be.
+</Callout>
+
+The picture that goes with those addresses — one process, high addresses at the top:
+
+```text
+   high addresses
+   ┌──────────────────────────────────────────┐  0x7FFD…
+   │  thread 1 stack   (grows DOWN ↓)         │  frames: locals, return addresses,
+   │      [main]  N MiB reserved              │  spilled registers, stackalloc
+   ├──────────────────────────────────────────┤
+   │                 unmapped                 │  a hole — touching it is a segfault
+   ├──────────────────────────────────────────┤
+   │  thread 2 stack   N MiB reserved         │  one per thread, sized at creation
+   ├──────────────────────────────────────────┤
+   │                 unmapped                 │
+   ├──────────────────────────────────────────┤  0x7F7D…
+   │  GC heap  (grows UP ↑)                   │  every object, every array, every
+   │      obj  obj  obj  → alloc pointer      │  string, every boxed value, every
+   │                                          │  closure and async state machine
+   ├──────────────────────────────────────────┤
+   │  loaded code and static data             │
+   └──────────────────────────────────────────┘
+   low addresses
+```
+
+Both regions are just mapped pages of the same address space —
+[virtual memory](/systems/virtual-memory/) is the page that explains why "mapped" is not the
+same as "real". Nothing at the hardware level marks one region "stack" and the other "heap".
+The difference is entirely in who moves the pointer and who decides you are done.
+
+### the promotion: how a local stops being a local
+
+Two `int` locals declared one line apart, in the same method. One of them is mentioned by a
+lambda. Their addresses, in one real run:
+
+```text
+=== 2b. two int locals, declared side by side ===
+  int captured (a lambda reads it)     0x7F7DA2C98ED8      836 KiB mapping (anonymous)
+  int plain                            0x7FFD619B16F8      136 KiB mapping [stack]
+```
+
+`captured` is on the heap. The C# compiler rewrote the method: it generated a class (you can see
+its name in any stack trace that walks through it — something like `<>c__DisplayClass8_0`),
+moved the variable into a field of that
+class, allocated one instance at the top of the method, and pointed both the method body and the
+lambda at that field. It has to. The delegate can outlive the frame, and the frame is gone the
+instant the method returns.
+
+That rewrite is not free and it is not visible in the source. Measured per operation:
+a lambda capturing one local costs **88 bytes** — 24 for the closure object plus 64 for the
+delegate — while a lambda capturing nothing costs **0**, because the compiler creates that one
+once and caches it in a static field.
+
+The same promotion happens to every local that must survive an `await`: the compiler builds a
+state machine and the locals become its fields, on the heap. The mechanism is on
+[threads and scheduling](/systems/threads-and-scheduling/); the consequence belongs here.
+"It's just a local, so it's thread-private" stops being true the moment a local is captured,
+because captured means *heap*, and heap means shared.
+
+Even the compiler's error messages admit it. Ask for the address of a captured variable and it
+tells you the truth:
+
+```text
+error CS1686: Local 'captured' or its members cannot have their address taken and be used
+inside an anonymous method or lambda expression
+```
+
+### the stack is a fixed-size region, decided before your code runs
+
+A stack is not elastic. It is a reservation made when the thread is created, and every frame
+eats into it. `ulimit -s` sets the reservation for the main thread and for the thread pool's
+worker threads — 16 MiB (16,384 KiB) here, read straight out of `/proc/self/limits`. An explicit
+`new Thread(f, n)` asks for `n` instead. Both are honoured
+exactly: a thread created with a 256 KiB request maps a 256 KiB (rounded to the page size)
+region and nothing more, confirmed here from `/proc/self/maps`:
+
+```text
+=== 2. a thread's stack is its own mapping, sized when the thread is created ===
+  thread-pool thread                   0x7F7D59B7B990    16388 KiB mapping (anonymous)
+  new Thread(f, 256 * 1024)            0x7F9C84B14AE0      280 KiB mapping (anonymous)
+```
+
+The size is a *reservation* of address space, not memory you paid for — the main thread's
+mapping held only 136 KiB of committed pages when the addresses earlier on this page were taken,
+and it grows as frames are pushed. On Windows the default comes from the executable header
+instead of `ulimit`, and is smaller; that is a documented difference, not something this page
+measures.
+
+Divide the reservation by the frame size and you have the depth at which your recursion dies.
+[The stack that ran out](/systems/stack-and-heap/stack-overflow-hunt/) does that arithmetic for
+four different reservations, shows the frame size stays constant regardless of which one you
+pick, and then proves it by killing a process.
+
+### `ref`, `in`, `out` — passing the address instead of the bytes
+
+A value-type parameter is a copy. `ref` passes the address of the variable instead, so the
+callee writes into the caller's storage; `in` passes the address read-only (an optimisation for
+big structs — you avoid the copy but promise not to write); `out` is `ref` with the compiler
+enforcing that the callee assigns before returning. All three are addresses of storage that
+already exists somewhere — none of them allocate.
+
+<Solution>
+
+```csharp
+using System.Runtime.InteropServices;              // CollectionsMarshal lives here
+
+var a = new Counter { Value = 0 };
+ByValue(a);                                        // a.Value is still 0
+ByRef(ref a);                                      // a.Value is now 1
+ByOut(out var b);                                  // b.Value is 42
+
+// The copy trap that follows from "a struct lives where its variable lives":
+var arr = new Counter[1];
+arr[0].Bump();                                     // arr[0] IS storage — this works, arr[0].Value == 1
+
+var list = new List<Counter> { new Counter { Value = 0 } };
+var copy = list[0];                                // the indexer RETURNS a copy
+copy.Bump();                                       // list[0].Value is still 0
+// list[0].Value = 5;                              // CS1612: cannot modify the return value
+
+// If you must mutate in place, ask for the real storage:
+ref var slot = ref CollectionsMarshal.AsSpan(list)[0];
+slot.Bump();                                       // list[0].Value is now 1
+
+static void ByValue(Counter c) => c.Bump();        // bumps a copy, then throws it away
+static void ByRef(ref Counter c) => c.Bump();      // bumps the caller's storage
+static void ByOut(out Counter c) => c = new Counter { Value = 42 };
+
+// Top-level statements must precede any type declaration, so Counter lands here (CS8803).
+struct Counter
+{
+    public int Value;
+    public void Bump() => Value++;                 // mutates the struct it is called on
+}
+```
+
+</Solution>
+
+An array indexer resolves to an address, so `arr[0].Bump()` mutates the array. `List<T>`'s
+indexer is a *method that returns a value*, so `list[0].Bump()` mutates a temporary that is
+discarded, silently, with no warning. This is the single most common way "structs are cheap"
+turns into a bug.
+
+### `Span<T>`, `stackalloc`, and why `ref struct` is so restricted
+
+`stackalloc int[64]` moves the stack pointer and hands you 256 bytes of your own frame — the C
+cameo's `sub rsp`, available from C#. `Span<T>` is the safe way to talk about that memory: a
+pointer plus a length, that can point at a stack buffer, a heap array, or unmanaged memory, and
+that bounds-checks every access.
+
+Which raises an obvious danger: a `Span<int>` over a `stackalloc` buffer is a pointer into a
+frame. If that span outlives the frame, it points at whatever the next call writes there. So
+`Span<T>` is a `ref struct`, and the compiler makes escape impossible rather than merely
+unlikely. Every one of these is a real error, taken from a live compile:
+
+```text
+error CS8345: Field or auto-implemented property cannot be of type 'Span<int>' unless it is
+              an instance member of a ref struct.
+error CS8352: Cannot use variable 'local' in this context because it may expose referenced
+              variables outside of their declaration scope
+error CS4007: Instance of type 'System.Span<int>' cannot be preserved across 'await' or
+              'yield' boundary.
+error CS8175: Cannot use ref local 's' inside an anonymous method, lambda expression, or
+              query expression
+```
+
+They are four spellings of one rule: **a `ref struct` may not end up on the heap.** No field of
+a class, no returning a span over your own frame, no surviving an `await` (the state machine is
+a heap object), no capture by a lambda (the closure is a heap object). The restrictions look
+arbitrary until you know where the heap is; then they are the only possible design.
+
+## the mental model
+
+Three questions, in order. They answer "where does this live" for any C# expression.
+
+1. **What kind of type is it?** Reference type → the *object* is on the heap, always. Value type
+   → the bytes are wherever the variable is, which is question 2.
+2. **Where is the variable?** A local or parameter → the frame. A field → inside its owner,
+   wherever the owner is. An array element → inside the array, on the heap. A captured local or
+   an `async` local that survives an `await` → a compiler-generated object, on the heap.
+3. **Did anything box it?** Assigning a value type to `object`, to an interface, or to a
+   non-generic API copies it into a fresh heap object with a header. That is a new allocation
+   every time, and the original is untouched.
+
+| the expression | where the bytes are |
+| --- | --- |
+| `int i` inside a method | frame |
+| `Point p` (a struct local) | frame |
+| `stackalloc int[64]` | frame |
+| `new int[64]` | heap, 24-byte header plus the elements |
+| `class Order` with a `DateTime` field | heap, header plus every field inline |
+| `struct Money` field of that class | heap — inside the `Order` object |
+| `List<Point>` with 1,000 items | one heap array holding 1,000 `Point`s back to back |
+| `List<object>` with 1,000 boxed ints | one heap array of 1,000 references, plus 1,000 heap objects |
+| `int` captured by a lambda | heap, in the closure object |
+
+<Watch items={[['object header', '16 B'], ['min object', '24 B'], ['array header', '24 B'], ['boxed int', '24 B'], ['closure + delegate', '88 B'], ['stack per thread', '16 MiB (ulimit -s)'], ['stack alloc', '1 instruction']]} />
+
+## why you should care
+
+**The metric that moves is allocation rate, and the symptom is p99 latency with a flat mean.**
+Filling a `List<int>` with a million ints allocates one 4 MB array and provokes zero collections.
+Filling a `List<object>` with the same million ints allocates 32 MB — an 8 MB array of references
+plus a million 24-byte boxes — and provokes real collections in the same loop:
+
+| one million ints | heap bytes | gen0 | gen1 | gen2 |
+| --- | --- | --- | --- | --- |
+| fill `List<int>` | 4,000,056 | +0 | +0 | +0 |
+| fill `List<object>` (boxing) | 32,000,072 | +2 | +2 | +1 |
+
+Same count of ints, same result, eight times the bytes — and the boxed version is the only one of
+the two whose fill provokes a collection at all. *When* one of those collections lands is not
+something the call site controls: the allocator only stops to collect once its current budget
+runs out, so the exact fill call that pays for it moves between runs. That unpredictability is
+itself the lesson — the cost of allocating is not paid where you allocate, it is paid later,
+whenever the collector decides your budget is spent.
+
+Reading the two lists back differs too, and for a reason that has nothing to do with allocation:
+summing a `List<int>` walks one contiguous 4 MB block, while summing a `List<object>` chases a
+million separate pointers to a million separate 24-byte objects scattered across the heap. Every
+hop is a new cache line, which is a [memory hierarchy](/systems/memory-hierarchy/) problem sitting
+on top of the allocation problem.
+
+**The incident shape** is a service whose mean latency is fine and whose p99 doubles under load,
+with gen2 collections climbing in `dotnet-counters`. Somebody is allocating per request in a hot
+path, and the usual suspects are all invisible in the source: a `params` array on a logging
+call, a closure inside a loop, a `foreach` over an interface-typed collection, a struct passed
+to something that takes `object`.
+
+**The other incident shape** has no latency at all: the process simply disappears, no exception
+in the log, container restarted, exit code 134. That is the stack running out, and no `catch`
+block anywhere in your code was consulted.
+
+**The next two pages follow directly from this one.** The pointer-chasing paragraph above is the
+opening of [the memory hierarchy](/systems/memory-hierarchy/): once you know that a million boxed
+ints are a million separate objects, the question becomes why touching them one at a time is
+slow, and the answer is about cache lines rather than allocation. And every "the GC decides" in
+this page's tables is an IOU that [GC internals](/systems/gc-internals/) settles — what a
+collection physically does, why it has to stop your threads to do it, and what makes an object
+survive.
+
+**The code review you can now do:** flag `object`/`IEnumerable`-typed parameters in hot paths
+(they box value types and allocate enumerators); flag lambdas declared inside loops (a fresh
+closure per iteration); flag `list[i].Field = x` on a `List<struct>` (it does not compile, and
+the workaround people write copies); flag recursion whose depth is a function of *input* rather
+than of a bounded structure; and stop flagging `new` on the argument that "allocation is slow" —
+it is a pointer bump, and what you are actually spending is collection time later.
+
+## the same idea in other languages
+
+| language | what it's called | the trap |
+| --- | --- | --- |
+| C | `malloc`/`free` for the heap, ordinary locals and `alloca` for the stack | the lifetime rule is enforced by nobody: returning the address of a local compiles cleanly and gives you a pointer into a frame that no longer exists. C# forbids the same mistake with `ref struct` rules at compile time |
+| C++ | values live on the stack by default, `new`/`make_unique` for the heap, destructors free at scope exit (RAII) | a `std::vector` local is a stack object whose *elements* are always on the heap — the same "the container is not its contents" split as `List<T>`, and the reason a vector of vectors scatters memory everywhere |
+| Java | every object is on the heap; only primitives and references sit in a frame's slots | Java has no user-declared value types before Valhalla, so there is no struct to misplace — but also no way to lay out an array of points contiguously. The JIT's escape analysis can scalar-replace a non-escaping object, which is an optimisation you cannot ask for and cannot rely on |
+| Go | the compiler decides per allocation, by escape analysis; returning a pointer to a local is legal and moves it to the heap | you cannot tell from the source which happened — `go build -gcflags=-m` prints "escapes to heap" for each one. Engineers coming from Go expect C# to do the same for classes, and it does not: `new` on a class allocates |
+| Python | every value is a heap object, including small integers; names are references | there is no value type at all, so a list of a million ints is a million objects plus an array of pointers — exactly the `List<object>` row measured above, except it is the only option |
+
+## exercises
+
+Both of these are about the same question asked in the two directions that matter: what did that
+line allocate, and what happens when the stack runs out.
+
+<ProblemList topic="stack-and-heap" />
+
+## interview drills
+
+**Q.** Where do structs live?
+
+- *weak answer* — "On the stack, classes go on the heap." This is the answer the interviewer is
+  fishing for, and it invites the follow-up that ends the conversation.
+- *strong answer* — A struct lives wherever its variable lives. As a local it is in the frame; as
+  a field of a class it is inside that object on the heap; as an array element it is in the
+  array on the heap; captured by a lambda it is in the closure object on the heap. The stack/heap
+  distinction is about the *variable*, not about the type.
+- *follow-up* — "So when is a struct actually cheaper?" When it avoids an allocation and a
+  pointer hop: an array of structs is one contiguous block, an array of class instances is a
+  block of references plus N separate objects.
+
+**Q.** We have a latency problem: mean is flat, p99 doubled, CPU is unchanged. Where do you look?
+
+- *weak answer* — "Add more caching" or "check the database." Both may be true and neither
+  explains the *shape*: a flat mean with a bad tail is something that happens to a small fraction
+  of requests, hard.
+- *strong answer* — That shape is a stop-the-world pause or a lock convoy. I'd look at GC counters
+  first: gen0/gen1/gen2 collection counts and pause time per collection. If gen2s are climbing,
+  something is allocating enough per request to promote, and I'd take an allocation profile
+  rather than guess.
+- *follow-up* — "What allocates that people don't notice?" Boxing into `object`/interface
+  parameters, closures created inside loops, `params` arrays, enumerating a collection through
+  an interface, and string concatenation in a loop.
+
+**Q.** A method takes a `Span<T>`. Why can't I store it in a field?
+
+- *weak answer* — "Because `Span` is a struct." True and not the reason; plenty of structs are
+  fields.
+- *strong answer* — Because a span can point into a stack frame, and a field lives in a heap
+  object that can outlive that frame. `Span<T>` is a `ref struct` precisely so the compiler can
+  prove it never reaches the heap — which is also why it cannot cross an `await`, be captured by
+  a lambda, or be a generic type argument in the general case.
+- *follow-up* — "What do you use when you need to keep it?" `Memory<T>`, which can live on the
+  heap, and `.Span` on it at the point of use.
+
+**Q.** Why can't you catch a `StackOverflowException` in .NET?
+
+- *weak answer* — "Because it's a fatal exception." Restating the behaviour is not the mechanism.
+- *strong answer* — Running a `catch` block requires stack space, and there is none left by
+  definition; and the runtime cannot know whether the frames it would have to unwind left shared
+  state consistent. Since .NET 2.0 the runtime fails the process instead of trying. The fix is to
+  bound the depth before you get there — an explicit stack on the heap, or a depth check.
+- *follow-up* — "What bounds it in practice?" The thread's stack reservation divided by the frame
+  size. Deep recursion over untrusted input is a denial-of-service bug, which is why
+  `System.Text.Json` caps nesting depth at 64 by default.
+
+**Q.** Is allocating in .NET expensive?
+
+- *weak answer* — "Yes, avoid `new` in hot paths." Cargo cult; it will not survive a follow-up.
+- *strong answer* — The allocation itself is a pointer bump in a thread-local buffer, so it is
+  cheap. What costs is everything downstream: the object must be traced, possibly copied when it
+  survives a collection, and it dirties cache lines. So allocation rate is what matters, not
+  allocation cost, and the fix is to allocate fewer objects — not to micro-optimise `new`.
+- *follow-up* — "How would you prove your change helped?" `GC.GetAllocatedBytesForCurrentThread`
+  around the operation gives an exact byte count with no timer noise, and gen0 collection counts
+  before and after confirm the rate actually dropped.

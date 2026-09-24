@@ -1,0 +1,135 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: advanced-graphs
+problem: number-of-provinces
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+
+## task
+
+There are `n` cities. `isConnected` is an `n × n` matrix where `isConnected[i][j] == 1` means
+city `i` and city `j` are directly connected, and connectivity is transitive: if `i-j` and `j-k`
+are connected, so is `i-k`. A **province** is a maximal group of cities connected to each other,
+directly or transitively. Return the number of provinces. LeetCode #547.
+
+```text
+isConnected = [[1,1,0],[1,1,0],[0,0,1]]  →  2   (cities 0-1 form one province, city 2 its own)
+```
+
+## how to think
+
+This is "count connected components," and a DFS/BFS flood-fill over the matrix would solve it in
+the same `O(n²)` time the matrix itself costs to read. So why union-find? Because `isConnected`
+isn't really "the graph" — it's a flat list of pairwise facts, `i` and `j` are connected, and
+union-find is built to answer exactly that shape of question without ever constructing an
+adjacency list: process each fact once, merge the two sets it names, done.
+
+It also matches how this exact question tends to grow in a follow-up: "what if connections
+arrive one at a time, and you need the province count after each one?" A flood-fill has to rerun
+from scratch on every new edge; union-find just keeps doing what it already does — one more
+`Union` call, no restart.
+
+<Callout kind="note" label="template instance">
+  **Union-find** skeleton, with union-by-size and path compression both live. Invariant: at every
+  point in the scan, the number of distinct roots in `parent` equals the number of provinces
+  formed by every connection processed *so far*. What varies: instead of returning `Union`'s
+  bool, the caller decrements a running `provinces` counter on every successful merge.
+</Callout>
+
+## solution
+
+```csharp
+public int FindCircleNum(int[][] isConnected)
+{
+    int n = isConnected.Length;
+    var parent = new int[n];
+    var size = new int[n];
+    for (int i = 0; i < n; i++) { parent[i] = i; size[i] = 1; }
+
+    int Find(int x)
+    {
+        if (parent[x] != x) parent[x] = Find(parent[x]);   // path compression
+        return parent[x];
+    }
+
+    int provinces = n;   // start assuming every city is its own province
+    for (int i = 0; i < n; i++)
+    {
+        for (int j = i + 1; j < n; j++)
+        {
+            if (isConnected[i][j] == 0) continue;
+
+            int ri = Find(i), rj = Find(j);
+            if (ri == rj) continue;                   // already the same province
+
+            if (size[ri] < size[rj]) (ri, rj) = (rj, ri);   // union by size
+            parent[rj] = ri;
+            size[ri] += size[rj];
+            provinces--;                                // two provinces just merged into one
+        }
+    }
+    return provinces;
+}
+```
+
+## trace
+
+Five cities, two provinces — `{0, 1}` and `{2, 3, 4}`:
+
+```text
+isConnected = [[1,1,0,0,0],
+               [1,1,0,0,0],
+               [0,0,1,1,0],
+               [0,0,1,1,1],
+               [0,0,0,1,1]]
+
+0 ─ 1        2 ─ 3 ─ 4
+```
+
+Only pairs with `isConnected[i][j] == 1` (and `j > i`, so each edge is visited once) reach the
+union step:
+
+| pair | `Find(i)` before | `Find(j)` before | action | provinces after |
+| --- | --- | --- | --- | --- |
+| (0,1) | 0 | 1 | union: `parent[1]=0`, `size[0]=2` | 4 |
+| (2,3) | 2 | 3 | union: `parent[3]=2`, `size[2]=2` | 3 |
+| (3,4) | 2 | 4 | union: `parent[4]=2`, `size[2]=3` | 2 |
+
+`(0,2)`, `(0,3)`, `(0,4)`, `(1,2)`, `(1,3)`, `(1,4)`, `(2,4)` are all `0` in the matrix and never
+reach the union check. Final `parent = [0, 0, 2, 2, 2]`, `size = [2, 1, 3, 1, 1]` — two roots,
+two provinces.
+
+## why it works
+
+Each `Union` either merges two previously-separate sets (provinces drop by exactly one) or is a
+no-op on a pair already in the same set (`ri == rj`, provinces unchanged). Since "province" is
+defined as a maximal connected group, and every direct connection in the matrix triggers exactly
+one `Union` call, the number of distinct roots after processing every entry equals the number of
+maximal groups — by the same argument that makes union-find correct for connectivity in general.
+Path compression and union-by-size don't change *what* gets merged, only how fast `Find` gets
+there — near-`O(1)` amortized, technically `O(α(n))`, the inverse Ackermann function, which is
+under 5 for any `n` you'll ever run this on.
+
+<Watch items={[['time', 'O(n² · α(n))'], ['space', 'O(n)']]} />
+
+## common bugs
+
+- Scanning the full matrix (`j` from `0`) instead of `j = i + 1` — redundant work at best
+  (`isConnected` is symmetric), double-counting if you forget the `ri == rj` guard at worst.
+- Unioning by rank/size but forgetting to update `size[ri]` after a merge — the next comparison
+  reads a stale value and union-by-size stops doing its job, degrading `Find` back toward `O(n)`.
+- Skipping path compression (`parent[x] = Find(parent[x])`) — still correct, just slower; long
+  chains form and `Find` degrades toward linear.
+- Off-by-one on the "start assuming everyone is separate" baseline — `provinces` must start at
+  `n`, not `0`, since a city connected to no one is still its own province.
+
+## variants you can now solve
+
+- **Redundant Connection** (LC 684) — same union-find; return the edge whose `Union` call is the
+  first to return `false` — that's the edge that closed a cycle.
+- **Accounts Merge** (LC 721) — union-find where the "cities" are email addresses and the fact
+  list comes from shared accounts instead of a matrix.
+- [Course Schedule](/patterns/advanced-graphs/course-schedule/) (LC 207) — connectivity's
+  directed cousin: ordering instead of grouping, Kahn's instead of union-find.

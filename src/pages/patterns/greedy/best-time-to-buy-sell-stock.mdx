@@ -1,0 +1,119 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: greedy
+problem: best-time-to-buy-sell-stock
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import Cells from '@components/Cells.astro';
+
+## task
+
+Given an array `prices` where `prices[i]` is the stock price on day `i`, find the maximum
+profit from buying on one day and selling on a *later* day. Return `0` if no profit is possible.
+
+```text
+prices = [7, 1, 5, 3, 6, 4]  →  5   (buy at 1, sell at 6)
+```
+
+## how to think
+
+Brute force checks every `(buy, sell)` pair with `buy < sell` — O(n²). Reframe the question one
+day at a time instead: *"if I sell today, what's the best profit I could have?"* That answer
+only depends on the **cheapest price seen before today** — every earlier day is a candidate buy
+day, and the cheapest one dominates all the others for any fixed sell day.
+
+So track the running minimum price as you scan left to right, and on every day ask both
+questions: does selling today (at the running minimum) beat the best profit found so far, and
+is today's price a new running minimum? One pass, two running numbers, done.
+
+<Callout kind="insight" label="this is Kadane again">
+  Let `diff[i] = prices[i] - prices[i-1]`. The profit from buying on day `l` and selling on day
+  `r` telescopes to `sum(diff[l+1..r])` — a subarray sum of the day-to-day changes. So the
+  answer to this problem **is** the maximum subarray sum of `diff`, and this greedy scan is
+  exactly [Maximum Subarray](/patterns/array-techniques/maximum-subarray/)'s extend-or-restart
+  recurrence: keep riding a positive run, or reset the moment a new low makes more sense than
+  dragging the old one along. Same recurrence, different bookkeeping.
+</Callout>
+
+<Callout kind="note" label="template instance">
+  **Track & decide** skeleton. Invariant: `minPrice` is the cheapest price seen in
+  `prices[0..i-1]`; `bestProfit` is the best profit achievable by selling on any day up to and
+  including `i`. `Update` is a running minimum fold; `Combine` scores "sell today" against the
+  running minimum before updating it, so you never buy and sell on the same index by accident.
+</Callout>
+
+## solution
+
+```csharp
+public int MaxProfit(int[] prices)
+{
+    int minPrice = prices[0];
+    int bestProfit = 0;
+
+    for (int i = 1; i < prices.Length; i++)
+    {
+        bestProfit = Math.Max(bestProfit, prices[i] - minPrice);   // sell today?
+        minPrice = Math.Min(minPrice, prices[i]);                  // or is today the new cheapest buy?
+    }
+    return bestProfit;
+}
+```
+
+## trace
+
+`prices = [7, 1, 5, 3, 6, 4]`, `minPrice` starts at `prices[0] = 7`, `bestProfit` starts at `0`:
+
+| i | prices[i] | prices[i] - minPrice | bestProfit | minPrice (after) |
+| --- | --- | --- | --- | --- |
+| 1 | 1 | 1 - 7 = -6 | max(0, -6) = **0** | min(7, 1) = **1** |
+| 2 | 5 | 5 - 1 = 4 | max(0, 4) = **4** | min(1, 5) = **1** |
+| 3 | 3 | 3 - 1 = 2 | max(4, 2) = **4** | min(1, 3) = **1** |
+| 4 | 6 | 6 - 1 = 5 | max(4, 5) = **5** | min(1, 6) = **1** |
+| 5 | 4 | 4 - 1 = 3 | max(5, 3) = **5** | min(1, 4) = **1** |
+
+`minPrice` locks onto `1` at `i = 1` and never moves again — every later day just asks whether
+selling against that `1` beats the current record. Final answer: `bestProfit = 5` (buy at `1`
+on day 1, sell at `6` on day 4).
+
+<Cells
+  data={[7, 1, 5, 3, 6, 4]}
+  pointers={{ 4: [{ t: 'i', c: 'amber' }] }}
+  cells={{ 1: 'ok', 4: 'ok' }}
+  caption="by i=4: minPrice is locked in at index 1 (price 1), and prices[4] - minPrice = 5 is the best profit found — the buy/sell pair the scan discovered"
+/>
+
+## why it works
+
+For a fixed sell day `i`, the best possible buy day is whichever earlier day had the lowest
+price — a higher earlier price can never produce more profit than the true minimum would, so
+tracking anything less than the running minimum throws away information for free. The global
+answer is the best profit over *some* sell day, so taking the max of `prices[i] - minPrice`
+across every `i` finds it. Both claims are never-regret arguments: the running minimum is never
+worse to remember than any other earlier price, and today's profit-if-sold is never worse to
+check than skipping the check.
+
+<Watch items={[['time', 'O(n)'], ['space', 'O(1)'], ['passes', '1']]} />
+
+## common bugs
+
+- Initializing `minPrice` to `0` instead of `prices[0]` — day 0 then looks like a free buy-in,
+  inflating every profit computed afterward.
+- Overwriting `bestProfit` directly instead of taking `Math.Max` — one bad day (a lower price
+  than the running minimum) can erase profit a better earlier day already banked.
+- Reaching for this exact template on the unlimited-transactions version (LC 122, below) — that
+  variant sums *every* positive day-to-day gain; this one caps at a single buy/sell pair and
+  the running-minimum framing doesn't extend to it.
+- If a follow-up asks for the actual buy/sell **days**, not just the profit, you need to
+  snapshot the day `minPrice` last changed — the running variable alone forgets it.
+
+## variants you can now solve
+
+- **Best Time to Buy and Sell Stock II** (LC 122) — unlimited transactions: sum every positive
+  `prices[i] - prices[i-1]`, since any profitable run can be captured by daily flips.
+- **Best Time to Buy and Sell Stock with Cooldown** (LC 309) — the never-regret argument breaks
+  (today's best choice depends on whether you're cooling down), so it becomes a small DP state
+  machine instead of a single running minimum.
+- [Maximum Subarray](/patterns/array-techniques/maximum-subarray/) (LC 53) — the formal name
+  for the recurrence this problem is secretly running, on the array of daily price deltas.

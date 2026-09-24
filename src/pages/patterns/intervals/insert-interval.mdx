@@ -1,0 +1,131 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: intervals
+problem: insert-interval
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+
+## task
+
+Given a list of intervals already sorted by start and already mutually non-overlapping, plus one
+new interval, insert it and merge if necessary. Return the sorted, merged result. LeetCode #57.
+
+```text
+intervals = [[1,2],[3,5],[6,7],[8,10],[12,16]], newInterval = [4,8]  →  [[1,2],[3,10],[12,16]]
+```
+
+## how to think
+
+You could throw the new interval into the list and re-run [Merge Intervals](/patterns/intervals/merge-intervals/)
+from scratch — sort, sweep, done. It works, but it throws away a precondition you were handed for
+free: the existing list is *already* sorted and *already* merged. Re-sorting `n + 1` elements to
+solve a problem where only one of them is new is `O(n log n)` when a single linear pass is enough.
+
+Walk the list once, in three phases. Phase one: every interval that ends before the new interval
+even starts is untouched — copy it straight through. Phase two: every interval that overlaps the
+new one gets absorbed into a single running `[start, end]`, because sorted + non-overlapping input
+guarantees that once you hit an interval that *doesn't* overlap, nothing after it will either.
+Push that one running interval. Phase three: whatever's left is untouched — copy it straight
+through too.
+
+Phase two is exactly the merge template's overlap check (`current.Start <= last.End`), just run
+against one specific "current" — the new interval — instead of against every element in turn.
+
+<Callout kind="note" label="template instance">
+  **Merge** skeleton, specialized: instead of sweeping every interval against the last *merged*
+  one, you sweep every interval against the one *new* interval, absorbing anything that overlaps
+  it into a running `[start, end]`. Invariant: once phase two stops absorbing, nothing later can
+  overlap — the input was already sorted and non-overlapping before you touched it.
+</Callout>
+
+## solution
+
+```csharp
+public int[][] Insert(int[][] intervals, int[] newInterval)
+{
+    var result = new List<int[]>();
+    int i = 0, n = intervals.Length;
+    int start = newInterval[0], end = newInterval[1];
+
+    // phase 1: intervals that end before the new one starts — untouched
+    while (i < n && intervals[i][1] < start)
+        result.Add(intervals[i++]);
+
+    // phase 2: every interval that overlaps the new one — absorb them all into one
+    while (i < n && intervals[i][0] <= end)
+    {
+        start = Math.Min(start, intervals[i][0]);
+        end = Math.Max(end, intervals[i][1]);
+        i++;
+    }
+    result.Add([start, end]);
+
+    // phase 3: everything starting after the merged interval ends — untouched
+    while (i < n)
+        result.Add(intervals[i++]);
+
+    return [.. result];
+}
+```
+
+## trace
+
+`intervals = [[1,2],[3,5],[6,7],[8,10],[12,16]]`, `newInterval = [4,8]` — running `(start, end)`
+begins at `(4, 8)`:
+
+| interval | phase | check | effect | `(start, end)` after |
+| --- | --- | --- | --- | --- |
+| `[1,2]` | 1 | `2 < 4` → yes | copy untouched | `(4, 8)` |
+| `[3,5]` | 2 | `3 <= 8` → yes | absorb | `(3, 8)` |
+| `[6,7]` | 2 | `6 <= 8` → yes | absorb (end unchanged) | `(3, 8)` |
+| `[8,10]` | 2 | `8 <= 8` → yes | absorb | `(3, 10)` |
+| — | 2 → stop | `[12,16]`: `12 <= 10` → no | push merged `[3,10]` | — |
+| `[12,16]` | 3 | — | copy untouched | — |
+
+`result = [[1,2],[3,10],[12,16]]`.
+
+The three absorptions in phase two are the "aha" — `[6,7]` overlaps but doesn't widen anything
+(it's already inside `[3,8]`), while `[8,10]` overlaps *and* widens the end:
+
+```text
+new interval starts as [4,8]
+absorb [3,5]:  start=min(4,3)=3  end=max(8,5)=8   -> [3,8]
+absorb [6,7]:  start=min(3,6)=3  end=max(8,7)=8   -> [3,8]   (end unchanged — already inside)
+absorb [8,10]: start=min(3,8)=3  end=max(8,10)=10 -> [3,10]  (widens again)
+```
+
+## why it works
+
+Because the input is already sorted and pairwise non-overlapping, phase one's stopping condition
+(`intervals[i][1] < start` becomes false) fires exactly when an interval first overlaps the new
+one. From there, phase two's running `(start, end)` only ever grows, and every interval it absorbs
+is a real overlap with that growing interval — because the input's own starts are non-decreasing,
+if interval `i` overlaps the running interval, interval `i + 1` either overlaps it too or starts
+strictly after it ends. The moment one starts after, sorted order guarantees every interval past
+it does as well, which is exactly what makes phase three safe to copy verbatim with zero checks.
+
+<Watch items={[['time', 'O(n)'], ['space', 'O(n)']]} />
+
+## common bugs
+
+- Re-running full Merge Intervals (sort + sweep) instead of exploiting that the input is already
+  sorted — correct, but pays `O(n log n)` for work that's really `O(n)`.
+- Writing phase one's loop as `intervals[i][1] <= start` — an interval ending exactly at the new
+  interval's start gets copied straight through instead of merged; touching counts as overlap
+  here, same as Merge Intervals, so the loop must stay strict `<`.
+- Falling straight from phase two's loop into phase three without pushing the accumulated
+  `[start, end]` first — the merged interval never makes it into the result.
+- Mutating `newInterval` in place across the phases instead of tracking `start`/`end` as separate
+  locals — `newInterval` may still be referenced by the caller after this call returns.
+
+## variants you can now solve
+
+- [Merge Intervals](/patterns/intervals/merge-intervals/) (LC 56) — the general case this problem
+  specializes: merge N arbitrary intervals instead of splicing one new interval into an
+  already-clean list.
+- **My Calendar I** (LC 729) — the same overlap check, asked as an incremental "can I book this?"
+  design problem instead of a batch insert-and-merge.
+- [Meeting Rooms II](/patterns/intervals/meeting-rooms-ii/) (LC 253) — a different question over
+  the same shape of input: not "merge them" but "how many can be open at the same instant."

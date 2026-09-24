@@ -1,0 +1,360 @@
+---
+layout: '@layouts/TopicLayout.astro'
+topic: networking
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+
+## the ground floor
+
+- **RTT** — round-trip time: one full there-and-back on a connection. Every cost on this page is
+  counted in round trips, not durations, because the actual number depends entirely on where the
+  other end physically is.
+- **head-of-line (HOL) blocking** — one stalled item blocking everything queued behind it, even
+  though the others are ready to go. It shows up at two different layers below, wearing two
+  different disguises, and telling them apart is most of this page.
+- **multiplexing** — many independent logical streams sharing one physical connection, each
+  identified separately, so nothing has to wait for an unrelated stream's turn.
+- **connection pool** — a client-held set of already-open connections to a host, checked out for
+  a request and checked back in rather than closed. Every "why is this slow" question on this
+  page eventually asks whether the connection was warm or cold.
+
+## core idea
+
+A request that leaves your process crosses a chain of round trips you did not choose: TCP to get
+bytes there reliably, TLS to get a room the two ends can trust, HTTP to describe what is wanted,
+and — for anything running behind a load balancer — one more hop that decides which host answers
+at all. Each layer has its own handshake, its own failure mode, and its own idea of what "ready"
+means.
+
+The one-sentence version a staff engineer reaches for: **everything below is a tax on either the
+first request to a place (paid in handshakes) or the concurrent requests sharing a place (paid in
+head-of-line blocking) — and most of the decisions on this page are about which of the two you
+are willing to pay more of.**
+
+## how it actually works
+
+### the handshake stack, before your byte gets sent
+
+A brand-new HTTPS connection pays two handshakes before the request you actually wanted goes
+anywhere:
+
+- **TCP**: SYN, SYN-ACK, ACK. One round trip before either side may treat the connection as open.
+- **TLS 1.3**: the client sends `ClientHello` with a key share already attached (a guess at which
+  key-exchange group the server supports); the server answers with `ServerHello`, its
+  certificate, and `Finished` in the same flight; the client replies `Finished`. That is **one**
+  round trip — TLS 1.3's actual improvement over TLS 1.2, which needed two because the client had
+  to wait to learn which cipher suite before it could send its key material.
+- **0-RTT resumption**: if the client has a cached session ticket from a prior connection, it may
+  attach early application data to its very first flight, before any handshake completes. This
+  removes a round trip, but that early data is not bound to a fresh random nonce the way the rest
+  of the handshake is — a captured `ClientHello` can be replayed, and the server would process the
+  early data again. Treat 0-RTT data as replayable by definition: fine for an idempotent `GET`,
+  never for a `POST` that charges a card, unless the application layer adds its own replay
+  defense.
+
+```text
+cold connection  (TLS 1.3, no session resumption)
+
+client                                   server
+  |--- SYN ------------------------------->|   \
+  |<-- SYN-ACK ----------------------------|    } RTT 1 : TCP handshake
+  |--- ACK -------------------------------->|   /
+  |--- ClientHello (+ key share) ---------->|   \
+  |<-- ServerHello, cert, Finished ---------|    } RTT 2 : TLS 1.3 handshake
+  |--- Finished ---------------------------->|   /
+  |--- GET /orders/42 ---------------------->|   \
+  |<-- 200 OK ------------------------------|    } RTT 3 : the request you actually wanted
+                                                 /
+total: 3 round trips before the first byte of YOUR response
+
+warm connection  (pooled, keep-alive)
+
+client                                   server
+  |--- GET /orders/43 ---------------------->|   \
+  |<-- 200 OK ------------------------------|    } RTT 1 : just the request
+                                                 /
+total: 1 round trip — this is the entire argument for connection pooling
+```
+
+### congestion control: why a fresh connection is also slow to fill up
+
+Even once a connection is open, TCP does not let it run at full speed immediately. Every
+connection starts in **slow start**: the sender's congestion window (`cwnd` — how many
+unacknowledged bytes it is willing to have in flight) begins small and roughly doubles each round
+trip, until either it reaches a ceiling or a loss is detected. From there it switches to
+**congestion avoidance**: additive increase, multiplicative decrease (AIMD) — grow the window by
+one segment per round trip on success, cut it by half on loss. A connection that has been sending
+steadily for a while has a large `cwnd` and can burst data through immediately; a freshly opened
+one has to *earn* that window one round trip at a time, regardless of how much bandwidth is
+actually free. This is a second, independent reason a pooled long-lived connection outperforms a
+fresh one — separate from, and additive with, the handshake cost above.
+
+### HTTP/1.1 → HTTP/2 → HTTP/3: what each one actually fixes
+
+- **HTTP/1.1**: one request in flight per connection at a time (pipelining exists on paper but is
+  effectively unusable, because a stalled response still blocks every response queued behind it
+  on that connection — application-level HOL blocking). Clients work around this by opening
+  several connections per host in parallel — commonly capped around six — which trades one kind
+  of blocking for handshake and `cwnd` costs multiplied by however many connections you opened.
+- **HTTP/2**: one TCP connection, many independent streams multiplexed over it, each with its own
+  flow-control window. This is a real fix for application-level HOL blocking — no more waiting
+  for an unrelated slow response before yours is even sent — and it is why HTTP/2 needs only one
+  connection per host instead of six.
+- **What HTTP/2 does not fix**: TCP delivers **one ordered byte stream**. If a single TCP segment
+  is lost, every stream multiplexed on that connection stalls, because TCP will not hand *any*
+  already-arrived bytes to HTTP/2 until the missing segment is retransmitted and the stream is
+  back in order — even the streams whose data has nothing to do with the lost segment. This is
+  transport-level HOL blocking, and HTTP/2 reintroduces it in exchange for fixing the
+  application-level version.
+- **HTTP/3**: swaps TCP for **QUIC**, which runs over UDP and does its own loss recovery
+  per-stream rather than for the connection as a whole. A lost packet stalls only the one stream
+  it belonged to; the rest keep delivering. QUIC also carries the TLS 1.3 handshake inside its own
+  handshake rather than layering a second one on top, which is why a fresh QUIC connection needs
+  fewer round trips than fresh TCP-plus-TLS.
+
+```text
+HTTP/2 over TCP, one segment lost              HTTP/3 over QUIC, one packet lost
+
+stream A  [====][====][====]                   stream A  [====][====][====]
+stream B  [==][ XX ][==][==]                   stream B  [==][ XX ][==][==]
+stream C  [===][===][===]                      stream C  [===][===][===]
+
+TCP hands HTTP/2 ONE ordered byte stream:      QUIC delivers loss recovery per stream:
+the segment carrying B's lost data blocks      only B stalls waiting for retransmit;
+A and C too — their bytes arrived, but TCP     A and C's already-arrived data is
+won't release out-of-order data                delivered to the app immediately
+```
+
+<Callout kind="trap" label="the folklore, corrected">
+  "HTTP/2 fixed head-of-line blocking" is only half true, and the missing half is exactly the
+  half that bites on real networks. HTTP/2 fixed the **application-level** blocking (one slow
+  response no longer blocks an unrelated one on the same connection). It reintroduced
+  **transport-level** blocking as a side effect of multiplexing everything onto a single ordered
+  TCP stream. HTTP/3 is the fix for the transport-level version, not a second fix for the
+  application-level one — that was already solved.
+</Callout>
+
+### connection reuse: keep-alive and pooling
+
+Keep-alive means the TCP connection is not closed after one request-response pair, so the next
+request to the same host skips both handshakes above entirely (the "warm connection" diagram).
+A **connection pool** is the client-side bookkeeping that makes this systematic: hold a set of
+already-open connections per host, check one out for a request, check it back in when the
+response finishes, and open a new one only when every pooled connection is busy.
+
+Closing a connection is not instantaneous bookkeeping either: whichever side sends the first
+`FIN` (an *active close*) holds that socket's `(local port, remote ip:port)` tuple in
+**`TIME_WAIT`** afterward, so it can absorb any stray duplicate segments still in flight before
+the tuple is reused. A service that opens and discards connections faster than the OS reclaims
+them is spending ephemeral ports faster than it thinks — see "how it fails" below.
+
+### L4 versus L7 load balancing
+
+An **L4** (transport-level) load balancer picks a backend once, at connection setup — typically
+by hashing the TCP/UDP 5-tuple, or round robin — and then forwards packets. It never terminates
+the connection and never reads the payload; from the backend's point of view, the client's own
+TCP connection effectively continues through it. It cannot tell a `200` from a `500`, so it
+cannot retry a failed request — it does not know a request failed at all.
+
+An **L7** (application-level) load balancer terminates the client's connection itself (which
+means it needs the TLS certificate, or the client's traffic must be plaintext to it), parses the
+HTTP request, and opens its **own**, separate connection to a chosen backend — two independent
+TCP connections end to end, each with its own handshake and its own congestion window, joined at
+the proxy. Because it actually understands HTTP, it can route by path or header, retry against a
+different backend, and reject malformed requests before they reach an app server. All of that
+costs the extra hop.
+
+### capacity arithmetic: connections per unit of concurrency
+
+Assume a downstream dependency needs to sustain **500 concurrent in-flight calls** from your
+service, and the pool is otherwise idle between calls (no queuing target).
+
+- Talking HTTP/1.1 to it: one request occupies one connection for its entire duration, so
+  sustaining 500 concurrent calls needs on the order of **500 simultaneously open pooled
+  connections**. Below that, calls 501 onward queue behind whichever connection frees first.
+- Talking HTTP/2 to it: many requests multiplex onto one connection, so in principle **one**
+  connection could carry all 500. In practice, servers cap concurrent streams per connection —
+  the HTTP/2 spec recommends they advertise no fewer than 100 via `SETTINGS_MAX_CONCURRENT_STREAMS`
+  — so with a server enforcing that floor, sustaining 500 concurrent calls needs
+  `ceil(500 / 100)` = **5 connections**, not 500.
+
+That two-order-of-magnitude gap — 500 sockets, each with its own handshake and `cwnd`, versus 5 —
+is the entire economic argument for preferring HTTP/2 (or higher) to a downstream you call at any
+real concurrency, independent of any latency claim.
+
+## the tradeoff
+
+**HTTP version**, once TLS and connection reuse are already in place:
+
+| axis | HTTP/1.1 | HTTP/2 | HTTP/3 (QUIC) |
+| --- | --- | --- | --- |
+| multiplexing | none — needs N connections | yes, one TCP connection | yes, one QUIC connection over UDP |
+| application-level HOL blocking | present (worked around with more connections) | fixed | fixed |
+| transport-level HOL blocking | avoided, because connections are independent | present under packet loss | fixed — per-stream loss recovery |
+| fresh-connection handshake | 1 RTT TCP + 1 RTT TLS 1.3 | same as 1.1 | fewer round trips — handshake folded into QUIC |
+| what governs your worst case | how many connections you were willing to open | packet loss rate on the path | not much is left to blame |
+
+Default to **HTTP/2** for service-to-service traffic and for browsers on stable links — it is a
+strict improvement over 1.1 that costs nothing in client behavior, and virtually every stack
+speaks it today. Reach specifically for **HTTP/3** when clients sit on lossy or high-latency
+links you do not control — mobile networks, satellite, cross-region public internet — because
+that is exactly the condition under which transport-level HOL blocking dominates; it costs you a
+newer, less universally-proxied protocol and UDP-hostile middleboxes on the path.
+
+**Load balancer layer**, independent of the HTTP version choice above:
+
+| axis | L4 | L7 |
+| --- | --- | --- |
+| balances | connections | requests |
+| sees | TCP/UDP headers only | full HTTP: path, headers, method, body |
+| can retry a failed request | no — has no concept of "failed" | yes — sees the status code |
+| can route by path/header/cookie | no | yes |
+| TLS | usually passthrough, backend holds the cert | usually terminated at the LB |
+| connections end to end | one, client-to-backend | two, joined at the proxy |
+
+Default to **L7** for a typical HTTP service — the retry, routing, and observability it buys are
+worth the extra hop for most request shapes. Drop to **L4** when the protocol is not HTTP at all
+(a raw TCP/database proxy), when you need the load balancer itself off the tail-latency and
+failure path, or when you deliberately do not want the LB holding your TLS certificate.
+
+## how it fails
+
+- **Socket/ephemeral-port exhaustion from a client that never pools.** *Symptom*: intermittent
+  `SocketException`s under load that look like the network is down. *Cause*: a codebase that
+  opens a new outbound connection per call instead of pooling — every closed connection still
+  holds its port in `TIME_WAIT` for a while, and under load the service opens new sockets faster
+  than the OS reclaims old ones. *On a dashboard*: connection failures cluster with request rate,
+  not with anything the downstream is doing; `netstat` on the box shows thousands of sockets in
+  `TIME_WAIT`.
+- **DNS staleness from a connection that never closes.** *Symptom*: after a failover or a
+  blue/green swap, some fraction of traffic keeps hitting a backend that was supposed to be
+  retired. *Cause*: a pooled connection, once open, keeps talking to the IP it originally
+  resolved — it has no reason to re-resolve DNS while it is healthy and idle-timeout hasn't
+  fired. *On a dashboard*: the new backend's request count stays flat after a cutover while the
+  old one, which should be draining, keeps taking traffic.
+- **Retry storms across client and load balancer.** *Symptom*: a downstream that is merely slow
+  falls over completely soon after. *Cause*: client-side retries (a Polly policy, say) stacked on
+  top of an L7 load balancer that also retries failed requests — each failure multiplies into
+  several attempts at two different layers, and the effective request rate the backend sees is a
+  multiple of what the client thinks it is sending. *On a dashboard*: backend request-rate graphs
+  read several times higher than the caller's own outbound-request-rate graph during the incident.
+- **HTTP/2 transport-level HOL blocking on lossy links.** *Symptom*: mobile or otherwise
+  loss-prone clients see one unrelated slow request stall everything else on the page, despite
+  the app being "on HTTP/2 for multiplexing." *Cause*: exactly the mechanism above — one lost TCP
+  segment blocks every multiplexed stream until it's retransmitted. *On a dashboard*: elevated
+  tail latency correlates with measured packet loss specifically for HTTP/2 clients, and is
+  absent for HTTP/1.1 clients on the same backend using separate connections.
+- **Nagle's algorithm meets delayed ACK.** *Symptom*: small, frequent request/response pairs (a
+  presence ping, a small RPC) show a fixed extra hop of latency that a raw network ping between
+  the same hosts does not. *Cause*: the sender's Nagle algorithm buffers a small write, waiting
+  either for more data to coalesce with it or for an ACK of the previous write; the receiver's
+  delayed-ACK timer is meanwhile waiting for a data segment of its own to piggyback the ACK on.
+  Neither side sends first. *Fix*: disable Nagle on that socket (`Socket.NoDelay = true` in .NET,
+  `TCP_NODELAY` underneath) for latency-sensitive small writes — but not everywhere, since
+  disabling it for bulk transfer just means more, smaller packets for no benefit.
+- **A pooled connection outlives an intermediate idle timeout.** *Symptom*: sporadic "connection
+  reset" errors that correlate with a lull in traffic, not a spike. *Cause*: a load balancer,
+  firewall, or NAT device between client and server silently drops idle TCP state after its own
+  idle timeout, shorter than the client pool's connection lifetime; the next request that reuses
+  the "still open" pooled connection gets an RST instead of a response. *Fix*: set the pool's
+  connection lifetime below whatever the tightest intermediate idle timeout is known to be.
+
+## in practice
+
+- **`HttpClient` and `IHttpClientFactory`.** The two failure modes above (socket exhaustion,
+  DNS staleness) are exactly the two ways to get `HttpClient` wrong, and they are opposite
+  mistakes: `new HttpClient()` per call never really releases its socket promptly, exhausting
+  ports under load; a single `static readonly HttpClient` held forever never re-resolves DNS.
+  `IHttpClientFactory` resolves both by handing out a pooled `SocketsHttpHandler` and rotating the
+  underlying handler on a lifetime (2 minutes by default) — you get pooling *and* periodic
+  re-resolution. Tune `SocketsHttpHandler.PooledConnectionLifetime` directly when you need it
+  shorter than the default, e.g. to stay under an infrastructure idle timeout.
+- **`SqlConnection` / `NpgsqlConnection` pooling.** The same connection-pool discipline applies
+  one layer down: ADO.NET connection pools are sized (`Max Pool Size`, default 100) and the
+  "Timeout expired. The timeout period elapsed prior to obtaining a connection from the pool"
+  error is the database-connection cousin of socket exhaustion — a symptom of checkouts without
+  matching check-ins (a missing `using`/`await using` on a `DbConnection`, most often), not of
+  the database itself being slow.
+- **gRPC requires HTTP/2.** Kestrel serves it natively, but an L7 proxy or gateway in front that
+  does not speak HTTP/2 to the *backend* (not just to the client) silently breaks it — the
+  failure usually surfaces as intermittent `UNAVAILABLE` at the proxy hop rather than an obvious
+  protocol error, because the proxy degrades the connection instead of rejecting it outright.
+  Confirm HTTP/2 (or gRPC specifically) is enabled end to end, not just at the edge.
+- **Polly retries need to know about the load balancer's own retries.** A retry policy configured
+  without knowledge of what sits between the client and the backend is a retry-storm risk by
+  default — see "how it fails" above. [Timeouts, retries & circuit breakers](/system-design/reliability/)
+  is where the budget for this actually gets set; this page is the path that budget is spent on.
+- **Kestrel endpoint configuration** chooses HTTP/1.1, HTTP/2, or HTTP/3 (and TLS) per endpoint
+  explicitly — nothing here is "automatic" the way a browser's protocol negotiation feels; a
+  service exposing HTTP/3 needs it turned on deliberately, alongside HTTP/1.1 or /2 as a fallback
+  for clients or intermediaries that do not speak QUIC yet.
+
+## the same idea elsewhere
+
+| elsewhere | the same mechanism | the trap |
+| --- | --- | --- |
+| memory hierarchy: DRAM vs. disk | closer tiers are orders of magnitude cheaper than the next one out — same shape as same-datacenter vs. cross-region, both as published reference figures rather than anything measured here | forgetting that the *choice of tier* (which datacenter, which region) is a design decision, not a fact about the network — see [memory hierarchy](/systems/memory-hierarchy/) |
+| a bounded `Channel<T>` or a paused Kafka partition | TCP's receive window is backpressure: the sender is throttled by how much the receiver says it can hold, exactly like a bounded producer/consumer queue — see [parallelism patterns](/systems/parallelism-patterns/) | sizing the buffer without sizing what happens when it's full just moves the failure from a kernel-level slowdown to an application-level `OutOfMemoryException` |
+| a syscall that blocks a thread | a synchronous socket read is a kernel boundary crossing, and a thread blocked on one is a thread the pool cannot use for anything else — see [processes, threads and the kernel](/systems/process-and-thread/) | reaching for more threads to fix a network-bound service instead of async I/O, which is the actual fix for a thread that is only waiting, not working |
+| a CDN edge | the first cache the request meets, and it has all of caching's problems — staleness, invalidation, cold keys — before the request has left the network layer at all — see [caching](/system-design/caching/) | treating "we have a CDN" as a latency fix rather than a cache-correctness problem you now also own |
+
+## interview drills
+
+**Q.** Your service's p99 latency to a downstream spikes for a few minutes after every deploy of
+that downstream, even though the new instances report healthy immediately.
+- *weak answer* — "the network is just noisy during deploys."
+- *strong answer* — pooled connections opened before the deploy are still pointed at the old
+  instances' IPs; as those instances are torn down, requests on already-open connections start
+  failing or hanging until the pool notices and re-resolves, rather than the client picking up
+  the new IPs immediately the way a fresh connection would.
+- *follow-up* — "how do you fix it without paying a handshake on every request?" — bound the
+  pool's connection lifetime below the deploy's drain grace period (`PooledConnectionLifetime` in
+  .NET), or make sure the old instances drain their existing connections gracefully before
+  disappearing from DNS/service discovery.
+
+**Q.** You moved a service from HTTP/1.1 to HTTP/2 expecting faster page loads. Desktop got
+faster; users on flaky mobile connections got *worse*. Why?
+- *weak answer* — "HTTP/2 should always be faster, multiplexing is strictly better."
+- *strong answer* — HTTP/2 multiplexes every stream onto one TCP connection, so under real
+  packet loss, transport-level head-of-line blocking stalls every stream behind the one lost
+  segment; HTTP/1.1's several independent connections don't share that fate — losing a segment on
+  one connection doesn't touch the others.
+- *follow-up* — "what actually fixes this without going back to HTTP/1.1?" — HTTP/3, because QUIC
+  does loss recovery per stream instead of for the whole connection.
+
+**Q.** Explain what TLS 1.3 changed about the handshake, and what the asterisk on "0-RTT" is.
+- *weak answer* — "it's faster because it does less" (no mechanism).
+- *strong answer* — the client sends its key share inside `ClientHello` itself, so the full
+  handshake collapses to one round trip instead of TLS 1.2's two; separately, 0-RTT lets a
+  *resumed* connection attach early application data to the very first flight using a cached
+  session ticket — but that data isn't bound to a fresh handshake, so a replayed `ClientHello`
+  replays the early data with it.
+- *follow-up* — "would you enable 0-RTT for a login endpoint?" — no, unless the endpoint's
+  processing is idempotent or has its own replay defense; reserve 0-RTT for safe, idempotent
+  requests.
+
+**Q.** Your L7 load balancer is configured to retry failed requests against a different backend.
+You start seeing duplicate charges on retried checkout calls. What went wrong, and what's the
+fix?
+- *weak answer* — "turn off retries."
+- *strong answer* — the load balancer can't tell the difference between "the request never
+  reached the backend" and "the backend processed it and then the response was lost" — retrying a
+  non-idempotent `POST` replays the side effect, not just the network attempt.
+- *follow-up* — "how do you keep the retry without the duplicate?" — scope automatic retries to
+  idempotent methods only, and for the ones that must be retried anyway, require an idempotency
+  key the backend deduplicates on.
+
+**Q.** A teammate "fixes" a timeout bug by changing every call site to
+`using var client = new HttpClient();`. Under load, it gets worse, not better. Why?
+- *weak answer* — "`using` disposes it properly, so this should be fine."
+- *strong answer* — disposing `HttpClient` doesn't immediately free its underlying socket, which
+  lingers in `TIME_WAIT`; a service issuing a fresh `HttpClient` per call opens and abandons a
+  connection per call, and under load it exhausts ephemeral ports faster than the OS reclaims
+  them, producing connection failures indistinguishable at first glance from a network outage.
+- *follow-up* — "if you go the other way and share one static `HttpClient` forever instead, what
+  breaks?" — it never re-resolves DNS while its pooled connections stay healthy, so it can keep
+  talking to a backend IP long after that backend should have been retired.
+
+<Watch items={[['TLS 1.3 full handshake', '1 RTT'], ['TLS 1.3 0-RTT', 'replayable — idempotent only'], ['HTTP/2 fix', 'application-level HOL only'], ['HTTP/3 fix', 'transport-level HOL, via QUIC/UDP'], ['L4 sees', 'connections, not requests'], ['L7 can', 'retry, route, terminate TLS']]} />

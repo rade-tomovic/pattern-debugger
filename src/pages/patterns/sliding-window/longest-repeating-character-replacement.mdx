@@ -1,0 +1,140 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: sliding-window
+problem: longest-repeating-character-replacement
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import Cells from '@components/Cells.astro';
+
+## task
+
+Given a string `s` of uppercase letters and an integer `k`, you may replace up to `k` characters
+in `s` with any other uppercase letter. Return the length of the longest substring you can make
+consist of a single repeated character.
+
+```text
+s = "AABABBA", k = 1  →  4   ("AABA" -> "AAAA", or "BABB" -> "BBBB")
+```
+
+## how to think
+
+A window `[left, right]` is achievable if you can turn it all into one character using at most
+`k` replacements. If the window's most frequent character occurs `maxFreq` times, everything else
+in the window has to be replaced — that's `windowLength - maxFreq` replacements. So the validity
+check collapses to one formula: `windowLength - maxFreq <= k`. Expand `right` every step,
+updating a 26-slot frequency count and the running `maxFreq`; when the formula breaks, shrink
+`left` once. This is another **longest** problem — shrink while invalid — but the "invalid"
+condition is a count formula instead of set membership.
+
+The non-obvious move: `maxFreq` is allowed to go **stale**. When the window shrinks, the true
+maximum frequency inside it might actually drop — but the code below never recomputes it down,
+only ever raises it. That's deliberate, not a bug (more in "why it works").
+
+<Callout kind="note" label="template instance">
+  **Variable window, longest**, shrink-while-invalid. Window state: `int[26] freq` plus a running
+  `maxFreq`. `IsValid()` is `windowLength - maxFreq <= k`. What varies from
+  [Longest Substring Without Repeating](/patterns/sliding-window/longest-substring-without-repeating/):
+  the state is a frequency count instead of a set, and validity is a formula instead of a
+  membership test — everything else is the same skeleton.
+</Callout>
+
+## solution
+
+```csharp
+public int CharacterReplacement(string s, int k)
+{
+    var freq = new int[26];
+    int left = 0, maxFreq = 0, best = 0;
+
+    for (int right = 0; right < s.Length; right++)
+    {
+        int ri = s[right] - 'A';
+        freq[ri]++;
+        maxFreq = Math.Max(maxFreq, freq[ri]);       // most frequent char seen in a window this size or smaller
+
+        int windowLen = right - left + 1;
+        if (windowLen - maxFreq > k)                 // more replacements needed than allowed → shrink by exactly one
+        {
+            freq[s[left] - 'A']--;
+            left++;
+            windowLen--;
+        }
+        best = Math.Max(best, windowLen);            // window length only ever grows or holds — never drops below a past best
+    }
+    return best;
+}
+```
+
+## trace
+
+`s = "AABABBA"` (indices 0-6: `A A B A B B A`), `k = 1`:
+
+| right | char | `freq[char]` | maxFreq | len before shrink | shrink? (`len - maxFreq` vs `k`) | left after | window | best |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 0 | A | 1 | 1 | 1 | `0 <= 1` valid | 0 | `"A"` | 1 |
+| 1 | A | 2 | 2 | 2 | `0 <= 1` valid | 0 | `"AA"` | 2 |
+| 2 | B | 1 | 2 | 3 | `1 <= 1` valid | 0 | `"AAB"` | 3 |
+| 3 | A | 3 | 3 | 4 | `1 <= 1` valid | 0 | `"AABA"` | 4 |
+| 4 | B | 2 | 3 | 5 | `2 > 1` invalid | 1 | `"ABAB"` | 4 |
+| 5 | B | 3 | 3 | 5 | `2 > 1` invalid | 2 | `"BABB"` | 4 |
+| 6 | A | 2 | 3 | 5 | `2 > 1` invalid | 3 | `"ABBA"` | 4 |
+
+`right = 3`: the window has grown to length 4 and is still valid — 3 A's plus 1 replaceable B —
+
+<Cells
+  data={['A', 'A', 'B', 'A', 'B', 'B', 'A']}
+  pointers={{ 0: [{ t: 'L', c: 'amber' }], 3: [{ t: 'R', c: 'cyan' }] }}
+  cells={{ 0: 'ok', 1: 'ok', 2: 'ok', 3: 'ok' }}
+  caption='right=3: window "AABA" — replace the one B, valid, and it is the answer length'
+/>
+
+`right = 4`: length hits 5 and breaks the formula — `maxFreq` stays stale at 3 even though the
+post-shrink window's true max is only 2 —
+
+<Cells
+  data={['A', 'A', 'B', 'A', 'B', 'B', 'A']}
+  pointers={{ 0: [{ t: 'L', c: 'amber' }], 4: [{ t: 'R', c: 'cyan' }] }}
+  cells={{ 0: 'warn', 1: 'win', 2: 'win', 3: 'win', 4: 'win' }}
+  caption="right=4: index 0 evicted, left slides to 1 — window length stays 4, best stays 4"
+/>
+
+## why it works
+
+`maxFreq` is a monotonic *upper bound* on the true most-frequent count inside the current window,
+not always the exact value — and that's fine, because of what the algorithm is actually asking:
+"has any window ever needed this few replacements for this many characters?" If `maxFreq` is
+stale-high, the validity check `windowLength - maxFreq <= k` only gets *more* conservative
+(harder to satisfy), so the window shrinks a little more eagerly than strictly necessary. But it
+never grows past a size the true count would also allow — `best` can only be an achievable length,
+and every achievable length was checked exactly when `maxFreq` was accurate for the window that
+found it. The window length itself never needs to drop below a previously recorded best, so
+recomputing `maxFreq` exactly on every shrink (an `O(26)` rescan) buys correctness you already
+have for free.
+
+<Watch items={[['time', 'O(26n) = O(n)'], ['space', 'O(1)']]} />
+
+## common bugs
+
+- Recomputing `maxFreq` exactly after every shrink, believing the stale value is wrong — it
+  isn't; the algorithm's correctness argument depends on it staying an upper bound, not the
+  live max.
+- Using a `while` loop that shrinks until `windowLength - maxFreq <= k` — unnecessary here, since
+  the window only ever needs one shrink per step to stay within one-off-formula distance; a
+  single `if` suffices and keeps `windowLen` from ever *shrinking* the best.
+- Forgetting that `best` tracks `windowLen`, not `right - left + 1` after further mutation — take
+  the snapshot before any later step changes `left`.
+- Off-by-one on the character index: `s[right] - 'A'` assumes uppercase input; lowercase or mixed
+  case needs a different offset or a 52/128-slot array.
+- Treating `k` as "replace exactly `k`" instead of "**up to** `k`" — a window needing fewer
+  replacements than `k` is still valid.
+
+## variants you can now solve
+
+- [Longest Substring Without Repeating Characters](/patterns/sliding-window/longest-substring-without-repeating/)
+  (LC 3) — the same shrink-while-invalid shape with the simpler membership validity check.
+- **Max Consecutive Ones III** (LC 1004) — identical shape on a binary array: validity is
+  "at most `k` zeros in the window," a special case of this same replacement-budget formula.
+- **Fruit Into Baskets** (LC 904) — validity is "at most 2 distinct fruit types in the window" —
+  swap the frequency array for a dictionary and cap `dict.Count` instead of a replacement budget.

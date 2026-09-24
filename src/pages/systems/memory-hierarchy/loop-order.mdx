@@ -1,0 +1,401 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: memory-hierarchy
+problem: loop-order
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import Solution from '@components/Solution.astro';
+
+## the question
+
+Multiply two square matrices, `C = A × B`, the way everyone writes it first:
+
+```csharp
+for (int i = 0; i < n; i++)
+    for (int j = 0; j < n; j++)
+    {
+        float s = 0;
+        for (int k = 0; k < n; k++) s += a[i * n + k] * b[k * n + j];
+        c[i * n + j] = s;
+    }
+```
+
+Now swap the two inner loops and accumulate into `C` instead of into a register:
+
+```csharp
+for (int i = 0; i < n; i++)
+    for (int k = 0; k < n; k++)
+    {
+        float aik = a[i * n + k];
+        for (int j = 0; j < n; j++) c[i * n + j] += aik * b[k * n + j];
+    }
+```
+
+Both versions execute exactly n³ multiply-adds, read exactly the same values, and produce the
+same matrix. Neither is a better algorithm than the other; they are the same algorithm with the
+loop headers in a different order.
+
+<Callout kind="insight" label="predict first">
+  Three commitments, all checkable by counting rather than by timing anything.
+
+  1. Both loops fetch a value out of `B` on every multiply-add. For the same n³ reads, does
+     `i,j,k` or `i,k,j` fetch more distinct 64-byte cache lines out of `B`? Put a number on it —
+     not "more", a multiple.
+  2. A third order, `j,k,i`, puts the `i` loop innermost, so **both** `A` and `C` are walked down
+     their columns at once. Is that better than `i,j,k`'s single column walk, worse, or the same?
+  3. `A`, `B` and `C` are all comfortably smaller than this box's L2 cache at every size below.
+     Does that mean `i,j,k`'s column walk is equally bad at every size — or is there a size where
+     the *arithmetic of the address itself*, not the amount of data, makes it worse than its
+     neighbours? Commit to a size before you scroll.
+</Callout>
+
+## the code
+
+One file. Three loop orders, checked against each other before anything else runs, plus this
+box's real L1 and L2 geometry — read from `/sys`, not assumed — turned into a table of how many
+of the lines a column touches each cache level can actually hold at once, at eight sizes.
+
+<Solution>
+
+```csharp
+// Evidence for /systems/memory-hierarchy/loop-order/ — run with:
+//   dotnet run bench/memory-hierarchy/loop-order.cs
+//
+// C = A x B, three loop orders. Every version executes exactly n^3 multiply-adds
+// and reads exactly the same values; only the ORDER in which the addresses are
+// visited differs. Nothing here is timed: the file checks that all three orders
+// compute the same matrix, then works out — from this box's real cache geometry,
+// read from /sys — how many of the lines a column walk touches can actually live
+// in L1 and in L2 at once, for eight sizes.
+using System.Runtime.CompilerServices;
+
+static class LoopOrder
+{
+    // i,j,k — the textbook order: one dot product at a time.
+    // b[k * n + j] walks DOWN a column: consecutive reads are n floats apart.
+    static void Ijk(float[] a, float[] b, float[] c, int n)
+    {
+        for (int i = 0; i < n; i++)
+            for (int j = 0; j < n; j++)
+            {
+                float s = 0;
+                for (int k = 0; k < n; k++) s += a[i * n + k] * b[k * n + j];
+                c[i * n + j] = s;
+            }
+    }
+
+    // i,k,j — same arithmetic, accumulated into C instead of a register.
+    // Both b[k * n + j] and c[i * n + j] now walk ALONG a row.
+    static void Ikj(float[] a, float[] b, float[] c, int n)
+    {
+        Array.Clear(c);
+        for (int i = 0; i < n; i++)
+            for (int k = 0; k < n; k++)
+            {
+                float aik = a[i * n + k];
+                for (int j = 0; j < n; j++) c[i * n + j] += aik * b[k * n + j];
+            }
+    }
+
+    // j,k,i — the worst case: a[i * n + k] and c[i * n + j] BOTH walk down columns.
+    static void Jki(float[] a, float[] b, float[] c, int n)
+    {
+        Array.Clear(c);
+        for (int j = 0; j < n; j++)
+            for (int k = 0; k < n; k++)
+            {
+                float bkj = b[k * n + j];
+                for (int i = 0; i < n; i++) c[i * n + j] += a[i * n + k] * bkj;
+            }
+    }
+
+    static bool ReadCache(int level, string type, out int lineBytes, out int ways, out int sets)
+    {
+        for (int idx = 0; idx < 8; idx++)
+        {
+            string dir = $"/sys/devices/system/cpu/cpu0/cache/index{idx}";
+            if (!Directory.Exists(dir)) break;
+            int lvl = int.Parse(File.ReadAllText($"{dir}/level").Trim());
+            string t = File.ReadAllText($"{dir}/type").Trim();
+            if (lvl == level && t == type)
+            {
+                lineBytes = int.Parse(File.ReadAllText($"{dir}/coherency_line_size").Trim());
+                ways = int.Parse(File.ReadAllText($"{dir}/ways_of_associativity").Trim());
+                sets = int.Parse(File.ReadAllText($"{dir}/number_of_sets").Trim());
+                return true;
+            }
+        }
+        lineBytes = ways = sets = 0;
+        return false;
+    }
+
+    static long Gcd(long x, long y) { while (y != 0) { (x, y) = (y, x % y); } return x; }
+
+    public static void Main()
+    {
+        // --- correctness: all three orders must compute the same C ---
+        // (float addition is not associative, so compare with a tolerance)
+        const int n = 256;
+        var rng = new Random(1);
+        float[] a = new float[n * n], b = new float[n * n], c = new float[n * n];
+        for (int i = 0; i < a.Length; i++) { a[i] = (float)rng.NextDouble(); b[i] = (float)rng.NextDouble(); }
+
+        Ijk(a, b, c, n);
+        float[] refC = (float[])c.Clone();
+        foreach (var f in new Action<float[], float[], float[], int>[] { Ikj, Jki })
+        {
+            f(a, b, c, n);
+            for (int i = 0; i < c.Length; i++)
+                if (Math.Abs(c[i] - refC[i]) > 1e-2f * Math.Max(1f, Math.Abs(refC[i])))
+                    throw new Exception($"FAIL: orders disagree at {i}: {c[i]} vs {refC[i]}");
+        }
+        Console.WriteLine("PASS: i,j,k / i,k,j / j,k,i all compute the same C\n");
+
+        // --- geometry: read this box's real L1d and L2 from /sys, no assumptions ---
+        if (!ReadCache(1, "Data", out int l1Line, out int l1Ways, out int l1Sets) ||
+            !ReadCache(2, "Unified", out int l2Line, out int l2Ways, out int l2Sets))
+        {
+            Console.WriteLine("cache geometry not available on this box — skipping the set-conflict table");
+            return;
+        }
+        int pageBytes = Environment.SystemPageSize;
+        Console.WriteLine($"L1d: {l1Sets} sets x {l1Ways} ways x {l1Line} B = {l1Sets * l1Ways * l1Line / 1024} KB (one way = {l1Sets * l1Line} B)");
+        Console.WriteLine($"L2:  {l2Sets} sets x {l2Ways} ways x {l2Line} B = {l2Sets * l2Ways * l2Line / 1024} KB (one way = {l2Sets * l2Line} B)");
+        Console.WriteLine($"page size: {pageBytes} B\n");
+
+        // A cache line lives in exactly one SET, chosen by a slice of bits in the
+        // middle of its address. The number of distinct sets a strided walk can
+        // reach, times the ways per set, bounds how many lines of that walk the
+        // cache can hold at once. Both caches are physically indexed and a C#
+        // program cannot see physical addresses — but bits below the page size ARE
+        // knowable, because virtual and physical addresses share them.
+        long PageOffsetSets(long strideBytes, int sets) => Math.Min(pageBytes / Gcd(strideBytes, pageBytes), sets);
+        long L1LinesHeld(long strideBytes) => PageOffsetSets(strideBytes, l1Sets) * l1Ways;
+        // For L2, only the bits inside the page offset are knowable from the stride;
+        // the rest of the set index comes from the physical frame number the kernel
+        // handed out, which a managed program cannot read. That unknown part can
+        // spread a walk over some further sets, bounded by how many page-offset-only
+        // sets one page already covers — so this is an upper bound, not a measurement.
+        int knownSetsPerPage = Math.Min(pageBytes / l2Line, l2Sets);
+        int unknownSpread = l2Sets / knownSetsPerPage;
+        long L2LinesHeldAtMost(long strideBytes) => PageOffsetSets(strideBytes, knownSetsPerPage) * unknownSpread * l2Ways;
+
+        Console.WriteLine($"{"n",6} {"column step (B)",16} {"lines a column needs",22} {"L1 can hold",12} {"L2 can hold at most",20}");
+        foreach (int sz in (int[])[512, 640, 704, 768, 896, 1024, 1088, 1152])
+        {
+            long stride = 4L * sz;
+            long needed = sz;
+            long l1 = L1LinesHeld(stride);
+            long l2 = L2LinesHeldAtMost(stride);
+            string flag = l2 < needed ? "  <-- L2 cannot hold the reuse set" : "";
+            Console.WriteLine($"{sz,6} {stride,16} {needed,22} {l1,12} {l2,20}{flag}");
+        }
+    }
+}
+```
+
+</Solution>
+
+## work it out
+
+Start with the inner loop, because it is the only one that matters: it runs n times for every
+single iteration of the two loops outside it, so whatever it does to addresses dominates.
+
+| order | inner loop | `A` access | `B` access | `C` access |
+| --- | --- | --- | --- | --- |
+| `i,j,k` | `k` | along a row, +4 B | **down a column, +4n B** | written once, outside the loop |
+| `i,k,j` | `j` | fixed — hoisted into a register | along a row, +4 B | along a row, +4 B |
+| `j,k,i` | `i` | **down a column, +4n B** | fixed — hoisted into a register | **down a column, +4n B**, read *and* written |
+
+`i,k,j`'s inner loop advances two pointers 4 bytes at a time. A 64-byte line holds 16 `float`
+values, so one line fetched off `B` and one off `C` each serve 16 consecutive iterations before
+the next fetch is due:
+
+```text
+i,k,j inner loop — one row of B, one row of C, both walked left to right
+
+  B row:  [ b0 b1 b2 b3 b4 b5 b6 b7 b8 b9 ... b15 ][ b16 b17 ... ]
+            └──────────── one 64 B line ───────────┘└─ next line ─┘
+          16 reads per line fetched — the pattern the hardware prefetcher exists for
+```
+
+`i,j,k`'s inner loop steps `b[k * n + j]` by `4n` bytes — a whole row — on every single
+iteration. For any n ≥ 16 that step is bigger than one line, so **every read lands on a line
+none of the previous 15 reads touched**:
+
+```text
+i,j,k inner loop — one column of B, n floats apart
+
+  [b(0,j)]....(4n B)....[b(1,j)]....(4n B)....[b(2,j)]....(4n B)....
+     └ own line┘            └ own line ┘           └ own line ┘
+  1 read per line fetched — every fetch pays for 64 bytes and uses 4
+```
+
+That is a countable fact, not a guess: for the same n³ multiply-adds, `i,j,k` fetches **16 times**
+as many distinct lines out of `B` as `i,k,j` does, because 16 is exactly `line size ÷ element
+size` (`64 ÷ 4`). `j,k,i` is worse again — its inner loop walks *two* matrices down their columns
+at once (`A` and `C`), so it pays that same 16× penalty twice over, and `C`'s lines are dirtied
+on every write, so an evicted line has to be written back as well as re-fetched later.
+
+Sixteen times the line fetches from the inner loop alone explains why the column-walking orders
+lose in general. It does not yet explain why one particular size — the third prediction — should
+behave differently from its neighbours. For that you have to ask a second question: it is not
+enough for `i,j,k` to fetch a column's 64-byte lines once. The very next `j` fetches the
+*adjacent* column, and its lines overlap the ones just fetched: bytes 4 apart share a line, so
+sixteen consecutive columns reuse the same set of `n` lines. If those lines are still resident
+when column `j+1` arrives, the 16× penalty above is the whole story. If they are not, `i,j,k`
+pays it again, from scratch, for every one of the sixteen columns that should have shared it.
+
+That reuse set is `64n` bytes: 32 KB at n = 512, 64 KB at n = 1024, 72 KB at n = 1152. Every one
+of those is a small fraction of this box's 512 KB L2, so **by capacity alone the reuse set always
+fits.** That is the naive prediction, and it is the wrong question. A cache line can only live in
+one *set*, chosen by a slice of bits out of the middle of its address, and a set holds a fixed
+number of lines — L2 here is 1024 sets of 8 ways. The number of *distinct sets* a stride can
+reach — not the number of bytes it needs — is what actually bounds how much of a strided walk the
+cache can hold at once, and that is arithmetic on the stride, computed in the file above without
+timing anything.
+
+## the answer
+
+```text
+PASS: i,j,k / i,k,j / j,k,i all compute the same C
+
+L1d: 64 sets x 8 ways x 64 B = 32 KB (one way = 4096 B)
+L2:  1024 sets x 8 ways x 64 B = 512 KB (one way = 65536 B)
+page size: 4096 B
+
+     n  column step (B)   lines a column needs  L1 can hold  L2 can hold at most
+   512             2048                    512           16                  256  <-- L2 cannot hold the reuse set
+   640             2560                    640           64                 1024
+   704             2816                    704          128                 2048
+   768             3072                    768           32                  512  <-- L2 cannot hold the reuse set
+   896             3584                    896           64                 1024
+  1024             4096                   1024            8                  128  <-- L2 cannot hold the reuse set
+  1088             4352                   1088          128                 2048
+  1152             4608                   1152           64                 1024  <-- L2 cannot hold the reuse set
+```
+
+L1 was never the answer at any size — its whole 32 KB is smaller than every reuse set in the
+table, n = 512 included, so a change in what L1 retains cannot be what separates one size from
+another. L2 is where the prediction and the naive one part ways: **four of the eight sizes leave
+L2 unable to hold their own reuse set**, and by a wide margin at n = 1024, whose column stride —
+4096 bytes — is exactly one memory page. At that stride every element of the column shares the
+same page-offset bits, so the address arithmetic collapses to a single reachable set combination:
+L2 can hold at most 128 of the 1024 lines the column needs, an eighth of the requirement, against
+2048 held — nearly double what is needed — one size over at n = 1088. Being an exact multiple of
+the page size is not a coincidence here; it is the single worst case the address arithmetic can
+produce, because it is the stride at which the fewest possible address bits are left to vary.
+
+This is also the answer to the third prediction directly: no, the effect is not uniform across
+sizes with comfortable headroom below L2's capacity. Four sizes in this table need under 72 KB —
+a fraction of a 512 KB cache — and still cannot get all of it resident, because *capacity* and
+*is the cache allowed to put this data anywhere* are different questions, and only the second one
+this table answers.
+
+<Watch items={[['cache line', '64 B'], ['page', '4096 B'], ['L1d', '64 sets x 8 ways = 32 KB'], ['L2 (this box)', '1024 sets x 8 ways = 512 KB'], ['reuse set', '64n bytes'], ['i,j,k vs i,k,j', '16x the line fetches (line size / element size)'], ['n=1024 L2 bound', '128 of 1024 lines needed']]} />
+
+## why it works that way
+
+A cache line's address splits into three slices: the low bits pick a byte inside the line, the
+next slice picks the *set*, and the rest is a tag that says which of the possible lines mapping
+to that set is actually sitting there. Virtual memory only remaps whole pages — see
+[virtual memory](/systems/virtual-memory/) — so the low bits of a virtual address and its
+physical address are identical up to the page size. Whenever a set-select slice fits entirely
+inside those low bits, the set a given stride lands in is knowable from the stride alone, with no
+information about where the OS actually put the page. A stride that shares a large factor with
+the page size — and a whole page is the largest and worst such factor — visits the *same* few
+sets over and over, no matter how large or how many-way the cache is overall, because the
+hardware never had more address bits to spread the accesses across than the stride left it. This
+is a property of the address arithmetic, not of the data: it is exactly the same reasoning that
+finds the cache line's own size on
+[Finding the cache line](/systems/memory-hierarchy/stride-and-cache-lines/), applied one level up.
+
+Two points worth stopping on. First, this is not a virtual-memory story, and the obvious
+explanation for it is wrong: n = 1024's column crosses 1024 distinct 4 KB pages, and n = 1088's
+crosses 1088 — *more* pages, not fewer — yet 1088 is the one with headroom to spare in the table
+above. If address translation pressure explained the gap, the size touching more pages should be
+the worse one; it is the set arithmetic above, not the page count, that tracks which sizes are
+constrained. Second, this generalises past matrix multiply to anything with a row or column stride
+that is a
+suspiciously round number in bytes: a grid width that is a power of two, an image stride, a
+hash table sized to the nearest power of two and walked by bucket. The rule to carry is not
+"powers of two are bad" — it is "work out the stride's gcd with the page size, in bytes, before
+you trust that a working set fits just because it is small."
+
+### the fix that this reasoning cannot finish for you
+
+Blocking — restricting `i,k,j` to T × T tiles so a reused chunk of `B` is deliberately shrunk — is
+the textbook answer to exactly this shortfall, and the geometry argument above says why it should
+work: a smaller tile touches a smaller span of addresses, so even a badly-conflicting stride only
+has to spread across as many sets as the *tile* reaches, and a 64-element tile's stride spans a
+tiny fraction of what a full n = 1024 column does. What this page cannot tell you is whether that
+fix is worth having on any given workload. Blocking adds three more levels of loop control and
+index arithmetic around every reused chunk, and whether the sets it frees up were actually costing
+you more than that overhead is a question about wall-clock time — the one kind of evidence this
+site does not carry. Reach for it once you have a profiler pointing at this exact loop, not because
+a table on a page told you to.
+
+## what this looks like in prod
+
+You will almost never write a matrix multiply. You will write this:
+
+```csharp
+foreach (var account in accounts)
+    foreach (var day in days)
+        total += ledger[day][account.Index];      // day-major storage, account-major loop
+```
+
+That is `i,j,k` with different names. Any time you have a two-dimensional structure — a grid, a
+time series by symbol, a feature matrix, a `byte[]` image — there is a fast axis and a slow one,
+the fast one is whichever is contiguous, and the loop nest either agrees with it or does not. The
+symptom in production is a job whose runtime grows far faster than its input while the number of
+records processed grows linearly, and whose profile is a flat hot loop with no expensive callee.
+
+The fix that this page's counting argument supports is the cheap one: swap the loops so the inner
+one runs along memory. If you cannot, because the outer dimension is fixed by an API, transpose
+the data once, up front, and pay one linear pass to make every subsequent pass sequential — worth
+it only if you scan more than once. Blocking is the fix everyone remembers from the textbook and
+the one to reach for last, against a profile, once the traversal order is already right.
+
+A dimension sized to a round power of two — a 1024-wide grid, a 4096-byte row stride, a bucket
+count rounded up to the nearest power of two — is worth a second look for exactly the reason
+above: it is the stride most likely to leave a cache unable to use most of its own sets, and it is
+also the size an engineer is least likely to think to change, because it looks deliberate.
+
+## the same idea in other languages
+
+| language | what it's called | the trap |
+| --- | --- | --- |
+| C / C++ | row-major, same as C#; `int a[N][N]` is one contiguous block | `int **a` built with a loop of `malloc` is *not* contiguous — each row is a separate allocation, so even the "fast" loop order pointer-chases once per row. The two declarations index identically and perform nothing alike. |
+| Fortran, Julia, MATLAB, R | column-major — the layout is transposed relative to C | The fast loop order is the *opposite* one. Transliterating a loop nest out of a Fortran numerical paper into C# and keeping the loop order gives you the slow version, and it will still be correct, which is why nobody notices. |
+| Java | `double[][]` is an array of row objects, not a rectangle | There is no true 2-D array. Rows are separate heap objects that may be anywhere, so row-major traversal is fast only because each row is internally contiguous — the row-to-row step is a pointer chase, and a column walk is a pointer chase *per element*. |
+| Go | `[N][N]float64` is contiguous row-major; `[][]float64` is a slice of slices | The two look almost identical at the declaration and behave like C and like Java respectively. |
+| Python + NumPy | `ndarray` is row-major ("C order") by default and carries explicit strides | `a.T` does not move any data — it returns a view with the strides swapped. Code that is fast on `a` and slow on `a.T` is the same code hitting the same distinction this page derives, with no syntactic clue. |
+
+## common bugs
+
+- **Trusting capacity and stopping there.** Four of the eight sizes above need under 72 KB out of
+  a 512 KB L2 and still cannot get all of it resident. "The working set is smaller than the
+  cache" answers a different question than "the cache is allowed to put this data anywhere it
+  likes" — only the second one is about associativity, and it is the one that decides this.
+- **Blaming the wrong boundary.** n = 1024's column crosses more 4 KB pages than n = 896's and
+  fewer than n = 1088's — page count does not order these sizes; the stride's gcd with the page
+  size does. Reach for the arithmetic in the file above before reaching for a virtual-memory
+  explanation.
+- **Assuming only exact powers of two are dangerous.** The rule is "shares a large factor with
+  the page size," not "is a power of two." A stride of 4096 is the worst case because it shares
+  *all* of the page's bits; a stride that merely happens to be even is nowhere near it.
+- **Forgetting to reset `C` between orders**, or resetting it *inside* whatever you are comparing.
+  `i,j,k` writes each `C` element once; every other order here accumulates into it, so it has to
+  start at zero or the accumulating orders silently compute garbage that a loose tolerance check
+  might still wave through.
+- **Reaching for blocking before checking whether anything is actually being evicted.** Blocking
+  trades cache pressure for loop overhead. Where the reused chunk already fits — which the L1
+  column in the table above says is true at every size here — there is no pressure left to trade
+  away, only overhead to pay.
+- **Assuming the specific sizes here transfer.** 1024 is the worst case *because* the numbers in
+  this table are 64-byte lines, a 4096-byte page, and this box's exact set counts. A machine with
+  a different page size or a different L2 geometry has a different worst size, found by the same
+  arithmetic, not by the same number.

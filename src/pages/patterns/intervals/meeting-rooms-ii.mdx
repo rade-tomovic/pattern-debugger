@@ -1,0 +1,180 @@
+---
+layout: '@layouts/ProblemLayout.astro'
+topic: intervals
+problem: meeting-rooms-ii
+---
+
+import Callout from '@components/Callout.astro';
+import Watch from '@components/Watch.astro';
+import Cells from '@components/Cells.astro';
+
+## task
+
+Given an array of meeting time intervals, return the minimum number of conference rooms required
+to hold all of them. LeetCode #253.
+
+```text
+intervals = [[0,30],[5,10],[15,20]]  →  2
+```
+
+## how to think
+
+Unlike merge (combine ranges) or select (choose among conflicting ones), this question asks a
+third thing: how many ranges are alive **at the worst instant**. Checking every point in
+continuous time is out; but room count only ever changes at a meeting's start or its end, so it's
+enough to process those moments in order.
+
+Sort meetings by start and walk through them one at a time, maintaining the set of currently
+occupied rooms as a min-heap of their end times. When the next meeting arrives, first free every
+room whose meeting has already ended by (or exactly at) this meeting's start — pop while the
+heap's minimum end is `<=` the current start. Then this meeting claims a room, whether it reused a
+just-freed one or needed a brand-new one — push its end time. The heap's size right after that
+push is exactly "rooms in use right now"; the largest size seen across the whole sweep is the
+answer.
+
+<Callout kind="note" label="template instance">
+  **Merge** skeleton's start-sort, with a min-heap replacing the single open run — instead of
+  folding overlapping ranges into one, you count how many are open at once. Invariant: at every
+  step, the heap holds exactly the end times of meetings still ongoing at the current meeting's
+  start. What's new: a min-heap standing in for "how many resources are checked out right now," a
+  shape borrowed from [heap & top-k](/patterns/heap-top-k/).
+</Callout>
+
+## solution
+
+```csharp
+public int MinMeetingRooms(int[][] intervals)
+{
+    if (intervals.Length == 0) return 0;
+
+    Array.Sort(intervals, (a, b) => a[0].CompareTo(b[0]));  // process meetings in start order
+
+    var endTimes = new PriorityQueue<int, int>();            // min-heap: soonest-ending room on top
+    int peak = 0;
+
+    foreach (var meeting in intervals)
+    {
+        while (endTimes.Count > 0 && endTimes.Peek() <= meeting[0])
+            endTimes.Dequeue();                               // that room's meeting is over — free it
+
+        endTimes.Enqueue(meeting[1], meeting[1]);             // this meeting claims a room (old or new)
+        peak = Math.Max(peak, endTimes.Count);                // rooms in use right now
+    }
+    return peak;
+}
+```
+
+## trace
+
+`intervals = [[1,5],[2,6],[4,8],[7,9],[9,11]]`, already sorted by start:
+
+| meeting | freed (ends popped) | heap after (end times) | count | peak so far |
+| --- | --- | --- | --- | --- |
+| `[1,5]` | — | `{5}` | 1 | 1 |
+| `[2,6]` | — | `{5,6}` | 2 | 2 |
+| `[4,8]` | — | `{5,6,8}` | 3 | 3 |
+| `[7,9]` | `5, 6` | `{8,9}` | 2 | 3 |
+| `[9,11]` | `8, 9` | `{11}` | 1 | 3 |
+
+Final: `peak = 3`.
+
+<Cells
+  data={[1, 2, 3, 2, 1]}
+  cells={{ 2: 'ok' }}
+  caption="rooms in use right after each meeting is processed — the peak of 3 lands on [4,8], the third meeting"
+/>
+
+Meeting `[7,9]` is the "aha": it doesn't just free one room, it cascades through every room whose
+meeting has already ended, stopping the instant it finds one still in use:
+
+```text
+before [7,9]: heap = {5, 6, 8}   (three rooms occupied, ending at 5, 6, 8)
+[7,9] starts at 7:
+  peek 5 <= 7 -> free it
+  peek 6 <= 7 -> free it
+  peek 8 <= 7 -> false, stop (that room is still in use)
+push end=9 -> heap = {8, 9}
+```
+
+## why it works
+
+The heap always holds exactly the end times of meetings in progress at the moment you're
+standing at — the current meeting's start. Sorting by start means you process meetings in the
+same order rooms would actually be requested in real time, so "the largest heap size seen during
+the sweep" is precisely "the largest number of simultaneously active meetings" — which is the true
+minimum room count, since popping-then-pushing is what models reusing a room the instant it frees
+up, and you can never get away with fewer rooms than the single worst moment demands.
+
+**The chronological events alternative.** Split every meeting into two independent events — a
+start and an end — sort each list on its own, then walk both with two pointers. Consuming a start
+before the next end needs a brand-new room; consuming an end before the next start frees one:
+
+```csharp
+public int MinMeetingRoomsEvents(int[][] intervals)
+{
+    int n = intervals.Length;
+    if (n == 0) return 0;
+
+    var starts = new int[n];
+    var ends = new int[n];
+    for (int i = 0; i < n; i++)
+    {
+        starts[i] = intervals[i][0];
+        ends[i] = intervals[i][1];
+    }
+    Array.Sort(starts);
+    Array.Sort(ends);
+
+    int rooms = 0, peak = 0;
+    int s = 0, e = 0;
+    while (s < n)
+    {
+        if (starts[s] < ends[e])   // a meeting starts before the earliest ongoing one ends
+        {
+            rooms++;
+            s++;
+        }
+        else                        // a room frees up first (or exactly ties) — reuse it
+        {
+            rooms--;
+            e++;
+        }
+        peak = Math.Max(peak, rooms);
+    }
+    return peak;
+}
+```
+
+Same input, same answer — the two pointers reconstruct the identical sequence of "claim a room" /
+"free a room" events the heap produced, just without paying `O(log n)` per operation: two flat
+sorts plus one linear scan. It wins on constant factor when meetings are dense, but the heap
+version is the one to lead with — it generalizes past this problem to anything shaped like
+"resources checked out over time," where events aren't cleanly separable in advance.
+
+<Watch items={[['time', 'O(n log n)'], ['space', 'O(n)']]} />
+
+## common bugs
+
+- `endTimes.Peek() < meeting[0]` instead of `<=` — a meeting ending at `10` and one starting at
+  `10` do **not** need separate rooms (the first has vacated by the time the second begins); `<`
+  wrongly holds that room hostage for one extra meeting.
+- Popping based on the wrong field — freeing rooms whenever a meeting's own end is small, instead
+  of comparing the heap's minimum end against the **current meeting's start**. Rooms free based on
+  what time it is now, not on some unrelated ordering.
+- In the two-pointer version, sorting `starts` and `ends` as tied pairs (keeping them attached to
+  their original meeting) instead of independently — the trick only works because, once
+  separated, you only need to know *how many* starts and ends have occurred, not which meeting
+  they belonged to.
+- Returning `endTimes.Count` (or `rooms`) at the end of the loop instead of tracking a running
+  `peak` — whatever's still open at the very last meeting is not necessarily the maximum seen
+  anywhere during the sweep.
+
+## variants you can now solve
+
+- **Meeting Rooms I** (LC 252) — the yes/no version: sort by start, and the moment any
+  `intervals[i][0] < intervals[i - 1][1]` you already know the answer is "no, you cannot attend
+  every meeting" — no heap needed.
+- [Merge Intervals](/patterns/intervals/merge-intervals/) (LC 56) — the same start-sort instinct,
+  a different question: combine overlapping ranges instead of counting how many are open at once.
+- **Car Pooling** (LC 1094) — the identical event-sweep idea, except "room" becomes passenger
+  capacity: each event adds or removes a signed passenger count instead of `+/-1` room.
