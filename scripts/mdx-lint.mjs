@@ -3,7 +3,7 @@
  * Fast MDX hazard linter.
  *
  * `astro build` is the real gate, but it writes to dist/ and takes seconds,
- * which makes it useless for parallel content agents (they race on dist/ and
+ * which makes it useless for parallel content writers (they race on dist/ and
  * only find out at the very end). This catches the one class of mistake that
  * actually breaks these builds — a raw `<` or `{` in prose, which MDX parses
  * as JSX — per file, in milliseconds, without touching dist/.

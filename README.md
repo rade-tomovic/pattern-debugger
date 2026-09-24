@@ -40,6 +40,12 @@ bun run build    # static build into dist/
 - Visualizers are one Preact `TracePlayer` island plus pure step-builder functions per
   algorithm, ported from the original "algorithm pattern debugger" artifact.
 
+## Contributing
+
+Changes land through pull requests only, on typed branches (`feat/`, `fix/`, `docs/`,
+`chore/`, ...) with Conventional Commits messages. See [CONTRIBUTING.md](CONTRIBUTING.md) for
+the workflow, the build gate and the content verification rules.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).

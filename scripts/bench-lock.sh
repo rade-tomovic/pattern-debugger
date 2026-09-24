@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # Serialize timing runs — but only the ones that actually need it.
 #
-# Content agents run in parallel (up to 14 at once on this box). A timing run
+# Content jobs run in parallel (up to 14 at once on this box). A timing run
 # that shares the machine with another timing run measures the other one, so
-# measurements must not overlap. But most of what agents run is NOT a
+# measurements must not overlap. But most of what those jobs run is NOT a
 # measurement — compile checks, `sizeof` probes, IL dumps, objdump, a bug hunt
 # reproducing a race, a cross-language correctness check. Forcing those through
-# the same exclusive gate leaves the box idle while a dozen agents queue behind
+# the same exclusive gate leaves the box idle while a dozen jobs queue behind
 # work that never needed isolation.
 #
 # So there are two modes, backed by flock(2):
@@ -46,7 +46,7 @@ if [ "$#" -eq 0 ]; then
   exit 2
 fi
 
-# The lock file must exist and be writable by every agent.
+# The lock file must exist and be writable by every job.
 if [ ! -e "$LOCK" ]; then
   ( umask 000; : > "$LOCK" ) 2>/dev/null || true
 fi
