@@ -55,6 +55,7 @@ const groups = sections.map((s) => ({
 </aside>
 
 <!-- mobile nav -->
+<mobile-nav>
 <details class="border-line bg-panel group fixed inset-x-0 top-0 z-40 border-b lg:hidden">
   <summary
     class="flex cursor-pointer items-center justify-between px-4 py-3 font-mono text-sm text-ink select-none"
@@ -91,3 +92,44 @@ const groups = sections.map((s) => ({
     <LangPicker />
   </nav>
 </details>
+</mobile-nav>
+
+<script>
+  class MobileNav extends HTMLElement {
+    #details: HTMLDetailsElement | null = null;
+
+    #close() {
+      if (this.#details) this.#details.open = false;
+    }
+
+    #onKeydown = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape' || !this.#details?.open) return;
+      this.#close();
+      this.#details.querySelector('summary')?.focus();
+    };
+
+    #onPointerdown = (e: PointerEvent) => {
+      if (!this.#details?.open) return;
+      if (e.target instanceof Node && this.#details.contains(e.target)) return;
+      this.#close();
+    };
+
+    #onLinkClick = (e: MouseEvent) => {
+      if (e.target instanceof Element && e.target.closest('a')) this.#close();
+    };
+
+    connectedCallback() {
+      this.#details = this.querySelector('details');
+      this.#details?.querySelector('nav')?.addEventListener('click', this.#onLinkClick);
+      document.addEventListener('keydown', this.#onKeydown);
+      document.addEventListener('pointerdown', this.#onPointerdown);
+    }
+
+    disconnectedCallback() {
+      document.removeEventListener('keydown', this.#onKeydown);
+      document.removeEventListener('pointerdown', this.#onPointerdown);
+    }
+  }
+
+  if (!customElements.get('mobile-nav')) customElements.define('mobile-nav', MobileNav);
+</script>
