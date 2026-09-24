@@ -150,12 +150,12 @@ steps + note + watch vars + ◀ ▶ keys) only where motion teaches:
 ## Build Phases
 
 1. ✅ Scaffold: bun + Astro 7 + TS 7 + Tailwind 4 + Preact + MDX, git init
-2. ✅ Content tree (this file + curriculum.ts) → multi-agent critique for coverage/ordering
+2. ✅ Content tree (this file + curriculum.ts) → multi-lens critique for coverage/ordering
    (three-lens audit: new problems, reorders, core/stretch tracks, connection reasons,
    advanced-graphs rename, study plan data)
 3. ✅ Design system: port artifact tokens to Tailwind theme; layout, nav, MDX component kit
    (Callout, TraceTable, CheatSheet, Connections, ComplexityBadge); exemplar pages
-4. 🚧 Content fan-out: one agent per topic writes topic + problem MDX; every C# snippet
+4. 🚧 Content fan-out: topic + problem MDX written per topic, in parallel; every C# snippet
    compiled and behavior-asserted with .NET 10; traces verified step-by-step; links
    validated against curriculum.ts (see `docs/content-brief.md` for the exact per-page
    contract, including the required template-instance callout)
