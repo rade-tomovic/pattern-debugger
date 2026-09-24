@@ -56,15 +56,15 @@ const groups = sections.map((s) => ({
 
 <!-- mobile nav -->
 <mobile-nav>
-<details class="border-line bg-panel group fixed inset-x-0 top-0 z-40 border-b lg:hidden">
+<details class="border-line bg-panel group peer fixed inset-x-0 top-0 z-40 border-b open:shadow-[0_18px_40px_rgb(0_0_0/0.55)] lg:hidden">
   <summary
     class="flex cursor-pointer items-center justify-between px-4 py-3 font-mono text-sm text-ink select-none"
   >
     <span><span class="text-muted">//</span> pattern debugger</span>
     <span class="text-muted group-open:hidden">≡ menu</span>
-    <span class="hidden text-muted group-open:inline">× close</span>
+    <span class="hidden text-amber group-open:inline">× close</span>
   </summary>
-  <nav class="max-h-[70dvh] space-y-4 overflow-y-auto px-4 pb-6" aria-label="Site">
+  <nav class="border-line max-h-[70dvh] space-y-4 overflow-y-auto border-t px-4 pt-4 pb-6" aria-label="Site">
     {
       groups.map((g) => (
         <div>
@@ -92,6 +92,7 @@ const groups = sections.map((s) => ({
     <LangPicker />
   </nav>
 </details>
+<div class="fixed inset-0 z-30 hidden bg-[rgb(0_0_0/0.6)] backdrop-blur-[2px] peer-open:block lg:hidden" aria-hidden="true"></div>
 </mobile-nav>
 
 <script>
