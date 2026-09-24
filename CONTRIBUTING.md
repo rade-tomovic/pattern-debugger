@@ -23,8 +23,11 @@ bun run dev          # localhost:4321
 2. Commit with [Conventional Commits](https://www.conventionalcommits.org) messages:
    `<type>: <imperative summary>`, optionally scoped, e.g. `feat(graphs): add Course Schedule II`.
 3. Run the gate (below) locally.
-4. Open a pull request against `main`. The PR title follows the same `<type>: <summary>` form.
-   The deploy workflow builds every PR and publishes a preview on Cloudflare Pages.
+4. Open a pull request against `main`. The PR title follows the same `<type>: <summary>` form,
+   because PRs are squash-merged and the title becomes the commit message on `main`.
+   The `Build` check (MDX lint, build, link check) must pass before merging. PRs from
+   branches in this repository also get a Cloudflare Pages preview deploy; PRs from forks
+   are built and checked but not deployed.
 
 | type | use for | branch example |
 | --- | --- | --- |
