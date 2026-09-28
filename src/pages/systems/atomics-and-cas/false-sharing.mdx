@@ -119,10 +119,15 @@ line exactly when they floor-divide to the same number.
 ```text
    stride 1 (8 bytes apart):  cells[0] cells[1] cells[2] cells[3]
                                └────────────── 32 bytes ──────────────┘
+        array starts 0-32 bytes into a line:
         ┌────────────────────────────────────────────────────────────┐
         │            ONE 64-byte line: [c0][c1][c2][c3][ … 32B free ] │
         └────────────────────────────────────────────────────────────┘
-              four threads, one owner at a time — this line ping-pongs
+        array starts 40 bytes into a line (48 and 56 split the same way, further left):
+        ┌──────────────────────────────┐┌──────────────────────────────┐
+        │ line N:   [ … ][c0][c1][c2]  ││ line N+1: [c3][ … ]           │
+        └──────────────────────────────┘└──────────────────────────────┘
+              either way, at least two threads share a line — it ping-pongs
 
    stride 8 (64 bytes apart):  cells[0]      cells[8]      cells[16]     cells[24]
         ┌──────────────┐┌──────────────┐┌──────────────┐┌──────────────┐
@@ -132,9 +137,12 @@ line exactly when they floor-divide to the same number.
               another core to give anything up
 ```
 
-At `stride: 1` the four counters cannot be more than 32 bytes apart from first to last, so they
-always fit inside one 64-byte-aligned block — one line, regardless of exactly where the array
-starts. At `stride: 8` consecutive counters are exactly 64 bytes apart, and for any address `a`,
+At `stride: 1` the four counters span 32 bytes from the start of the first to the end of the
+last, so they sit in one line or in two adjacent lines — never more. Which one depends on where
+the array starts: an 8-byte-aligned payload that starts at byte 0, 8, 16, 24 or 32 of a line keeps
+all four in that line; one that starts at byte 40, 48 or 56 pushes the last one or more across the
+boundary. Either way at least two threads share a line, so the contention does not go away. At
+`stride: 8` consecutive counters are exactly 64 bytes apart, and for any address `a`,
 `(a + 64) / 64 == a / 64 + 1` always — floor division of a multiple of the line size shifts the
 line index by exactly one, with no dependency on where `a` sits inside its line. **Stride 64 bytes
 is not "usually enough" — it is the smallest stride that is guaranteed sufficient by arithmetic

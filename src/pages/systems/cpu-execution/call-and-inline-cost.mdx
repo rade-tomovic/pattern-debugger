@@ -134,16 +134,18 @@ static class Ops
 
 ### the call the JIT could not remove
 
-`DOTNET_JitDisasm` on `Inlined` and `NotInlined`, real output, block labels and offsets kept:
+`DOTNET_JitDisasm` on `Inlined` and `NotInlined`, real output, block labels kept. The two were
+captured on different machines — `Inlined` on Windows x64, `NotInlined` on Linux x64 — so the
+frame setup and the argument registers follow different ABIs; the loop bodies are what compare:
 
 ```text
-;  the inlined loop — Program:<<Main>$>g__Inlined|0_1():long (Tier1-OSR)
+;  the inlined loop — Program:<<Main>$>g__Inlined|0_1():long (Tier1-OSR, Windows x64)
 G_M000_IG01:
-       push     rbp
-       mov      rbp, rsp
+       mov      rcx, qword ptr [rsp+0x38]    ; total, carried over from the tier-0 frame
+       mov      eax, dword ptr [rsp+0x34]    ; i, carried over from the tier-0 frame
 G_M000_IG02:
-       xor      eax, eax             ; total = 0
-       mov      ecx, 1               ; i = 1 (OSR resumes mid-loop)
+       cmp      eax, 0xFA0
+       jge      SHORT G_M000_IG04
 G_M000_IG03:
        lea      edx, [rax+0x03]      ; i + 1 + 2, folded into one instruction
        movsxd   rdx, edx
@@ -154,10 +156,10 @@ G_M000_IG03:
 G_M000_IG04:
        mov      rax, rcx
 G_M000_IG05:
-       add      rsp, 80
+       add      rsp, 120
        pop      rbp
        ret
-; Total bytes of code 59
+; Total bytes of code 43
 
 ;  the same source with inlining forbidden — Program:<<Main>$>g__NotInlined|0_2():long (Tier1-OSR)
 G_M000_IG01:
@@ -193,8 +195,10 @@ G_M000_IG05:
 ```
 
 (Both listings say `Tier1-OSR` because promotion happened *during* a running loop — on-stack
-replacement patched the optimised body in mid-flight. The loop body is what matters and it is
-the same shape in the non-OSR version.)
+replacement patched the optimised body in mid-flight. That is why neither prologue starts
+`total` at zero: an OSR body is entered with the loop already partway through, so its first
+instructions load the live `total` and `i` out of the tier-0 frame it is taking over. The loop
+body is what matters and it is the same shape in the non-OSR version.)
 
 Count instructions rather than guess. The inlined loop body (`IG03`) is six instructions: `lea`,
 `movsxd`, `add`, `inc`, `cmp`, `jl`. The not-inlined loop body is nine: three `mov`s to place
@@ -316,8 +320,8 @@ And the instruction- and byte-counts from the disassembly above:
 
 | variant | instructions per iteration | method size | registers holding `total`/`i` |
 | --- | --- | --- | --- |
-| inlined call | 6 | 59 bytes | `rcx` / `eax` — caller-free registers, no save needed |
-| call, no inline | 9 | 84 bytes | `r15` / `rbx` — callee-saved, pushed and popped around the call |
+| inlined call | 6 | 43 bytes (Windows x64 capture) | `rcx` / `eax` — caller-free registers, no save needed |
+| call, no inline | 9 | 84 bytes (Linux x64 capture) | `r15` / `rbx` — callee-saved, pushed and popped around the call |
 | interface, guard hit | 14 (bounds check, type check, folded arithmetic) | 167 bytes, same as the row below | `r14` / `r15`, plus the guard's `cmp` and branch every iteration |
 | interface, guard miss | 20 (the 14 above, minus the folded `lea`, plus the 7-instruction real dispatch) | same 167 bytes | same — the cold block is reached, not recompiled |
 
@@ -343,7 +347,7 @@ cannot resolve, so it manufactures a resolvable one — a type check plus a dire
 on a profile instead of a proof. The bet is encoded once in the machine code; only how often it
 pays off changes with what the call site actually sees.
 
-<Watch items={[['inlined loop body', '6 instructions, 59 bytes total'], ['not-inlined loop body', '9 instructions, 84 bytes total'], ['registers spilled across the call', 'r15, rbx (callee-saved)'], ['guarded-devirt code, 1 type vs 2', 'identical, 167 bytes either way'], ['CallPoly guard pass rate', '2,000 of 4,000 — exact, from the alternation']]} />
+<Watch items={[['inlined loop body', '6 instructions'], ['not-inlined loop body', '9 instructions'], ['registers spilled across the call, Linux x64', 'r15, rbx (callee-saved)'], ['guarded-devirt code, 1 type vs 2', 'identical, 167 bytes either way'], ['CallPoly guard pass rate', '2,000 of 4,000 — exact, from the alternation']]} />
 
 ## what this looks like in prod
 

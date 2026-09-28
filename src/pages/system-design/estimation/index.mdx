@@ -3,7 +3,6 @@ layout: '@layouts/TopicLayout.astro'
 topic: estimation
 ---
 
-import Callout from '@components/Callout.astro';
 import Watch from '@components/Watch.astro';
 
 ## the ground floor
@@ -171,7 +170,7 @@ Working it through:
 - total requests/day = `50,000,000 × 20 = 1,000,000,000`
 - average QPS = `1,000,000,000 / 86,400 ≈ 11,574 req/s`
 - peak QPS = `11,574 × 3 ≈ 34,722 req/s`
-- of that peak, writes ≈ `34,722 / 21 ≈ 1,653/s`, reads ≈ `20 × 1,653 ≈ 33,069/s`
+- of that peak, writes ≈ `34,722 / 21 ≈ 1,653/s`, reads ≈ `34,722 − 1,653 ≈ 33,069/s`
 - writes/day = `1,000,000,000 / 21 ≈ 47,619,048`
 - raw bytes/day = `47,619,048 × 200 ≈ 9.52 GB/day`
 - physically stored bytes/day, replication factor 3 = `9.52 × 3 ≈ 28.57 GB/day`

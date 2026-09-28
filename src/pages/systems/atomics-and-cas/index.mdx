@@ -254,7 +254,7 @@ value that gets reused. Real output:
 === 3. ABA, scripted ===
   start                    stack: C -> B -> A   head=C
   thread 2 popped C, popped B, pushed C back
-  before thread 2's CAS…    stack: C -> A   head=C
+  before thread 1's CAS…    stack: C -> A   head=C
   thread 1's CAS returned  popped=C
   after                    stack: B -> A   head=B
 ```
@@ -269,8 +269,10 @@ value that gets reused. Real output:
 | 6 | `CompareExchange(head, B, C)` — C is what it expected, so it **succeeds** | | B | B → A |
 
 Thread 1 popped C, which is correct. What is not correct is that it set `head` to B — a node that
-was removed from the stack two steps ago — and lost A entirely. Every individual operation was
-atomic. The algorithm is still wrong.
+thread 2 removed two steps ago and now owns. B is back in the stack while thread 2 still holds it,
+so the same node is live in two places, and the next pop hands it out a second time. A survives
+only because nobody touched `next[B]`; nothing in the algorithm guaranteed that. Every individual
+operation was atomic. The algorithm is still wrong.
 
 <Callout kind="insight" label="what the GC takes away, and what it does not">
   In C++ this bug has a second, worse edge: node C could have been `free`d and its address handed

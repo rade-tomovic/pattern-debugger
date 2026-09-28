@@ -94,7 +94,7 @@ static class Bench
         // thread 2, in the window: pop C, pop B, push C back.
         int c = PopUnsafe(); int b = PopUnsafe(); Push(c);
         Console.WriteLine($"  thread 2 popped {name[c]}, popped {name[b]}, pushed {name[c]} back");
-        Console.WriteLine($"  before thread 2's CAS…    stack: {Dump()}   head={name[head]}");
+        Console.WriteLine($"  before thread 1's CAS…    stack: {Dump()}   head={name[head]}");
         t2Done.Set(); t1.Join();
 
         Console.WriteLine($"  thread 1's CAS returned  popped={(popped >= 0 ? name[popped] : popped.ToString())}");

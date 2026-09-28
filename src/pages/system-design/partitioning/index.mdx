@@ -76,7 +76,7 @@ CONSISTENT HASHING RING — hash space 0..359, walked clockwise, wraps at 360
   |         |         |         |         |         |         |
  C2        A1        B1        C1        A2        B2      (wraps to C2)
 
- key "order-4471" hashes to  47 -> first vnode clockwise is A1 -> node A
+ key "order-4471" hashes to  47 -> first vnode clockwise is B1 -> node B
  key "user-9002"  hashes to 302 -> first vnode clockwise is C2 -> node C (wrap)
 
  NODE D JOINS, placing two vnodes: D1 at 70, D2 at 230
@@ -85,16 +85,18 @@ CONSISTENT HASHING RING — hash space 0..359, walked clockwise, wraps at 360
   |    |    |     |    |    |    |    |    |
  C2   A1   D1    B1   C1   A2   D2   B2   (wraps)
        \___/\____/          \___/\____/
-      unchanged  moved            unchanged  moved
-      (owned by   from B1         (owned by   from B2
-       A1 still)  to D1            A2 still)  to D2
+      moved     unchanged         moved     unchanged
+      from B1   (owned by         from B2   (owned by
+      to D1      B1 still)        to D2      B2 still)
+
+ key "order-4471" at 47 now lands on D1 -> node D. "user-9002" at 302 still lands on C2.
 
  only the arcs (A1, D1] and (A2, D2] change owner. every other key's nearest
  vnode — and therefore its node — never moved. that is the entire point:
  node count changed, but roughly 1/N of keys moved, not (N-1)/N of them.
 ```
 
-`A1`/`A2`, `B1`, `C1`/`C2` are **virtual nodes** — a physical node claims several points on the
+`A1`/`A2`, `B1`/`B2`, `C1`/`C2` are **virtual nodes** — a physical node claims several points on the
 ring, not one. Without them, one physical node can land a large arc purely by hash luck, and
 the arcs stay that lumpy forever; more virtual nodes per physical node smooths the arc sizes
 toward equal, at the cost of a bigger routing table.

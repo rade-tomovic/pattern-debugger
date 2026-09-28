@@ -295,8 +295,8 @@ behaviour has never been specified has specified it by default, and the default 
   by peak queue depth judges nothing under a heap limit — that number is decided by the limit
   divided by the message size, not by how good the fix is.
 - **Sizing the bound by "how many messages we expect" rather than by memory.** The number that
-  matters is capacity × message size — 64 × 8 KiB is half a megabyte, and 100,000 × 8 KiB is 800.
-  Pick the bound by multiplying, not by intuition about volume.
+  matters is capacity × message size — 64 × 8 KiB is half a mebibyte, and 100,000 × 8 KiB is
+  781.25 MiB. Pick the bound by multiplying, not by intuition about volume.
 - **Trusting an `await` to yield.** `await w.WriteAsync(x)` on an unbounded channel completes
   synchronously every time, so the producer's loop never gives up its thread. `async` is not
   concurrency by itself; it is concurrency only where something in the `async` chain can actually
