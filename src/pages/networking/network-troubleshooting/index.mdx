@@ -481,13 +481,13 @@ catch (HttpRequestException ex)
     // and in .NET 8 and later, ex.HttpRequestError names the same thing directly.
     string rung = ex.InnerException switch
     {
-        SocketException { SocketError: SocketError.HostNotFound }
+        SocketException { SocketErrorCode: SocketError.HostNotFound }
             => "rung 1 — the name never resolved",
-        SocketException { SocketError: SocketError.NetworkUnreachable or SocketError.HostUnreachable }
+        SocketException { SocketErrorCode: SocketError.NetworkUnreachable or SocketError.HostUnreachable }
             => "rung 2 — no route: nothing was sent",
-        SocketException { SocketError: SocketError.ConnectionRefused }
+        SocketException { SocketErrorCode: SocketError.ConnectionRefused }
             => "rung 3 — refused: reachable, nothing listening",
-        SocketException { SocketError: SocketError.TimedOut }
+        SocketException { SocketErrorCode: SocketError.TimedOut }
             => "rung 3 — silence: dropped, suspect a filter",
         AuthenticationException
             => "rung 4 — TCP connected, TLS did not",

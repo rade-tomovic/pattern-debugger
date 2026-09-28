@@ -208,7 +208,7 @@ Assume — genuinely assumed, not measured — a topic carrying 50 million event
 record size of 1 KB, a 7-day retention window, and a replication factor of 3 (the common
 default, tolerating one broker loss without data loss given `min.insync.replicas=2`).
 
-- average rate: `50,000,000 / 86,400 ≈ 580` events/sec — the same "divide the daily figure by
+- average rate: `50,000,000 / 86,400 ≈ 579` events/sec — the same "divide the daily figure by
   the seconds in a day" move [estimation](/system-design/estimation/) uses for request rates.
 - raw bytes/day: `50,000,000 × 1,000 B = 50,000,000,000 B ≈ 50 GB/day` (decimal GB throughout).
 - 7-day footprint, one copy: `50 GB × 7 = 350 GB`.

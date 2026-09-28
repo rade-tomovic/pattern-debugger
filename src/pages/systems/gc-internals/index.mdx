@@ -346,7 +346,8 @@ below the line and one above:
 | 84,000 B (small object heap) | 119 | 29 | 0 |
 | 86,000 B (large object heap) | 628 | 628 | 628 |
 
-Below the line, 119 gen0 collections and a couple dozen gen1 promotions, but not one gen2 — the
+Below the line, 119 gen0 collections and a few dozen gen1 collections at most (29 on this run —
+the gen1 count moves with the machine's GC budgets), but not one gen2 — the
 arrays are small enough for the generational fast path to handle them normally. One size class
 above it, **every single collection is a full gen2**, because the LOH is only ever visited
 alongside gen2 work.
@@ -549,10 +550,10 @@ Three sentences, and they answer most GC questions you will ever be asked:
 | `new byte[8192]` | 99 | 3 | 0 |
 | `ArrayPool.Rent` | 0 | 0 | 0 |
 
-Ninety-nine gen0 collections and three gen1 collections happened during the allocating run, and
-zero happened during the pooled one. Each of those collections stopped every thread — including
+Ninety-nine collections happened during the allocating run — three of them reached gen1 on this
+run, a count that moves with the machine's GC budgets — and zero happened during the pooled one. Each of those collections stopped every thread — including
 whichever request happened to be executing at that instant. That request pays for the pause; the
-other 199,801 do not. That is the entire shape of a GC latency incident: the average looks fine
+other 199,901 do not. That is the entire shape of a GC latency incident: the average looks fine
 because most
 requests never overlap a collection, the tail is on fire because some unlucky fraction always
 does, and CPU looks normal because the work is real work, just not the request's own work.

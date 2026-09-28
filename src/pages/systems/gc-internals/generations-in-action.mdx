@@ -37,16 +37,17 @@ buffer.
   reason it from what survival does to an object's generation, not from a guess.
 </Callout>
 
-## the experiment
+## the code
 
 The exact file that produced every number below —
-`dotnet run bench/gc-internals/generations-in-action.cs`:
+`dotnet run bench/gc-internals/generations-in-action.cs -c Release`:
 
 <Solution>
 
 ```csharp
-// The exercise for /systems/gc-internals/generations-in-action/.
-//   dotnet run bench/gc-internals/generations-in-action.cs
+// The exercise for /systems/gc-internals/generations-in-action/. No Stopwatch anywhere in this
+// file — everything reported is a byte count, an object count, or a collection count.
+//   dotnet run bench/gc-internals/generations-in-action.cs -c Release
 using System;
 using System.Runtime.CompilerServices;
 
@@ -127,6 +128,36 @@ foreach (string pattern in new[] { "churn", "retain", "reuse" })
     GC.KeepAlive(sink);
 }
 
+// ── the promotion ladder: one retained object, watched across collections ────
+Console.WriteLine("\n=== one object that is never dropped, after each forced collection ===");
+{
+    var survivor = new Entry(1, 1);
+    Console.WriteLine($"  freshly allocated                      gen={GC.GetGeneration(survivor)}");
+    for (int i = 1; i <= 4; i++)
+    {
+        GC.Collect(0, GCCollectionMode.Forced, blocking: true);
+        Console.WriteLine($"  after gen0 collection #{i}               gen={GC.GetGeneration(survivor)}");
+    }
+    GC.Collect(1, GCCollectionMode.Forced, blocking: true);
+    Console.WriteLine($"  after a gen1 collection                gen={GC.GetGeneration(survivor)}");
+    GC.Collect(2, GCCollectionMode.Forced, blocking: true);
+    Console.WriteLine($"  after a gen2 collection                gen={GC.GetGeneration(survivor)}");
+    GC.KeepAlive(survivor);
+}
+
+// ── where the retained objects ended up ──────────────────────────────────────
+Console.WriteLine("\n=== generation census of the 2,000,000 retained objects ===");
+{
+    Array.Clear(keep);
+    GC.Collect(2, GCCollectionMode.Forced, blocking: true);
+    Retain(N, keep);
+    var census = new int[3];
+    foreach (var e in keep) census[GC.GetGeneration(e)]++;
+    Console.WriteLine($"  gen0 {census[0]:N0}   gen1 {census[1]:N0}   gen2 {census[2]:N0}");
+    Console.WriteLine($"  heap now {GC.GetTotalMemory(false) / 1048576.0:F1} MB");
+    GC.KeepAlive(keep);
+}
+
 class Entry(int key, long value)
 {
     public int Key = key;
@@ -136,7 +167,9 @@ class Entry(int key, long value)
 
 </Solution>
 
-## what it controls for
+## work it out
+
+### what the experiment controls for
 
 **The three loops do identical work apart from the lifetime.** Same iteration count, same
 arithmetic, same `Entry` type, same field writes. `churn` and `retain` even allocate the same
@@ -159,7 +192,31 @@ in `reuse`'s numbers even though `reuse` never touched them.
 and `GC.GetAllocatedBytesForCurrentThread` are exact counters with no scheduler noise in them —
 they report the same numbers on every run, on any machine, which is not true of a stopwatch.
 
-## the numbers
+### what the collector does in each case
+
+The mechanism is one sentence: **a collection's cost is proportional to what survives it, and
+survival is what promotion is made of.** Walk each pattern through it.
+
+In `churn`, every `Entry` is unreachable before the next one is born. When gen0's budget runs
+out, the collector suspends the threads, walks the roots, finds essentially nothing alive in
+gen0, and declares the whole region free — the dead objects are **never visited**. Marking is a
+walk over live objects; garbage costs nothing to collect because the collector never learns it
+existed. So `churn` should cost one gen0 collection per gen0 budget's worth of allocation and
+nothing else — gen1 and gen2 are never touched, because nothing is ever promoted into them.
+
+In `retain`, the keeper array is a root, so every object the loop has produced so far is
+reachable. Now a gen0 collection finds *everything* in gen0 alive: it must mark all of it and
+promote the lot into gen1. Which means the next collection has a full gen1 to deal with, and
+eventually a gen2 collection walks the whole heap — a promotion cascade, running on exactly the
+bytes `churn` walks away from for free.
+
+In `reuse`, there is one object. The allocation pointer never moves, so the gen0 budget is never
+exhausted, so no collection is ever triggered — not "a small number," zero, because a collection
+is triggered only by an allocation and this loop performs none. The prediction that trips people
+up here is expecting some background housekeeping to run anyway; there is none. If nothing
+allocates, nothing collects.
+
+## the answer
 
 | pattern | allocated MB | gen0 | gen1 | gen2 | heap after MB |
 | --- | --- | --- | --- | --- | --- |
@@ -168,38 +225,15 @@ they report the same numbers on every run, on any machine, which is not true of 
 | `reuse` | 0.0 | 0 | 0 | 0 | 15.3 |
 
 `churn` and `retain` allocate the identical 61.0 MB — the difference is entirely in what happens
-after. `reuse` allocates nothing and its heap-after figure is just whatever the runtime had
-resident from starting up.
-
-## why
-
-The mechanism is one sentence: **a collection's cost is proportional to what survives it, and
-survival is what promotion is made of.**
-
-### what the collector actually did in each case
-
-In `churn`, every `Entry` is unreachable before the next one is born. When gen0's budget runs
-out, the collector suspends the threads, walks the roots, finds essentially nothing alive in
-gen0, and declares the whole region free — the dead objects are **never visited**. Marking is a
-walk over live objects; garbage costs nothing to collect because the collector never learns it
-existed. 61 MB of allocation cost exactly 3 gen0 collections and nothing else — gen1 and gen2
-were never touched, because nothing was ever promoted into them.
-
-In `retain`, the keeper array is a root, so every object the loop has produced so far is
-reachable. Now a gen0 collection finds *everything* in gen0 alive: it must mark all of it and
-promote the lot into gen1. Which means the next collection has a full gen1 to deal with, and
-eventually a gen2 collection walks the whole heap — the 4/3/1 ladder above is that promotion
-cascade happening in real time, on the identical 61 MB `churn` walked away from for free.
-
-In `reuse`, there is one object. The allocation pointer never moves, so the gen0 budget is never
-exhausted, so no collection is ever triggered — not "a small number," zero, because a collection
-is triggered only by an allocation and this loop performs none. The prediction that trips people
-up here is expecting some background housekeeping to run anyway; there is none. If nothing
-allocates, nothing collects.
+after. `churn`'s 61 MB cost exactly 3 gen0 collections and nothing else; `retain`'s 4/3/1 is the
+promotion cascade from the previous section, happening in real time. `reuse` allocates nothing,
+collects nothing, and its heap-after figure is just whatever the runtime had resident from
+starting up.
 
 ### the promotion ladder, watched directly
 
-The same source file also tracks one deliberately-retained object across forced collections:
+The last two blocks of the same file track one deliberately-retained object across forced
+collections, then count where `retain`'s objects ended up:
 
 ```text
 === one object that is never dropped, after each forced collection ===
@@ -217,7 +251,7 @@ gen0 collections, and a gen0 collection does not look at gen1 — so the object 
 untouched and uncounted, until something forces a gen1 collection. **That is the generational
 bet paying off**: the vast majority of collections never even glance at the data you kept.
 
-The flip side is the census of where `retain`'s 2,000,000 objects ended up:
+The flip side is that census of the 2,000,000 retained objects:
 
 ```text
 === generation census of the 2,000,000 retained objects ===
@@ -233,6 +267,14 @@ promotion runs on. The other two patterns' gen2 count is zero for two different 
 lived long enough (`churn`), or nothing was ever allocated (`reuse`) — which is worth holding
 onto, because a profiler showing "gen2: 0" does not by itself tell you which of those two stories
 you are in.
+
+## why it works that way
+
+Surviving is the only thing a generational collector charges for. Allocation is a pointer bump;
+a dead object is never visited; a live one is marked, copied into the next generation, and from
+then on is only looked at by the rarer, larger collections. Every pattern above is that rule
+applied to a different survival rate: none (`churn`), all (`retain`), or nothing allocated to
+survive in the first place (`reuse`).
 
 ### why `churn` still costs something against `reuse`
 

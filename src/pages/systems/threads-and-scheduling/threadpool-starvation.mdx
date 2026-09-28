@@ -245,7 +245,7 @@ for the blocking call *and* a pool thread for the caller waiting on it, so it do
 threads consumed per request. Moving blocking code onto the pool does not remove the blocking; it
 just makes it somebody else's thread.
 
-<Watch items={[['pool threads used, blocking', '42 (this run)'], ['pool threads used, await', '16 (== cores)'], ['injection rounds, blocking', '4'], ['injection rounds, await', '1'], ['extra workers await needed', '0']]} />
+<Watch items={[['pool threads used, blocking', '42 (this run)'], ['pool threads used, await', '16 (== cores)'], ['injection rounds, blocking', '4 (this run)'], ['injection rounds, await', '1'], ['extra workers await needed', '0']]} />
 
 ## what this looks like in prod
 

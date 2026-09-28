@@ -91,7 +91,7 @@ Seed the heap with one head per list, then pop/refill until every source is exha
 | 7 | A:5 | `{C:6}` | — (A exhausted) | `{C:6}` | `[1,1,2,3,4,4,5]` |
 | 8 | C:6 | `{}` | — (C exhausted) | `{}` | `[1,1,2,3,4,4,5,6]` |
 
-Step 1 is the tie worth noticing: `A` and `C` both offer `1` at the seed. `PriorityQueue` breaks
+Step 1 is the tie worth noticing: `A` and `B` both offer `1` at the seed. `PriorityQueue` breaks
 ties arbitrarily — either order is correct, since both `1`s belong at the front either way.
 
 ## why it works
